@@ -5,7 +5,9 @@ use aivyx_config::Settings;
 use aivyx_core::Agent;
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{ConfirmationGate, ExecutionConfiner, NoopConfiner, PermissionGate};
-use aivyx_tools::{EditFileTool, ReadFileTool, ToolExecutor, ToolRegistry, WriteFileTool};
+use aivyx_tools::{
+    EditFileTool, GlobTool, GrepTool, ReadFileTool, ToolExecutor, ToolRegistry, WriteFileTool,
+};
 use clap::Parser;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -65,16 +67,18 @@ async fn main() -> anyhow::Result<()> {
         settings.backend.api_key.clone(),
     ));
 
+    let deny_paths = settings.permissions.resolved_deny_paths();
+
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
+    registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
 
     let (prompter, permission_rx) = aivyx_tui::permission_channel();
-    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
-        Arc::new(prompter),
-        settings.permissions.resolved_deny_paths(),
-    ));
+    let gate: Arc<dyn PermissionGate> =
+        Arc::new(ConfirmationGate::new(Arc::new(prompter), deny_paths));
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let executor = ToolExecutor::new(registry, gate, confiner);
     let system_prompt = build_system_prompt(&executor);

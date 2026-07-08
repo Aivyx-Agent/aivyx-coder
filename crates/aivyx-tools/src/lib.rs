@@ -19,7 +19,7 @@ mod diff;
 mod path_resolve;
 mod tools;
 
-pub use tools::{EditFileTool, ReadFileTool, WriteFileTool};
+pub use tools::{EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool};
 
 #[derive(Debug, Error)]
 pub enum ToolError {

@@ -93,14 +93,31 @@ mechanism for *invoking* tools (that part works fine); this was specifically
 about how edit *content* gets communicated and validated — but per the
 investigation above, edit content format was never the actual problem.
 
-### Phase 3 — Search and navigation tools
-Add a content-search tool (grep-equivalent) and a path-search tool
-(glob-equivalent) — universal across every agent studied, no index/server
-needed, and a natural extension of the existing `ToolRegistry`/`ConfirmationGate`
-framework (read-only, auto-allow like `read_file`). Rust crates: `ignore` +
-`grep-searcher`/`grep-regex` (ripgrep's own library crates) as already
-anticipated in earlier planning, avoiding a hard dependency on an external
-`rg` binary.
+### Phase 3 — Search and navigation tools — ✅ done
+Added `grep` (content search) and `glob` (path search) tools, named to match
+Claude Code's own tool names deliberately — well-represented in training
+data, which matters for small local models. Built on `ignore` + `grep-searcher`/
+`grep-regex`/`grep-matcher`/`globset` (ripgrep's own library crates), so both
+respect `.gitignore` and don't follow symlinks by default, same as ripgrep
+itself. Both are read-only/auto-allow like `read_file`, extending the
+existing `ToolRegistry`/`ConfirmationGate` framework as planned.
+
+Planning this surfaced a real gap before it shipped: `ConfirmationGate::is_denied`
+checks `path.starts_with(denied)`, correct for a single-file target but
+insufficient for a recursive search — if the search root is merely an
+*ancestor* of a `deny_paths` entry, the top-level check passes and a naive
+walk would read into the denied subtree anyway. Closed by threading
+`deny_paths` into both tools directly (constructor argument, not a broader
+`ToolExecutionContext` change) and skipping any walked entry under a denied
+path via a new shared `path_resolve::is_denied` helper. Verified this holds
+end-to-end: a live pty-driven run against a real local model, with a `secret/`
+directory configured as `deny_paths` and containing the *same* search string
+as a legitimate file elsewhere in the tree, confirmed `grep`/`glob` only ever
+returned the legitimate match — no trace of the denied file's name or content
+anywhere in the session, alongside confirming `.gitignore`-excluded content
+was also correctly absent. 11 new unit tests across both tools: real matches,
+`.gitignore` respected, denied-subtree-as-ancestor-root closed, symlink
+escape closed, output capped and clearly reported when truncated.
 
 ### Phase 4 — A verification loop
 Add a way for the agent to run the project's own build/test/lint and get the
