@@ -27,7 +27,9 @@ directional, not committed fact, until spot-checked.
 - A 27B model (`qwen3.6:27b`) completes a full 5-turn edit task correctly, ~7x slower per call.
 - Ollama itself can panic under sustained multi-tool-call load (external bug, not ours) — our error handling degraded gracefully when it did.
 
-**Phase 1 hardening complete** (this pass): cancellation now propagates through the tool-dispatch loop and the next LLM request; `max_tool_iterations_per_turn` is wired from config (clamped to a minimum of 1); the LLM client has a connect timeout, an idle-stream timeout, and a size cap on accumulated response text; a truncated (`length`/`error` finish reason) response now surfaces as a visible error instead of looking like a normal empty turn; `TerminalGuard` no longer leaks raw mode on partial init failure and `restore_terminal` attempts both cleanup steps independently; tool-result/tool-call/notice transcript lines preserve embedded newlines instead of rendering as one concatenated wall of text; the auto-scroll offset is computed from ratatui's own post-wrap row count instead of pre-wrap logical line count; `write_file` now shows an explicit warning instead of a silent/ambiguous prompt when overwriting an existing binary file; and `SYSTEM_PROMPT`'s tool list is derived from `ToolExecutor::definitions()` so it can't drift. Deliberately deferred (narrow/theoretical, documented in the plan rather than fixed): the `edit_file` TOCTOU, case-sensitive path comparison, relative `deny_paths` entries, the `path_resolve`/`aivyx-config` home-dir divergence, `Tool::execute`'s type-system bypassability, and a couple of efficiency-only findings (history-cloning cost, full-transcript-rebuild-per-redraw).
+**Phase 1 hardening complete** (this pass): cancellation now propagates through the tool-dispatch loop and the next LLM request; `max_tool_iterations_per_turn` is wired from config (clamped to a minimum of 1); the LLM client has a connect timeout, an idle-stream timeout, and a size cap on accumulated response text; a truncated (`length`/`error` finish reason) response now surfaces as a visible error instead of looking like a normal empty turn; `TerminalGuard` no longer leaks raw mode on partial init failure and `restore_terminal` attempts both cleanup steps independently; tool-result/tool-call/notice transcript lines preserve embedded newlines instead of rendering as one concatenated wall of text; the auto-scroll offset is computed from ratatui's own post-wrap row count instead of pre-wrap logical line count; `write_file` now shows an explicit warning instead of a silent/ambiguous prompt when overwriting an existing binary file; and `SYSTEM_PROMPT`'s tool list is derived from `ToolExecutor::definitions()` so it can't drift. Deliberately deferred (narrow/theoretical, documented in the plan rather than fixed): the `edit_file` TOCTOU, case-sensitive path comparison, relative `deny_paths` entries, the `path_resolve`/`aivyx-config` home-dir divergence, `Tool::execute`'s type-system bypassability, and a couple of efficiency-only findings (history-cloning cost, full-transcript-rebuild-per-redraw). A follow-up review of this same pass caught 5 real regressions it had introduced (a cancellation/history-corruption bug, an off-by-2 in the new scroll fix, an empty-tool-result rendering bug, a `TerminalGuard` alt-screen leak, and an unbounded pre-first-byte hang) — all fixed and live-verified, see memory `project-aivyx-coder-phase1-hardening`.
+
+**Phase 2 investigated, not built** (see the Phase 2 section below and memory `project-aivyx-coder-phase2-investigation`): confirmed via a new raw wire-traffic logger that the `ornith:9b` degradation is a model-generation failure (hallucinated procedural rules, indecision spiraling, then a bare `finish_reason: stop` with no tool call) rather than a client bug or an edit-format problem — no engineering fix identified at this layer.
 
 ## What the research says a coding agent needs
 
@@ -60,17 +62,36 @@ done from the original Phase 1 idea: revising the three tool descriptions/error
 messages per Anthropic's tool-design guidance — still worth doing before the
 tool surface grows, folded into whichever of Phase 2/3 lands next.
 
-### Phase 2 — Fix editing reliability at the root cause
-This is the highest-leverage change given what's already been observed:
-adopt a prompted SEARCH/REPLACE-style edit format for `edit_file` (Aider's
-pattern) instead of leaning solely on native tool-calling for the edit
-payload, with a bounded repair loop — on a non-matching edit, feed back the
-actual nearby file content and let the model retry, capped at ~3 attempts
-(reusing/finally activating the `max_tool_iterations` plumbing from Phase 1).
-This directly targets the `ornith:9b` degradation pattern rather than hoping
-a better model always saves you. Native tool-calling stays the mechanism for
-*invoking* tools (that part works fine); this is specifically about how edit
-*content* gets communicated and validated.
+### Phase 2 — Fix editing reliability at the root cause — investigated, not building this
+Before implementing the prompted SEARCH/REPLACE rework described below, reviewed
+the plan against the actual evidence and found it doesn't target the observed
+failure: a repair loop already exists for free (`ToolExecutor::dispatch` already
+feeds tool errors back into history, and `Agent::run_turn`'s multi-iteration loop
+already lets the model retry within a turn), and the `ornith:9b` degradation
+happens *before or without* any edit ever being attempted, so an edit-format
+change can't reach it. Built an opt-in raw wire-traffic logger
+(`AIVYX_DEBUG_LOG`, `crates/aivyx-llm/src/openai_compat.rs`) and re-ran the
+original capability-test scenario with it on. Root cause, confirmed from the
+raw log: a genuine model-generation failure, not a client bug — history
+assembly is correct through every captured request; the model itself sometimes
+hallucinates procedural rules that were never in the system prompt, argues with
+itself about them in its reasoning trace, and ends the turn with
+`finish_reason: "stop"` and zero tool calls instead of executing what it just
+described. This looks like an inherent small-model (9B) agentic-reliability
+limit, not something fixable at the edit-format or plumbing layer. No further
+engineering action planned here — see memory `project-aivyx-coder-phase2-investigation`
+for the full findings with log excerpts. Mitigation remains what the original
+capability test already showed: prefer a larger model (`qwen3.6:27b`) for
+multi-step work.
+
+_Original plan, kept for reference, not being built_: adopt a prompted
+SEARCH/REPLACE-style edit format for `edit_file` (Aider's pattern) instead of
+leaning solely on native tool-calling for the edit payload, with a bounded
+repair loop — on a non-matching edit, feed back the actual nearby file content
+and let the model retry, capped at ~3 attempts. Native tool-calling stays the
+mechanism for *invoking* tools (that part works fine); this was specifically
+about how edit *content* gets communicated and validated — but per the
+investigation above, edit content format was never the actual problem.
 
 ### Phase 3 — Search and navigation tools
 Add a content-search tool (grep-equivalent) and a path-search tool
