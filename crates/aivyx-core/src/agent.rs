@@ -21,6 +21,15 @@ pub enum AgentEvent {
 /// a misbehaving backend that never stops streaming.
 const MAX_ASSISTANT_TEXT_BYTES: usize = 10 * 1024 * 1024;
 
+/// A single LLM response containing more tool calls than this has the
+/// excess skipped rather than dispatched. `max_tool_iterations_per_turn`
+/// counts LLM round-trips, not calls within one round, so without this a
+/// single response could commit an unbounded number of actions — each one
+/// individually already-approved via the Always-Allow cache or a
+/// pre-approved `allowed_commands` entry — with no existing safeguard
+/// noticing until well after the fact.
+const MAX_TOOL_CALLS_PER_RESPONSE: usize = 20;
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("llm backend error: {0}")]
@@ -74,15 +83,16 @@ impl Agent {
     }
 
     /// Records a synthetic tool result for a call that was never dispatched
-    /// because cancellation fired first. The assistant message already
-    /// pushed to history recorded this call as a `ContentBlock::ToolCall`;
-    /// every such call needs a matching `Role::Tool` result or the next
-    /// turn's request will contain an assistant message with unanswered
+    /// — either cancellation fired first, or the response exceeded
+    /// `MAX_TOOL_CALLS_PER_RESPONSE`. The assistant message already pushed
+    /// to history recorded this call as a `ContentBlock::ToolCall`; every
+    /// such call needs a matching `Role::Tool` result or the next turn's
+    /// request will contain an assistant message with unanswered
     /// tool_calls, which most OpenAI-compatible backends reject outright.
-    fn record_cancelled_tool_result(&mut self, call: ToolCall) {
+    fn record_skipped_tool_result(&mut self, call: ToolCall, reason: &str) {
         let result = ToolResult {
             call_id: call.id,
-            output: ToolOutput::Denied("cancelled before this tool call was executed".to_string()),
+            output: ToolOutput::Denied(reason.to_string()),
         };
         self.emit(AgentEvent::ToolResult(result.clone()));
         self.history.push(Message {
@@ -208,17 +218,28 @@ impl Agent {
                 return Ok(());
             }
 
-            for call in tool_calls {
+            for (index, call) in tool_calls.into_iter().enumerate() {
                 // Every one of these calls is already recorded as a
                 // ContentBlock::ToolCall in the assistant message just
                 // pushed to history — each one needs a matching Role::Tool
                 // result or the *next* turn's request will contain an
                 // assistant message with unanswered tool_calls, which most
                 // OpenAI-compatible backends reject outright. So once
-                // cancelled, record the remaining calls as cancelled rather
-                // than silently skipping them.
+                // cancelled (or over the per-response cap), record the
+                // remaining calls as skipped rather than silently dropping
+                // them.
+                if index >= MAX_TOOL_CALLS_PER_RESPONSE {
+                    self.record_skipped_tool_result(
+                        call,
+                        "skipped — too many tool calls in a single response",
+                    );
+                    continue;
+                }
                 if cancellation.is_cancelled() {
-                    self.record_cancelled_tool_result(call);
+                    self.record_skipped_tool_result(
+                        call,
+                        "cancelled before this tool call was executed",
+                    );
                     continue;
                 }
 

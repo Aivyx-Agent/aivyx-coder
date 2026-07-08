@@ -100,13 +100,35 @@ impl ExecutionConfiner for NoopConfiner {
 /// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
 /// in every caller.
 #[cfg(feature = "sandbox-backend")]
-pub fn default_confiner(cwd: &Path, extra_read_paths: &[PathBuf]) -> Arc<dyn ExecutionConfiner> {
-    Arc::new(LandlockConfiner::new(cwd, extra_read_paths))
+pub fn default_confiner(
+    cwd: &Path,
+    extra_read_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
+    require_enforcement: bool,
+) -> Arc<dyn ExecutionConfiner> {
+    Arc::new(LandlockConfiner::new(
+        cwd,
+        extra_read_paths,
+        deny_paths,
+        require_enforcement,
+    ))
 }
 
 #[cfg(not(feature = "sandbox-backend"))]
-pub fn default_confiner(_cwd: &Path, _extra_read_paths: &[PathBuf]) -> Arc<dyn ExecutionConfiner> {
+pub fn default_confiner(
+    _cwd: &Path,
+    _extra_read_paths: &[PathBuf],
+    _deny_paths: &[PathBuf],
+    _require_enforcement: bool,
+) -> Arc<dyn ExecutionConfiner> {
     Arc::new(NoopConfiner)
+}
+
+/// Shared by `ConfirmationGate::is_denied` and (behind `sandbox-backend`)
+/// `LandlockConfiner`'s path-grant construction — both need the same
+/// "is this path under a denied path" check.
+pub(crate) fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
+    deny_paths.iter().any(|denied| path.starts_with(denied))
 }
 
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is

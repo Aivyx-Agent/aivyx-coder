@@ -36,7 +36,7 @@ pub struct Settings {
     pub sandbox: SandboxSettings,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SandboxSettings {
     /// Additional filesystem paths process-executing tools may read from,
@@ -46,6 +46,23 @@ pub struct SandboxSettings {
     /// node_modules cache living outside the project directory), not a
     /// fully general reconfigurable policy.
     pub extra_read_paths: Vec<String>,
+    /// Whether process-execution tools must refuse to run at all if real
+    /// Landlock confinement can't actually be established (kernel support
+    /// missing/disabled, or the kernel only partially enforces the
+    /// requested ruleset) — fail closed rather than silently running
+    /// unconfined. Defaults to `true`: a coding agent whose core value
+    /// proposition includes real sandboxing should not silently degrade to
+    /// no sandboxing at all without the user explicitly opting into that.
+    pub require_enforcement: bool,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            extra_read_paths: Vec::new(),
+            require_enforcement: true,
+        }
+    }
 }
 
 impl SandboxSettings {
@@ -139,21 +156,66 @@ impl PermissionSettings {
 /// `SandboxSettings::resolved_extra_read_paths`: expands a leading `~` into
 /// an absolute path, skipping entries that can't be expanded (no home
 /// directory found) rather than leaving them unresolved and silently wrong.
+/// Every result is also symlink-canonicalized (see `resolve_symlinks`) —
+/// without this, a symlinked entry (e.g. `~/.ssh` symlinked via a dotfile
+/// manager) would never match the fully-resolved paths every tool actually
+/// checks against, making the entry a silent no-op.
 fn resolve_tilde_paths(raw_paths: &[String]) -> Vec<PathBuf> {
     let home_dir = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
 
     raw_paths
         .iter()
         .filter_map(|raw| {
-            if let Some(rest) = raw.strip_prefix("~/") {
+            let expanded = if let Some(rest) = raw.strip_prefix("~/") {
                 home_dir.as_ref().map(|home| home.join(rest))
             } else if raw == "~" {
                 home_dir.clone()
+            } else if raw.starts_with('~') {
+                // `~username`-style expansion (another user's home
+                // directory) isn't supported. Failing loudly (skip + warn)
+                // is safer than silently keeping it as a literal string —
+                // no real filesystem path is relative and tilde-prefixed,
+                // so it would otherwise be a permanently no-op entry with
+                // no indication anything was wrong.
+                tracing::warn!(
+                    entry = %raw,
+                    "unsupported ~username path syntax in config; skipping this entry"
+                );
+                None
             } else {
                 Some(PathBuf::from(raw))
-            }
+            };
+            expanded.map(|path| resolve_symlinks(&path))
         })
         .collect()
+}
+
+/// Canonicalizes as much of `path` as exists, then re-appends whatever
+/// doesn't. Mirrors `aivyx-tools`'s `path_resolve::resolve_symlinks`
+/// exactly — duplicated here rather than having this lower-level config
+/// crate depend on the tools crate for one small helper. Keep the two in
+/// sync if either changes.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut current = path;
+
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            let mut result = canonical;
+            for component in tail.into_iter().rev() {
+                result.push(component);
+            }
+            return result;
+        }
+
+        match (current.file_name(), current.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +260,18 @@ impl Settings {
         fs::write(path, toml_string).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+
+        // The config may contain a plaintext `backend.api_key` — restrict
+        // it to owner-read-write rather than leaving it at the OS/umask
+        // default (commonly world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
     }
 
     /// CLI flags win over the config file when present.
@@ -253,25 +326,60 @@ mod tests {
         let home = directories::UserDirs::new()
             .unwrap()
             .home_dir()
-            .to_path_buf();
+            .canonicalize()
+            .expect("$HOME must exist");
         let settings = PermissionSettings {
             deny_paths: vec!["~/.ssh".to_string()],
             ..PermissionSettings::default()
         };
 
+        // `~/.ssh` need not exist for this test — `resolve_symlinks` walks
+        // up to the nearest existing ancestor (home itself) and re-appends
+        // the rest, same as `path_resolve::resolve` does for tools.
         assert_eq!(settings.resolved_deny_paths(), vec![home.join(".ssh")]);
     }
 
     #[test]
     fn non_tilde_deny_paths_pass_through_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shadow");
+        std::fs::write(&target, "").unwrap();
         let settings = PermissionSettings {
-            deny_paths: vec!["/etc/shadow".to_string()],
+            deny_paths: vec![target.to_str().unwrap().to_string()],
             ..PermissionSettings::default()
         };
 
         assert_eq!(
             settings.resolved_deny_paths(),
-            vec![PathBuf::from("/etc/shadow")]
+            vec![target.canonicalize().unwrap()]
         );
+    }
+
+    #[test]
+    fn tilde_username_syntax_is_skipped_not_treated_as_literal() {
+        let settings = PermissionSettings {
+            deny_paths: vec!["~root/.ssh".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert!(settings.resolved_deny_paths().is_empty());
+    }
+
+    #[test]
+    fn require_enforcement_defaults_to_true() {
+        assert!(SandboxSettings::default().require_enforcement);
+    }
+
+    #[test]
+    fn config_file_is_written_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let settings = Settings::default();
+
+        settings.write_to(&path).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

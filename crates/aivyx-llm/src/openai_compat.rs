@@ -79,8 +79,20 @@ fn debug_log_from_env() -> Option<Arc<Mutex<std::fs::File>>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .ok()?;
+
+    // This file can accumulate whatever the agent reads or runs — file
+    // contents, command output, potentially secrets — across the whole
+    // session, indefinitely. Restrict it to owner-only, same as
+    // `config.toml`. Set unconditionally (not just on fresh creation) in
+    // case a file from before this existed with looser permissions.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
     Some(Arc::new(Mutex::new(file)))
 }
 

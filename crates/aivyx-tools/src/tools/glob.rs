@@ -84,14 +84,22 @@ impl Tool for GlobTool {
         let cwd = ctx.cwd.clone();
         let deny_paths = self.deny_paths.clone();
 
-        let output =
-            tokio::task::spawn_blocking(move || run_glob(&args.pattern, &root, &cwd, &deny_paths))
-                .await
-                .map_err(|err| {
-                    ToolError::ExecutionFailed(format!("glob task panicked: {err}"))
-                })??;
+        let handle =
+            tokio::task::spawn_blocking(move || run_glob(&args.pattern, &root, &cwd, &deny_paths));
 
-        Ok(ToolOutput::Ok(output))
+        // See `grep.rs`'s `execute` for why this only makes the UI
+        // responsive to Ctrl+C, not the underlying walk itself — tokio has
+        // no way to forcibly preempt a `spawn_blocking` thread.
+        tokio::select! {
+            result = handle => {
+                let output = result
+                    .map_err(|err| ToolError::ExecutionFailed(format!("glob task panicked: {err}")))??;
+                Ok(ToolOutput::Ok(output))
+            }
+            _ = ctx.cancellation.cancelled() => {
+                Err(ToolError::ExecutionFailed("search was cancelled".to_string()))
+            }
+        }
     }
 }
 

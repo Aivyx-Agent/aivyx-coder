@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
     path_beneath_rules,
 };
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
@@ -16,15 +16,23 @@ use crate::ExecutionConfiner;
 
 const LANDLOCK_ABI: ABI = ABI::V7;
 
+/// `LANDLOCK_CREATE_RULESET_VERSION` from the kernel's landlock UAPI header
+/// — not re-exported by the `landlock` crate (its `uapi` module is
+/// private), but stable and simple enough to inline directly rather than
+/// pull in a second crate for one flag value.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+
 /// Common system/toolchain read paths granted by default, in addition to
 /// the working directory and any configured `extra_read_paths`. Scoping
 /// reads to just the working directory breaks real toolchains (compilers,
 /// package managers reading outside the project) — deliberately not Codex
 /// CLI's "read everything" default, though: Landlock has no negative/deny
-/// rule, so excluding `deny_paths` entries (`~/.ssh`, `~/.aws`) from a broad
-/// `/` grant would require enumerating and re-granting every sibling
-/// directory except the denied ones. A bounded, explicit list sidesteps
-/// that entirely — denied paths are simply never granted, full stop.
+/// rule, so excluding `deny_paths` entries from a broad `/` grant would
+/// require enumerating and re-granting every sibling directory except the
+/// denied ones. A bounded, explicit list mostly sidesteps that — and for
+/// the one grant that can't stay narrow (the working directory, which must
+/// be granted wholesale to be useful), `grant_paths_excluding` below does
+/// the carve-out properly instead of ignoring the problem.
 /// Nonexistent paths are silently skipped by `path_beneath_rules`, so it's
 /// safe to list toolchain paths that may not exist on a given system.
 const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
@@ -35,10 +43,12 @@ const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup"];
 /// Syscalls with no legitimate use in a coding agent's shell commands,
 /// blocked regardless of what Landlock's filesystem scoping already
 /// prevents — defense in depth against confinement-escape/introspection
-/// primitives (`ptrace`, `io_uring`) and privileged operations that a
-/// namespace-based sandbox (like Codex CLI's bubblewrap) would otherwise
-/// block for free via capability dropping. This design doesn't use
-/// namespaces, so those need to be explicit here instead.
+/// primitives (`ptrace`, `io_uring`, `perf_event_open`, the kernel keyring,
+/// `userfaultfd`) and privileged operations that a namespace-based sandbox
+/// (like Codex CLI's bubblewrap) would otherwise block for free via
+/// capability dropping. This design doesn't use namespaces, so those need
+/// to be explicit here instead. `unshare`/`setns` are blocked outright since
+/// a coding agent's tools never need to create or join namespaces.
 const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
@@ -59,28 +69,93 @@ const BLOCKED_SYSCALLS: &[i64] = &[
     libc::SYS_swapoff,
     libc::SYS_acct,
     libc::SYS_bpf,
+    libc::SYS_perf_event_open,
+    libc::SYS_keyctl,
+    libc::SYS_add_key,
+    libc::SYS_request_key,
+    libc::SYS_userfaultfd,
+    libc::SYS_unshare,
+    libc::SYS_setns,
+    libc::SYS_personality,
 ];
+
+/// Read-only probe of kernel Landlock support, safe to call from the parent
+/// at any time — mirrors the `landlock` crate's own internal ABI-detection
+/// logic (`landlock-0.4.5/src/compat.rs`, `LandlockStatus::current`): a
+/// null ruleset-attr pointer and zero size, which the kernel documents as
+/// just reporting the ABI version rather than creating a real ruleset.
+/// Returns the raw syscall result: non-negative is the supported ABI
+/// version, negative means unsupported (`ENOSYS`) or disabled (`EOPNOTSUPP`).
+fn detect_landlock_abi() -> i64 {
+    // SAFETY: read-only syscall with a null pointer and zero length, per the
+    // kernel's own documented probing convention (see comment above).
+    unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    }
+}
 
 pub struct LandlockConfiner {
     read_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
     seccomp_program: BpfProgram,
+    require_enforcement: bool,
 }
 
 impl LandlockConfiner {
-    pub fn new(cwd: &Path, extra_read_paths: &[PathBuf]) -> Self {
-        let mut read_paths: Vec<PathBuf> = DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
+    pub fn new(
+        cwd: &Path,
+        extra_read_paths: &[PathBuf],
+        deny_paths: &[PathBuf],
+        require_enforcement: bool,
+    ) -> Self {
+        if detect_landlock_abi() < 0 {
+            tracing::warn!(
+                require_enforcement,
+                "Landlock is not supported or not enabled on this kernel; process-execution \
+                 tools will {} until this is resolved",
+                if require_enforcement {
+                    "refuse to run (sandbox.require_enforcement is true)"
+                } else {
+                    "run unconfined (sandbox.require_enforcement is false)"
+                }
+            );
+        }
+
+        // `grant_paths_excluding` is applied uniformly to every candidate
+        // root, not just `cwd` — any of them could, in principle, contain a
+        // nested `deny_paths` entry (most concretely: `cwd` is very
+        // commonly itself a subdirectory of the system tmp dir, e.g. in
+        // tests or scratch working directories, so the tmp-dir grant below
+        // needs the same treatment or it silently re-grants whatever `cwd`'s
+        // own carve-out just excluded). It's a no-op (returns the root
+        // unchanged) whenever nothing is actually nested underneath, so this
+        // costs nothing extra in the common case.
+        let mut read_candidates: Vec<PathBuf> =
+            DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
-            read_paths.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
+            read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        read_paths.push(cwd.to_path_buf());
-        read_paths.extend(extra_read_paths.iter().cloned());
+        read_candidates.push(cwd.to_path_buf());
+        read_candidates.extend(extra_read_paths.iter().cloned());
+        let read_paths: Vec<PathBuf> = read_candidates
+            .iter()
+            .flat_map(|root| grant_paths_excluding(root, deny_paths))
+            .collect();
 
-        let mut write_paths = vec![cwd.to_path_buf(), std::env::temp_dir()];
+        let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            write_paths.push(PathBuf::from(tmpdir));
+            write_candidates.push(PathBuf::from(tmpdir));
         }
+        let write_paths: Vec<PathBuf> = write_candidates
+            .iter()
+            .flat_map(|root| grant_paths_excluding(root, deny_paths))
+            .collect();
 
         let seccomp_program = build_seccomp_filter();
 
@@ -88,6 +163,7 @@ impl LandlockConfiner {
             read_paths,
             write_paths,
             seccomp_program,
+            require_enforcement,
         }
     }
 
@@ -112,6 +188,46 @@ impl LandlockConfiner {
     }
 }
 
+/// Landlock has no negative/deny rule — a domain can only ever be *more*
+/// restricted than ambient, never "grant X except Y". To grant `root`
+/// wholesale while still excluding a `deny_paths` entry nested somewhere
+/// inside it, enumerate `root`'s direct children and grant each
+/// individually: recurse into any child that itself contains a denial
+/// further down, and skip entirely any child that *is* a denial. When
+/// nothing under `root` is denied (the common case), this returns `root`
+/// unchanged with no extra filesystem work.
+fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+    if deny_paths.iter().any(|denied| denied == root) {
+        return Vec::new();
+    }
+    let relevant: Vec<&PathBuf> = deny_paths
+        .iter()
+        .filter(|denied| denied.starts_with(root))
+        .collect();
+    if relevant.is_empty() {
+        return vec![root.to_path_buf()];
+    }
+
+    // Can't enumerate what's inside `root` — fail toward less access, not
+    // more, rather than granting a directory whose contents are unknown.
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut grants = Vec::new();
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if relevant.iter().any(|denied| **denied == child) {
+            continue;
+        }
+        if relevant.iter().any(|denied| denied.starts_with(&child)) {
+            grants.extend(grant_paths_excluding(&child, deny_paths));
+        } else {
+            grants.push(child);
+        }
+    }
+    grants
+}
+
 fn build_seccomp_filter() -> BpfProgram {
     let rules = BLOCKED_SYSCALLS
         .iter()
@@ -131,14 +247,32 @@ fn build_seccomp_filter() -> BpfProgram {
 
 impl ExecutionConfiner for LandlockConfiner {
     fn confine(&self, mut command: tokio::process::Command) -> tokio::process::Command {
+        let require_enforcement = self.require_enforcement;
+
         let ruleset = match self.build_ruleset() {
             Ok(ruleset) => ruleset,
             Err(err) => {
-                // Fail open on the ruleset itself, matching the crate's own
-                // best-effort philosophy: a coding agent that stops working
-                // because sandboxing couldn't be constructed is a worse
-                // outcome than running this one command unconfined.
-                tracing::warn!(error = %err, "failed to build Landlock ruleset; running unconfined");
+                if require_enforcement {
+                    // Fail closed: make the spawn itself fail rather than
+                    // running unconfined. This closure runs in the parent
+                    // (we haven't forked yet), so a detailed, allocated
+                    // error message is fine here — the async-signal-safety
+                    // constraint only applies inside `pre_exec` below.
+                    tracing::warn!(
+                        error = %err,
+                        "failed to build Landlock ruleset; refusing to run unconfined \
+                         (sandbox.require_enforcement is true)"
+                    );
+                    unsafe {
+                        command.pre_exec(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+                    }
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to build Landlock ruleset; running unconfined \
+                         (sandbox.require_enforcement is false)"
+                    );
+                }
                 return command;
             }
         };
@@ -146,23 +280,29 @@ impl ExecutionConfiner for LandlockConfiner {
         let seccomp_program = self.seccomp_program.clone();
         let mut seccomp_program = Some(seccomp_program);
 
-        // SAFETY: the closure only calls `RulesetCreated::restrict_self()`
-        // and `seccompiler::apply_filter()`, both verified against crate
-        // source to be thin wrappers around a handful of raw syscalls
-        // (`landlock_restrict_self`, `prctl`, `seccomp`) with no heap
-        // allocation at the call site — the async-signal-safety contract
-        // `pre_exec` requires. All allocation (ruleset/filter construction)
-        // already happened above, in the parent, before this runs.
+        // SAFETY: every error path inside this closure uses an
+        // `ErrorKind`-based `io::Error` (std's allocation-free "simple"
+        // repr), never `io::Error::other`/`.to_string()` — both allocate,
+        // which is unsound inside a forked, single-threaded child where
+        // another thread's held malloc-arena lock at fork time can leave
+        // the allocator permanently wedged from this process's point of
+        // view. The tradeoff is losing the detailed underlying error
+        // message from inside the child; that's the correct, honest
+        // price of fork-safety here. All allocation (ruleset/filter
+        // construction) already happened above, in the parent.
         unsafe {
             command.pre_exec(move || {
                 if let Some(ruleset) = ruleset.take() {
-                    ruleset
+                    let status = ruleset
                         .restrict_self()
-                        .map_err(|err| io::Error::other(err.to_string()))?;
+                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+                    if require_enforcement && status.ruleset != RulesetStatus::FullyEnforced {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    }
                 }
                 if let Some(program) = seccomp_program.take() {
                     seccompiler::apply_filter(&program)
-                        .map_err(|err| io::Error::other(err.to_string()))?;
+                        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
                 }
                 Ok(())
             });
@@ -177,7 +317,7 @@ mod tests {
     use std::process::Stdio;
 
     fn confiner_for(dir: &Path) -> LandlockConfiner {
-        LandlockConfiner::new(dir, &[])
+        LandlockConfiner::new(dir, &[], &[], true)
     }
 
     async fn run(mut command: tokio::process::Command) -> (bool, String) {
@@ -286,5 +426,48 @@ mod tests {
             "a normal command should not be broken by the seccomp filter"
         );
         assert!(output.contains("still works"));
+    }
+
+    #[tokio::test]
+    async fn deny_paths_entry_nested_inside_cwd_is_excluded_from_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("secret");
+        std::fs::create_dir(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("id_rsa"), "top secret").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
+
+        let confiner =
+            LandlockConfiner::new(dir.path(), &[], std::slice::from_ref(&secret_dir), true);
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(secret_dir.join("id_rsa"));
+        let command = confiner.confine(command);
+        let (success, output) = run(command).await;
+        assert!(!success, "denied subdirectory should not be readable");
+        assert!(!output.contains("top secret"));
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join("public.txt"));
+        let command = confiner.confine(command);
+        let (success, output) = run(command).await;
+        assert!(
+            success,
+            "sibling of the denied subdirectory should still be readable"
+        );
+        assert!(output.contains("hello"));
+    }
+
+    #[test]
+    fn grant_paths_excluding_returns_root_unchanged_when_nothing_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = grant_paths_excluding(dir.path(), &[]);
+        assert_eq!(grants, vec![dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn grant_paths_excluding_returns_empty_when_root_itself_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()]);
+        assert!(grants.is_empty());
     }
 }

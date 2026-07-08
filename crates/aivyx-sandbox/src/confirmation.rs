@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     ActionKind, PermissionDecision, PermissionGate, PermissionPrompter, PermissionRequest,
-    PermissionTarget, UserResponse,
+    PermissionTarget, UserResponse, path_is_denied,
 };
 
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
@@ -86,9 +86,7 @@ impl ConfirmationGate {
         let PermissionTarget::Path(path) = &request.target else {
             return false;
         };
-        self.deny_paths
-            .iter()
-            .any(|denied| path.starts_with(denied))
+        path_is_denied(path, &self.deny_paths)
     }
 }
 
@@ -96,6 +94,12 @@ impl ConfirmationGate {
 impl PermissionGate for ConfirmationGate {
     async fn check(&self, request: &PermissionRequest) -> PermissionDecision {
         if self.is_denied(request) {
+            tracing::warn!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "permission denied: target is under a deny_paths entry"
+            );
             return PermissionDecision::Deny;
         }
 
@@ -105,17 +109,39 @@ impl PermissionGate for ConfirmationGate {
 
         let key = PermissionKey::from_request(request);
         if self.always_allow.lock().unwrap().contains(&key) {
+            tracing::info!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "permission allowed (cached Always-Allow)"
+            );
             return PermissionDecision::AllowAlways;
         }
 
-        match self.prompter.prompt(request).await {
+        let decision = match self.prompter.prompt(request).await {
             UserResponse::Allow => PermissionDecision::Allow,
             UserResponse::AllowAlways => {
                 self.always_allow.lock().unwrap().insert(key);
                 PermissionDecision::AllowAlways
             }
             UserResponse::Deny => PermissionDecision::Deny,
+        };
+        match decision {
+            PermissionDecision::Deny => tracing::warn!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "permission denied by user"
+            ),
+            _ => tracing::info!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                always = %matches!(decision, PermissionDecision::AllowAlways),
+                "permission allowed by user"
+            ),
         }
+        decision
     }
 }
 

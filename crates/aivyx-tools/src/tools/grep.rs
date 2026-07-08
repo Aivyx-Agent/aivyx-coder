@@ -93,7 +93,7 @@ impl Tool for GrepTool {
         let cwd = ctx.cwd.clone();
         let deny_paths = self.deny_paths.clone();
 
-        let output = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             run_grep(
                 &args.pattern,
                 args.case_insensitive,
@@ -101,11 +101,23 @@ impl Tool for GrepTool {
                 &cwd,
                 &deny_paths,
             )
-        })
-        .await
-        .map_err(|err| ToolError::ExecutionFailed(format!("grep task panicked: {err}")))??;
+        });
 
-        Ok(ToolOutput::Ok(output))
+        // `spawn_blocking` runs on a real OS thread tokio can't forcibly
+        // preempt — this can't stop an in-flight walk, but it does stop the
+        // *UI* from blocking on Ctrl+C while a large/slow search finishes;
+        // the abandoned thread keeps running detached until it naturally
+        // completes, its result simply discarded.
+        tokio::select! {
+            result = handle => {
+                let output = result
+                    .map_err(|err| ToolError::ExecutionFailed(format!("grep task panicked: {err}")))??;
+                Ok(ToolOutput::Ok(output))
+            }
+            _ = ctx.cancellation.cancelled() => {
+                Err(ToolError::ExecutionFailed("search was cancelled".to_string()))
+            }
+        }
     }
 }
 
@@ -123,15 +135,18 @@ fn run_grep(
         .map_err(|err| ToolError::InvalidArguments(format!("invalid regex pattern: {err}")))?;
 
     let mut results: Vec<String> = Vec::new();
+    // Set only when an *actual* extra match is encountered beyond the cap
+    // (checked before pushing, in the sink below) — not derived from
+    // `results.len() >= MAX_MATCHES` after the fact, which can't tell
+    // "there were exactly MAX_MATCHES matches, no more" apart from "there
+    // were more". Mirrors `glob.rs`'s already-correct pattern.
+    let mut truncated = false;
 
     // `WalkBuilder` respects .gitignore and does not follow symlinks by
     // default — reusing ripgrep's own default closes the same class of
     // symlink-based deny_paths escape that `path_resolve::resolve_symlinks`
     // fixes for single-file tools, without reimplementing it here.
     for entry in WalkBuilder::new(root).build() {
-        if results.len() >= MAX_MATCHES {
-            break;
-        }
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if is_denied(path, deny_paths) {
@@ -144,6 +159,7 @@ fn run_grep(
         let display_path = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
         let mut searcher = SearcherBuilder::new().build();
         let sink_results = &mut results;
+        let sink_truncated = &mut truncated;
         // Errors here (binary content, permission denied, non-UTF8 match)
         // are skipped rather than propagated — matches grep's own behavior
         // of silently passing over files it can't search as text.
@@ -152,6 +168,7 @@ fn run_grep(
             path,
             UTF8(|line_number, line| {
                 if sink_results.len() >= MAX_MATCHES {
+                    *sink_truncated = true;
                     return Ok(false);
                 }
                 sink_results.push(format!(
@@ -161,9 +178,11 @@ fn run_grep(
                 Ok(true)
             }),
         );
+        if truncated {
+            break;
+        }
     }
 
-    let truncated = results.len() >= MAX_MATCHES;
     let mut output = results.join("\n");
     if truncated {
         output.push_str(&format!(
@@ -273,6 +292,37 @@ mod tests {
         };
         assert!(text.contains("public.txt"));
         assert!(!text.contains("secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn exactly_max_matches_is_not_reported_as_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "needle\n".repeat(MAX_MATCHES);
+        std::fs::write(dir.path().join("a.txt"), content).unwrap();
+
+        let tool = GrepTool::new(vec![]);
+        let output = run(&tool, dir.path(), args("needle", None)).await;
+
+        let ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output")
+        };
+        assert_eq!(text.lines().count(), MAX_MATCHES);
+        assert!(!text.contains("narrow your pattern"));
+    }
+
+    #[tokio::test]
+    async fn more_than_max_matches_is_reported_as_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "needle\n".repeat(MAX_MATCHES + 1);
+        std::fs::write(dir.path().join("a.txt"), content).unwrap();
+
+        let tool = GrepTool::new(vec![]);
+        let output = run(&tool, dir.path(), args("needle", None)).await;
+
+        let ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("narrow your pattern"));
     }
 
     #[tokio::test]
