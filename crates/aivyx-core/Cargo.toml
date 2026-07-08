@@ -1,0 +1,17 @@
+[package]
+name = "aivyx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
+aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
+aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+futures = "0.3.32"
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio-util = "0.7.18"
+tracing = "0.1.44"

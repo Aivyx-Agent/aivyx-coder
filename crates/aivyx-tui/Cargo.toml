@@ -1,0 +1,16 @@
+[package]
+name = "aivyx-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+anyhow = "1.0.103"
+crossterm = { version = "0.28.1", features = ["event-stream"] }
+futures = "0.3.32"
+ratatui = "0.29.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync"] }
+tokio-util = "0.7.18"
+tui-textarea = "0.7.0"

@@ -1,0 +1,466 @@
+use std::collections::BTreeMap;
+
+use aivyx_types::{
+    ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition, ToolOutput,
+};
+use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures::stream::{self, BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
+
+use crate::backend::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
+
+/// Talks to any server exposing an OpenAI-compatible `/chat/completions`
+/// endpoint with SSE streaming — this covers Ollama (`/v1`), vLLM, and
+/// llama.cpp's `--server` mode without backend-specific code.
+pub struct OpenAiCompatBackend {
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    http: reqwest::Client,
+}
+
+impl OpenAiCompatBackend {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            api_key,
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmBackend for OpenAiCompatBackend {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        let wire_request = WireRequest::from_chat_request(&self.model, &request);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        let mut http_request = self.http.post(url).json(&wire_request);
+        if let Some(key) = &self.api_key {
+            http_request = http_request.bearer_auth(key);
+        }
+
+        let response = http_request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::BackendError { status, body });
+        }
+
+        let sse_stream = response.bytes_stream().eventsource();
+
+        let stream = sse_stream
+            .scan(ToolCallAccumulator::default(), |accumulator, event| {
+                let events = match event {
+                    Ok(event) => {
+                        let data = event.data.trim();
+                        if data == "[DONE]" {
+                            Vec::new()
+                        } else {
+                            match serde_json::from_str::<WireChunk>(data) {
+                                Ok(chunk) => accumulator.consume(chunk),
+                                Err(err) => vec![Err(LlmError::Parse(format!(
+                                    "invalid stream chunk: {err} (data: {data})"
+                                )))],
+                            }
+                        }
+                    }
+                    Err(err) => vec![Err(LlmError::Parse(err.to_string()))],
+                };
+                futures::future::ready(Some(events))
+            })
+            .flat_map(stream::iter);
+
+        Ok(stream.boxed())
+    }
+}
+
+/// Reassembles the argument-fragment stream OpenAI-style servers send for
+/// native tool calls (`delta.tool_calls[i].function.arguments` arrives as
+/// partial JSON, keyed by index, across multiple chunks).
+#[derive(Default)]
+struct ToolCallAccumulator {
+    pending: BTreeMap<u32, PendingToolCall>,
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    fn consume(&mut self, chunk: WireChunk) -> Vec<Result<StreamEvent, LlmError>> {
+        let mut events = Vec::new();
+
+        if let Some(usage) = chunk.usage {
+            events.push(Ok(StreamEvent::Usage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+            }));
+        }
+
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return events;
+        };
+
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            events.push(Ok(StreamEvent::TextDelta(content)));
+        }
+
+        for tool_call_delta in choice.delta.tool_calls.unwrap_or_default() {
+            let entry = self.pending.entry(tool_call_delta.index).or_default();
+            if let Some(id) = tool_call_delta.id {
+                entry.id = Some(id);
+            }
+            if let Some(function) = tool_call_delta.function {
+                if let Some(name) = function.name {
+                    entry.name = Some(name);
+                }
+                if let Some(arguments) = function.arguments {
+                    entry.arguments.push_str(&arguments);
+                }
+            }
+        }
+
+        if let Some(finish_reason) = choice.finish_reason {
+            let reason = match finish_reason.as_str() {
+                "stop" => FinishReason::Stop,
+                "tool_calls" => FinishReason::ToolCalls,
+                "length" => FinishReason::Length,
+                _ => FinishReason::Error,
+            };
+
+            if reason == FinishReason::ToolCalls {
+                for (_, pending) in std::mem::take(&mut self.pending) {
+                    events.push(Self::finalize(pending).map(StreamEvent::ToolCallComplete));
+                }
+            }
+
+            events.push(Ok(StreamEvent::Done {
+                finish_reason: reason,
+            }));
+        }
+
+        events
+    }
+
+    fn finalize(pending: PendingToolCall) -> Result<ToolCall, LlmError> {
+        let id = pending
+            .id
+            .ok_or_else(|| LlmError::Parse("tool call missing id".to_string()))?;
+        let name = pending
+            .name
+            .ok_or_else(|| LlmError::Parse("tool call missing name".to_string()))?;
+        let arguments = if pending.arguments.trim().is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&pending.arguments)
+                .map_err(|err| LlmError::Parse(format!("invalid tool call arguments: {err}")))?
+        };
+
+        Ok(ToolCall {
+            id: ToolCallId(id),
+            name,
+            arguments,
+            source: ToolCallSource::Native,
+        })
+    }
+}
+
+// ---- wire format (request) ----
+
+#[derive(Serialize)]
+struct WireRequest {
+    model: String,
+    messages: Vec<WireMessage>,
+    stream: bool,
+    stream_options: WireStreamOptions,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct WireStreamOptions {
+    include_usage: bool,
+}
+
+impl WireRequest {
+    fn from_chat_request(model: &str, request: &ChatRequest) -> Self {
+        let tool_choice = if request.tools.is_empty() {
+            None
+        } else {
+            Some(match request.tool_choice {
+                ToolChoice::Auto => "auto",
+                ToolChoice::None => "none",
+                ToolChoice::Required => "required",
+            })
+        };
+
+        Self {
+            model: model.to_string(),
+            messages: request.messages.iter().map(WireMessage::from).collect(),
+            stream: true,
+            stream_options: WireStreamOptions {
+                include_usage: true,
+            },
+            tools: request.tools.iter().map(WireToolDefinition::from).collect(),
+            tool_choice,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireMessage {
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl From<&Message> for WireMessage {
+    fn from(message: &Message) -> Self {
+        let role = match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_result_text: Option<String> = None;
+
+        for block in &message.content {
+            match block {
+                ContentBlock::Text(t) => text.push_str(t),
+                ContentBlock::ToolCall(call) => tool_calls.push(WireToolCall::from(call)),
+                ContentBlock::ToolResult(result) => {
+                    tool_result_text = Some(match &result.output {
+                        ToolOutput::Ok(s) => s.clone(),
+                        ToolOutput::Error(s) => format!("Error: {s}"),
+                        ToolOutput::Denied(s) => format!("Denied: {s}"),
+                    });
+                }
+            }
+        }
+
+        let content = tool_result_text.or(if text.is_empty() && !tool_calls.is_empty() {
+            None
+        } else {
+            Some(text)
+        });
+
+        Self {
+            role,
+            content,
+            tool_calls,
+            tool_call_id: message.tool_call_id.as_ref().map(|id| id.0.clone()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: WireFunctionCall,
+}
+
+#[derive(Serialize)]
+struct WireFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+impl From<&ToolCall> for WireToolCall {
+    fn from(call: &ToolCall) -> Self {
+        Self {
+            id: call.id.0.clone(),
+            call_type: "function",
+            function: WireFunctionCall {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireToolDefinition {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    function: WireFunctionDefinition,
+}
+
+#[derive(Serialize)]
+struct WireFunctionDefinition {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl From<&ToolDefinition> for WireToolDefinition {
+    fn from(def: &ToolDefinition) -> Self {
+        Self {
+            tool_type: "function",
+            function: WireFunctionDefinition {
+                name: def.name.clone(),
+                description: def.description.clone(),
+                parameters: def.parameters_schema.clone(),
+            },
+        }
+    }
+}
+
+// ---- wire format (streamed response) ----
+
+#[derive(Deserialize)]
+struct WireChunk {
+    #[serde(default)]
+    choices: Vec<WireChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+#[derive(Deserialize)]
+struct WireChoice {
+    #[serde(default)]
+    delta: WireDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct WireDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct WireToolCallDelta {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<WireFunctionCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct WireFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_message_omits_content_for_tool_call_only_assistant_message() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: ToolCallId("call_1".to_string()),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+                source: ToolCallSource::Native,
+            })],
+            tool_call_id: None,
+        };
+
+        let wire = WireMessage::from(&message);
+        assert_eq!(wire.role, "assistant");
+        assert!(wire.content.is_none());
+        assert_eq!(wire.tool_calls.len(), 1);
+        assert_eq!(wire.tool_calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn wire_message_carries_tool_result_text_and_call_id() {
+        let message = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult(aivyx_types::ToolResult {
+                call_id: ToolCallId("call_1".to_string()),
+                output: ToolOutput::Ok("file contents".to_string()),
+            })],
+            tool_call_id: Some(ToolCallId("call_1".to_string())),
+        };
+
+        let wire = WireMessage::from(&message);
+        assert_eq!(wire.role, "tool");
+        assert_eq!(wire.content.as_deref(), Some("file contents"));
+        assert_eq!(wire.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn accumulator_reassembles_streamed_tool_call_arguments() {
+        let mut accumulator = ToolCallAccumulator::default();
+
+        let chunk1: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": "{\"path\":"}}]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        assert!(accumulator.consume(chunk1).is_empty());
+
+        let chunk2: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"src/main.rs\"}"}}]},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        let events = accumulator.consume(chunk2);
+
+        let mut saw_tool_call = false;
+        for event in events {
+            if let Ok(StreamEvent::ToolCallComplete(call)) = event {
+                saw_tool_call = true;
+                assert_eq!(call.name, "read_file");
+                assert_eq!(call.arguments, serde_json::json!({"path": "src/main.rs"}));
+            }
+        }
+        assert!(saw_tool_call, "expected a completed tool call event");
+    }
+}
