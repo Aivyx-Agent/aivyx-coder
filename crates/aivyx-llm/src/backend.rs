@@ -76,4 +76,8 @@ pub enum LlmError {
     BackendError { status: u16, body: String },
     #[error("failed to parse backend response: {0}")]
     Parse(String),
+    #[error("backend went silent (no data for too long) — it may be hung or unreachable")]
+    Timeout,
+    #[error("backend response exceeded the maximum allowed size and was aborted")]
+    ResponseTooLarge,
 }

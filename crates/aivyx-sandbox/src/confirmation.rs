@@ -191,6 +191,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deny_paths_wins_over_read_auto_allow() {
+        // Locks in the order inside `check`: the deny-list is consulted
+        // before the read-auto-allow shortcut, not after. A refactor that
+        // swapped the order (e.g. to skip the deny check for reads as an
+        // "optimization") would silently start auto-allowing reads of
+        // denied paths — and every other test in this file uses either a
+        // Write request or a non-denied Read, so none of them would catch
+        // that regression.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(prompter.clone(), vec![PathBuf::from("/home/user/.ssh")]);
+
+        let decision = gate
+            .check(&read_request("/home/user/.ssh/id_ed25519"))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn plain_deny_is_never_cached() {
         let prompter = Arc::new(FakePrompter {
             response: UserResponse::Deny,

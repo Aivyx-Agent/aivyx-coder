@@ -46,15 +46,26 @@ impl Tool for WriteFileTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let resolved = resolve(cwd, &args.path);
 
-        let old_content = match std::fs::read_to_string(&resolved) {
-            Ok(content) => Some(content),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
-            // Fails open on the preview only (unreadable/binary existing file) — the gate
-            // still gets to decide, it just won't have a diff to show.
-            Err(_) => None,
+        let preview = match std::fs::read_to_string(&resolved) {
+            Ok(old) => Some(unified_diff(
+                &resolved.display().to_string(),
+                &old,
+                &args.content,
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(unified_diff(
+                &resolved.display().to_string(),
+                "",
+                &args.content,
+            )),
+            // Fails open on the gate decision (the user can still approve
+            // or deny) but must NOT look identical to the new-file case —
+            // an existing binary/non-UTF8 file is about to be destroyed.
+            Err(_) => Some(format!(
+                "WARNING: {} already exists but could not be read as text (binary file?). \
+                 This write will overwrite it entirely.",
+                resolved.display()
+            )),
         };
-        let preview = old_content
-            .map(|old| unified_diff(&resolved.display().to_string(), &old, &args.content));
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
@@ -84,5 +95,37 @@ impl Tool for WriteFileTool {
             args.content.len(),
             resolved.display()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_file_preview_shows_additions_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "path": "new.txt", "content": "hello\n" });
+
+        let request = WriteFileTool.permission_request(&args, dir.path()).unwrap();
+
+        let preview = request.preview.expect("expected a preview");
+        assert!(preview.contains("+hello"));
+    }
+
+    #[test]
+    fn existing_binary_file_gets_a_warning_instead_of_a_silent_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.bin");
+        std::fs::write(&target, [0xFF, 0xFE, 0x00, 0xD8, 0x00]).unwrap();
+        let args = serde_json::json!({ "path": "existing.bin", "content": "hello\n" });
+
+        let request = WriteFileTool.permission_request(&args, dir.path()).unwrap();
+
+        let preview = request
+            .preview
+            .expect("expected a warning preview, not None");
+        assert!(preview.contains("WARNING"));
+        assert!(preview.contains("binary"));
     }
 }

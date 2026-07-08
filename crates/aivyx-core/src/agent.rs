@@ -1,14 +1,12 @@
 use std::path::Path;
 
-use aivyx_llm::{ChatRequest, LlmBackend, LlmError, StreamEvent, ToolChoice};
+use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
 use aivyx_tools::ToolExecutor;
 use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolResult};
 use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
-
-const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -19,12 +17,18 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// Caps unbounded growth of a single turn's accumulated assistant text from
+/// a misbehaving backend that never stops streaming.
+const MAX_ASSISTANT_TEXT_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("llm backend error: {0}")]
     Llm(#[from] LlmError),
     #[error("maximum tool iterations ({0}) exceeded for this turn")]
     MaxIterationsExceeded(u32),
+    #[error("response exceeded the maximum allowed size and was aborted")]
+    ResponseTooLarge,
 }
 
 pub struct Agent {
@@ -41,6 +45,7 @@ impl Agent {
         llm: std::sync::Arc<dyn LlmBackend>,
         executor: ToolExecutor,
         system_prompt: impl Into<String>,
+        max_tool_iterations: u32,
         events_tx: UnboundedSender<AgentEvent>,
     ) -> Self {
         Self {
@@ -48,7 +53,9 @@ impl Agent {
             executor,
             system_prompt: system_prompt.into(),
             history: Vec::new(),
-            max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
+            // A misconfigured 0 would otherwise make every turn a silent
+            // no-op (the tool-loop range would simply never iterate).
+            max_tool_iterations: max_tool_iterations.max(1),
             events_tx,
         }
     }
@@ -79,6 +86,10 @@ impl Agent {
         self.history.push(Message::text(Role::User, user_input));
 
         for iteration in 1..=self.max_tool_iterations {
+            if cancellation.is_cancelled() {
+                break;
+            }
+
             let request = ChatRequest {
                 messages: self.assemble_messages(),
                 tools: self.executor.definitions(),
@@ -97,6 +108,7 @@ impl Agent {
 
             let mut assistant_text = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut finish_reason = None;
 
             loop {
                 let next_event = tokio::select! {
@@ -110,13 +122,23 @@ impl Agent {
                     Ok(StreamEvent::TextDelta(text)) => {
                         assistant_text.push_str(&text);
                         self.emit(AgentEvent::TextDelta(text));
+                        if assistant_text.len() > MAX_ASSISTANT_TEXT_BYTES {
+                            let err = AgentError::ResponseTooLarge;
+                            self.emit(AgentEvent::Error(err.to_string()));
+                            return Err(err);
+                        }
                     }
                     Ok(StreamEvent::ToolCallComplete(call)) => {
                         self.emit(AgentEvent::ToolCallDetected(call.clone()));
                         tool_calls.push(call);
                     }
                     Ok(StreamEvent::Usage { .. }) => {}
-                    Ok(StreamEvent::Done { .. }) => break,
+                    Ok(StreamEvent::Done {
+                        finish_reason: reason,
+                    }) => {
+                        finish_reason = Some(reason);
+                        break;
+                    }
                     Err(err) => {
                         self.emit(AgentEvent::Error(err.to_string()));
                         return Err(AgentError::Llm(err));
@@ -126,6 +148,25 @@ impl Agent {
 
             if cancellation.is_cancelled() {
                 break;
+            }
+
+            // The model's response was cut off mid-generation (output-length
+            // cap or a backend-side error) rather than finishing normally —
+            // without this, a truncated turn looks identical to the model
+            // simply choosing not to say anything further.
+            match finish_reason {
+                Some(FinishReason::Length) => {
+                    self.emit(AgentEvent::Error(
+                        "response was truncated (hit the model's output limit) before it finished"
+                            .to_string(),
+                    ));
+                }
+                Some(FinishReason::Error) => {
+                    self.emit(AgentEvent::Error(
+                        "backend reported an error while finishing the response".to_string(),
+                    ));
+                }
+                _ => {}
             }
 
             let mut assistant_content = Vec::new();
@@ -149,6 +190,10 @@ impl Agent {
             }
 
             for call in tool_calls {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+
                 let result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
@@ -159,6 +204,10 @@ impl Agent {
                     tool_call_id: Some(result.call_id.clone()),
                     content: vec![ContentBlock::ToolResult(result)],
                 });
+            }
+
+            if cancellation.is_cancelled() {
+                break;
             }
 
             if iteration == self.max_tool_iterations {

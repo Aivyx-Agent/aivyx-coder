@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use aivyx_config::Settings;
@@ -9,11 +10,25 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
-const SYSTEM_PROMPT: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
-You have three tools: read_file, write_file (creates or fully overwrites a file), and edit_file \
-(exact-string search/replace — old_string must match exactly once in the file, or set replace_all). \
-Mutating actions (write_file, edit_file) require the user to approve a confirmation prompt before \
-they take effect, so explain what you're about to do before calling them.";
+const SYSTEM_PROMPT_PREAMBLE: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
+Mutating actions require the user to approve a confirmation prompt before they take effect, so explain \
+what you're about to do before calling them.";
+
+/// Builds the tool-describing part of the system prompt from the tools
+/// actually registered, so it can't silently drift out of sync with what's
+/// sent to the model via `ChatRequest.tools` as the tool set grows.
+fn build_system_prompt(executor: &ToolExecutor) -> String {
+    let definitions = executor.definitions();
+    if definitions.is_empty() {
+        return format!("{SYSTEM_PROMPT_PREAMBLE}\n\nYou have no tools available in this session.");
+    }
+
+    let mut prompt = format!("{SYSTEM_PROMPT_PREAMBLE}\n\nAvailable tools:");
+    for def in &definitions {
+        let _ = write!(prompt, "\n- {}: {}", def.name, def.description);
+    }
+    prompt
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,9 +77,16 @@ async fn main() -> anyhow::Result<()> {
     ));
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let executor = ToolExecutor::new(registry, gate, confiner);
+    let system_prompt = build_system_prompt(&executor);
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let agent = Agent::new(llm, executor, SYSTEM_PROMPT, events_tx);
+    let agent = Agent::new(
+        llm,
+        executor,
+        system_prompt,
+        settings.permissions.max_tool_iterations_per_turn,
+        events_tx,
+    );
 
     let cwd = std::env::current_dir()?;
 

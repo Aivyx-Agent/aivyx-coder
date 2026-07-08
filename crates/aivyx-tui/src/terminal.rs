@@ -20,6 +20,19 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn init() -> io::Result<Self> {
         enable_raw_mode()?;
+        // If anything below fails, raw mode is already on but no
+        // `TerminalGuard` exists yet for `Drop` to clean it up — disable it
+        // ourselves before propagating the error.
+        match Self::init_after_raw_mode() {
+            Ok(guard) => Ok(guard),
+            Err(err) => {
+                let _ = disable_raw_mode();
+                Err(err)
+            }
+        }
+    }
+
+    fn init_after_raw_mode() -> io::Result<Self> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
@@ -39,8 +52,13 @@ impl Drop for TerminalGuard {
 }
 
 fn restore_terminal() -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    // Both steps are attempted independently — a failure in one must not
+    // skip the other, since they restore unrelated pieces of terminal
+    // state (raw mode vs. the alternate screen buffer).
+    let raw_mode_result = disable_raw_mode();
+    let alt_screen_result = execute!(io::stdout(), LeaveAlternateScreen);
+    raw_mode_result?;
+    alt_screen_result?;
     Ok(())
 }
 

@@ -1,0 +1,160 @@
+# aivyx-coder Development Roadmap
+
+_Last updated: 2026-07-08_
+
+This roadmap synthesizes two things: (1) an honest inventory of what aivyx-coder
+can and can't do today, based on the audit and capability testing already done
+against this codebase, and (2) deep research into how existing coding-agent
+frameworks (Claude Code, Aider, OpenHands/SWE-agent, Codex CLI, Cline,
+Cursor/Windsurf) are architected, what tools they converge on, and why. Where
+a claim below comes from that research it's cited; where it's carried over
+from this project's own testing it says so; a couple of items on local-model
+tool-calling internals (grammar-constrained decoding, exact Landlock ABI
+version numbers) are marked **[unverified]** because the research pass that
+was covering them was cut off by a session limit mid-way — treat those as
+directional, not committed fact, until spot-checked.
+
+## Where things stand today
+
+**Built and working** (foundation + ConfirmationGate passes, commits
+`e958cdb`, `146dd22`, `23cfbd8`):
+- Streaming chat against any OpenAI-compatible local backend (Ollama/vLLM/llama.cpp), multi-turn history, cancellation (partially — see gaps).
+- `read_file` / `write_file` / `edit_file`, each behind `ConfirmationGate`: `deny_paths` hard-block (now symlink-safe), reads auto-allow, everything else prompts with a per-exact-target Always-Allow cache, diff preview via `similar`.
+- A ratatui TUI with a live-streaming chat view and a permission-confirmation modal.
+
+**Verified real-world behavior** (see memory: `project_aivyx_coder_ornith_capability_test`):
+- A 9B model (`ornith:9b`) completes one clean read→act tool cycle, then reliably degrades — gets stuck re-reading the same file and eventually hallucinates content that isn't there, rather than taking further action.
+- A 27B model (`qwen3.6:27b`) completes a full 5-turn edit task correctly, ~7x slower per call.
+- Ollama itself can panic under sustained multi-tool-call load (external bug, not ours) — our error handling degraded gracefully when it did.
+
+**Phase 1 hardening complete** (this pass): cancellation now propagates through the tool-dispatch loop and the next LLM request; `max_tool_iterations_per_turn` is wired from config (clamped to a minimum of 1); the LLM client has a connect timeout, an idle-stream timeout, and a size cap on accumulated response text; a truncated (`length`/`error` finish reason) response now surfaces as a visible error instead of looking like a normal empty turn; `TerminalGuard` no longer leaks raw mode on partial init failure and `restore_terminal` attempts both cleanup steps independently; tool-result/tool-call/notice transcript lines preserve embedded newlines instead of rendering as one concatenated wall of text; the auto-scroll offset is computed from ratatui's own post-wrap row count instead of pre-wrap logical line count; `write_file` now shows an explicit warning instead of a silent/ambiguous prompt when overwriting an existing binary file; and `SYSTEM_PROMPT`'s tool list is derived from `ToolExecutor::definitions()` so it can't drift. Deliberately deferred (narrow/theoretical, documented in the plan rather than fixed): the `edit_file` TOCTOU, case-sensitive path comparison, relative `deny_paths` entries, the `path_resolve`/`aivyx-config` home-dir divergence, `Tool::execute`'s type-system bypassability, and a couple of efficiency-only findings (history-cloning cost, full-transcript-rebuild-per-redraw).
+
+## What the research says a coding agent needs
+
+Full findings are in the research agent's output from this session; the load-bearing conclusions:
+
+1. **Tool set**: every serious agent converges on the same short list beyond file read/write/edit — content search (grep-equivalent), path search (glob-equivalent), shell execution, git operations, and (for anything beyond toy tasks) a way to run the project's own build/test/lint and read the result. ([Claude Code tool system](https://callsphere.ai/blog/claude-code-tool-system-explained), [Aider docs](https://aider.chat/docs/usage/lint-test.html))
+2. **The single most transferable lesson for this project**: Aider deliberately does **not** rely on native function-calling for file edits, even on models that support it — it found structured tool-calling is often *worse* than a well-specified prompted text format (SEARCH/REPLACE-style blocks) for editing quality, and pairs that with a repair loop (on a failed match, show the model the actual nearby content and re-prompt, capped at ~3 retries). This is close to an exact description of the `ornith:9b` failure mode already observed here. ([edit formats](https://aider.chat/docs/more/edit-formats.html), [troubleshooting](https://aider.chat/docs/troubleshooting/edit-errors.html))
+3. **Context/codebase understanding for small-context local models**: the field has moved *away* from embeddings/RAG for code (stale indexes, worse precision than exact search — ["grep beat embeddings"](https://jxnl.co/writing/2025/09/11/why-grep-beat-embeddings-in-our-swe-bench-agent-lessons-from-augment/)) and toward two complementary techniques: agentic grep (no index, always fresh) and Aider's tree-sitter **repo map** (compressed, ranked symbol signatures for the whole repo within a token budget, no server required). Both fit a local-first, no-daemon Rust tool far better than embeddings would.
+4. **Verification loops are the biggest lever for actual task success**, not prompt cleverness — SWE-bench analyses consistently show iterative edit→test→fix beats single-shot generation. A deterministic compiler/test-runner as the feedback signal is *more* reliable for a weak local model than asking it to self-critique in prose.
+5. **Sandboxing**: for a single-binary, no-daemon-assumed local CLI, the field's answer is not Docker — it's kernel-level primitives. Notably, **OpenAI's Codex CLI is itself a Rust codebase** that ships exactly the architecture this project already planned (`ExecutionConfiner` → real Landlock/seccomp instead of `NoopConfiner`): Landlock for filesystem scoping, seccomp-bpf for syscall allow-listing, no privileged daemon. This directly validates the existing design and gives a concrete reference implementation to study.
+6. **UX patterns worth adopting cheaply**: a hard read-only "plan mode" (just withhold write-tool grants at the permission layer — trivial on top of the existing `ConfirmationGate`), a persisted/visible task list (more valuable here than in cloud tools, since local sessions get interrupted more often), and context-window-budget visibility in place of the cost tracking cloud tools show (a local model silently degrades on overflow instead of costing money — a worse failure mode to be blind to).
+7. **Tool design hygiene**: Anthropic's own ["Writing Effective Tools for Agents"](https://www.anthropic.com/engineering/writing-tools-for-agents) argues for fewer, higher-level tools with explicit descriptions and *actionable* error messages rather than raw errors — directly relevant to revising `read_file`/`write_file`/`edit_file` before the tool surface grows.
+
+## Roadmap
+
+Phases are ordered by dependency and leverage, not by ease. Each closes a
+specific gap identified above.
+
+### Phase 1 — Harden what's already shipped — ✅ done
+Fixed the audit backlog before adding surface area: cancellation propagation
+through the tool-dispatch loop, `max_tool_iterations_per_turn` wired from
+config, HTTP/idle timeouts + size caps on `OpenAiCompatBackend`, truncated-response
+surfacing, `TerminalGuard`/`restore_terminal` robustness, the tool-result
+newline-stripping and scroll-math rendering bugs, `write_file`'s binary-overwrite
+prompt clarity, a regression test locking in deny-before-read-auto-allow
+ordering, and `SYSTEM_PROMPT` derived from tool definitions. The `edit_file`
+TOCTOU and a handful of narrow/theoretical findings were deliberately deferred
+rather than fixed — see the "Phase 1 hardening complete" note above. Not yet
+done from the original Phase 1 idea: revising the three tool descriptions/error
+messages per Anthropic's tool-design guidance — still worth doing before the
+tool surface grows, folded into whichever of Phase 2/3 lands next.
+
+### Phase 2 — Fix editing reliability at the root cause
+This is the highest-leverage change given what's already been observed:
+adopt a prompted SEARCH/REPLACE-style edit format for `edit_file` (Aider's
+pattern) instead of leaning solely on native tool-calling for the edit
+payload, with a bounded repair loop — on a non-matching edit, feed back the
+actual nearby file content and let the model retry, capped at ~3 attempts
+(reusing/finally activating the `max_tool_iterations` plumbing from Phase 1).
+This directly targets the `ornith:9b` degradation pattern rather than hoping
+a better model always saves you. Native tool-calling stays the mechanism for
+*invoking* tools (that part works fine); this is specifically about how edit
+*content* gets communicated and validated.
+
+### Phase 3 — Search and navigation tools
+Add a content-search tool (grep-equivalent) and a path-search tool
+(glob-equivalent) — universal across every agent studied, no index/server
+needed, and a natural extension of the existing `ToolRegistry`/`ConfirmationGate`
+framework (read-only, auto-allow like `read_file`). Rust crates: `ignore` +
+`grep-searcher`/`grep-regex` (ripgrep's own library crates) as already
+anticipated in earlier planning, avoiding a hard dependency on an external
+`rg` binary.
+
+### Phase 4 — A verification loop
+Add a way for the agent to run the project's own build/test/lint and get the
+output back automatically after an edit — the single capability the research
+flags as most correlated with actually-successful task completion. Scope this
+narrower than general shell-exec initially (e.g. a dedicated "run project
+command" tool with a small configurable allowlist) to capture the verification
+value before taking on full arbitrary-command sandboxing in Phase 5.
+
+### Phase 5 — Shell execution behind real sandboxing
+Implement the `ExecutionConfiner` this project's trait already anticipates:
+Landlock (filesystem scope) + seccomp-bpf (syscall allow-list), replacing
+`NoopConfiner`, following the pattern validated by Codex CLI's own Rust
+implementation. Rust crates: `landlock` (already a dependency), `seccompiler`
+(new). This phase **must** also close the `ConfirmationGate`/`PermissionKey`
+gaps already found for `PermissionTarget::Command` (deny_paths doesn't cover
+it, Always-Allow caches by program name only, dropping args) — those are
+currently dead code but become live risk the moment a shell tool exists, so
+fix them as part of shipping the tool, not after. Add command-level
+allowlisting as an additional trust tier beyond raw confirm/deny.
+
+_[unverified] Worth a short research spike before Phase 2/5 lock in their
+designs: whether Ollama/llama.cpp's grammar-constrained decoding (GBNF /
+JSON-schema-to-grammar, long supported by llama.cpp; vLLM has an equivalent
+via outlines/xgrammar) can be made to constrain native tool-call syntax
+specifically, not just freeform JSON mode — if so, it could reduce or remove
+the need for Phase 2's prompted-format fallback for some backends. Not
+confirmed this session; check before committing engineering time either way._
+
+### Phase 6 — Codebase understanding (repo map)
+Build an Aider-style repo map: extract per-file symbol signatures (functions,
+types) via `tree-sitter`, rank by a dependency/reference graph, inject a
+token-budgeted slice into the system prompt. This is the best-fit context
+strategy for small local context windows per the research (cheap, no server,
+degrades gracefully) — prioritize it over embeddings/RAG, which the field has
+moved away from for code specifically.
+
+### Phase 7 — Git integration and checkpointing
+A git-ops tool (status/diff/log/commit), shelling out to the `git` CLI to
+match the user's real config/credentials (consistent with this project's
+existing choice for tool-vs-library tradeoffs). Open design question worth
+deciding deliberately rather than defaulting: auto-commit every accepted edit
+into the user's real history with an AI-authored message (Aider's approach —
+transparent, doubles as an audit trail) vs. a separate shadow git repo for
+step-by-step rewind (Cline's approach — less invasive to the user's actual
+history). Given this project's emphasis on transparency over magic, auto-commit
+to the real repo is the more consistent default, but flag it for confirmation
+before building.
+
+### Phase 8 — Agentic UX
+A hard **plan mode** (read-only enforced at the permission layer — trivial on
+top of the existing gate, just withhold write grants until the user confirms
+a plan), a **persisted, visible task list** (more valuable here than in cloud
+tools since local sessions are interrupted more often — crashes, slow
+inference), **session persistence/resume**, and **context-budget visibility**
+(percentage of context window consumed) in place of the cost-tracking cloud
+tools show, since local inference has no per-token cost but silently degrades
+on context overflow instead — a worse failure mode to be blind to.
+
+### Phase 9 — Stretch goals
+LSP integration for exact symbol resolution (complements, doesn't replace,
+the repo map and grep tools), MCP support for external tool integration,
+sub-agent delegation for context-isolated exploration, and an
+architect/editor model-pairing mode (a stronger model plans in prose, a
+faster local model executes the mechanical edit) — directly enabled once
+Phase 2's prompted edit format exists.
+
+## Notes on sequencing
+
+Phases 1-2 are deliberately reliability-first rather than feature-first: the
+research and this project's own capability testing agree that adding tool
+surface on top of unreliable tool-calling/editing just multiplies failure
+modes rather than fixing the underlying one. Phases 3-4 are the cheapest,
+highest-consensus additions (every agent studied has them, none need new
+infrastructure). Phase 5 is gated behind Phase 1-4 partly because it's the
+biggest single chunk of new complexity (real sandboxing) and partly because
+shell-exec is exactly where the `Command`-target permission gaps matter —
+better to have the simpler tools' patterns settled first.

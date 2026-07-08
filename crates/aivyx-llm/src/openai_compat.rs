@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use aivyx_types::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition, ToolOutput,
@@ -9,6 +10,23 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
+
+/// How long to wait for a TCP+TLS handshake before giving up — this is
+/// deliberately NOT a whole-request timeout, since a legitimately long
+/// local-model generation can run far longer than any reasonable connect
+/// window without anything being wrong.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to tolerate silence between SSE chunks before treating the
+/// backend as hung. Generous on purpose — large local models can be slow
+/// between tokens — but bounded, since nothing else in this codebase can
+/// currently interrupt a `stream_chat` call that just never produces
+/// another byte.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Caps unbounded growth from a misbehaving or malicious backend that
+/// never stops streaming a single field.
+const MAX_ACCUMULATED_BYTES: usize = 10 * 1024 * 1024;
 
 /// Talks to any server exposing an OpenAI-compatible `/chat/completions`
 /// endpoint with SSE streaming — this covers Ollama (`/v1`), vLLM, and
@@ -26,11 +44,16 @@ impl OpenAiCompatBackend {
         model: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .expect("failed to build the HTTP client");
+
         Self {
             base_url: base_url.into(),
             model: model.into(),
             api_key,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 }
@@ -60,12 +83,19 @@ impl LlmBackend for OpenAiCompatBackend {
             return Err(LlmError::BackendError { status, body });
         }
 
-        let sse_stream = response.bytes_stream().eventsource();
+        // Wrapping with an idle timeout here (rather than a blanket
+        // `reqwest::Client::timeout`) means a slow-but-alive local model
+        // can stream for as long as it needs to, while a truly hung
+        // connection still gets caught.
+        let sse_stream =
+            tokio_stream::StreamExt::timeout(response.bytes_stream().eventsource(), IDLE_TIMEOUT);
 
         let stream = sse_stream
-            .scan(ToolCallAccumulator::default(), |accumulator, event| {
-                let events = match event {
-                    Ok(event) => {
+            .scan(ToolCallAccumulator::default(), |accumulator, item| {
+                let events = match item {
+                    Err(_elapsed) => vec![Err(LlmError::Timeout)],
+                    Ok(Err(err)) => vec![Err(LlmError::Parse(err.to_string()))],
+                    Ok(Ok(event)) => {
                         let data = event.data.trim();
                         if data == "[DONE]" {
                             Vec::new()
@@ -78,7 +108,6 @@ impl LlmBackend for OpenAiCompatBackend {
                             }
                         }
                     }
-                    Err(err) => vec![Err(LlmError::Parse(err.to_string()))],
                 };
                 futures::future::ready(Some(events))
             })
@@ -135,6 +164,9 @@ impl ToolCallAccumulator {
                 }
                 if let Some(arguments) = function.arguments {
                     entry.arguments.push_str(&arguments);
+                    if entry.arguments.len() > MAX_ACCUMULATED_BYTES {
+                        return vec![Err(LlmError::ResponseTooLarge)];
+                    }
                 }
             }
         }
@@ -462,5 +494,23 @@ mod tests {
             }
         }
         assert!(saw_tool_call, "expected a completed tool call event");
+    }
+
+    #[test]
+    fn oversized_tool_call_arguments_abort_instead_of_growing_unbounded() {
+        let mut accumulator = ToolCallAccumulator::default();
+
+        let huge_fragment = "a".repeat(MAX_ACCUMULATED_BYTES + 1);
+        let chunk: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "write_file", "arguments": huge_fragment}}]},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let events = accumulator.consume(chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Err(LlmError::ResponseTooLarge)));
     }
 }

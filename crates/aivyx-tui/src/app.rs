@@ -210,13 +210,20 @@ impl App {
             .flat_map(chat_line_to_lines)
             .collect();
         let viewport_height = layout[0].height.saturating_sub(2);
-        let scroll = (lines.len() as u16).saturating_sub(viewport_height);
+        // border chars, left + right
+        let content_width = layout[0].width.saturating_sub(2);
 
         let transcript = Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title("aivyx-coder"))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        frame.render_widget(transcript, layout[0]);
+            .wrap(Wrap { trim: false });
+        // `Paragraph::scroll` applies its offset *after* wrapping, so the
+        // offset must be computed from the wrapped (post-wrap) row count —
+        // `lines.len()` alone undercounts as soon as anything actually
+        // wraps, and the transcript stops reaching the true bottom.
+        let wrapped_rows = transcript.line_count(content_width) as u16;
+        let scroll = wrapped_rows.saturating_sub(viewport_height);
+
+        frame.render_widget(transcript.scroll((scroll, 0)), layout[0]);
 
         frame.render_widget(&self.input, layout[1]);
 
@@ -323,21 +330,26 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
+    // Every variant goes through `prefixed_lines` (not a single
+    // `Line::from(format!(...))`) so multi-line text — e.g. any read_file
+    // result longer than one line — actually breaks into separate `Line`s.
+    // Ratatui's `Span` rendering silently drops embedded `\n` characters,
+    // so skipping this for tool output rendered as one concatenated wall
+    // of text instead of the file's real line breaks.
     match line {
         ChatLine::User(text) => prefixed_lines(text, "you  > ", Style::default().fg(Color::Cyan)),
         ChatLine::Assistant(text) => prefixed_lines(text, "aivyx> ", Style::default()),
-        ChatLine::ToolCall(text) => vec![
-            Line::from(format!("  tool call: {text}")).style(Style::default().fg(Color::Yellow)),
-        ],
-        ChatLine::ToolResult(text) => vec![
-            Line::from(format!("  tool result: {text}")).style(Style::default().fg(Color::Green)),
-        ],
-        ChatLine::Notice(text) => {
-            vec![
-                Line::from(format!("  ! {text}"))
-                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            ]
+        ChatLine::ToolCall(text) => {
+            prefixed_lines(text, "  tool call: ", Style::default().fg(Color::Yellow))
         }
+        ChatLine::ToolResult(text) => {
+            prefixed_lines(text, "  tool result: ", Style::default().fg(Color::Green))
+        }
+        ChatLine::Notice(text) => prefixed_lines(
+            text,
+            "  ! ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
