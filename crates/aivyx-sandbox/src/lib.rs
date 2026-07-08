@@ -8,11 +8,16 @@
 //! confiner at all — a concrete `LandlockConfiner` is deliberately deferred
 //! to a later pass.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
+#[cfg(feature = "sandbox-backend")]
+mod confiner;
 mod confirmation;
+#[cfg(feature = "sandbox-backend")]
+pub use confiner::LandlockConfiner;
 pub use confirmation::ConfirmationGate;
 
 /// What a tool is asking to do, described *before* any side effect happens.
@@ -74,10 +79,10 @@ pub trait PermissionPrompter: Send + Sync {
     async fn prompt(&self, request: &PermissionRequest) -> UserResponse;
 }
 
-/// Wraps/restricts an about-to-spawn process. The v1 (this pass) caller
-/// uses a no-op identity confiner; a Linux landlock/bubblewrap backend can
-/// be dropped in later behind the `landlock-backend` feature without
-/// touching any tool implementation.
+/// Wraps/restricts an about-to-spawn process. `NoopConfiner` is the
+/// identity fallback; `LandlockConfiner` (behind the `sandbox-backend`
+/// feature, on by default) is the real Landlock + seccomp-bpf backend —
+/// swapping between them never touches any tool implementation.
 pub trait ExecutionConfiner: Send + Sync {
     fn confine(&self, command: tokio::process::Command) -> tokio::process::Command;
 }
@@ -88,6 +93,20 @@ impl ExecutionConfiner for NoopConfiner {
     fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
         command
     }
+}
+
+/// Builds the best confiner available for this build: `LandlockConfiner`
+/// when the `sandbox-backend` feature is enabled (the default), otherwise
+/// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
+/// in every caller.
+#[cfg(feature = "sandbox-backend")]
+pub fn default_confiner(cwd: &Path, extra_read_paths: &[PathBuf]) -> Arc<dyn ExecutionConfiner> {
+    Arc::new(LandlockConfiner::new(cwd, extra_read_paths))
+}
+
+#[cfg(not(feature = "sandbox-backend"))]
+pub fn default_confiner(_cwd: &Path, _extra_read_paths: &[PathBuf]) -> Arc<dyn ExecutionConfiner> {
+    Arc::new(NoopConfiner)
 }
 
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is

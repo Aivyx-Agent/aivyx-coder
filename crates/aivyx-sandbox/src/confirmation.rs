@@ -57,11 +57,28 @@ pub struct ConfirmationGate {
 }
 
 impl ConfirmationGate {
-    pub fn new(prompter: Arc<dyn PermissionPrompter>, deny_paths: Vec<PathBuf>) -> Self {
+    /// `pre_approved_commands` seeds the Always-Allow cache directly (as
+    /// `(program, args)` pairs) rather than requiring an interactive
+    /// confirmation the first time — these represent commands the user
+    /// already trusted by writing them into config, so an additional
+    /// "are you sure" click adds friction without a security benefit. This
+    /// is the "command-level allowlisting" trust tier: `run_command` only
+    /// ever runs entries from this same list, and `run_shell` treats an
+    /// exact match against it as pre-approved before falling back to the
+    /// normal confirm-then-cache flow for anything else.
+    pub fn new(
+        prompter: Arc<dyn PermissionPrompter>,
+        deny_paths: Vec<PathBuf>,
+        pre_approved_commands: Vec<(String, Vec<String>)>,
+    ) -> Self {
+        let always_allow = pre_approved_commands
+            .into_iter()
+            .map(|(program, args)| PermissionKey::Command { program, args })
+            .collect();
         Self {
             prompter,
             deny_paths,
-            always_allow: Mutex::new(HashSet::new()),
+            always_allow: Mutex::new(always_allow),
         }
     }
 
@@ -143,7 +160,11 @@ mod tests {
             response: UserResponse::Allow,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![PathBuf::from("/home/user/.ssh")]);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.ssh")],
+            vec![],
+        );
 
         let decision = gate
             .check(&write_request("/home/user/.ssh/id_ed25519"))
@@ -159,7 +180,7 @@ mod tests {
             response: UserResponse::Deny,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![]);
+        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![]);
 
         let decision = gate
             .check(&read_request("/home/user/project/src/main.rs"))
@@ -175,7 +196,7 @@ mod tests {
             response: UserResponse::AllowAlways,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![]);
+        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![]);
 
         let first = gate.check(&write_request("/home/user/project/a.rs")).await;
         assert_eq!(first, PermissionDecision::AllowAlways);
@@ -205,7 +226,11 @@ mod tests {
             response: UserResponse::Allow,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![PathBuf::from("/home/user/.ssh")]);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.ssh")],
+            vec![],
+        );
 
         let decision = gate
             .check(&read_request("/home/user/.ssh/id_ed25519"))
@@ -225,7 +250,7 @@ mod tests {
             response: UserResponse::AllowAlways,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![]);
+        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![]);
 
         let test_request = PermissionRequest {
             tool_name: "run_command".to_string(),
@@ -262,12 +287,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_approved_commands_skip_the_prompt_entirely() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![("cargo".to_string(), vec!["test".to_string()])],
+        );
+
+        let request = PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+
+        let decision = gate.check(&request).await;
+        assert_eq!(decision, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+
+        // A different argv sharing the same program is NOT pre-approved —
+        // the exact-match scoping applies here too.
+        let different_args = PermissionRequest {
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["build".to_string()],
+            },
+            ..request
+        };
+        let decision = gate.check(&different_args).await;
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn plain_deny_is_never_cached() {
         let prompter = Arc::new(FakePrompter {
             response: UserResponse::Deny,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![]);
+        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![]);
 
         gate.check(&write_request("/home/user/project/a.rs")).await;
         gate.check(&write_request("/home/user/project/a.rs")).await;

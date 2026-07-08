@@ -17,10 +17,12 @@ use tokio_util::sync::CancellationToken;
 
 mod diff;
 mod path_resolve;
+mod process;
 mod tools;
 
+pub use process::CommandSpec;
 pub use tools::{
-    CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, WriteFileTool,
+    EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool, WriteFileTool,
 };
 
 #[derive(Debug, Error)]

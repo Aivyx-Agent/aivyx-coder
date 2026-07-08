@@ -147,17 +147,67 @@ independently, while re-running the same command doesn't re-prompt.
 Phase 5, where the model chooses arbitrary commands/args and it actually
 matters; this phase's allowlist is fully user-fixed, so it doesn't need it.
 
-### Phase 5 — Shell execution behind real sandboxing
-Implement the `ExecutionConfiner` this project's trait already anticipates:
-Landlock (filesystem scope) + seccomp-bpf (syscall allow-list), replacing
-`NoopConfiner`, following the pattern validated by Codex CLI's own Rust
-implementation. Rust crates: `landlock` (already a dependency), `seccompiler`
-(new). This phase **must** also close the `ConfirmationGate`/`PermissionKey`
-gaps already found for `PermissionTarget::Command` (deny_paths doesn't cover
-it, Always-Allow caches by program name only, dropping args) — those are
-currently dead code but become live risk the moment a shell tool exists, so
-fix them as part of shipping the tool, not after. Add command-level
-allowlisting as an additional trust tier beyond raw confirm/deny.
+### Phase 5 — Shell execution behind real sandboxing — ✅ done
+Implemented `LandlockConfiner` (`ExecutionConfiner`, replacing `NoopConfiner`
+by default), and a general `run_shell` tool (arbitrary `sh -c` commands,
+unlike Phase 4's fixed-menu `run_command`).
+
+Before implementing, checked this section's own claim of "following the
+pattern validated by Codex CLI" — stale: Codex CLI's *current* Linux sandbox
+is bubblewrap (namespaces), with Landlock kept only as a legacy fallback, and
+its seccomp policy is a narrow denylist, not a broad allowlist. Presented the
+corrected tradeoff to the user (bubblewrap, matching Codex exactly but adding
+a new external binary dependency and materially more complexity, vs. Landlock
++ a seccomp denylist, fitting the existing trait with no new binary
+dependency) — user chose Landlock + seccomp denylist. Verified the concrete
+integration against the real `landlock` 0.4.5 / `seccompiler` 0.5.0 crate
+source before writing any code (not `sandlock-core`, which looked convenient
+but is 3 months old with under 500 downloads and no docs — too unproven for
+a kernel security boundary): confinement is applied via `tokio::process::Command::pre_exec`
+(the forked child, after `fork()` before `exec()` — not the crate's own
+one-shot-wrapper example pattern, since aivyx-coder must keep running after
+spawning a subprocess), with the full ruleset and compiled BPF program built
+in the parent (all allocation front-loaded) so the `pre_exec` closure itself
+only calls two verified-allocation-free syscall wrappers.
+
+Filesystem policy (informed by, not copied from, Codex's lesson that
+cwd-only reads break real toolchains): write access scoped to cwd + tmp;
+read access to cwd + a built-in list of common system/toolchain paths
+(`/usr`, `/lib`, `/bin`, `/etc`, `~/.cargo`, `~/.rustup`) plus a config
+escape hatch (`sandbox.extra_read_paths`) — deliberately not Codex's
+"read everything" default, since Landlock has no negative/deny rule and
+carving `deny_paths` entries out of a broad grant would need fragile
+sibling-enumeration; a bounded allowlist sidesteps the problem entirely.
+Seccomp is a narrow denylist (`ptrace`, `io_uring_*`, `mount`, `reboot`,
+module-loading, etc.) with default-allow otherwise — network is
+unrestricted by default, matching Codex's own default preset.
+
+This closes the remaining piece of audit finding #3 (`deny_paths` not
+covering `Command` targets) via a **better** mechanism than originally
+planned: real kernel enforcement instead of a heuristic string-match check,
+so the heuristic was deliberately not built at all. The other half of
+finding #3 (Always-Allow caching by program name only, dropping args) was
+already fixed in Phase 4.
+
+"Command-level allowlisting as an additional trust tier": `run_shell`
+reuses Phase 4's `permissions.allowed_commands` list — an exact match
+skips confirmation entirely (pre-seeded into `ConfirmationGate`'s
+Always-Allow cache at construction, in both the direct `(program, args)`
+form and the `sh -c "..."` form, since the two tools have different
+invocation shapes) — rather than building a new "is this command pattern
+safe" classifier, which is real security engineering in its own right and
+easy to get subtly wrong.
+
+Verified live, not just unit-tested: with a Landlock ABI 9 kernel active on
+the dev machine, real (not mocked) tests confirm a write inside the granted
+root succeeds, a write outside it fails, a read outside the allowlist fails,
+and the seccomp filter doesn't break normal commands. A pty-driven E2E run
+demonstrated the actual defense-in-depth property this phase exists for: a
+shell command that tried to write outside the working directory was
+approved by the (simulated) human at the confirmation prompt, and the
+**kernel still blocked it** — the write never happened, and the agent
+correctly reported the permission failure back rather than silently
+succeeding or hanging.
 
 _[unverified] Worth a short research spike before Phase 2/5 lock in their
 designs: whether Ollama/llama.cpp's grammar-constrained decoding (GBNF /

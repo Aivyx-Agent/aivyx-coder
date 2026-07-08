@@ -33,6 +33,27 @@ pub enum ConfigError {
 pub struct Settings {
     pub backend: BackendSettings,
     pub permissions: PermissionSettings,
+    pub sandbox: SandboxSettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxSettings {
+    /// Additional filesystem paths process-executing tools may read from,
+    /// beyond the built-in default (the working directory plus common
+    /// system/toolchain paths). Empty by default — an escape hatch for
+    /// ecosystems the built-in list doesn't cover (e.g. a Python venv or
+    /// node_modules cache living outside the project directory), not a
+    /// fully general reconfigurable policy.
+    pub extra_read_paths: Vec<String>,
+}
+
+impl SandboxSettings {
+    /// Expands a leading `~` in each `extra_read_paths` entry — see
+    /// `PermissionSettings::resolved_deny_paths` for the same convention.
+    pub fn resolved_extra_read_paths(&self) -> Vec<PathBuf> {
+        resolve_tilde_paths(&self.extra_read_paths)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,21 +131,29 @@ impl PermissionSettings {
     /// directory found) are skipped rather than left unresolved and
     /// silently wrong.
     pub fn resolved_deny_paths(&self) -> Vec<PathBuf> {
-        let home_dir = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
-
-        self.deny_paths
-            .iter()
-            .filter_map(|raw| {
-                if let Some(rest) = raw.strip_prefix("~/") {
-                    home_dir.as_ref().map(|home| home.join(rest))
-                } else if raw == "~" {
-                    home_dir.clone()
-                } else {
-                    Some(PathBuf::from(raw))
-                }
-            })
-            .collect()
+        resolve_tilde_paths(&self.deny_paths)
     }
+}
+
+/// Shared by `PermissionSettings::resolved_deny_paths` and
+/// `SandboxSettings::resolved_extra_read_paths`: expands a leading `~` into
+/// an absolute path, skipping entries that can't be expanded (no home
+/// directory found) rather than leaving them unresolved and silently wrong.
+fn resolve_tilde_paths(raw_paths: &[String]) -> Vec<PathBuf> {
+    let home_dir = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+
+    raw_paths
+        .iter()
+        .filter_map(|raw| {
+            if let Some(rest) = raw.strip_prefix("~/") {
+                home_dir.as_ref().map(|home| home.join(rest))
+            } else if raw == "~" {
+                home_dir.clone()
+            } else {
+                Some(PathBuf::from(raw))
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

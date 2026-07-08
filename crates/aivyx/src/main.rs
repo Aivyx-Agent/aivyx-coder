@@ -5,10 +5,10 @@ use std::time::Duration;
 use aivyx_config::Settings;
 use aivyx_core::Agent;
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
-use aivyx_sandbox::{ConfirmationGate, ExecutionConfiner, NoopConfiner, PermissionGate};
+use aivyx_sandbox::{ConfirmationGate, PermissionGate};
 use aivyx_tools::{
-    CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, ToolExecutor,
-    ToolRegistry, WriteFileTool,
+    CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool,
+    ToolExecutor, ToolRegistry, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -74,6 +74,19 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let deny_paths = settings.permissions.resolved_deny_paths();
+    let cwd = std::env::current_dir()?;
+
+    let command_specs: Vec<CommandSpec> = settings
+        .permissions
+        .allowed_commands
+        .iter()
+        .map(|c| CommandSpec {
+            name: c.name.clone(),
+            program: c.program.clone(),
+            args: c.args.clone(),
+            timeout: Duration::from_secs(c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)),
+        })
+        .collect();
 
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadFileTool));
@@ -81,31 +94,41 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
+    registry.register(Arc::new(RunShellTool));
 
     // Only registered when configured — an always-erroring tool offered to
     // the model would just be confusing noise for a project that hasn't
     // opted into any commands.
-    if !settings.permissions.allowed_commands.is_empty() {
-        let commands = settings
-            .permissions
-            .allowed_commands
-            .iter()
-            .map(|c| CommandSpec {
-                name: c.name.clone(),
-                program: c.program.clone(),
-                args: c.args.clone(),
-                timeout: Duration::from_secs(
-                    c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS),
-                ),
-            })
-            .collect();
-        registry.register(Arc::new(RunCommandTool::new(commands)));
+    if !command_specs.is_empty() {
+        registry.register(Arc::new(RunCommandTool::new(command_specs.clone())));
+    }
+
+    // Each configured command is pre-approved in two forms: the direct
+    // `(program, args)` invocation `run_command` uses, and the `sh -c
+    // "<program> <args>"` form `run_shell` always wraps commands in — the
+    // two tools have genuinely different invocation shapes (direct exec vs.
+    // shell-interpreted), so a single natural config entry (e.g. `program =
+    // "cargo", args = ["test"]`) needs both to be recognized by either tool
+    // without requiring the user to write it out twice in different shapes.
+    let mut pre_approved_commands: Vec<(String, Vec<String>)> = Vec::new();
+    for spec in &command_specs {
+        pre_approved_commands.push((spec.program.clone(), spec.args.clone()));
+        let shell_form = if spec.args.is_empty() {
+            spec.program.clone()
+        } else {
+            format!("{} {}", spec.program, spec.args.join(" "))
+        };
+        pre_approved_commands.push(("sh".to_string(), vec!["-c".to_string(), shell_form]));
     }
 
     let (prompter, permission_rx) = aivyx_tui::permission_channel();
-    let gate: Arc<dyn PermissionGate> =
-        Arc::new(ConfirmationGate::new(Arc::new(prompter), deny_paths));
-    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+        Arc::new(prompter),
+        deny_paths,
+        pre_approved_commands,
+    ));
+    let confiner =
+        aivyx_sandbox::default_confiner(&cwd, &settings.sandbox.resolved_extra_read_paths());
     let executor = ToolExecutor::new(registry, gate, confiner);
     let system_prompt = build_system_prompt(&executor);
 
@@ -117,8 +140,6 @@ async fn main() -> anyhow::Result<()> {
         settings.permissions.max_tool_iterations_per_turn,
         events_tx,
     );
-
-    let cwd = std::env::current_dir()?;
 
     aivyx_tui::run(agent, events_rx, cwd, permission_rx).await
 }
