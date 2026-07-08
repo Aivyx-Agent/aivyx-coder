@@ -20,6 +20,7 @@ enum PermissionKey {
     },
     Command {
         program: String,
+        args: Vec<String>,
     },
     Other {
         action: ActionKind,
@@ -34,8 +35,9 @@ impl PermissionKey {
                 action: request.action,
                 path: path.clone(),
             },
-            PermissionTarget::Command { program, .. } => PermissionKey::Command {
+            PermissionTarget::Command { program, args } => PermissionKey::Command {
                 program: program.clone(),
+                args: args.clone(),
             },
             PermissionTarget::Other(description) => PermissionKey::Other {
                 action: request.action,
@@ -211,6 +213,52 @@ mod tests {
 
         assert_eq!(decision, PermissionDecision::Deny);
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn always_allow_for_a_command_does_not_cover_a_different_argv_with_the_same_program() {
+        // Regression test for audit finding #3: PermissionKey::Command used
+        // to key the Always-Allow cache by `program` alone, dropping `args`
+        // — approving `cargo test` would have silently also auto-approved
+        // `cargo build` or any other argv sharing the same program name.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(prompter.clone(), vec![]);
+
+        let test_request = PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+        let build_request = PermissionRequest {
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["build".to_string()],
+            },
+            ..test_request.clone()
+        };
+
+        let first = gate.check(&test_request).await;
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // Same program, different args: must prompt again, not hit the
+        // `cargo test` cache entry.
+        let second = gate.check(&build_request).await;
+        assert_eq!(second, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+
+        // The original exact command is still cached on its own.
+        let third = gate.check(&test_request).await;
+        assert_eq!(third, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

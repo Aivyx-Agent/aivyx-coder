@@ -1,16 +1,22 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aivyx_config::Settings;
 use aivyx_core::Agent;
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{ConfirmationGate, ExecutionConfiner, NoopConfiner, PermissionGate};
 use aivyx_tools::{
-    EditFileTool, GlobTool, GrepTool, ReadFileTool, ToolExecutor, ToolRegistry, WriteFileTool,
+    CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, ToolExecutor,
+    ToolRegistry, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+
+/// Applied when an `allowed_commands` entry doesn't set its own
+/// `timeout_secs`.
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 
 const SYSTEM_PROMPT_PREAMBLE: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
 Mutating actions require the user to approve a confirmation prompt before they take effect, so explain \
@@ -75,6 +81,26 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
+
+    // Only registered when configured — an always-erroring tool offered to
+    // the model would just be confusing noise for a project that hasn't
+    // opted into any commands.
+    if !settings.permissions.allowed_commands.is_empty() {
+        let commands = settings
+            .permissions
+            .allowed_commands
+            .iter()
+            .map(|c| CommandSpec {
+                name: c.name.clone(),
+                program: c.program.clone(),
+                args: c.args.clone(),
+                timeout: Duration::from_secs(
+                    c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS),
+                ),
+            })
+            .collect();
+        registry.register(Arc::new(RunCommandTool::new(commands)));
+    }
 
     let (prompter, permission_rx) = aivyx_tui::permission_channel();
     let gate: Arc<dyn PermissionGate> =

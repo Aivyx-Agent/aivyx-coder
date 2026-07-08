@@ -119,13 +119,33 @@ was also correctly absent. 11 new unit tests across both tools: real matches,
 `.gitignore` respected, denied-subtree-as-ancestor-root closed, symlink
 escape closed, output capped and clearly reported when truncated.
 
-### Phase 4 — A verification loop
-Add a way for the agent to run the project's own build/test/lint and get the
-output back automatically after an edit — the single capability the research
-flags as most correlated with actually-successful task completion. Scope this
-narrower than general shell-exec initially (e.g. a dedicated "run project
-command" tool with a small configurable allowlist) to capture the verification
-value before taking on full arbitrary-command sandboxing in Phase 5.
+### Phase 4 — A verification loop — ✅ done
+Added `run_command`: the model selects a name from a fixed, user-configured
+allowlist (`[[permissions.allowed_commands]]` in config.toml — empty by
+default, fail-closed) and gets back exit status plus stdout/stderr, tail-truncated
+(not head-truncated, unlike `grep`/`glob`) since the actionable signal in
+build/test output is almost always at the end. The model never supplies a
+program or arbitrary args — that's what makes auto-caching repeated runs via
+the normal Always-Allow flow safe without waiting on Phase 5's real
+sandboxing. Spawns through `ExecutionConfiner::confine` (currently
+`NoopConfiner`), so Phase 5's `LandlockConfiner` slots in later with no tool
+changes needed. Process execution races a concurrent stdout/stderr drain
+against a timeout and the existing `CancellationToken`, killing the child on
+either — draining concurrently with waiting, not after, avoids a deadlock if
+the child fills its pipe buffer before exiting.
+
+Planning surfaced and closed a real bug before it ever shipped:
+`PermissionKey::Command` (the Always-Allow cache key) only hashed `program`,
+dropping `args` — audit finding #3, previously dead code since no
+command-executing tool existed to exercise it. Two allowlist entries sharing
+a program (e.g. both using `cargo`) would have had approving one silently
+auto-approve the other. Fixed by keying on `(program, args)`; live-verified
+end-to-end (see `project-aivyx-coder-phase4-run-command` memory) that a
+second command sharing a program with an already-approved one still prompts
+independently, while re-running the same command doesn't re-prompt.
+`deny_paths` still doesn't cover `Command` targets — deliberately left for
+Phase 5, where the model chooses arbitrary commands/args and it actually
+matters; this phase's allowlist is fully user-fixed, so it doesn't need it.
 
 ### Phase 5 — Shell execution behind real sandboxing
 Implement the `ExecutionConfiner` this project's trait already anticipates:

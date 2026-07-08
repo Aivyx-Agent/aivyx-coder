@@ -75,6 +75,11 @@ pub struct PermissionSettings {
     /// `resolved_deny_paths`.
     pub deny_paths: Vec<String>,
     pub max_tool_iterations_per_turn: u32,
+    /// Fixed set of commands the `run_command` tool may execute — the model
+    /// selects one by `name`, it never supplies a program or arbitrary args.
+    /// Empty by default: nothing is runnable until a project explicitly
+    /// opts in.
+    pub allowed_commands: Vec<AllowedCommand>,
 }
 
 impl Default for PermissionSettings {
@@ -83,8 +88,20 @@ impl Default for PermissionSettings {
             mode: PermissionMode::Confirm,
             deny_paths: vec!["~/.ssh".to_string(), "~/.aws".to_string()],
             max_tool_iterations_per_turn: 25,
+            allowed_commands: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowedCommand {
+    pub name: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Overrides the tool's default timeout for this command when set.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl PermissionSettings {
