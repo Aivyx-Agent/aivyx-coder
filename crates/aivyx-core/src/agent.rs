@@ -2,7 +2,7 @@ use std::path::Path;
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
 use aivyx_tools::ToolExecutor;
-use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolResult};
+use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
 use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
@@ -71,6 +71,25 @@ impl Agent {
         // If the receiver (the TUI) has been dropped there's nothing
         // meaningful left to do with this event.
         let _ = self.events_tx.send(event);
+    }
+
+    /// Records a synthetic tool result for a call that was never dispatched
+    /// because cancellation fired first. The assistant message already
+    /// pushed to history recorded this call as a `ContentBlock::ToolCall`;
+    /// every such call needs a matching `Role::Tool` result or the next
+    /// turn's request will contain an assistant message with unanswered
+    /// tool_calls, which most OpenAI-compatible backends reject outright.
+    fn record_cancelled_tool_result(&mut self, call: ToolCall) {
+        let result = ToolResult {
+            call_id: call.id,
+            output: ToolOutput::Denied("cancelled before this tool call was executed".to_string()),
+        };
+        self.emit(AgentEvent::ToolResult(result.clone()));
+        self.history.push(Message {
+            role: Role::Tool,
+            tool_call_id: Some(result.call_id.clone()),
+            content: vec![ContentBlock::ToolResult(result)],
+        });
     }
 
     /// Runs one user turn to completion: sends the request, streams the
@@ -190,8 +209,17 @@ impl Agent {
             }
 
             for call in tool_calls {
+                // Every one of these calls is already recorded as a
+                // ContentBlock::ToolCall in the assistant message just
+                // pushed to history — each one needs a matching Role::Tool
+                // result or the *next* turn's request will contain an
+                // assistant message with unanswered tool_calls, which most
+                // OpenAI-compatible backends reject outright. So once
+                // cancelled, record the remaining calls as cancelled rather
+                // than silently skipping them.
                 if cancellation.is_cancelled() {
-                    break;
+                    self.record_cancelled_tool_result(call);
+                    continue;
                 }
 
                 let result = self

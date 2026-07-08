@@ -213,17 +213,24 @@ impl App {
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
 
-        let transcript = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("aivyx-coder"))
-            .wrap(Wrap { trim: false });
+        let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
         // `Paragraph::scroll` applies its offset *after* wrapping, so the
         // offset must be computed from the wrapped (post-wrap) row count —
         // `lines.len()` alone undercounts as soon as anything actually
         // wraps, and the transcript stops reaching the true bottom.
+        //
+        // `line_count` must be measured BEFORE `.block(...)` is attached:
+        // once a block is set, ratatui adds the block's own vertical space
+        // (2 rows for `Borders::ALL`) into the count, which would double
+        // count against `viewport_height` (already border-excluded) and
+        // over-scroll by exactly that many rows.
         let wrapped_rows = transcript.line_count(content_width) as u16;
         let scroll = wrapped_rows.saturating_sub(viewport_height);
 
-        frame.render_widget(transcript.scroll((scroll, 0)), layout[0]);
+        let transcript = transcript
+            .block(Block::default().borders(Borders::ALL).title("aivyx-coder"))
+            .scroll((scroll, 0));
+        frame.render_widget(transcript, layout[0]);
 
         frame.render_widget(&self.input, layout[1]);
 
@@ -354,6 +361,13 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
 }
 
 fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        // `str::lines()` yields nothing for an empty string, which would
+        // otherwise make the whole entry vanish from the transcript
+        // instead of e.g. showing "tool result: " for a 0-byte file read.
+        return vec![Line::from(prefix).style(style)];
+    }
+
     let indent = " ".repeat(prefix.len());
     text.lines()
         .enumerate()

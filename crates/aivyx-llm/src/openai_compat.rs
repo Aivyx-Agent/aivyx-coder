@@ -46,6 +46,12 @@ impl OpenAiCompatBackend {
     ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            // Bounds the gap `connect_timeout` and the SSE idle-timeout
+            // wrapper both miss: a backend that accepts the TCP connection
+            // but never sends so much as a status line. Resets on every
+            // successful read, so it never caps a legitimately long
+            // generation — only true silence.
+            .read_timeout(IDLE_TIMEOUT)
             .build()
             .expect("failed to build the HTTP client");
 

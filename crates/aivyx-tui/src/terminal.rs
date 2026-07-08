@@ -20,13 +20,17 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn init() -> io::Result<Self> {
         enable_raw_mode()?;
-        // If anything below fails, raw mode is already on but no
-        // `TerminalGuard` exists yet for `Drop` to clean it up — disable it
-        // ourselves before propagating the error.
+        // If anything below fails, raw mode is already on and possibly the
+        // alternate screen too, but no `TerminalGuard` exists yet for `Drop`
+        // to clean it up — restore both ourselves before propagating the
+        // error. `restore_terminal` is safe to call even if
+        // `EnterAlternateScreen` never actually ran: emitting
+        // `LeaveAlternateScreen` when not in the alternate screen is a
+        // harmless no-op on real terminals.
         match Self::init_after_raw_mode() {
             Ok(guard) => Ok(guard),
             Err(err) => {
-                let _ = disable_raw_mode();
+                let _ = restore_terminal();
                 Err(err)
             }
         }
