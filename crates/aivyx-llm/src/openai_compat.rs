@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aivyx_types::{
@@ -36,6 +38,7 @@ pub struct OpenAiCompatBackend {
     model: String,
     api_key: Option<String>,
     http: reqwest::Client,
+    debug_log: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl OpenAiCompatBackend {
@@ -60,7 +63,32 @@ impl OpenAiCompatBackend {
             model: model.into(),
             api_key,
             http,
+            debug_log: debug_log_from_env(),
         }
+    }
+}
+
+/// Opt-in raw request/response capture for diagnosing local-model quirks —
+/// e.g. malformed history assembly, or a reasoning-capable model's
+/// `delta.reasoning` content, which `WireDelta` doesn't model and so
+/// silently drops via serde's default behavior during normal parsing. Set
+/// `AIVYX_DEBUG_LOG=<path>` to capture raw wire traffic there; unset by
+/// default, so this has zero cost for normal use.
+fn debug_log_from_env() -> Option<Arc<Mutex<std::fs::File>>> {
+    let path = std::env::var_os("AIVYX_DEBUG_LOG")?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    Some(Arc::new(Mutex::new(file)))
+}
+
+fn log_line(log: &Arc<Mutex<std::fs::File>>, line: &str) {
+    // Best-effort: a logging failure (disk full, lock poisoned by a panic
+    // elsewhere) must never take down the actual chat turn.
+    if let Ok(mut file) = log.lock() {
+        let _ = writeln!(file, "{line}\n");
     }
 }
 
@@ -76,6 +104,12 @@ impl LlmBackend for OpenAiCompatBackend {
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
         let wire_request = WireRequest::from_chat_request(&self.model, &request);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+
+        if let Some(log) = &self.debug_log {
+            let body = serde_json::to_string_pretty(&wire_request)
+                .unwrap_or_else(|err| format!("<failed to serialize wire_request: {err}>"));
+            log_line(log, &format!("=== request ===\n{body}"));
+        }
 
         let mut http_request = self.http.post(url).json(&wire_request);
         if let Some(key) = &self.api_key {
@@ -96,13 +130,20 @@ impl LlmBackend for OpenAiCompatBackend {
         let sse_stream =
             tokio_stream::StreamExt::timeout(response.bytes_stream().eventsource(), IDLE_TIMEOUT);
 
+        let debug_log = self.debug_log.clone();
         let stream = sse_stream
-            .scan(ToolCallAccumulator::default(), |accumulator, item| {
+            .scan(ToolCallAccumulator::default(), move |accumulator, item| {
                 let events = match item {
                     Err(_elapsed) => vec![Err(LlmError::Timeout)],
                     Ok(Err(err)) => vec![Err(LlmError::Parse(err.to_string()))],
                     Ok(Ok(event)) => {
                         let data = event.data.trim();
+                        // Logged before typed parsing so fields `WireChunk`
+                        // doesn't model (e.g. a reasoning model's
+                        // `delta.reasoning`) still show up in the capture.
+                        if let Some(log) = &debug_log {
+                            log_line(log, &format!("=== event ===\n{data}"));
+                        }
                         if data == "[DONE]" {
                             Vec::new()
                         } else {
