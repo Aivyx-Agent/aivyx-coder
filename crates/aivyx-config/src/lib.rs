@@ -69,9 +69,10 @@ pub enum ToolCallingMode {
 #[serde(default)]
 pub struct PermissionSettings {
     pub mode: PermissionMode,
-    /// Hard-blocked regardless of prompt/allow-list state. Not yet
-    /// enforced this pass — no tools exist to gate — but validated on
-    /// load so the shape is settled.
+    /// Hard-blocked regardless of prompt/allow-list state, enforced by
+    /// `ConfirmationGate` before any prompt or Always-Allow cache lookup.
+    /// Entries may use a leading `~` for the home directory — see
+    /// `resolved_deny_paths`.
     pub deny_paths: Vec<String>,
     pub max_tool_iterations_per_turn: u32,
 }
@@ -83,6 +84,29 @@ impl Default for PermissionSettings {
             deny_paths: vec!["~/.ssh".to_string(), "~/.aws".to_string()],
             max_tool_iterations_per_turn: 25,
         }
+    }
+}
+
+impl PermissionSettings {
+    /// Expands a leading `~` (home directory) in each `deny_paths` entry
+    /// into an absolute `PathBuf`. Entries that can't be expanded (no home
+    /// directory found) are skipped rather than left unresolved and
+    /// silently wrong.
+    pub fn resolved_deny_paths(&self) -> Vec<PathBuf> {
+        let home_dir = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+
+        self.deny_paths
+            .iter()
+            .filter_map(|raw| {
+                if let Some(rest) = raw.strip_prefix("~/") {
+                    home_dir.as_ref().map(|home| home.join(rest))
+                } else if raw == "~" {
+                    home_dir.clone()
+                } else {
+                    Some(PathBuf::from(raw))
+                }
+            })
+            .collect()
     }
 }
 
@@ -176,5 +200,32 @@ mod tests {
         settings.apply_overrides(Some("http://localhost:8080/v1".to_string()), None);
         assert_eq!(settings.backend.base_url, "http://localhost:8080/v1");
         assert_eq!(settings.backend.model, BackendSettings::default().model);
+    }
+
+    #[test]
+    fn tilde_prefixed_deny_paths_expand_to_the_home_directory() {
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
+        let settings = PermissionSettings {
+            deny_paths: vec!["~/.ssh".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert_eq!(settings.resolved_deny_paths(), vec![home.join(".ssh")]);
+    }
+
+    #[test]
+    fn non_tilde_deny_paths_pass_through_unchanged() {
+        let settings = PermissionSettings {
+            deny_paths: vec!["/etc/shadow".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert_eq!(
+            settings.resolved_deny_paths(),
+            vec![PathBuf::from("/etc/shadow")]
+        );
     }
 }

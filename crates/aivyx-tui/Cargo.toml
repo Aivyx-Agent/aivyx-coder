@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 anyhow = "1.0.103"
+async-trait = "0.1.89"
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 futures = "0.3.32"
 ratatui = "0.29.0"

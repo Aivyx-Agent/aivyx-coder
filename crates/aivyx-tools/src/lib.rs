@@ -1,14 +1,12 @@
 //! Tool trait + execution pipeline.
 //!
-//! Foundation pass: signatures only, no concrete tools (`ReadFile`,
-//! `WriteFile`, shell-exec, grep, git) yet — those land alongside the
-//! permission-gate implementation next pass. The one piece of real
-//! behavior worth having now is `ToolExecutor::dispatch`'s shape: the
-//! permission check is centralized here rather than inside individual
-//! `Tool::execute` impls, so a future tool author can't forget to gate a
-//! dangerous action.
+//! `ToolExecutor::dispatch` centralizes the permission check rather than
+//! leaving it to individual `Tool::execute` impls, so a tool author can't
+//! forget to gate a dangerous action. `read_file`/`write_file`/`edit_file`
+//! (this pass) are the first concrete tools; shell-exec/grep/git are a
+//! later pass.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aivyx_sandbox::{ExecutionConfiner, PermissionGate, PermissionRequest};
@@ -16,6 +14,12 @@ use aivyx_types::{ToolCall, ToolDefinition, ToolOutput, ToolResult};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+
+mod diff;
+mod path_resolve;
+mod tools;
+
+pub use tools::{EditFileTool, ReadFileTool, WriteFileTool};
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -25,6 +29,8 @@ pub enum ToolError {
     ExecutionFailed(String),
     #[error("no tool registered with name: {0}")]
     NotFound(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub struct ToolExecutionContext {
@@ -39,10 +45,12 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
     /// Inspect (already schema-validated) arguments and describe the
-    /// permission needed, with NO side effects performed.
+    /// permission needed. May do a bounded read (e.g. to build a diff
+    /// preview) but must not perform the actual mutating side effect.
     fn permission_request(
         &self,
         arguments: &serde_json::Value,
+        cwd: &Path,
     ) -> Result<PermissionRequest, ToolError>;
 
     /// Only ever invoked by `ToolExecutor` after `PermissionGate::check`
@@ -126,7 +134,7 @@ impl ToolExecutor {
             .get(&call.name)
             .ok_or_else(|| ToolError::NotFound(call.name.clone()))?;
 
-        let permission_request = tool.permission_request(&call.arguments)?;
+        let permission_request = tool.permission_request(&call.arguments, cwd)?;
 
         use aivyx_sandbox::PermissionDecision;
         match self.gate.check(&permission_request).await {

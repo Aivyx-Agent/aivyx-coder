@@ -2,17 +2,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aivyx_core::{Agent, AgentEvent};
+use aivyx_sandbox::{PermissionRequest, PermissionTarget, UserResponse};
 use aivyx_types::ToolOutput;
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 
+use crate::permission::{ModalRequest, PermissionModalReceiver};
 use crate::terminal::TerminalGuard;
 
 enum ChatLine {
@@ -31,6 +33,7 @@ pub async fn run(
     mut agent: Agent,
     mut agent_events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     cwd: PathBuf,
+    mut permission_rx: PermissionModalReceiver,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -60,6 +63,33 @@ pub async fn run(
                 if let CtEvent::Key(key) = &event
                     && key.kind == KeyEventKind::Press
                 {
+                    if app.pending_permission.is_some() {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                app.resolve_permission(UserResponse::Deny);
+                                if let Some(cancellation) = active_cancellation.lock().unwrap().as_ref() {
+                                    cancellation.cancel();
+                                }
+                            }
+                            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                                app.resolve_permission(UserResponse::Allow);
+                            }
+                            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                                app.resolve_permission(UserResponse::AllowAlways);
+                            }
+                            (KeyCode::Char('n'), KeyModifiers::NONE)
+                            | (KeyCode::Esc, KeyModifiers::NONE)
+                            | (KeyCode::Enter, KeyModifiers::NONE) => {
+                                app.resolve_permission(UserResponse::Deny);
+                            }
+                            // Swallow everything else while a modal is up — no
+                            // accidental approval, no leaking keystrokes into
+                            // the input box behind it.
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match (key.code, key.modifiers) {
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let cancellation = active_cancellation.lock().unwrap().clone();
@@ -88,6 +118,11 @@ pub async fn run(
                     app.handle_agent_event(event);
                 }
             }
+            maybe_modal = permission_rx.recv() => {
+                if let Some(modal) = maybe_modal {
+                    app.pending_permission = Some(modal);
+                }
+            }
         }
     }
 
@@ -98,6 +133,7 @@ struct App {
     transcript: Vec<ChatLine>,
     input: TextArea<'static>,
     streaming_active: bool,
+    pending_permission: Option<ModalRequest>,
 }
 
 impl App {
@@ -106,6 +142,13 @@ impl App {
             transcript: Vec::new(),
             input: new_input_box(),
             streaming_active: false,
+            pending_permission: None,
+        }
+    }
+
+    fn resolve_permission(&mut self, response: UserResponse) {
+        if let Some(modal) = self.pending_permission.take() {
+            let _ = modal.reply_tx.send(response);
         }
     }
 
@@ -186,6 +229,10 @@ impl App {
             Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
             layout[2],
         );
+
+        if let Some(modal) = &self.pending_permission {
+            render_permission_modal(frame, &modal.request);
+        }
     }
 }
 
@@ -194,6 +241,85 @@ fn new_input_box() -> TextArea<'static> {
     input.set_placeholder_text("Type a message and press Enter to send...");
     input.set_block(Block::default().borders(Borders::ALL).title("Message"));
     input
+}
+
+fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionRequest) {
+    let area = centered_rect(70, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!("Tool: {}", request.tool_name))
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(format!("Action: {:?}", request.action)),
+        target_line(&request.target),
+        Line::from(""),
+    ];
+
+    match request.preview.as_deref() {
+        Some(preview) if !preview.is_empty() => lines.extend(preview.lines().map(diff_line)),
+        _ => lines.push(Line::from(format!("Args: {}", request.arguments_preview))),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from("[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny")
+            .style(Style::default().fg(Color::DarkGray)),
+    );
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Permission required")
+                .style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(modal, area);
+}
+
+fn target_line(target: &PermissionTarget) -> Line<'static> {
+    match target {
+        PermissionTarget::Path(path) => Line::from(format!("Target: {}", path.display())),
+        PermissionTarget::Command { program, args } => {
+            Line::from(format!("Command: {program} {}", args.join(" ")))
+        }
+        PermissionTarget::Other(description) => Line::from(format!("Target: {description}")),
+    }
+}
+
+fn diff_line(line: &str) -> Line<'static> {
+    let style = if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    Line::from(line.to_string()).style(style)
+}
+
+/// Standard ratatui centered-popup pattern: split vertically then
+/// horizontally around the target percentage, keep the middle piece.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {

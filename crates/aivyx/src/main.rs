@@ -3,14 +3,17 @@ use std::sync::Arc;
 use aivyx_config::Settings;
 use aivyx_core::Agent;
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
-use aivyx_sandbox::{AlwaysDenyGate, ExecutionConfiner, NoopConfiner, PermissionGate};
-use aivyx_tools::{ToolExecutor, ToolRegistry};
+use aivyx_sandbox::{ConfirmationGate, ExecutionConfiner, NoopConfiner, PermissionGate};
+use aivyx_tools::{EditFileTool, ReadFileTool, ToolExecutor, ToolRegistry, WriteFileTool};
 use clap::Parser;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 const SYSTEM_PROMPT: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
-This build has no tools available yet — answer directly and concisely.";
+You have three tools: read_file, write_file (creates or fully overwrites a file), and edit_file \
+(exact-string search/replace — old_string must match exactly once in the file, or set replace_all). \
+Mutating actions (write_file, edit_file) require the user to approve a confirmation prompt before \
+they take effect, so explain what you're about to do before calling them.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,11 +50,16 @@ async fn main() -> anyhow::Result<()> {
         settings.backend.api_key.clone(),
     ));
 
-    // No concrete tools this pass, so the registry is empty and this gate
-    // is never actually consulted — see AlwaysDenyGate's doc comment for
-    // why "deny" is the right placeholder decision anyway.
-    let registry = ToolRegistry::new();
-    let gate: Arc<dyn PermissionGate> = Arc::new(AlwaysDenyGate);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ReadFileTool));
+    registry.register(Arc::new(WriteFileTool));
+    registry.register(Arc::new(EditFileTool));
+
+    let (prompter, permission_rx) = aivyx_tui::permission_channel();
+    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+        Arc::new(prompter),
+        settings.permissions.resolved_deny_paths(),
+    ));
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let executor = ToolExecutor::new(registry, gate, confiner);
 
@@ -60,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cwd = std::env::current_dir()?;
 
-    aivyx_tui::run(agent, events_rx, cwd).await
+    aivyx_tui::run(agent, events_rx, cwd, permission_rx).await
 }
 
 fn init_tracing() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {

@@ -1,16 +1,19 @@
 //! Security boundary for tool execution.
 //!
-//! Foundation pass: trait signatures only. `PermissionGate` is the
-//! decision point every tool call must pass through before `Tool::execute`
-//! runs; `ExecutionConfiner` is the (currently no-op) hook for OS-level
-//! process confinement (Linux landlock/bubblewrap), kept as a separate
-//! trait so non-process tools (e.g. file read) never need a confiner at
-//! all. Concrete implementations (`ConfirmationGate`, `LandlockConfiner`)
-//! are deliberately deferred to the next pass — see the project plan.
+//! `PermissionGate` is the decision point every tool call must pass through
+//! before `Tool::execute` runs; `ConfirmationGate` is the real (prompting)
+//! implementation. `ExecutionConfiner` is the (currently no-op) hook for
+//! OS-level process confinement (Linux landlock/bubblewrap), kept as a
+//! separate trait so non-process tools (e.g. file read) never need a
+//! confiner at all — a concrete `LandlockConfiner` is deliberately deferred
+//! to a later pass.
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+
+mod confirmation;
+pub use confirmation::ConfirmationGate;
 
 /// What a tool is asking to do, described *before* any side effect happens.
 #[derive(Debug, Clone)]
@@ -19,9 +22,13 @@ pub struct PermissionRequest {
     pub action: ActionKind,
     pub target: PermissionTarget,
     pub arguments_preview: serde_json::Value,
+    /// Human-renderable preview of the effect (e.g. a unified diff for a
+    /// file write/edit). Computed by the tool, since only it has the old
+    /// and new content — this crate and the UI treat it as an opaque string.
+    pub preview: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
     Read,
     Write,
