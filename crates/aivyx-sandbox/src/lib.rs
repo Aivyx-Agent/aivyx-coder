@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
@@ -54,11 +55,46 @@ pub enum PermissionTarget {
     Other(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     AllowAlways,
-    Deny,
+    /// The optional reason is surfaced to the model in `ToolOutput::Denied`
+    /// so it can adapt (plan mode, deny_paths, user refusal) instead of
+    /// blindly retrying; `None` falls back to the executor's generic
+    /// "permission denied" message.
+    Deny(Option<String>),
+}
+
+/// Shared plan-mode flag: while active, the permission gate denies every
+/// action that could mutate anything outside the agent's own session state,
+/// and the agent withholds mutating tools from the model entirely. Toggled
+/// only by the user (TUI keybinding / `--plan` startup flag), never by the
+/// model — the whole point is that it doesn't depend on model cooperation.
+///
+/// `Relaxed` ordering throughout: no data is published through this flag; a
+/// toggle racing one in-flight permission check by a single tool call is
+/// acceptable, since the gate re-checks on every call.
+#[derive(Debug, Clone, Default)]
+pub struct PlanMode(Arc<AtomicBool>);
+
+impl PlanMode {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn active(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.0.store(active, Ordering::Relaxed);
+    }
+
+    /// Flips the mode and returns the *new* state.
+    pub fn toggle(&self) -> bool {
+        !self.0.fetch_xor(true, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +182,8 @@ pub struct AlwaysDenyGate;
 #[async_trait]
 impl PermissionGate for AlwaysDenyGate {
     async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
-        PermissionDecision::Deny
+        PermissionDecision::Deny(Some(
+            "no permission gate is configured (fail-closed default)".to_string(),
+        ))
     }
 }

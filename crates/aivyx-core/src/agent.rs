@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
+use aivyx_sandbox::PlanMode;
 use aivyx_tools::ToolExecutor;
 use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
 use futures::StreamExt;
@@ -60,6 +61,24 @@ const ELIDE_TOOL_RESULT_CHARS: usize = 4000;
 /// the standard rough approximation for English/code.
 const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
 
+/// Appended to the system prompt while plan mode is active. The withheld
+/// tools (see `ToolExecutor::plan_definitions`) are the enforcement; this
+/// note is what makes the model *plan* instead of flailing at their absence.
+const PLAN_MODE_PROMPT: &str = "PLAN MODE is active: tools that modify files or run commands are \
+withheld. Explore with the read and search tools, record a step-by-step plan with set_tasks, \
+then summarize the plan and ask the user to press Ctrl+P to approve it and switch to Act mode. \
+Do not claim to have made any changes — you cannot make any in this mode.";
+
+/// Scalar knobs for an `Agent`, grouped so `Agent::new`'s arity stays sane
+/// as configuration accumulates (it has grown every phase so far).
+#[derive(Debug, Clone, Copy)]
+pub struct AgentConfig {
+    /// Max LLM round-trips per user turn; clamped to a minimum of 1.
+    pub max_tool_iterations: u32,
+    /// The model's context window, in tokens; clamped to a minimum of 1.
+    pub context_tokens: u32,
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("llm backend error: {0}")]
@@ -91,6 +110,9 @@ pub struct Agent {
     tasks: Arc<Mutex<Vec<Task>>>,
     /// Where the session is persisted after each turn; `None` disables it.
     session_path: Option<PathBuf>,
+    /// Read at every request assembly (tool list + system-prompt note); the
+    /// gate holds its own clone for enforcement, and the TUI toggles it.
+    plan_mode: PlanMode,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -99,9 +121,9 @@ impl Agent {
         llm: std::sync::Arc<dyn LlmBackend>,
         executor: ToolExecutor,
         system_prompt: impl Into<String>,
-        max_tool_iterations: u32,
-        context_limit: u32,
+        config: AgentConfig,
         tasks: Arc<Mutex<Vec<Task>>>,
+        plan_mode: PlanMode,
         events_tx: UnboundedSender<AgentEvent>,
     ) -> Self {
         Self {
@@ -111,15 +133,16 @@ impl Agent {
             history: Vec::new(),
             // A misconfigured 0 would otherwise make every turn a silent
             // no-op (the tool-loop range would simply never iterate).
-            max_tool_iterations: max_tool_iterations.max(1),
+            max_tool_iterations: config.max_tool_iterations.max(1),
             // A 0 here would make the budget indicator meaningless and
             // trigger compaction constantly; clamp to a floor.
-            context_limit: context_limit.max(1),
+            context_limit: config.context_tokens.max(1),
             last_request_chars: None,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             history_truncated: false,
             tasks,
             session_path: None,
+            plan_mode,
             events_tx,
         }
     }
@@ -151,15 +174,17 @@ impl Agent {
     }
 
     fn assemble_messages(&self) -> Vec<Message> {
-        let system = if self.history_truncated {
-            format!(
-                "{}\n\n(Note: earlier parts of this conversation were truncated to fit the \
+        let mut system = self.system_prompt.clone();
+        if self.history_truncated {
+            system.push_str(
+                "\n\n(Note: earlier parts of this conversation were truncated to fit the \
                  model's context window. Ask the user to restate anything you're missing.)",
-                self.system_prompt
-            )
-        } else {
-            self.system_prompt.clone()
-        };
+            );
+        }
+        if self.plan_mode.active() {
+            system.push_str("\n\n");
+            system.push_str(PLAN_MODE_PROMPT);
+        }
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::text(Role::System, system));
         messages.extend(self.history.iter().cloned());
@@ -272,7 +297,13 @@ impl Agent {
 
             let request = ChatRequest {
                 messages: self.assemble_messages(),
-                tools: self.executor.definitions(),
+                // Re-evaluated every iteration, not once per turn, so a
+                // mid-turn toggle takes effect on the very next request.
+                tools: if self.plan_mode.active() {
+                    self.executor.plan_definitions()
+                } else {
+                    self.executor.definitions()
+                },
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
                 max_tokens: None,
@@ -537,7 +568,7 @@ mod tests {
 
     use aivyx_sandbox::{
         ActionKind, ExecutionConfiner, NoopConfiner, PermissionDecision, PermissionGate,
-        PermissionRequest, PermissionTarget,
+        PermissionRequest, PermissionTarget, PlanMode,
     };
     use aivyx_tools::{Tool, ToolError, ToolExecutionContext, ToolRegistry};
     use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
@@ -678,7 +709,18 @@ mod tests {
         let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
         let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
         let executor = ToolExecutor::new(registry, gate, confiner);
-        let agent = Agent::new(llm, executor, "system", max_iters, 8192, Arc::default(), tx);
+        let agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: max_iters,
+                context_tokens: 8192,
+            },
+            Arc::default(),
+            PlanMode::new(),
+            tx,
+        );
         (agent, rx, mock)
     }
 
@@ -874,6 +916,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_mode_filters_tools_and_annotates_the_system_prompt_per_request() {
+        // Two turns against the same agent: one with plan mode on, one after
+        // toggling it off — the request the backend actually receives must
+        // flip both the tool list and the system-prompt note, proving the
+        // flag is consulted per-request rather than latched at construction.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (tx, _rx) = unbounded_channel();
+        let stop = || {
+            vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]
+        };
+        let mock = Arc::new(MockBackend::new(vec![stop(), stop()]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 10,
+                context_tokens: 8192,
+            },
+            Arc::default(),
+            plan_mode.clone(),
+            tx,
+        );
+
+        agent
+            .run_turn("plan".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+        plan_mode.set_active(false);
+        agent
+            .run_turn("act".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let plan_tools: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+        let act_tools: Vec<&str> = received[1].tools.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(plan_tools, vec!["read_file"]);
+        assert_eq!(act_tools, vec!["read_file", "write_file"]);
+
+        let plan_system = received[0].messages[0].text_content();
+        let act_system = received[1].messages[0].text_content();
+        assert!(plan_system.contains("PLAN MODE"));
+        assert!(!act_system.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
     async fn usage_arriving_after_done_is_still_surfaced() {
         // The shape real OpenAI-compatible servers (incl. Ollama) produce
         // with `stream_options.include_usage`: the usage chunk trails the
@@ -943,7 +1043,18 @@ mod tests {
         let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
         let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
         let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(llm, executor, "system", 10, 8192, Arc::clone(&tasks), tx);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 10,
+                context_tokens: 8192,
+            },
+            Arc::clone(&tasks),
+            PlanMode::new(),
+            tx,
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.json");

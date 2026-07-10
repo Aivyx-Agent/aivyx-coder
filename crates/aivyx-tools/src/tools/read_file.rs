@@ -24,6 +24,10 @@ impl Tool for ReadFileTool {
         "read_file"
     }
 
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),

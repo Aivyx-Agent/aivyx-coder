@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aivyx_config::Settings;
-use aivyx_core::{Agent, session};
+use aivyx_core::{Agent, AgentConfig, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
-use aivyx_sandbox::{ConfirmationGate, PermissionGate};
+use aivyx_sandbox::{ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
     CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool,
     SetTasksTool, ToolExecutor, ToolRegistry, WriteFileTool,
@@ -59,6 +59,11 @@ struct Cli {
     /// first completed turn replaces the stored one.
     #[arg(long)]
     resume: bool,
+
+    /// Start in plan mode: the model can only read, search, and build a
+    /// task list until you approve with Ctrl+P in the TUI.
+    #[arg(long)]
+    plan: bool,
 }
 
 #[tokio::main]
@@ -149,11 +154,17 @@ async fn main() -> anyhow::Result<()> {
         pre_approved_commands.push(("sh".to_string(), vec!["-c".to_string(), shell_form]));
     }
 
+    // One shared flag, three consumers: the gate enforces it, the agent
+    // filters tools + annotates the system prompt by it, the TUI toggles it.
+    let plan_mode = PlanMode::new();
+    plan_mode.set_active(cli.plan);
+
     let (prompter, permission_rx) = aivyx_tui::permission_channel();
     let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
         Arc::new(prompter),
         deny_paths.clone(),
         pre_approved_commands,
+        plan_mode.clone(),
     ));
     let confiner = aivyx_sandbox::default_confiner(
         &cwd,
@@ -169,9 +180,12 @@ async fn main() -> anyhow::Result<()> {
         llm,
         executor,
         system_prompt,
-        settings.permissions.max_tool_iterations_per_turn,
-        settings.backend.context_tokens,
+        AgentConfig {
+            max_tool_iterations: settings.permissions.max_tool_iterations_per_turn,
+            context_tokens: settings.backend.context_tokens,
+        },
         Arc::clone(&tasks),
+        plan_mode.clone(),
         events_tx,
     );
 
@@ -202,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    aivyx_tui::run(agent, events_rx, cwd, permission_rx, restored).await
+    aivyx_tui::run(agent, events_rx, cwd, permission_rx, restored, plan_mode).await
 }
 
 /// Best-effort check, used only to decide whether to warn about sending

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
-use aivyx_sandbox::{PermissionRequest, PermissionTarget, UserResponse};
+use aivyx_sandbox::{PermissionRequest, PermissionTarget, PlanMode, UserResponse};
 use aivyx_types::{ContentBlock, Message, Role, ToolOutput};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
@@ -40,6 +40,7 @@ pub async fn run(
     cwd: PathBuf,
     mut permission_rx: PermissionModalReceiver,
     restored: Option<SessionState>,
+    plan_mode: PlanMode,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -55,7 +56,7 @@ pub async fn run(
     });
 
     let mut guard = TerminalGuard::init()?;
-    let mut app = App::new(restored);
+    let mut app = App::new(restored, plan_mode);
     let mut crossterm_events = EventStream::new();
 
     loop {
@@ -113,6 +114,10 @@ pub async fn run(
                             }
                             continue;
                         }
+                        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                            app.toggle_plan_mode();
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -146,10 +151,13 @@ struct App {
     /// The agent's task list, rendered as a panel between the transcript
     /// and the input box whenever it's non-empty.
     tasks: Vec<Task>,
+    /// Shared with the gate (enforcement) and the agent (tool filtering +
+    /// system-prompt note); the TUI owns the only toggle.
+    plan_mode: PlanMode,
 }
 
 impl App {
-    fn new(restored: Option<SessionState>) -> Self {
+    fn new(restored: Option<SessionState>, plan_mode: PlanMode) -> Self {
         let (transcript, tasks) = match restored {
             Some(state) => {
                 let mut transcript = seed_transcript(&state.history);
@@ -168,7 +176,20 @@ impl App {
             pending_permission: None,
             context_usage: None,
             tasks,
+            plan_mode,
         }
+    }
+
+    fn toggle_plan_mode(&mut self) {
+        let active = self.plan_mode.toggle();
+        // The toggle goes into the transcript, not just the status line —
+        // when reading back a session, *when* the mode flipped relative to
+        // the conversation matters.
+        self.transcript.push(ChatLine::Notice(if active {
+            "plan mode ON — write/execute tools withheld until you approve (Ctrl+P)".to_string()
+        } else {
+            "plan mode OFF — full tool access restored".to_string()
+        }));
     }
 
     fn resolve_permission(&mut self, response: UserResponse) {
@@ -295,7 +316,16 @@ impl App {
         } else {
             "ready — Enter to send, Ctrl+C to quit"
         };
-        let mut status_spans = vec![Span::styled(base, Style::default().fg(Color::DarkGray))];
+        let mut status_spans = Vec::new();
+        if self.plan_mode.active() {
+            status_spans.push(Span::styled(
+                "PLAN (Ctrl+P to act)   ·   ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        status_spans.push(Span::styled(base, Style::default().fg(Color::DarkGray)));
         if let Some((used, limit)) = self.context_usage {
             let pct = (used as f64 / limit.max(1) as f64 * 100.0).round() as u32;
             // Green under 60%, amber approaching the ceiling, red once

@@ -74,6 +74,12 @@ impl Tool for SetTasksTool {
         "set_tasks"
     }
 
+    // Session-internal only — deliberately available in plan mode, where
+    // the task list is exactly how the model records the plan for review.
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),

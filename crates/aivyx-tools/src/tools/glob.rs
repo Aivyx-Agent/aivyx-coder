@@ -44,6 +44,10 @@ impl Tool for GlobTool {
         "glob"
     }
 
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),

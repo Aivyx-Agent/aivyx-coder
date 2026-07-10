@@ -36,6 +36,15 @@ below), the agent compacts: oversized tool results are elided to head+tail
 excerpts first, then the oldest turns are dropped — with a visible notice,
 never silently.
 
+**Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx --plan`) makes the
+agent read-only while you scope out work: it can read, search, and build a
+task list (the task panel becomes the reviewable plan), but tools that touch
+files or run commands are withheld from the model entirely — and the
+permission gate independently denies them even if the model invents a call.
+Press `Ctrl+P` again to approve the plan and switch back to Act mode; a
+magenta `PLAN` badge in the status line shows the current stance. See
+"Security model" for why this is an enforced boundary, not a suggestion.
+
 Build/test the workspace:
 
 ```
@@ -89,7 +98,7 @@ denied entry. This covers:
   command physically cannot read or write it regardless of how the command is
   phrased (redirection, env vars, etc.).
 
-### 2. `ConfirmationGate` — human-in-the-loop, three trust tiers
+### 2. `ConfirmationGate` — human-in-the-loop, tiered trust
 
 Every tool call passes through the gate before it runs:
 
@@ -102,13 +111,25 @@ Every tool call passes through the gate before it runs:
    a distinct action kind so audit logs never record a state change as a
    "read" — and so a tool that touches the outside world can't honestly
    describe itself as internal.
-3. **Everything else** → an interactive confirmation modal, showing the exact
+3. **Plan mode** (when active) → every remaining action is denied outright,
+   with a reason the model can read. This check deliberately sits *before*
+   the Always-Allow cache and the pre-approved command tier below: an
+   approval you granted before entering plan mode cannot execute during it.
+   Only the user can toggle the mode (Ctrl+P / `--plan`) — the model has no
+   way to exit it. Belt-and-braces: in plan mode the mutating tools aren't
+   even offered to the model in the request, so this gate tier is the
+   backstop for a hallucinated call, not the primary UX.
+4. **Everything else** → an interactive confirmation modal, showing the exact
    target/command and (for edits) a diff. Choosing **Always Allow** caches that
    *exact* target `(program, args)` or path for the rest of the session.
-4. **Pre-approved commands**: entries in `permissions.allowed_commands` are
+5. **Pre-approved commands**: entries in `permissions.allowed_commands` are
    seeded into the Always-Allow cache at startup, so a command you already
    trusted by writing it into config runs without a prompt. This is the
    command-level allowlist tier.
+
+Denials carry their reason through to the model (`plan mode is active…`,
+`target is under a configured deny_paths entry…`, `the user denied this
+action`), so it can adapt instead of blindly retrying.
 
 All gate decisions (allow / deny / always-allow) are logged to `aivyx.log` in
 the config directory, so a session's permission history is auditable after the

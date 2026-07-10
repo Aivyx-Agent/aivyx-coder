@@ -49,6 +49,16 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
 
+    /// Whether this tool can mutate anything outside the agent's own
+    /// session state (filesystem, processes, network). Decides whether the
+    /// tool is offered to the model at all while plan mode is active — the
+    /// static, argument-free counterpart of `permission_request`'s
+    /// `ActionKind`. Defaults to `true` (fail-closed): a new tool stays
+    /// hidden in plan mode unless it explicitly declares itself safe.
+    fn mutates_outside_session(&self) -> bool {
+        true
+    }
+
     /// Inspect (already schema-validated) arguments and describe the
     /// permission needed. May do a bounded read (e.g. to build a diff
     /// preview) but must not perform the actual mutating side effect.
@@ -89,6 +99,18 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.iter().map(|tool| tool.definition()).collect()
     }
+
+    /// The subset of `definitions` offered while plan mode is active: only
+    /// tools that cannot mutate anything outside the session. Withholding
+    /// the rest (instead of offering them and denying at the gate) matters
+    /// for small local models, which retry-loop on unavailable actions.
+    pub fn plan_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .filter(|tool| !tool.mutates_outside_session())
+            .map(|tool| tool.definition())
+            .collect()
+    }
 }
 
 pub struct ToolExecutor {
@@ -112,6 +134,11 @@ impl ToolExecutor {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.registry.definitions()
+    }
+
+    /// See `ToolRegistry::plan_definitions`.
+    pub fn plan_definitions(&self) -> Vec<ToolDefinition> {
+        self.registry.plan_definitions()
     }
 
     pub async fn dispatch(
@@ -144,11 +171,13 @@ impl ToolExecutor {
         use aivyx_sandbox::PermissionDecision;
         match self.gate.check(&permission_request).await {
             PermissionDecision::Allow | PermissionDecision::AllowAlways => {}
-            PermissionDecision::Deny => {
-                return Ok(ToolOutput::Denied(format!(
-                    "permission denied for tool `{}`",
-                    call.name
-                )));
+            PermissionDecision::Deny(reason) => {
+                // The gate's reason (plan mode, deny_paths, user refusal)
+                // gives the model something to adapt to; without one, fall
+                // back to the generic message.
+                return Ok(ToolOutput::Denied(reason.unwrap_or_else(|| {
+                    format!("permission denied for tool `{}`", call.name)
+                })));
             }
         }
 
@@ -159,5 +188,37 @@ impl ToolExecutor {
         };
 
         tool.execute(call.arguments.clone(), &ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_definitions_offer_only_session_safe_tools() {
+        // The full default tool set, registered in main.rs order: the plan
+        // subset must be exactly the read/search tools plus set_tasks — a
+        // newly added tool lands on the mutating (hidden) side unless it
+        // explicitly opts out, so this test also catches an accidental
+        // opt-out on something dangerous.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(EditFileTool));
+        registry.register(Arc::new(GrepTool::new(vec![])));
+        registry.register(Arc::new(GlobTool::new(vec![])));
+        registry.register(Arc::new(RunShellTool));
+        registry.register(Arc::new(SetTasksTool::new(Arc::default())));
+
+        let all: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+        let plan: Vec<String> = registry
+            .plan_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        assert_eq!(all.len(), 7);
+        assert_eq!(plan, vec!["read_file", "grep", "glob", "set_tasks"]);
     }
 }

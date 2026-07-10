@@ -237,7 +237,7 @@ history). Given this project's emphasis on transparency over magic, auto-commit
 to the real repo is the more consistent default, but flag it for confirmation
 before building.
 
-### Phase 8 — Agentic UX — ✅ done except plan mode
+### Phase 8 — Agentic UX — ✅ done
 A hard **plan mode** (read-only enforced at the permission layer — trivial on
 top of the existing gate, just withhold write grants until the user confirms
 a plan), a **persisted, visible task list** (more valuable here than in cloud
@@ -286,8 +286,89 @@ actually being hit in local testing. Design decisions worth recording:
   (`stream_options.include_usage` semantics) — caught by live E2E testing,
   now locked in by a regression test.
 
-**Still open from this phase:** plan mode (wants its own focused design pass
-at the permission layer).
+#### Plan mode design (agreed and built 2026-07-11)
+
+Built exactly as designed below, and live-verified end-to-end through the
+real binary with `qwen3.5:9b`: started with `--plan`, a change request
+produced a `set_tasks` plan with no permission modal and no file change;
+Ctrl+P flipped to Act, and the same request then flowed through a real
+confirmation modal onto disk. One deviation worth noting: grouping
+`Agent::new`'s scalar knobs into an `AgentConfig` struct (the constructor
+had grown to 8 args across the phases — clippy was right).
+
+A user-controlled read-only stance, enforced at the permission layer — not a
+prompt-level suggestion, because the whole premise of this project is that
+the model may be wrong or manipulated.
+
+**Decisions made with the user:**
+- **Exit is a user toggle only** (Ctrl+P flips Plan ⇄ Act, plus a `--plan`
+  flag to start in plan mode). No model-signaled `exit_plan_mode` tool in v1:
+  it adds tool surface that small local models may never call or call
+  prematurely, and a manual toggle is always needed as the escape hatch
+  anyway. The model is instructed to record its plan via `set_tasks` (the
+  task panel *is* the reviewable plan — direct synergy with the Phase 8
+  task list) and announce when it's ready for review. Revisit the tool
+  later only if the manual flow proves annoying.
+- **Write/execute tools are hidden while planning**: filtered out of the
+  per-request `ChatRequest.tools` (the agent already rebuilds definitions
+  every iteration), with the gate still blocking as the hard backstop.
+  Rationale: small local models loop badly on unavailable actions (the
+  `ornith:9b` read-loop finding), so not offering a tool beats letting it
+  fail repeatedly.
+
+**Mechanism** — one shared flag, three consumers (same wiring pattern as the
+Phase 8 tasks handle):
+- A `PlanMode` newtype over `Arc<AtomicBool>` defined in `aivyx-sandbox`
+  (the lowest crate all three consumers can reach), `Relaxed` ordering —
+  nothing hangs off the flag; a toggle racing one in-flight check by a
+  single tool call is acceptable and documented.
+- **`ConfirmationGate`**: check order becomes `deny_paths` → Read/`Internal`
+  auto-allow → **plan-mode deny of everything else** → Always-Allow cache →
+  prompt. Critically the plan check sits *before* the cache and the
+  pre-approved `allowed_commands` tier, so prior approvals cannot leak
+  through plan mode; that ordering gets its own regression test, like
+  `deny_paths_wins_over_read_auto_allow` locks in the existing order.
+  Plan-mode denials are logged (audit trail) like every other decision.
+- **`Agent`**: when active, sends the filtered tool definitions and appends
+  a plan-mode note to the system prompt per-request (same pattern as the
+  existing history-truncation note): explore read-only, record the plan
+  with `set_tasks`, tell the user to press Ctrl+P to approve. Toggling
+  mid-turn is safe by construction: *into* plan mode, the gate cuts off
+  writes on the very next tool call; *out of* it, the current iteration
+  already holds the filtered tool list, so full capability returns on the
+  next request — acceptable, documented.
+- **TUI**: Ctrl+P intercept in the key loop (swallowed while a permission
+  modal is up, like everything else); a colored `PLAN` badge in the status
+  line with the exit hint; a transcript notice line on each toggle so the
+  mode change is part of the visible record.
+
+**Supporting type changes, done honestly rather than minimally:**
+- `Tool` gains a coarse static classification (default: *mutating*, i.e.
+  fail-closed — a new tool is hidden in plan mode unless explicitly marked
+  otherwise) overridden by `read_file`/`grep`/`glob`/`set_tasks`. This is
+  the tool-level analogue of `ActionKind`, needed because filtering
+  definitions must happen before any arguments exist for
+  `permission_request` to classify.
+- `PermissionDecision::Deny` grows an optional reason string (surfaced in
+  `ToolOutput::Denied`), because "permission denied for tool X" gives the
+  model nothing to adapt to — a plan-mode denial should say it's plan mode,
+  and a `deny_paths` denial can say that too. Value beyond plan mode;
+  `ToolOutput::Denied`'s own doc comment already promises exactly this.
+
+**Deliberately not doing:** persisting the mode into the session file
+(sessions always resume in Act mode — the mode is a live UI stance, not
+conversation data); a per-tool plan-mode allowlist in config (YAGNI until a
+real need shows up); any relaxation for "read-only-ish" shell commands
+(`Execute` is `Execute` — a shell can read anything its sandbox grants, and
+plan mode's promise is *no side effects*, kernel-independent).
+
+**Verification bar:** gate unit tests (plan blocks Write/Execute/Delete even
+when cached or pre-approved; Read/Internal pass; toggle restores; reason
+surfaces), an agent test that definitions are filtered and restored, and a
+live E2E through the real binary: start with `--plan`, request a change,
+confirm the model plans via `set_tasks` instead of editing (and that a
+forced write attempt is denied with the plan-mode reason), Ctrl+P, confirm
+execution then proceeds through the normal confirmation flow.
 
 ### Phase 9 — Stretch goals
 LSP integration for exact symbol resolution (complements, doesn't replace,
