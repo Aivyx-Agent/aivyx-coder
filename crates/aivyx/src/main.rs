@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aivyx_config::Settings;
-use aivyx_core::Agent;
+use aivyx_core::{Agent, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{ConfirmationGate, PermissionGate};
 use aivyx_tools::{
     CommandSpec, EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool,
-    ToolExecutor, ToolRegistry, WriteFileTool,
+    SetTasksTool, ToolExecutor, ToolRegistry, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -53,6 +53,12 @@ struct Cli {
     /// Override config.toml's backend model
     #[arg(long)]
     model: Option<String>,
+
+    /// Resume the previous session for this directory (conversation history
+    /// and task list). Without this flag a fresh session starts — and its
+    /// first completed turn replaces the stored one.
+    #[arg(long)]
+    resume: bool,
 }
 
 #[tokio::main]
@@ -99,6 +105,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // One handle shared between the `set_tasks` tool (the model-facing
+    // mutator) and the agent (which renders and persists the list).
+    let tasks: Arc<std::sync::Mutex<Vec<session::Task>>> = Arc::default();
+
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(WriteFileTool));
@@ -106,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
     registry.register(Arc::new(RunShellTool));
+    registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
 
     // Only registered when configured — an always-erroring tool offered to
     // the model would just be confusing noise for a project that hasn't
@@ -154,15 +165,44 @@ async fn main() -> anyhow::Result<()> {
     let system_prompt = build_system_prompt(&executor);
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let agent = Agent::new(
+    let mut agent = Agent::new(
         llm,
         executor,
         system_prompt,
         settings.permissions.max_tool_iterations_per_turn,
+        settings.backend.context_tokens,
+        Arc::clone(&tasks),
         events_tx,
     );
 
-    aivyx_tui::run(agent, events_rx, cwd, permission_rx).await
+    // Persistence is always on (it's what makes `--resume` possible after a
+    // crash or an interrupted slow-model turn); only *restoring* is opt-in.
+    let restored = match session::session_file_path(&cwd) {
+        Some(path) => {
+            let restored = if cli.resume {
+                let state = session::load(&path);
+                if state.is_none() {
+                    tracing::info!(path = %path.display(), "--resume: no resumable session found, starting fresh");
+                }
+                state
+            } else {
+                None
+            };
+            if let Some(state) = &restored {
+                agent.restore(state.clone());
+            }
+            agent.set_session_path(path);
+            restored
+        }
+        None => {
+            tracing::warn!(
+                "no state directory available — session persistence and --resume are disabled"
+            );
+            None
+        }
+    };
+
+    aivyx_tui::run(agent, events_rx, cwd, permission_rx, restored).await
 }
 
 /// Best-effort check, used only to decide whether to warn about sending

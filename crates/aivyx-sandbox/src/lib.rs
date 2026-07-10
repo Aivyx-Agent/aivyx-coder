@@ -39,6 +39,12 @@ pub enum ActionKind {
     Write,
     Execute,
     Delete,
+    /// Mutates only the agent's own in-session state (e.g. the task list) —
+    /// no filesystem, process, or network effect. Auto-allowed like `Read`,
+    /// but kept distinct so a tool that touches the outside world can't
+    /// honestly describe itself this way, and so audit logs don't record an
+    /// internal state change as a "Read" of anything.
+    Internal,
 }
 
 #[derive(Debug, Clone)]

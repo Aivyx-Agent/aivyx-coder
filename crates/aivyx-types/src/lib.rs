@@ -85,6 +85,26 @@ pub enum ToolOutput {
     Denied(String),
 }
 
+/// One item in the agent's session task list — an externalized scratchpad
+/// of intent the model doesn't have to hold entirely in its context window.
+/// Lives here (not in `aivyx-core`) because the `set_tasks` tool in
+/// `aivyx-tools`, the session persistence in `aivyx-core`, and the task
+/// panel in `aivyx-tui` all share it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    pub id: u32,
+    pub text: String,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,

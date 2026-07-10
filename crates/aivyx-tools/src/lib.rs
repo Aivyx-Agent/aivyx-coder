@@ -22,7 +22,8 @@ mod tools;
 
 pub use process::CommandSpec;
 pub use tools::{
-    EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool, WriteFileTool,
+    EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool,
+    WriteFileTool,
 };
 
 #[derive(Debug, Error)]

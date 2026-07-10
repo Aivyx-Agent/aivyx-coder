@@ -21,6 +21,21 @@ Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
 pointing at Ollama (`http://localhost:11434/v1`); edit it to taste.
 
+Sessions persist automatically: after every completed turn the conversation
+history and task list are saved (one session per project directory, keyed by
+the canonicalized cwd, under `~/.local/state/aivyx-coder/sessions/`, written
+`0600` since they embed file contents and command output read during the
+session). `aivyx --resume` restores the previous session for the current
+directory — transcript, task list, and all; without the flag a fresh session
+starts and its first completed turn replaces the stored one.
+
+The status line shows a live context-budget indicator (`ctx 6.1k/8.2k (74%)`,
+colored green/amber/red) once the backend reports token usage. When the
+conversation approaches the configured window (`backend.context_tokens`,
+below), the agent compacts: oversized tool results are elided to head+tail
+excerpts first, then the oldest turns are dropped — with a visible notice,
+never silently.
+
 Build/test the workspace:
 
 ```
@@ -46,6 +61,7 @@ with running commands).
 | `edit_file` | exact-substring replace in a file | prompt (then cacheable) |
 | `run_command` | run one of a fixed, configured allowlist by name | prompt / pre-approved |
 | `run_shell` | run an arbitrary `sh -c` command | prompt / pre-approved |
+| `set_tasks` | replace the agent's own task list (shown in the TUI) | none (internal state only) |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command
@@ -81,7 +97,11 @@ Every tool call passes through the gate before it runs:
 2. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
    no side effect on its own, so prompting on every read would make the tool
    unusable. (But note: read output re-enters the model's context — see
-   "Known limitations".)
+   "Known limitations".) `Internal` actions (`set_tasks`, which mutates only
+   the agent's own session state) are auto-allowed on the same basis, but are
+   a distinct action kind so audit logs never record a state change as a
+   "read" — and so a tool that touches the outside world can't honestly
+   describe itself as internal.
 3. **Everything else** → an interactive confirmation modal, showing the exact
    target/command and (for edits) a diff. Choosing **Always Allow** caches that
    *exact* target `(program, args)` or path for the rest of the session.
@@ -138,6 +158,11 @@ may hold an `api_key`):
 base_url = "http://localhost:11434/v1"
 model = "qwen3.5:9b"
 # api_key = "..."   # only for auth-protected local endpoints
+# Your model's context window, in tokens. Drives the status-line budget
+# indicator and history compaction. Conservative default (8192) — set it to
+# what your model actually supports; it is not auto-detected because the
+# OpenAI-compatible /v1 surface doesn't expose it reliably.
+context_tokens = 8192
 
 [permissions]
 deny_paths = ["~/.ssh", "~/.aws"]

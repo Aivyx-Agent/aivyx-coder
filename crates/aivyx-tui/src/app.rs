@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aivyx_core::{Agent, AgentEvent};
+use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
 use aivyx_sandbox::{PermissionRequest, PermissionTarget, UserResponse};
-use aivyx_types::ToolOutput;
+use aivyx_types::{ContentBlock, Message, Role, ToolOutput};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +16,11 @@ use tui_textarea::TextArea;
 
 use crate::permission::{ModalRequest, PermissionModalReceiver};
 use crate::terminal::TerminalGuard;
+
+/// Task-panel rows before the panel stops growing and shows a window into
+/// the list instead — the transcript, not the task list, deserves the
+/// vertical space.
+const MAX_VISIBLE_TASKS: usize = 6;
 
 enum ChatLine {
     User(String),
@@ -34,6 +39,7 @@ pub async fn run(
     mut agent_events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     cwd: PathBuf,
     mut permission_rx: PermissionModalReceiver,
+    restored: Option<SessionState>,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -49,7 +55,7 @@ pub async fn run(
     });
 
     let mut guard = TerminalGuard::init()?;
-    let mut app = App::new();
+    let mut app = App::new(restored);
     let mut crossterm_events = EventStream::new();
 
     loop {
@@ -134,15 +140,34 @@ struct App {
     input: TextArea<'static>,
     streaming_active: bool,
     pending_permission: Option<ModalRequest>,
+    /// Latest `(used, limit)` context-token counts from the backend, shown
+    /// in the status line. `None` until the first response reports usage.
+    context_usage: Option<(u32, u32)>,
+    /// The agent's task list, rendered as a panel between the transcript
+    /// and the input box whenever it's non-empty.
+    tasks: Vec<Task>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(restored: Option<SessionState>) -> Self {
+        let (transcript, tasks) = match restored {
+            Some(state) => {
+                let mut transcript = seed_transcript(&state.history);
+                transcript.push(ChatLine::Notice(format!(
+                    "resumed previous session ({} messages restored)",
+                    state.history.len()
+                )));
+                (transcript, state.tasks)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         Self {
-            transcript: Vec::new(),
+            transcript,
             input: new_input_box(),
             streaming_active: false,
             pending_permission: None,
+            context_usage: None,
+            tasks,
         }
     }
 
@@ -179,30 +204,43 @@ impl App {
                 )));
             }
             AgentEvent::ToolResult(result) => {
-                let text = match result.output {
-                    ToolOutput::Ok(s) => s,
-                    ToolOutput::Error(s) => format!("error: {s}"),
-                    ToolOutput::Denied(s) => format!("denied: {s}"),
-                };
-                self.transcript.push(ChatLine::ToolResult(text));
+                self.transcript
+                    .push(ChatLine::ToolResult(tool_output_text(&result.output)));
             }
             AgentEvent::TurnComplete => self.streaming_active = false,
             AgentEvent::Error(message) => {
                 self.transcript.push(ChatLine::Notice(message));
                 self.streaming_active = false;
             }
+            AgentEvent::ContextUsage { used, limit } => {
+                self.context_usage = Some((used, limit));
+            }
+            AgentEvent::TasksUpdated(tasks) => {
+                self.tasks = tasks;
+            }
         }
     }
 
     fn render(&self, frame: &mut ratatui::Frame) {
+        // The task panel only occupies a row of the layout while there are
+        // tasks to show — an empty bordered box would just eat transcript
+        // space for the (common) sessions that never use the task list.
+        let tasks_height = if self.tasks.is_empty() {
+            0
+        } else {
+            self.tasks.len().min(MAX_VISIBLE_TASKS) as u16 + 2 // + borders
+        };
+        let mut constraints = vec![Constraint::Min(1)];
+        if tasks_height > 0 {
+            constraints.push(Constraint::Length(tasks_height));
+        }
+        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(1));
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(frame.area());
+        let (input_area, status_area) = (layout[layout.len() - 2], layout[layout.len() - 1]);
 
         let lines: Vec<Line> = self
             .transcript
@@ -232,21 +270,140 @@ impl App {
             .scroll((scroll, 0));
         frame.render_widget(transcript, layout[0]);
 
-        frame.render_widget(&self.input, layout[1]);
+        if tasks_height > 0 {
+            let done = self
+                .tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::Done)
+                .count();
+            let task_lines: Vec<Line> = task_window(&self.tasks, MAX_VISIBLE_TASKS)
+                .iter()
+                .map(task_line)
+                .collect();
+            let panel = Paragraph::new(task_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Tasks ({done}/{})", self.tasks.len())),
+            );
+            frame.render_widget(panel, layout[1]);
+        }
 
-        let status = if self.streaming_active {
+        frame.render_widget(&self.input, input_area);
+
+        let base = if self.streaming_active {
             "streaming... (Ctrl+C to cancel)"
         } else {
             "ready — Enter to send, Ctrl+C to quit"
         };
-        frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
-            layout[2],
-        );
+        let mut status_spans = vec![Span::styled(base, Style::default().fg(Color::DarkGray))];
+        if let Some((used, limit)) = self.context_usage {
+            let pct = (used as f64 / limit.max(1) as f64 * 100.0).round() as u32;
+            // Green under 60%, amber approaching the ceiling, red once
+            // compaction is imminent — so the user sees the window filling
+            // instead of the model silently degrading on overflow.
+            let color = if pct >= 85 {
+                Color::Red
+            } else if pct >= 60 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            status_spans.push(Span::styled(
+                format!(
+                    "   ·   ctx {}/{} ({pct}%)",
+                    format_tokens(used),
+                    format_tokens(limit)
+                ),
+                Style::default().fg(color),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
 
         if let Some(modal) = &self.pending_permission {
             render_permission_modal(frame, &modal.request);
         }
+    }
+}
+
+/// Rebuilds transcript lines from a restored session's message history, so
+/// a resumed conversation is visible instead of starting on a blank screen
+/// with invisible context. Mirrors what `handle_agent_event` would have
+/// produced live; the system prompt is never part of stored history.
+fn seed_transcript(history: &[Message]) -> Vec<ChatLine> {
+    let mut lines = Vec::new();
+    for message in history {
+        match message.role {
+            Role::System => {}
+            Role::User => lines.push(ChatLine::User(message.text_content())),
+            Role::Assistant => {
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text(text) if !text.is_empty() => {
+                            lines.push(ChatLine::Assistant(text.clone()));
+                        }
+                        ContentBlock::ToolCall(call) => {
+                            lines.push(ChatLine::ToolCall(format!(
+                                "{}({})",
+                                call.name, call.arguments
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Role::Tool => {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult(result) = block {
+                        lines.push(ChatLine::ToolResult(tool_output_text(&result.output)));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn tool_output_text(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Ok(s) => s.clone(),
+        ToolOutput::Error(s) => format!("error: {s}"),
+        ToolOutput::Denied(s) => format!("denied: {s}"),
+    }
+}
+
+/// The slice of tasks the panel shows when the list is longer than `max`:
+/// a window starting at the first unfinished task (clamped so the window is
+/// always full). A long list's leading run of done items is the least
+/// interesting part — without this, a 10-task list with 6 done would show
+/// only finished work. Each row displays the task's real id, so a window
+/// starting mid-list is self-explanatory.
+fn task_window(tasks: &[Task], max: usize) -> &[Task] {
+    if tasks.len() <= max {
+        return tasks;
+    }
+    let first_unfinished = tasks
+        .iter()
+        .position(|t| t.status != TaskStatus::Done)
+        .unwrap_or(0);
+    let start = first_unfinished.min(tasks.len() - max);
+    &tasks[start..start + max]
+}
+
+fn task_line(task: &Task) -> Line<'static> {
+    let (marker, style) = match task.status {
+        TaskStatus::Pending => ("[ ]", Style::default()),
+        TaskStatus::InProgress => ("[~]", Style::default().fg(Color::Yellow)),
+        TaskStatus::Done => ("[x]", Style::default().fg(Color::DarkGray)),
+    };
+    Line::from(format!("{marker} {}. {}", task.id, task.text)).style(style)
+}
+
+/// Compact token count for the status line: `6.1k`, `512`, `128.0k`.
+fn format_tokens(n: u32) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -421,6 +578,84 @@ mod tests {
         assert_eq!(lines[0].to_string(), "Command: sh -c echo first");
         // The second statement must be present as its own visible line.
         assert!(lines[1].to_string().contains("echo second"));
+    }
+
+    fn task(id: u32, text: &str, status: TaskStatus) -> Task {
+        Task {
+            id,
+            text: text.to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn seed_transcript_rebuilds_user_assistant_and_tool_lines() {
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource, ToolResult};
+
+        let history = vec![
+            Message::text(Role::User, "read foo"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text("looking".to_string()),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: ToolCallId("c1".to_string()),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "foo"}),
+                        source: ToolCallSource::Native,
+                    }),
+                ],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                tool_call_id: Some(ToolCallId("c1".to_string())),
+                content: vec![ContentBlock::ToolResult(ToolResult {
+                    call_id: ToolCallId("c1".to_string()),
+                    output: ToolOutput::Denied("nope".to_string()),
+                })],
+            },
+        ];
+
+        let lines = seed_transcript(&history);
+
+        assert_eq!(lines.len(), 4);
+        assert!(matches!(&lines[0], ChatLine::User(t) if t == "read foo"));
+        assert!(matches!(&lines[1], ChatLine::Assistant(t) if t == "looking"));
+        assert!(matches!(&lines[2], ChatLine::ToolCall(t) if t.starts_with("read_file(")));
+        assert!(matches!(&lines[3], ChatLine::ToolResult(t) if t == "denied: nope"));
+    }
+
+    #[test]
+    fn task_window_shows_everything_when_it_fits() {
+        let tasks = vec![
+            task(1, "a", TaskStatus::Done),
+            task(2, "b", TaskStatus::Pending),
+        ];
+        assert_eq!(task_window(&tasks, 6).len(), 2);
+    }
+
+    #[test]
+    fn task_window_skips_a_leading_run_of_done_tasks() {
+        let mut tasks: Vec<Task> = (1..=6).map(|i| task(i, "done", TaskStatus::Done)).collect();
+        tasks.push(task(7, "current", TaskStatus::InProgress));
+        tasks.push(task(8, "next", TaskStatus::Pending));
+
+        let window = task_window(&tasks, 6);
+
+        assert_eq!(window.len(), 6);
+        // The window is clamped to stay full, so it starts before the first
+        // unfinished task here — but the unfinished tail must be visible.
+        assert!(window.iter().any(|t| t.text == "current"));
+        assert!(window.iter().any(|t| t.text == "next"));
+    }
+
+    #[test]
+    fn task_window_of_all_done_tasks_shows_the_head() {
+        let tasks: Vec<Task> = (1..=9).map(|i| task(i, "done", TaskStatus::Done)).collect();
+        let window = task_window(&tasks, 6);
+        assert_eq!(window.len(), 6);
+        assert_eq!(window[0].id, 1);
     }
 
     #[test]

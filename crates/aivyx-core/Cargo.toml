@@ -9,9 +9,15 @@ aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+directories = "6.0.0"
 futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tokio-util = "0.7.18"
 tracing = "0.1.44"
+
+[dev-dependencies]
+async-trait = "0.1.89"
+tempfile = "3.27.0"

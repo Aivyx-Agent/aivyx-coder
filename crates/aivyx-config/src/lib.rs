@@ -82,6 +82,13 @@ pub struct BackendSettings {
     /// Parsed and validated now; only exercised once the text-fallback
     /// parser lands (see project plan, milestone M4).
     pub tool_calling_mode: ToolCallingMode,
+    /// The model's context window, in tokens — used to show a live budget
+    /// indicator and to trigger context compaction before the window
+    /// overflows. Conservative default; **set this to your model's actual
+    /// window** (qwen3.5/qwen3.6 support far more than the default). Not
+    /// auto-detected: the OpenAI-compatible `/v1` surface doesn't expose it
+    /// reliably across Ollama/vLLM/llama.cpp.
+    pub context_tokens: u32,
 }
 
 impl Default for BackendSettings {
@@ -91,6 +98,7 @@ impl Default for BackendSettings {
             model: "qwen3.5:9b".to_string(),
             api_key: None,
             tool_calling_mode: ToolCallingMode::Native,
+            context_tokens: 8192,
         }
     }
 }

@@ -237,7 +237,7 @@ history). Given this project's emphasis on transparency over magic, auto-commit
 to the real repo is the more consistent default, but flag it for confirmation
 before building.
 
-### Phase 8 — Agentic UX
+### Phase 8 — Agentic UX — ✅ done except plan mode
 A hard **plan mode** (read-only enforced at the permission layer — trivial on
 top of the existing gate, just withhold write grants until the user confirms
 a plan), a **persisted, visible task list** (more valuable here than in cloud
@@ -246,6 +246,48 @@ inference), **session persistence/resume**, and **context-budget visibility**
 (percentage of context window consumed) in place of the cost-tracking cloud
 tools show, since local inference has no per-token cost but silently degrades
 on context overflow instead — a worse failure mode to be blind to.
+
+**Built (2026-07):** three of the four, brought forward ahead of Phases 6–7
+because context overflow and interrupted sessions were the failure modes
+actually being hit in local testing. Design decisions worth recording:
+
+- **Context budget**: `backend.context_tokens` config (not auto-detected —
+  the OpenAI-compat `/v1` surface doesn't expose the window reliably across
+  Ollama/vLLM/llama.cpp), a live colored `ctx used/limit (%)` status-line
+  indicator fed by the backend's real `prompt_tokens`, and a
+  self-calibrating chars-per-token estimator (starts at ~4, re-calibrated
+  from each response's actual usage) that decides when to compact.
+- **Compaction** at 80% of the window, down to 60% (hysteresis so it doesn't
+  re-fire every turn): first elide oversized tool results to head+tail
+  excerpts (one huge `read_file` output is usually the dominant consumer,
+  and trimming it is far less lossy than dropping turns), then drop the
+  oldest whole turn-groups, cutting only at user-message boundaries so a
+  `tool_call` is never separated from its result. Truncation is surfaced to
+  both the user (notice line) and the model (system-prompt note) — never
+  silent.
+- **Session persistence**: saved after every turn (crash-safe), owner-only
+  0o600 (the session embeds file contents and command output), one file per
+  project directory keyed by FNV-1a of the canonicalized cwd, under
+  `~/.local/state/aivyx-coder/sessions/` — deliberately *outside* the
+  project so conversation data can't end up committed to its repo. Restore
+  is opt-in via `--resume`; the TUI rebuilds the visible transcript from
+  the restored history.
+- **Task list**: a `set_tasks` tool using whole-list replacement
+  (TodoWrite-style) rather than incremental add/update ops — no id
+  bookkeeping across turns for small local models to get wrong, and
+  self-healing after a malformed call. Verified live: `qwen3.5:9b` used it
+  correctly on the first try. Rendered as a bordered TUI panel that only
+  takes vertical space while non-empty; persisted with the session. Gated
+  behind a new honest `ActionKind::Internal` (auto-allowed — it mutates
+  nothing outside the agent's own session state) instead of mislabeling
+  the write as a `Read`.
+- Fixed en route: the agent loop `break`-ing on `finish_reason` lost the
+  usage chunk OpenAI-compatible servers send *after* it
+  (`stream_options.include_usage` semantics) — caught by live E2E testing,
+  now locked in by a regression test.
+
+**Still open from this phase:** plan mode (wants its own focused design pass
+at the permission layer).
 
 ### Phase 9 — Stretch goals
 LSP integration for exact symbol resolution (complements, doesn't replace,

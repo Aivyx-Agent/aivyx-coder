@@ -47,9 +47,10 @@ impl PermissionKey {
     }
 }
 
-/// The real `PermissionGate`: hard-blocks `deny_paths`, auto-allows reads,
-/// otherwise prompts (with an in-memory, per-exact-target Always-Allow
-/// cache for the rest of the session).
+/// The real `PermissionGate`: hard-blocks `deny_paths`, auto-allows reads
+/// and `Internal` (session-state-only) actions, otherwise prompts (with an
+/// in-memory, per-exact-target Always-Allow cache for the rest of the
+/// session).
 pub struct ConfirmationGate {
     prompter: Arc<dyn PermissionPrompter>,
     deny_paths: Vec<PathBuf>,
@@ -103,7 +104,7 @@ impl PermissionGate for ConfirmationGate {
             return PermissionDecision::Deny;
         }
 
-        if request.action == ActionKind::Read {
+        if matches!(request.action, ActionKind::Read | ActionKind::Internal) {
             return PermissionDecision::Allow;
         }
 
@@ -212,6 +213,27 @@ mod tests {
             .check(&read_request("/home/user/project/src/main.rs"))
             .await;
 
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_actions_auto_allow_without_prompting() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![]);
+
+        let request = PermissionRequest {
+            tool_name: "set_tasks".to_string(),
+            action: ActionKind::Internal,
+            target: PermissionTarget::Other("session task list".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+
+        let decision = gate.check(&request).await;
         assert_eq!(decision, PermissionDecision::Allow);
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
     }
