@@ -62,7 +62,79 @@ done from the original Phase 1 idea: revising the three tool descriptions/error
 messages per Anthropic's tool-design guidance — still worth doing before the
 tool surface grows, folded into whichever of Phase 2/3 lands next.
 
-### Phase 2 — Fix editing reliability at the root cause — investigated, not building this
+### Phase 2 — Fix editing reliability at the root cause — revisited, building scoped (2026-07-11)
+
+**Revisit rationale** (design pass with the user, after Phases 3–8 shipped):
+the original investigation below stands — ornith:9b's degradation happens
+before any edit is attempted and no edit format can reach it. What the
+revisit targets is the *other* claim from the research, which the
+investigation never tested: that multiline edit *content* travels badly
+through JSON tool arguments (escaping, whitespace fidelity) even on models
+whose tool-calling transport works. Our E2Es so far only ever exercised
+trivial one-line writes under hyper-directive prompts — the native edit
+path has never been stress-tested on real multiline edits.
+
+**User-confirmed forks:** scope is **edits only** (SEARCH/REPLACE blocks
+replace how edit_file/write_file payloads travel; every other tool keeps
+native calling, which demonstrably works — full text-mode tool invocation
+remains unbuilt), and the default format is **decided by A/B evidence**:
+the same real multiline-edit tasks run through both paths on `qwen3.5:9b`,
+wire-logged, winner becomes the config default, loser stays selectable via
+`[backend] edit_format = "native" | "prompted"`.
+
+**Design:**
+- Blocks are parsed from the assistant's plain text (Aider's format: a
+  path line, `<<<<<<< SEARCH`, old text, `=======`, new text,
+  `>>>>>>> REPLACE`; fence-tolerant; empty SEARCH = create the file) and
+  **synthesized into ordinary `ToolCall`s** (`ToolCallSource::TextFallback`
+  — the variant has been waiting for this since the foundation pass) that
+  dispatch through the normal executor. One security path: same gate, same
+  diff-preview modal, same plan-mode denial, same checkpoints. No parallel
+  edit machinery.
+- Malformed blocks get a synthetic call + error result (via the existing
+  skipped-result mechanism), so the model receives precise in-history
+  feedback and the call/result balance invariant holds.
+- In prompted mode, edit_file/write_file stay registered (the synthetic
+  calls need them) but leave the model-facing tool definitions; the system
+  prompt teaches the block format instead.
+- The repair loop already exists (tool errors feed back, iterations retry);
+  it gets sharpened for both modes by adding a nearest-miss hint to
+  edit_file's zero-match error (locate the closest partial match, quote the
+  surrounding lines).
+
+**A/B results (2026-07-11, qwen3.5:9b, 3 tasks × 3 reps per format,
+auto-approved modals, success judged from final file state): native 7/9,
+prompted 6/9 — format is not the bottleneck.** Every success in *both*
+formats was a first-try, single-approval correct edit: no JSON mangling in
+native payloads, no match failures in prompted blocks. Every failure in
+both formats shared one signature — a ~95s reasoning stall ending without
+any action — i.e. the same model-side agentic limit the original
+investigation identified, unreachable by either format. The default stays
+`native` (it also ran ~45% faster overall); `prompted` remains fully
+supported via `[backend] edit_format` / `--edit-format` for models that
+genuinely mangle tool-call JSON, which qwen3.5:9b, measured, does not.
+
+It took four rounds to get an honest measurement, and the discards were
+more valuable than the verdict:
+- Round 1 (pilot, discarded): a 25s quiet-window in the harness was
+  killing runs mid-reasoning (the thinking phase streams `delta.reasoning`,
+  which the client drops — silence looks like a hang), and the system
+  prompt still steered prompted-mode runs toward the withheld edit tools.
+- Round 2 (aborted on discovery): **Ollama had been serving a 4096-token
+  window all along** — no `num_ctx` in the model, no
+  `OLLAMA_CONTEXT_LENGTH` on the service, not settable via `/v1` — so
+  `context_tokens = 8192` was fiction and reasoning phases truncated
+  mid-think (`finish_reason: length`) across *both* formats, masquerading
+  as model unreliability. Fixed with a derived `qwen35-8k` model; README
+  documents the trap; the truncation error now explains it; Phase 10's
+  window-mismatch probe is the permanent fix.
+- Round 3 (discarded): the harness matched the modal's `[y] Allow` hint,
+  which ratatui can splice across cell runs — at least one fully-correct
+  native run sat unapproved at a perfect diff and was scored FAIL.
+- Round 4 (clean, reported above), after two product fixes the rounds
+  surfaced: `edit_file` now rejects no-op edits (a confused model looped
+  through 11 approved no-change edits believing each worked) and its
+  zero-match error quotes the nearest-miss region.
 Before implementing the prompted SEARCH/REPLACE rework described below, reviewed
 the plan against the actual evidence and found it doesn't target the observed
 failure: a repair loop already exists for free (`ToolExecutor::dispatch` already
@@ -518,6 +590,69 @@ sub-agent delegation for context-isolated exploration, and an
 architect/editor model-pairing mode (a stronger model plans in prose, a
 faster local model executes the mechanical edit) — directly enabled once
 Phase 2's prompted edit format exists.
+
+### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
+
+The Phase 2 A/B diagnosis promoted the serving layer to a first-class
+reliability component: Ollama's hidden 4096-token serving default (not
+settable via `/v1`, invisible until a reasoning phase burns through it)
+silently truncated responses across *both* edit formats and masqueraded as
+model unreliability. Direction confirmed with the user; hardware verified:
+RTX 4090 / 24 GB — comfortable for qwen3.5:9b-class GGUFs at 16k context,
+and CUDA means the SGLang spike is fully feasible.
+
+**Part A — llama-server as the recommended serving path.** Same GGUF
+models, same kernels as Ollama, but everything explicit — the trap class
+this phase was born from is structurally impossible when `-c` is on the
+command line.
+- A0 Install (AUR `llama.cpp-cuda` / ggml-org prebuilt CUDA binaries /
+  source build) and obtain GGUFs — reuse Ollama's existing blobs (the
+  `FROM` path in `ollama show --modelfile`) or pull from HuggingFace.
+- A1 Bring-up: `llama-server -m <gguf> -c 16384 --jinja --cache-reuse 256`
+  with aivyx pointed at it via `--base-url`; `--jinja` is load-bearing for
+  native tool-call templating, `--cache-reuse` for agent-loop prompt reuse.
+- A2 Compatibility verification through the existing live-E2E harnesses,
+  wire-log inspected. Watch specifically: streaming tool-call delta shape,
+  usage-chunk ordering (Phase 8's drain-to-stream-end fix should hold —
+  verify, don't assume), and finish_reason semantics. Any quirks get fixed
+  in `aivyx-llm` with regression tests.
+- A3 **Window-mismatch probe** (small new code): at startup, best-effort
+  query the server's real context window (llama-server exposes `/props`
+  n_ctx; Ollama exposes model params via `/api/show`) and warn loudly when
+  it's smaller than `backend.context_tokens`. Converts this phase's silent
+  trap into a startup warning; silently skipped on servers exposing
+  neither endpoint. Decision (flagged for veto): build it — it's the
+  permanent fix for the diagnosis class, not just a doc note.
+- A4 Docs: a README "Serving" section — recommended invocation, a systemd
+  user-unit example, the context-matching rule (`context_tokens` ≤ `-c`).
+  Decision (flagged for veto): the *shipped* default base_url stays Ollama
+  (the 5-minute quick start is real value); the recommended serious setup
+  is llama-server, and the user's own config migrates.
+- A5 Acceptance test: re-run the Phase 2 edit-format A/B against
+  llama-server — doubles as evidence on whether edit-format results are
+  provider-sensitive.
+
+**Part B — SGLang constrained-decoding spike** (bounded: one session, no
+aivyx architecture changes inside the spike). Answers the research pass's
+standing `[unverified]` question: can grammar-constrained decoding
+(xgrammar) force *native tool-call* syntax — function name plus
+schema-valid arguments — at generation time? If yes, that attacks edit
+reliability at a level neither prompt format reaches.
+- B0 Serve a qwen3.5-9B quant (AWQ/FP8) via SGLang on the 4090; aivyx
+  pointed at its `/v1` unmodified.
+- B1 Baseline compatibility through the same E2E subset.
+- B2 The measurement: malformed-tool-call incidence and edit-task success
+  with vs without constrained decoding, against the llama-server baseline
+  from A5 — same harness, same tasks, wire-logged.
+- B3 Radix-cache benefit: time-to-first-token on iteration ≥2 of
+  multi-tool turns vs llama-server's `--cache-reuse`.
+- B4 Decision gate: aivyx only grows config surface (structured-output
+  request knobs) if B2 shows a material win — evidence before
+  architecture, same rule Phase 2 set.
+
+**Sequencing:** after the Phase 2 revisit lands (A/B round 3 in flight as
+this is written; default decision + commit pending). Part A first; Part B
+uses A5's numbers as its baseline.
 
 ## Notes on sequencing
 

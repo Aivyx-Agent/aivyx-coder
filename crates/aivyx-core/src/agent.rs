@@ -5,12 +5,15 @@ use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, To
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::PlanMode;
 use aivyx_tools::ToolExecutor;
-use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
+use aivyx_types::{
+    ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolOutput, ToolResult,
+};
 use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::edit_blocks::{self, BlockParse};
 use crate::session::{self, SessionState, Task};
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,39 @@ withheld. Explore with the read and search tools, record a step-by-step plan wit
 then summarize the plan and ask the user to press Ctrl+P to approve it and switch to Act mode. \
 Do not claim to have made any changes — you cannot make any in this mode.";
 
+/// How edit content travels to and from the model. See ROADMAP.md Phase 2
+/// for the A/B evidence behind the configured default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditFormat {
+    /// Edits are edit_file/write_file tool calls with JSON arguments.
+    Native,
+    /// Edits are SEARCH/REPLACE blocks in the assistant's plain text,
+    /// parsed by `edit_blocks` and applied through the same tools (and
+    /// therefore the same permission gate) as synthesized calls; the edit
+    /// tools themselves are withheld from the model's tool list.
+    Prompted,
+}
+
+/// The tools hidden from the model (but kept registered — the synthesized
+/// calls dispatch to them) while `EditFormat::Prompted` is active.
+const PROMPTED_EDIT_HIDDEN_TOOLS: &[&str] = &["edit_file", "write_file"];
+
+/// Appended to the system prompt in prompted edit mode (outside plan mode).
+const EDIT_FORMAT_PROMPT: &str = "To modify or create files, do NOT call tools. Write \
+SEARCH/REPLACE blocks directly in your reply, formatted exactly like this:\n\
+\n\
+path/to/file.rs\n\
+<<<<<<< SEARCH\n\
+exact existing lines to find\n\
+=======\n\
+replacement lines\n\
+>>>>>>> REPLACE\n\
+\n\
+Rules: the SEARCH text must match the current file content exactly — copy it verbatim, \
+including indentation. Keep each block small and focused; use several blocks for several \
+changes. To create a new file, leave the SEARCH section empty. Each block is applied only \
+after the user approves it, and you will receive a result for each block.";
+
 /// Scalar knobs for an `Agent`, grouped so `Agent::new`'s arity stays sane
 /// as configuration accumulates (it has grown every phase so far).
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +114,18 @@ pub struct AgentConfig {
     pub max_tool_iterations: u32,
     /// The model's context window, in tokens; clamped to a minimum of 1.
     pub context_tokens: u32,
+    /// How edit content travels (see `EditFormat`).
+    pub edit_format: EditFormat,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_iterations: 25,
+            context_tokens: 8192,
+            edit_format: EditFormat::Native,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -122,6 +170,10 @@ pub struct Agent {
     /// the context estimator — a ~1k-token block compaction can't see would
     /// silently eat the window's headroom.
     repo_map_text: Option<String>,
+    edit_format: EditFormat,
+    /// Monotonic id source for tool calls synthesized from SEARCH/REPLACE
+    /// blocks — they need ids that can't collide with the backend's.
+    synthetic_seq: u64,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -154,6 +206,8 @@ impl Agent {
             plan_mode,
             repo_map: None,
             repo_map_text: None,
+            edit_format: config.edit_format,
+            synthetic_seq: 0,
             events_tx,
         }
     }
@@ -218,6 +272,12 @@ impl Agent {
         if self.plan_mode.active() {
             system.push_str("\n\n");
             system.push_str(PLAN_MODE_PROMPT);
+        } else if self.edit_format == EditFormat::Prompted {
+            // Not taught during plan mode — the plan note already forbids
+            // modifications, and teaching an edit syntax at the same time
+            // would just invite blocks the gate then has to bounce.
+            system.push_str("\n\n");
+            system.push_str(EDIT_FORMAT_PROMPT);
         }
         if let Some(map) = &self.repo_map_text {
             system.push_str("\n\n");
@@ -347,10 +407,16 @@ impl Agent {
                 messages: self.assemble_messages(),
                 // Re-evaluated every iteration, not once per turn, so a
                 // mid-turn toggle takes effect on the very next request.
-                tools: if self.plan_mode.active() {
-                    self.executor.plan_definitions()
-                } else {
-                    self.executor.definitions()
+                tools: {
+                    let mut tools = if self.plan_mode.active() {
+                        self.executor.plan_definitions()
+                    } else {
+                        self.executor.definitions()
+                    };
+                    if self.edit_format == EditFormat::Prompted {
+                        tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
+                    }
+                    tools
                 },
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
@@ -434,7 +500,12 @@ impl Agent {
             match finish_reason {
                 Some(FinishReason::Length) => {
                     self.emit(AgentEvent::Error(
-                        "response was truncated (hit the model's output limit) before it finished"
+                        "response was truncated (hit the model's output limit) before it \
+                         finished. If this happens early in a response, the server's actual \
+                         context window is probably smaller than backend.context_tokens — \
+                         Ollama defaults to 4096 unless the model sets num_ctx or the server \
+                         sets OLLAMA_CONTEXT_LENGTH; a reasoning model's thinking phase can \
+                         consume the whole remainder invisibly."
                             .to_string(),
                     ));
                 }
@@ -446,11 +517,70 @@ impl Agent {
                 _ => {}
             }
 
+            // In prompted edit mode, the assistant's plain text may carry
+            // SEARCH/REPLACE blocks: turn each into an ordinary tool call
+            // (source: TextFallback) so it flows through the exact same
+            // gate / diff-preview / checkpoint path as a native call.
+            // Malformed blocks become a call plus an error-shaped result so
+            // the model gets precise corrective feedback in-history without
+            // breaking the call/result balance invariant.
+            let mut malformed_blocks: Vec<(ToolCall, String)> = Vec::new();
+            if self.edit_format == EditFormat::Prompted {
+                for parsed in edit_blocks::parse_edit_blocks(&assistant_text) {
+                    self.synthetic_seq += 1;
+                    let id = ToolCallId(format!("prompted-edit-{}", self.synthetic_seq));
+                    match parsed {
+                        BlockParse::Ok(block) => {
+                            let (name, arguments) = if block.search.is_empty() {
+                                (
+                                    "write_file",
+                                    serde_json::json!({
+                                        "path": block.path,
+                                        "content": block.replace,
+                                    }),
+                                )
+                            } else {
+                                (
+                                    "edit_file",
+                                    serde_json::json!({
+                                        "path": block.path,
+                                        "old_string": block.search,
+                                        "new_string": block.replace,
+                                    }),
+                                )
+                            };
+                            let call = ToolCall {
+                                id,
+                                name: name.to_string(),
+                                arguments,
+                                source: ToolCallSource::TextFallback,
+                            };
+                            self.emit(AgentEvent::ToolCallDetected(call.clone()));
+                            tool_calls.push(call);
+                        }
+                        BlockParse::Malformed(message) => {
+                            malformed_blocks.push((
+                                ToolCall {
+                                    id,
+                                    name: "edit_file".to_string(),
+                                    arguments: serde_json::json!({}),
+                                    source: ToolCallSource::TextFallback,
+                                },
+                                message,
+                            ));
+                        }
+                    }
+                }
+            }
+
             let mut assistant_content = Vec::new();
             if !assistant_text.is_empty() {
                 assistant_content.push(ContentBlock::Text(assistant_text));
             }
             for call in &tool_calls {
+                assistant_content.push(ContentBlock::ToolCall(call.clone()));
+            }
+            for (call, _) in &malformed_blocks {
                 assistant_content.push(ContentBlock::ToolCall(call.clone()));
             }
             if !assistant_content.is_empty() {
@@ -461,7 +591,25 @@ impl Agent {
                 });
             }
 
+            let had_malformed_blocks = !malformed_blocks.is_empty();
+            for (call, message) in malformed_blocks {
+                self.record_skipped_tool_result(
+                    call,
+                    &format!(
+                        "malformed SEARCH/REPLACE block ({message}) — re-emit the complete \
+                         block: path line, <<<<<<< SEARCH, old text, =======, new text, \
+                         >>>>>>> REPLACE"
+                    ),
+                );
+            }
+
             if tool_calls.is_empty() {
+                // Nothing to execute — but a malformed block means the
+                // model tried to act: keep the loop going so the feedback
+                // just recorded can drive a corrected retry.
+                if had_malformed_blocks {
+                    continue;
+                }
                 self.emit(AgentEvent::TurnComplete);
                 return Ok(());
             }
@@ -746,10 +894,10 @@ mod tests {
         }
     }
 
-    fn build_agent(
+    fn build_agent_with_config(
         responses: Vec<Vec<StreamEvent>>,
         registry: ToolRegistry,
-        max_iters: u32,
+        config: AgentConfig,
     ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
         let (tx, rx) = unbounded_channel();
         let mock = Arc::new(MockBackend::new(responses));
@@ -761,15 +909,43 @@ mod tests {
             llm,
             executor,
             "system",
-            AgentConfig {
-                max_tool_iterations: max_iters,
-                context_tokens: 8192,
-            },
+            config,
             Arc::default(),
             PlanMode::new(),
             tx,
         );
         (agent, rx, mock)
+    }
+
+    fn build_agent(
+        responses: Vec<Vec<StreamEvent>>,
+        registry: ToolRegistry,
+        max_iters: u32,
+    ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
+        build_agent_with_config(
+            responses,
+            registry,
+            AgentConfig {
+                max_tool_iterations: max_iters,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn prompted_config() -> AgentConfig {
+        AgentConfig {
+            edit_format: EditFormat::Prompted,
+            ..Default::default()
+        }
+    }
+
+    fn text_response(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta(text.to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]
     }
 
     fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -992,7 +1168,7 @@ mod tests {
             "system",
             AgentConfig {
                 max_tool_iterations: 10,
-                context_tokens: 8192,
+                ..Default::default()
             },
             Arc::default(),
             plan_mode.clone(),
@@ -1019,6 +1195,157 @@ mod tests {
         let act_system = received[1].messages[0].text_content();
         assert!(plan_system.contains("PLAN MODE"));
         assert!(!act_system.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn prompted_blocks_apply_through_the_normal_tool_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("target.rs"),
+            "fn old_name() {}\nfn other() {}\n",
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+        let block = "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn renamed() {}\n>>>>>>> REPLACE";
+        let (mut agent, _rx, mock) = build_agent_with_config(
+            vec![text_response(block), text_response("done")],
+            registry,
+            prompted_config(),
+        );
+
+        agent
+            .run_turn(
+                "rename it".to_string(),
+                dir.path(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("target.rs")).unwrap();
+        assert!(
+            content.contains("fn renamed()"),
+            "edit not applied: {content}"
+        );
+        assert!(content.contains("fn other()"));
+        // The synthesized call is in history, marked TextFallback, balanced
+        // by its result — and the loop continued for a second round-trip.
+        assert_eq!(count_tool_calls(&agent.history), 1);
+        assert_eq!(count_tool_results(&agent.history), 1);
+        let synthetic = agent
+            .history
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolCall(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(synthetic.source, ToolCallSource::TextFallback);
+        assert_eq!(mock.received.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_search_block_creates_a_new_file_via_write_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let block = "fresh.txt\n<<<<<<< SEARCH\n=======\nhello world\n>>>>>>> REPLACE";
+        let (mut agent, _rx, _) = build_agent_with_config(
+            vec![text_response(block), text_response("done")],
+            registry,
+            prompted_config(),
+        );
+
+        agent
+            .run_turn(
+                "create it".to_string(),
+                dir.path(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(),
+            "hello world\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_block_feeds_an_error_back_and_the_turn_continues() {
+        let broken = "target.rs\n<<<<<<< SEARCH\nfn a() {}\n=======\nfn b() {}\n"; // no terminator
+        let (mut agent, _rx, mock) = build_agent_with_config(
+            vec![text_response(broken), text_response("understood")],
+            ToolRegistry::new(),
+            prompted_config(),
+        );
+
+        agent
+            .run_turn("edit".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_denied_containing(&agent.history, "malformed SEARCH/REPLACE"),
+            1
+        );
+        // The feedback drove a second round-trip instead of ending the turn.
+        assert_eq!(mock.received.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn native_mode_never_parses_block_syntax_out_of_text() {
+        // A model quoting the format in conversation (or a file containing
+        // markers being discussed) must not trigger edits in native mode.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.rs"), "fn old_name() {}\n").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+        let block = "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn changed() {}\n>>>>>>> REPLACE";
+        let (mut agent, _rx, mock) =
+            build_agent_with_config(vec![text_response(block)], registry, AgentConfig::default());
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(count_tool_calls(&agent.history), 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target.rs")).unwrap(),
+            "fn old_name() {}\n"
+        );
+        assert_eq!(mock.received.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prompted_mode_hides_edit_tools_and_teaches_the_block_format() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        registry.register(Arc::new(aivyx_tools::EditFileTool));
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (mut agent, _rx, mock) =
+            build_agent_with_config(vec![text_response("hello")], registry, prompted_config());
+
+        agent
+            .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(tool_names, vec!["read_file"]);
+        assert!(
+            received[0].messages[0]
+                .text_content()
+                .contains("SEARCH/REPLACE")
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1463,7 @@ mod tests {
             "system",
             AgentConfig {
                 max_tool_iterations: 10,
-                context_tokens: 8192,
+                ..Default::default()
             },
             Arc::clone(&tasks),
             PlanMode::new(),

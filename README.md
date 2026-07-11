@@ -36,6 +36,16 @@ below), the agent compacts: oversized tool results are elided to head+tail
 excerpts first, then the oldest turns are dropped — with a visible notice,
 never silently.
 
+**Edit format** (`[backend] edit_format`, or `--edit-format` per session):
+`native` sends edits as `edit_file`/`write_file` tool-call JSON; `prompted`
+teaches the model to write Aider-style SEARCH/REPLACE blocks as plain text
+instead — multiline code survives plain text better than JSON string
+escaping on small models. Parsed blocks are applied through the *same*
+tools, so the permission modal, diff preview, plan-mode denial, deny_paths,
+and checkpoints all behave identically in both formats; malformed blocks
+get corrective feedback the model can retry from. See ROADMAP.md Phase 2
+for the A/B measurements behind the default.
+
 **Repository map**: on each turn a token-budgeted map of the repo's
 top-ranked files and symbol signatures (tree-sitter extraction, PageRank
 over the internal reference graph — Rust files only for now) is appended to
@@ -213,6 +223,14 @@ model = "qwen3.5:9b"
 # indicator and history compaction. Conservative default (8192) — set it to
 # what your model actually supports; it is not auto-detected because the
 # OpenAI-compatible /v1 surface doesn't expose it reliably.
+#
+# IMPORTANT: the server must actually SERVE this window. Ollama defaults to
+# 4096 unless the model's Modelfile sets num_ctx or the service sets
+# OLLAMA_CONTEXT_LENGTH — the /v1 endpoint cannot request it per-call. A
+# too-small server window shows up as responses truncating "before they
+# finished", especially on reasoning models whose thinking phase invisibly
+# consumes the remainder. Cheap fix without touching the service:
+#   printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 8192\n' | ollama create qwen35-8k -f -
 context_tokens = 8192
 
 [permissions]

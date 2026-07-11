@@ -40,12 +40,23 @@ fn apply_edit(
             "old_string must not be empty".to_string(),
         ));
     }
+    if old_string == new_string {
+        // Without this, a confused model can loop forever on "successful"
+        // edits that change nothing, believing each one worked — observed
+        // live during the Phase 2 A/B (11 approved no-ops, zero net change).
+        return Err(ToolError::InvalidArguments(
+            "old_string and new_string are identical — this edit changes nothing. Re-check \
+             what you intended to change; if the file already has the desired content, no \
+             edit is needed"
+                .to_string(),
+        ));
+    }
 
     let match_count = old.matches(old_string).count();
     if match_count == 0 {
-        return Err(ToolError::InvalidArguments(
-            "old_string not found in file".to_string(),
-        ));
+        return Err(ToolError::InvalidArguments(nearest_miss_message(
+            old, old_string,
+        )));
     }
     if match_count > 1 && !replace_all {
         return Err(ToolError::InvalidArguments(format!(
@@ -59,6 +70,33 @@ fn apply_edit(
     } else {
         old.replacen(old_string, new_string, 1)
     })
+}
+
+/// Zero-match errors quote the file region around the closest partial
+/// match (the first line of `old_string` located in the file), so the
+/// model's retry converges on the real content instead of guessing —
+/// this is the repair loop's steering signal in both edit formats.
+fn nearest_miss_message(content: &str, old_string: &str) -> String {
+    let base = "old_string not found in file";
+    let Some(anchor) = old_string.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return base.to_string();
+    };
+    let Some(anchor_line) = content
+        .lines()
+        .position(|line| line.contains(anchor) || line.trim() == anchor)
+    else {
+        return format!("{base} (not even its first line, `{anchor}`, appears — re-read the file)");
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = anchor_line.saturating_sub(2);
+    let end = (anchor_line + old_string.lines().count() + 2).min(lines.len());
+    format!(
+        "{base}. The file near the closest partial match (line {}) actually reads:\n{}\n\
+         Adjust old_string to match this exactly.",
+        anchor_line + 1,
+        lines[start..end].join("\n")
+    )
 }
 
 pub struct EditFileTool;
@@ -153,6 +191,45 @@ mod tests {
     fn zero_matches_is_an_error() {
         let err = apply_edit("fn foo() {}\n", "fn missing()", "x", false).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn a_no_op_edit_is_rejected_with_guidance() {
+        let err = apply_edit("fn same() {}\n", "fn same() {}", "fn same() {}", false).unwrap_err();
+        let ToolError::InvalidArguments(msg) = err else {
+            panic!("expected InvalidArguments")
+        };
+        assert!(msg.contains("identical"), "msg: {msg}");
+    }
+
+    #[test]
+    fn zero_match_error_quotes_the_nearest_miss_region() {
+        // The model sent slightly-wrong content (missing indentation): the
+        // error must quote what the file actually says around the closest
+        // partial match, so the retry can copy it verbatim.
+        let content = "fn top() {}\n\nfn middle() {\n    let value = 1;\n    value + 1\n}\n";
+        let err = apply_edit(
+            content,
+            "fn middle() {\nlet value = 1;\n}", // wrong indentation
+            "x",
+            false,
+        )
+        .unwrap_err();
+
+        let ToolError::InvalidArguments(msg) = err else {
+            panic!("expected InvalidArguments")
+        };
+        assert!(msg.contains("closest partial match"), "msg: {msg}");
+        assert!(msg.contains("    let value = 1;"), "msg: {msg}");
+    }
+
+    #[test]
+    fn zero_match_with_no_anchor_line_stays_terse() {
+        let err = apply_edit("fn foo() {}\n", "completely_absent_text", "x", false).unwrap_err();
+        let ToolError::InvalidArguments(msg) = err else {
+            panic!("expected InvalidArguments")
+        };
+        assert!(msg.contains("re-read the file"), "msg: {msg}");
     }
 
     #[test]

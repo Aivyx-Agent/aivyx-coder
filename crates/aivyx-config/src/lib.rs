@@ -130,6 +130,21 @@ pub struct BackendSettings {
     /// auto-detected: the OpenAI-compatible `/v1` surface doesn't expose it
     /// reliably across Ollama/vLLM/llama.cpp.
     pub context_tokens: u32,
+    /// How edit content travels: "native" sends edits as edit_file /
+    /// write_file tool-call arguments; "prompted" teaches the model to
+    /// write SEARCH/REPLACE blocks as plain text instead (parsed by aivyx
+    /// and applied through the same permission gate). Multiline code
+    /// survives plain text better than JSON string escaping on some
+    /// models — see ROADMAP.md Phase 2 for the A/B evidence behind the
+    /// default.
+    pub edit_format: EditFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditFormat {
+    Native,
+    Prompted,
 }
 
 impl Default for BackendSettings {
@@ -140,6 +155,12 @@ impl Default for BackendSettings {
             api_key: None,
             tool_calling_mode: ToolCallingMode::Native,
             context_tokens: 8192,
+            // Evidence-based default: the Phase 2 A/B (qwen3.5:9b, see
+            // ROADMAP.md) measured native 7/9 vs prompted 6/9 with zero
+            // payload-format failures in either — native is simpler and
+            // ~45% faster, prompted stays available for models that
+            // genuinely mangle tool-call JSON.
+            edit_format: EditFormat::Native,
         }
     }
 }
