@@ -202,6 +202,13 @@ async fn main() -> anyhow::Result<()> {
         events_tx,
     );
 
+    if settings.repo_map.enabled {
+        agent.set_repo_map(
+            Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
+            settings.repo_map.budget_tokens,
+        );
+    }
+
     // Persistence is always on (it's what makes `--resume` possible after a
     // crash or an interrupted slow-model turn); only *restoring* is opt-in.
     let restored = match session::session_file_path(&cwd) {

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
+use aivyx_repomap::RepoMap;
 use aivyx_sandbox::PlanMode;
 use aivyx_tools::ToolExecutor;
 use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolOutput, ToolResult};
@@ -113,6 +114,14 @@ pub struct Agent {
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
     plan_mode: PlanMode,
+    /// `(map, budget_tokens)` when the repo map is enabled; re-rendered
+    /// once per turn (cheap after the first pass — only changed files
+    /// re-parse) into `repo_map_text`.
+    repo_map: Option<(Arc<RepoMap>, u32)>,
+    /// The rendered slice appended to the system prompt; also counted by
+    /// the context estimator — a ~1k-token block compaction can't see would
+    /// silently eat the window's headroom.
+    repo_map_text: Option<String>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -143,8 +152,33 @@ impl Agent {
             tasks,
             session_path: None,
             plan_mode,
+            repo_map: None,
+            repo_map_text: None,
             events_tx,
         }
+    }
+
+    /// Enables the repository map: rendered per turn, appended to the
+    /// system prompt within `budget_tokens`.
+    pub fn set_repo_map(&mut self, map: Arc<RepoMap>, budget_tokens: u32) {
+        self.repo_map = Some((map, budget_tokens));
+    }
+
+    /// Re-renders the map off the async runtime. Best-effort: a failure
+    /// just means this turn goes without a map.
+    async fn refresh_repo_map(&mut self) {
+        let Some((map, budget)) = &self.repo_map else {
+            return;
+        };
+        let map = Arc::clone(map);
+        let budget = *budget;
+        self.repo_map_text = match tokio::task::spawn_blocking(move || map.render(budget)).await {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!(error = %err, "repo map rendering panicked; continuing without it");
+                None
+            }
+        };
     }
 
     /// Enables session persistence: after each turn the full session is
@@ -185,19 +219,29 @@ impl Agent {
             system.push_str("\n\n");
             system.push_str(PLAN_MODE_PROMPT);
         }
+        if let Some(map) = &self.repo_map_text {
+            system.push_str("\n\n");
+            system.push_str(map);
+        }
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::text(Role::System, system));
         messages.extend(self.history.iter().cloned());
         messages
     }
 
-    /// Rough token estimate for the current system prompt + history, using
-    /// the self-calibrated `chars_per_token`. Deliberately consistent with
-    /// the char-count used for calibration (both ignore tool-definition
-    /// tokens), so the systematic omission cancels out in the ratio.
+    /// Char count feeding both the size estimate and the calibration pair —
+    /// the two must use the same measure so systematic omissions (e.g.
+    /// tool-definition tokens) cancel out in the ratio. Includes the
+    /// rendered repo map, which is real prompt weight every request.
+    fn prompt_chars(&self) -> usize {
+        message_chars(&self.system_prompt, &self.history)
+            + self.repo_map_text.as_ref().map_or(0, |m| m.chars().count())
+    }
+
+    /// Rough token estimate for the current prompt, using the
+    /// self-calibrated `chars_per_token`.
     fn estimate_prompt_tokens(&self) -> u32 {
-        let chars = message_chars(&self.system_prompt, &self.history);
-        (chars as f64 / self.chars_per_token).ceil() as u32
+        (self.prompt_chars() as f64 / self.chars_per_token).ceil() as u32
     }
 
     /// Keeps the prompt within the model's window: when the estimate crosses
@@ -284,6 +328,10 @@ impl Agent {
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
         self.history.push(Message::text(Role::User, user_input));
+        // Once per turn, not per iteration: within a turn the map rarely
+        // changes materially, and re-walking on every tool round-trip would
+        // add latency exactly where slow local models already hurt.
+        self.refresh_repo_map().await;
 
         for iteration in 1..=self.max_tool_iterations {
             if cancellation.is_cancelled() {
@@ -293,7 +341,7 @@ impl Agent {
             self.compact_if_needed();
             // Recorded here (not from `assemble_messages`) so it pairs with
             // the estimator's own char-count for a consistent calibration.
-            self.last_request_chars = Some(message_chars(&self.system_prompt, &self.history));
+            self.last_request_chars = Some(self.prompt_chars());
 
             let request = ChatRequest {
                 messages: self.assemble_messages(),
@@ -971,6 +1019,45 @@ mod tests {
         let act_system = received[1].messages[0].text_content();
         assert!(plan_system.contains("PLAN MODE"));
         assert!(!act_system.contains("PLAN MODE"));
+    }
+
+    #[tokio::test]
+    async fn repo_map_is_rendered_into_the_system_prompt_and_counted_by_the_estimator() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("widget.rs"),
+            "pub fn extremely_distinctive_symbol() {}\n",
+        )
+        .unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_repo_map(
+            Arc::new(aivyx_repomap::RepoMap::new(
+                dir.path().to_path_buf(),
+                vec![],
+            )),
+            1000,
+        );
+        let chars_without_map = agent.prompt_chars();
+
+        agent
+            .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("Repository map"));
+        assert!(system.contains("extremely_distinctive_symbol"));
+        // The estimator must see the map's weight, or compaction would run
+        // blind to a block that's present in every request.
+        assert!(agent.prompt_chars() > chars_without_map + 50);
     }
 
     #[tokio::test]

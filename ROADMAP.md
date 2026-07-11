@@ -217,13 +217,66 @@ specifically, not just freeform JSON mode — if so, it could reduce or remove
 the need for Phase 2's prompted-format fallback for some backends. Not
 confirmed this session; check before committing engineering time either way._
 
-### Phase 6 — Codebase understanding (repo map)
+### Phase 6 — Codebase understanding (repo map) — ✅ done
 Build an Aider-style repo map: extract per-file symbol signatures (functions,
 types) via `tree-sitter`, rank by a dependency/reference graph, inject a
 token-budgeted slice into the system prompt. This is the best-fit context
 strategy for small local context windows per the research (cheap, no server,
 degrades gracefully) — prioritize it over embeddings/RAG, which the field has
 moved away from for code specifically.
+
+#### Phase 6 design (agreed 2026-07-11)
+
+**User-confirmed forks:** the map is **injected** as a token-budgeted slice
+appended to the system prompt every request (Aider's proven shape — small
+local models won't proactively call an optional map tool, and first-turn
+orientation is where the map earns its keep), and v1 parses **Rust only**
+(one grammar and one tags query to get right; other languages become
+mechanical follow-ups once the pipeline is proven; unknown-language files
+simply contribute no symbols).
+
+**Mechanism — a new `aivyx-repomap` crate**, dependency-free of the rest of
+the workspace (pure input → string):
+- **Walk**: `ignore::WalkBuilder` rooted at the cwd — gitignore-aware, no
+  symlink following, `deny_paths` excluded — collecting `.rs` files under a
+  per-file size cap.
+- **Extract** per file via tree-sitter queries: definitions (fn, struct,
+  enum, trait, mod, const, static, type alias, macro) each carrying its
+  signature line, plus references (called identifiers, used type names).
+- **Cache** per-file extraction keyed by `(mtime, size)` — a render pass
+  re-parses only changed files; the walk itself is cheap. In-memory only
+  (an on-disk cache is a later optimization, not v1).
+- **Rank** files by PageRank (plain power iteration, damping 0.85) over the
+  cross-file graph: an edge from referencing file to defining file per
+  matched symbol name, weighted by reference count. This is the part that
+  makes the map *relevant* rather than alphabetical.
+- **Render** top-ranked files as `path:` + indented signature lines until
+  the token budget (chars/4, same estimator convention as the agent) is
+  spent; per-file signature cap so one huge module can't hog the budget.
+- **Agent integration**: rendered once per *turn* (not per iteration) via
+  `spawn_blocking`, appended to the system prompt like the plan-mode and
+  truncation notes — and **counted by the context estimator** (a ~1k-token
+  map that compaction can't see would silently eat the window's headroom).
+  Active in plan mode: orientation is most valuable while planning.
+- **Config**: `[repo_map] enabled = true, budget_tokens = 1024`. The map
+  is skipped when the repo yields no symbols (no noise for non-Rust
+  projects in v1).
+
+**Deliberately not in v1:** ranking personalization toward
+recently-touched/chat-mentioned files (Aider does this; a clean follow-up
+once the base map proves itself), on-disk tag caching, and additional
+languages.
+
+**Built (2026-07-11), as designed** — new `aivyx-repomap` crate (9 unit
+tests: extraction kinds, references, ranking, budget, deny/gitignore
+exclusion, cache invalidation, deleted-file eviction), agent integration
+with the map's weight visible to the compaction estimator, and a live E2E
+that verified through the raw wire capture (`AIVYX_DEBUG_LOG`) that the map
+— with the hub file correctly outranking an unreferenced one — was inside
+the actual request's system prompt. E2E harness lesson (again): a "model
+replied" check that pattern-matches the reply text also matches the typed
+prompt's own echo; the `ctx` usage indicator is the honest
+request-completed signal.
 
 ### Phase 7 — Git integration and checkpointing — ✅ done
 A git-ops tool (status/diff/log/commit), shelling out to the `git` CLI to

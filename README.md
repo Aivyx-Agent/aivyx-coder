@@ -36,6 +36,15 @@ below), the agent compacts: oversized tool results are elided to head+tail
 excerpts first, then the oldest turns are dropped — with a visible notice,
 never silently.
 
+**Repository map**: on each turn a token-budgeted map of the repo's
+top-ranked files and symbol signatures (tree-sitter extraction, PageRank
+over the internal reference graph — Rust files only for now) is appended to
+the system prompt, giving the model orientation it wouldn't ask for on its
+own. Gitignore-aware, `deny_paths` excluded, cached per file so only edits
+re-parse. Its token weight is counted by the compaction estimator. Configure
+or disable under `[repo_map]`; non-Rust projects simply get no map and pay
+no cost.
+
 **Worktree checkpoints**: when the working directory is a git repository,
 the agent snapshots the entire worktree to `refs/aivyx/checkpoints/<ts>`
 *before every mutating tool call* (file writes, edits, and any
@@ -225,6 +234,10 @@ extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
 
 [git]
 checkpoints = true   # snapshot the worktree before every mutating tool call
+
+[repo_map]
+enabled = true       # append a ranked symbol map to the system prompt
+budget_tokens = 1024 # rough token budget the map may consume per request
 ```
 
 ## Known limitations

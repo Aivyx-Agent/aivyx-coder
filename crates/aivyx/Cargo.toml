@@ -8,6 +8,7 @@ license.workspace = true
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
+aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
 aivyx-tui = { version = "0.1.0", path = "../aivyx-tui" }

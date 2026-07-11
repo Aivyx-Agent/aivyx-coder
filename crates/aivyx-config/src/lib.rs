@@ -35,6 +35,29 @@ pub struct Settings {
     pub permissions: PermissionSettings,
     pub sandbox: SandboxSettings,
     pub git: GitSettings,
+    pub repo_map: RepoMapSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoMapSettings {
+    /// Append a token-budgeted map of the repository's top-ranked files and
+    /// symbols to the system prompt each turn (Rust files only for now).
+    /// Costs prompt tokens every request but gives the model repository
+    /// orientation it won't ask for on its own.
+    pub enabled: bool,
+    /// Rough token budget the rendered map may consume. Counted against
+    /// `backend.context_tokens` by the compaction estimator.
+    pub budget_tokens: u32,
+}
+
+impl Default for RepoMapSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            budget_tokens: 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

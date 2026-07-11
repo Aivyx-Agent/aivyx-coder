@@ -1,0 +1,544 @@
+//! Aider-style repository map: tree-sitter symbol extraction, PageRank over
+//! the cross-file reference graph, and a token-budgeted rendering that gets
+//! appended to the agent's system prompt each turn.
+//!
+//! v1 parses Rust only (per the Phase 6 design); files in other languages
+//! simply contribute no symbols and the map degrades gracefully — an empty
+//! map renders as `None` so non-Rust projects pay no prompt cost at all.
+//!
+//! Deliberately dependency-free of the rest of the workspace: pure
+//! filesystem-in, string-out.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+use streaming_iterator::StreamingIterator;
+use tree_sitter::{Parser, Query, QueryCursor};
+
+/// Files larger than this are skipped — generated monsters would dominate
+/// parse time while contributing noise.
+const MAX_FILE_BYTES: u64 = 512 * 1024;
+
+/// Signatures shown per file before "..." — one huge module must not hog
+/// the whole budget.
+const MAX_SIGNATURES_PER_FILE: usize = 20;
+
+/// Same chars-per-token convention as the agent's estimator.
+const CHARS_PER_TOKEN: usize = 4;
+
+const PAGERANK_DAMPING: f64 = 0.85;
+const PAGERANK_ITERATIONS: usize = 30;
+
+/// Definition captures: the `@name` capture is the symbol, the `@item`
+/// capture is the whole item whose first line becomes the signature.
+const DEF_QUERY: &str = r#"
+(function_item name: (identifier) @name) @item
+(function_signature_item name: (identifier) @name) @item
+(struct_item name: (type_identifier) @name) @item
+(enum_item name: (type_identifier) @name) @item
+(union_item name: (type_identifier) @name) @item
+(trait_item name: (type_identifier) @name) @item
+(mod_item name: (identifier) @name) @item
+(const_item name: (identifier) @name) @item
+(static_item name: (identifier) @name) @item
+(type_item name: (type_identifier) @name) @item
+(macro_definition name: (identifier) @name) @item
+"#;
+
+/// Reference captures: call targets, used type names, invoked macros.
+/// `type_identifier` also matches each type's own definition site; that
+/// self-reference is filtered out when graph edges are built (same-file
+/// references never create an edge).
+const REF_QUERY: &str = r#"
+(call_expression function: (identifier) @ref)
+(call_expression function: (scoped_identifier name: (identifier) @ref))
+(call_expression function: (field_expression field: (field_identifier) @ref))
+(type_identifier) @ref
+(macro_invocation macro: (identifier) @ref)
+"#;
+
+#[derive(Debug, Clone)]
+struct Def {
+    name: String,
+    /// First line of the item, e.g. `pub fn run_turn(&mut self,`.
+    signature: String,
+    is_pub: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FileTags {
+    defs: Vec<Def>,
+    /// Referenced name -> occurrence count.
+    refs: HashMap<String, u32>,
+}
+
+struct CacheEntry {
+    mtime: SystemTime,
+    size: u64,
+    tags: FileTags,
+}
+
+pub struct RepoMap {
+    root: PathBuf,
+    deny_paths: Vec<PathBuf>,
+    cache: Mutex<HashMap<PathBuf, CacheEntry>>,
+}
+
+impl RepoMap {
+    pub fn new(root: PathBuf, deny_paths: Vec<PathBuf>) -> Self {
+        Self {
+            root,
+            deny_paths,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Builds the budgeted map, or `None` when the repository yields no
+    /// symbols (not a Rust project, or nothing parseable) — the caller then
+    /// adds nothing to the prompt. Synchronous and CPU-bound: call from
+    /// `spawn_blocking`.
+    pub fn render(&self, budget_tokens: u32) -> Option<String> {
+        if budget_tokens == 0 {
+            return None;
+        }
+        let files = self.collect_tags();
+        if files.iter().all(|(_, tags)| tags.defs.is_empty()) {
+            return None;
+        }
+
+        let ranks = pagerank(&files);
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        order.sort_by(|&a, &b| {
+            ranks[b]
+                .partial_cmp(&ranks[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let budget_chars = budget_tokens as usize * CHARS_PER_TOKEN;
+        let mut out = String::from("Repository map (top files by internal references):\n");
+        for &i in &order {
+            let (path, tags) = &files[i];
+            if tags.defs.is_empty() {
+                continue;
+            }
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            let entry = render_file(relative, tags);
+            if out.len() + entry.len() > budget_chars {
+                // Budget spent; whatever ranked below simply isn't shown.
+                break;
+            }
+            out.push_str(&entry);
+        }
+
+        // Only the header fit — the budget is too small to say anything.
+        (out.lines().count() > 1).then_some(out)
+    }
+
+    /// Walks the repo and returns tags for every parseable file, re-parsing
+    /// only files whose `(mtime, size)` changed since the cached entry.
+    fn collect_tags(&self) -> Vec<(PathBuf, FileTags)> {
+        let mut extractor = Extractor::new();
+        let mut cache = self.cache.lock().unwrap();
+        let mut results = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+
+        for entry in ignore::WalkBuilder::new(&self.root).build() {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !entry.file_type().is_some_and(|ft| ft.is_file())
+                || path.extension().is_none_or(|e| e != "rs")
+                || is_denied(path, &self.deny_paths)
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+            let path = path.to_path_buf();
+            seen.push(path.clone());
+            let fresh = cache
+                .get(&path)
+                .is_some_and(|c| c.mtime == mtime && c.size == meta.len());
+            if !fresh {
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let tags = extractor.extract(&source);
+                cache.insert(
+                    path.clone(),
+                    CacheEntry {
+                        mtime,
+                        size: meta.len(),
+                        tags,
+                    },
+                );
+            }
+            if let Some(entry) = cache.get(&path) {
+                results.push((path, entry.tags.clone()));
+            }
+        }
+
+        // Deleted files must leave the cache (and the map).
+        cache.retain(|path, _| seen.contains(path));
+        results
+    }
+}
+
+fn is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
+    // Denied entries are canonicalized at config load; canonicalize the
+    // candidate too so a symlinked spelling can't slip past the comparison
+    // (same convention as the search tools).
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    deny_paths
+        .iter()
+        .any(|denied| canonical.starts_with(denied) || path.starts_with(denied))
+}
+
+struct Extractor {
+    parser: Parser,
+    def_query: Query,
+    ref_query: Query,
+}
+
+impl Extractor {
+    fn new() -> Self {
+        let language = tree_sitter::Language::from(tree_sitter_rust::LANGUAGE);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .expect("bundled Rust grammar must load");
+        let def_query = Query::new(&language, DEF_QUERY).expect("DEF_QUERY must compile");
+        let ref_query = Query::new(&language, REF_QUERY).expect("REF_QUERY must compile");
+        Self {
+            parser,
+            def_query,
+            ref_query,
+        }
+    }
+
+    fn extract(&mut self, source: &str) -> FileTags {
+        let Some(tree) = self.parser.parse(source, None) else {
+            return FileTags::default();
+        };
+        let bytes = source.as_bytes();
+        let mut tags = FileTags::default();
+
+        let name_index = self
+            .def_query
+            .capture_index_for_name("name")
+            .expect("@name exists");
+        let item_index = self
+            .def_query
+            .capture_index_for_name("item")
+            .expect("@item exists");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.def_query, tree.root_node(), bytes);
+        while let Some(m) = matches.next() {
+            let name = m
+                .captures
+                .iter()
+                .find(|c| c.index == name_index)
+                .and_then(|c| c.node.utf8_text(bytes).ok());
+            let item = m.captures.iter().find(|c| c.index == item_index);
+            if let (Some(name), Some(item)) = (name, item) {
+                let signature = signature_line(item.node.utf8_text(bytes).unwrap_or(""));
+                tags.defs.push(Def {
+                    name: name.to_string(),
+                    is_pub: signature.starts_with("pub "),
+                    signature,
+                });
+            }
+        }
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.ref_query, tree.root_node(), bytes);
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                if let Ok(name) = capture.node.utf8_text(bytes) {
+                    *tags.refs.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        tags
+    }
+}
+
+/// First line of an item, cleaned for display: cut at the body's opening
+/// `{` (which also drops a single-line item's entire body), then strip a
+/// trailing `;`.
+fn signature_line(item_text: &str) -> String {
+    let first = item_text.lines().next().unwrap_or("");
+    let head = first.split_once('{').map_or(first, |(head, _)| head);
+    head.trim_end().trim_end_matches(';').trim_end().to_string()
+}
+
+/// PageRank over the cross-file reference graph: an edge from the
+/// referencing file to each *other* file defining that name, weighted by
+/// reference count and split across multiple definers. Plain power
+/// iteration — the graphs here are a few hundred nodes, not the web.
+fn pagerank(files: &[(PathBuf, FileTags)]) -> Vec<f64> {
+    let n = files.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // name -> indices of files defining it
+    let mut definers: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (_, tags)) in files.iter().enumerate() {
+        for def in &tags.defs {
+            definers.entry(def.name.as_str()).or_default().push(i);
+        }
+    }
+
+    // out_edges[src] = (dst, weight)
+    let mut out_edges: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for (src, (_, tags)) in files.iter().enumerate() {
+        for (name, count) in &tags.refs {
+            let Some(dsts) = definers.get(name.as_str()) else {
+                continue;
+            };
+            let external: Vec<usize> = dsts.iter().copied().filter(|&d| d != src).collect();
+            if external.is_empty() {
+                continue;
+            }
+            let weight = f64::from(*count) / external.len() as f64;
+            for dst in external {
+                out_edges[src].push((dst, weight));
+            }
+        }
+    }
+    let out_totals: Vec<f64> = out_edges
+        .iter()
+        .map(|edges| edges.iter().map(|(_, w)| w).sum::<f64>())
+        .collect();
+
+    let mut ranks = vec![1.0 / n as f64; n];
+    for _ in 0..PAGERANK_ITERATIONS {
+        let mut next = vec![(1.0 - PAGERANK_DAMPING) / n as f64; n];
+        for src in 0..n {
+            if out_totals[src] == 0.0 {
+                // Dangling node: its rank redistributes uniformly.
+                for rank in next.iter_mut() {
+                    *rank += PAGERANK_DAMPING * ranks[src] / n as f64;
+                }
+                continue;
+            }
+            for &(dst, weight) in &out_edges[src] {
+                next[dst] += PAGERANK_DAMPING * ranks[src] * weight / out_totals[src];
+            }
+        }
+        ranks = next;
+    }
+    ranks
+}
+
+fn render_file(path: &Path, tags: &FileTags) -> String {
+    let mut out = format!("\n{}:\n", path.display());
+    // Public items first (they're what other files can actually use), each
+    // group in source order.
+    let (pubs, privs): (Vec<&Def>, Vec<&Def>) = tags.defs.iter().partition(|d| d.is_pub);
+    for (shown, def) in pubs.iter().chain(privs.iter()).enumerate() {
+        if shown == MAX_SIGNATURES_PER_FILE {
+            out.push_str("  ...\n");
+            break;
+        }
+        out.push_str("  ");
+        out.push_str(&def.signature);
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn extracts_definition_kinds_with_signatures() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+pub struct Widget { size: u32 }
+pub enum Mode { A, B }
+pub trait Render { fn draw(&self); }
+pub fn make_widget(size: u32) -> Widget { Widget { size } }
+const LIMIT: usize = 10;
+mod helpers;
+type Alias = Vec<u8>;
+"#,
+        );
+
+        let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
+        for expected in [
+            "Widget",
+            "Mode",
+            "Render",
+            "draw",
+            "make_widget",
+            "LIMIT",
+            "helpers",
+            "Alias",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let make = tags.defs.iter().find(|d| d.name == "make_widget").unwrap();
+        assert_eq!(make.signature, "pub fn make_widget(size: u32) -> Widget");
+        assert!(make.is_pub);
+        let limit = tags.defs.iter().find(|d| d.name == "LIMIT").unwrap();
+        assert!(!limit.is_pub);
+    }
+
+    #[test]
+    fn extracts_call_type_and_macro_references() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+fn caller() {
+    let w: Widget = make_widget(3);
+    helper::assist();
+    w.render();
+    println!("done");
+}
+"#,
+        );
+        for expected in ["Widget", "make_widget", "assist", "render", "println"] {
+            assert!(
+                tags.refs.contains_key(expected),
+                "missing ref {expected}: {:?}",
+                tags.refs.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn heavily_referenced_files_rank_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "core.rs",
+            "pub struct Engine;\npub fn start(e: Engine) {}\n",
+        );
+        write(
+            dir.path(),
+            "a.rs",
+            "fn a() { let e: Engine = todo!(); start(e); }\n",
+        );
+        write(
+            dir.path(),
+            "b.rs",
+            "fn b() { let e: Engine = todo!(); start(e); }\n",
+        );
+        write(dir.path(), "lonely.rs", "pub fn unused_helper() {}\n");
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).expect("map should render");
+
+        let core_pos = rendered.find("core.rs").expect("core.rs in map");
+        let lonely_pos = rendered.find("lonely.rs").expect("lonely.rs in map");
+        assert!(
+            core_pos < lonely_pos,
+            "referenced file should outrank unreferenced one:\n{rendered}"
+        );
+        assert!(rendered.contains("pub struct Engine"));
+    }
+
+    #[test]
+    fn budget_limits_how_many_files_appear() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            write(
+                dir.path(),
+                &format!("file{i:02}.rs"),
+                &format!("pub fn function_number_{i:02}_with_a_long_name() {{}}\n"),
+            );
+        }
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+
+        let big = map.render(10_000).unwrap();
+        let small = map.render(60).unwrap();
+        assert!(small.len() < big.len());
+        assert!(small.matches(".rs:").count() < big.matches(".rs:").count());
+    }
+
+    #[test]
+    fn no_rust_files_means_no_map() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "readme.md", "# nothing to parse\n");
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        assert!(map.render(1000).is_none());
+    }
+
+    #[test]
+    fn denied_and_gitignored_files_stay_out_of_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        write(dir.path(), ".gitignore", "generated.rs\n");
+        write(dir.path(), "visible.rs", "pub fn visible_fn() {}\n");
+        write(dir.path(), "generated.rs", "pub fn generated_fn() {}\n");
+        write(dir.path(), "secret/hidden.rs", "pub fn secret_fn() {}\n");
+
+        let deny = vec![dir.path().canonicalize().unwrap().join("secret")];
+        let map = RepoMap::new(dir.path().to_path_buf(), deny);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(rendered.contains("visible_fn"));
+        assert!(
+            !rendered.contains("generated_fn"),
+            "gitignored leaked:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("secret_fn"),
+            "denied leaked:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn cache_invalidates_when_a_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib.rs", "pub fn before_edit() {}\n");
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        assert!(map.render(1000).unwrap().contains("before_edit"));
+
+        // A same-length content change with a bumped mtime must re-parse.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(dir.path(), "lib.rs", "pub fn aafter_edit() {}\n");
+        let rendered = map.render(1000).unwrap();
+        assert!(rendered.contains("aafter_edit"), "stale cache:\n{rendered}");
+        assert!(!rendered.contains("before_edit"));
+    }
+
+    #[test]
+    fn deleted_files_leave_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "keep.rs", "pub fn keep_fn() {}\n");
+        write(dir.path(), "gone.rs", "pub fn gone_fn() {}\n");
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        assert!(map.render(1000).unwrap().contains("gone_fn"));
+
+        std::fs::remove_file(dir.path().join("gone.rs")).unwrap();
+        let rendered = map.render(1000).unwrap();
+        assert!(!rendered.contains("gone_fn"));
+        assert!(rendered.contains("keep_fn"));
+    }
+
+    #[test]
+    fn zero_budget_renders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "lib.rs", "pub fn some_fn() {}\n");
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        assert!(map.render(0).is_none());
+    }
+}

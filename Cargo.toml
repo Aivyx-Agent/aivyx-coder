@@ -12,6 +12,7 @@ aivyx-types = { path = "crates/aivyx-types" }
 aivyx-llm = { path = "crates/aivyx-llm" }
 aivyx-sandbox = { path = "crates/aivyx-sandbox" }
 aivyx-tools = { path = "crates/aivyx-tools" }
+aivyx-repomap = { path = "crates/aivyx-repomap" }
 aivyx-core = { path = "crates/aivyx-core" }
 aivyx-config = { path = "crates/aivyx-config" }
 aivyx-tui = { path = "crates/aivyx-tui" }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
+aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
