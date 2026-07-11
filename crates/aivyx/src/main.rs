@@ -229,6 +229,23 @@ async fn main() -> anyhow::Result<()> {
     let system_prompt = build_system_prompt(&executor, edit_format);
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+    // Best-effort probe of the *served* context window (llama-server
+    // /props, Ollama /api/show) — a smaller-than-configured window means
+    // silent mid-response truncation, the exact failure the Phase 2 A/B
+    // spent a round diagnosing. Advisory only: the warning lands in the
+    // transcript as a notice; an unreachable/unknown server stays silent.
+    {
+        let served =
+            aivyx_llm::probe_served_context(&settings.backend.base_url, &settings.backend.model)
+                .await;
+        if let Some(warning) = aivyx_llm::context_warning(settings.backend.context_tokens, &served)
+        {
+            tracing::warn!(%warning, "context window mismatch");
+            let _ = events_tx.send(aivyx_core::AgentEvent::Error(warning));
+        }
+    }
+
     let mut agent = Agent::new(
         llm,
         executor,

@@ -97,6 +97,67 @@ build without it (non-Linux, or a kernel without Landlock), use
 process confinement (see "require_enforcement" below for how that interacts
 with running commands).
 
+## Serving
+
+aivyx speaks the OpenAI-compatible `/v1` API, so any local server works.
+Two supported setups:
+
+**Ollama (quick start).** Zero-setup, and the shipped default. One trap to
+know: Ollama serves its *own* default context window (typically 4096)
+unless the model sets `num_ctx` or the service sets
+`OLLAMA_CONTEXT_LENGTH` — `/v1` cannot request more, and a too-small
+window truncates responses mid-thought (reasoning models burn it
+invisibly). aivyx probes for this at startup and warns in the transcript;
+the fix is a derived model (see the config reference below).
+
+**llama-server (recommended for serious use).** Same GGUF models and
+kernels as Ollama, everything explicit — the hidden-window trap can't
+exist when `-c` is on the command line:
+
+```
+llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
+  -c 16384 -ngl 99 --jinja --cache-reuse 256 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --presence-penalty 1.5 \
+  --host 127.0.0.1 --port 8080
+```
+
+`--jinja` is load-bearing (native tool-call templating); `--cache-reuse`
+keeps agent-loop prompts warm across tool round-trips. Point aivyx at it
+with `base_url = "http://127.0.0.1:8080/v1"`. The startup probe reads
+llama-server's `/props` and confirms the served window.
+
+**Sampling does not migrate from Ollama.** Ollama applies the Modelfile's
+sampling parameters server-side; llama-server uses its own generic
+defaults instead — and reasoning models are sensitive to this. Measured
+here: qwen3.5 without its recommended `--presence-penalty 1.5` fell into
+90-second reasoning loops that ended turns without acting, on tasks the
+same model handled in seconds under Ollama. Always pass the model
+family's recommended sampling flags (the values above are Qwen's; check
+your model's card — `ollama show <model>` lists what Ollama was using).
+
+Prefer GGUFs from HuggingFace (`-hf repo:QUANT` downloads and caches
+them). Reusing Ollama's blob files directly (`ollama show --modelfile`
+reveals the path) sometimes works but is **not reliable**: Ollama's fork
+writes metadata upstream llama.cpp may reject, and Ollama stores chat
+templates outside the GGUF — a missing template silently breaks native
+tool-calling (calls stream through as plain text).
+
+Example systemd user unit (`~/.config/systemd/user/llama-server.service`):
+
+```ini
+[Unit]
+Description=llama-server for aivyx
+[Service]
+ExecStart=/home/you/Projects/llama.cpp/build/bin/llama-server \
+  -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M -c 16384 -ngl 99 \
+  --jinja --cache-reuse 256 \
+  --temp 1.0 --top-k 20 --top-p 0.95 --presence-penalty 1.5 \
+  --host 127.0.0.1 --port 8080
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
 ## Tools
 
 | Tool | Action | Confirmation |

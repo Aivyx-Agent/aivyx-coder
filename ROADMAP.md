@@ -654,6 +654,81 @@ reliability at a level neither prompt format reaches.
 this is written; default decision + commit pending). Part A first; Part B
 uses A5's numbers as its baseline.
 
+**Part A progress (2026-07-11): A0–A4 built and live-verified; A5 in
+flight.** llama-server built from source (CUDA sm_89; ggml's
+`GGML_CCACHE=ON` default auto-adopts the system sccache and corrupts
+parallel nvcc builds — `-DGGML_CCACHE=OFF`). Verified against it: 5/5
+map-E2E checks (streaming, usage ordering, repo-map injection) and 9/9
+git-E2E checks (tool-call deltas, modals, checkpoints, commit) with the
+unsloth qwen3.5-9B GGUF at an explicit, probe-confirmed 16k window. The
+A3 window probe shipped (`aivyx-llm::probe`, llama-server `/props` +
+Ollama `/api/show`, advisory transcript notice) and live-passed all three
+cases: warns on bare-Ollama-no-num_ctx, silent on llama-server-16k and on
+the derived 8k Ollama model. Three migration gotchas found by
+verification, all documented in README's Serving section:
+1. **Ollama blob reuse is arch-dependent** — the qwen35 blob carries
+   Ollama-fork GGUF metadata upstream rejects; and even a loadable blob
+   (lfm2.5) breaks native tool-calling because Ollama stores chat
+   templates *outside* the GGUF (calls streamed through as raw
+   `<|tool_call_start|>` text). HF GGUFs are the reliable path.
+2. **Tool-call parsing is per-model-template**: verify per model, don't
+   assume — the git E2E is the acceptance test for it.
+3. **Sampling does not migrate**: Ollama applies Modelfile sampling
+   server-side; llama-server uses generic defaults — qwen3.5 without its
+   recommended `--presence-penalty 1.5` fell into 90s reasoning loops
+   that ended turns without acting (diagnosed via a direct non-streaming
+   repro that exonerated the chat template). First A5 attempt caught
+   this; the corrected-sampling rerun is in flight.
+
+### Phase 11 — Candidate directions (scoped 2026-07-11, user-proposed)
+
+Three external projects, each reinterpreted onto primitives aivyx already
+has rather than ported. Recommended build order: 11a → 11b → 11c (rising
+security surface). None started; each wants its own design pass first.
+
+**11a — Council mode** (inspiration: karpathy/llm-council — multiple
+models answer, anonymously cross-rank, a chairman synthesizes; upstream
+uses OpenRouter/cloud). *Our interpretation, local-only*: a `/council
+<question>` TUI command for hard design decisions — the question plus
+relevant context goes to N configured **local** models (each just another
+`OpenAiCompatBackend`; sequential execution because one GPU, which Ollama's
+model-swapping serves fine even when the daily driver is llama-server),
+responses anonymized, each model ranks the others, the configured chairman
+(e.g. `qwen3.6:27b`) synthesizes into the transcript. Read-only by
+construction — council members get no tools — so it's plan-mode-native:
+exactly where a second opinion on a plan is worth the latency. Config:
+`[council] models = [...], chairman = "..."`. The hardware already fits:
+four local models are pulled and idle.
+
+**11b — Agent-maintained codebase wiki** (inspiration:
+langchain-ai/openwiki — a CLI that writes and maintains agent-facing repo
+documentation). *Our interpretation*: no separate tool — the agent itself
+generates and maintains `docs/wiki/*.md` (architecture overview, module
+guides, decision log) via a `/wiki` command, using its existing gated
+read/search/edit/git tools; checkpoint refs make regeneration free to
+attempt. The repo map gains awareness of wiki pages so they surface as
+context when relevant. This mechanizes the project's own
+"document design as we go" discipline. Open questions for its design pass:
+injection policy vs budget, and staleness detection (git_read diffing
+since the last wiki update is already enough plumbing).
+
+**11c — Autonomous research loop** (inspiration: karpathy/autoresearch —
+an agent iterates on a training script overnight against one metric with a
+fixed time budget, keep-or-discard per experiment). *Our interpretation*:
+`aivyx --auto "<goal>"` — loop: plan a small change → apply → run the
+configured **metric command** (an `allowed_commands` entry; cargo
+test/bench or a user score script) → keep (checkpoint + experiment-log
+entry) or discard (**rewind to the pre-experiment checkpoint ref** — the
+Phase 7 machinery is exactly the keep/discard primitive) → repeat within
+an iteration/wall-clock budget, session log persisted throughout. aivyx
+uniquely already owns every primitive this needs. The hard part is
+deliberate: unattended operation means no human at the permission modal,
+so the gate needs an explicit autonomous trust profile (edits confined to
+the worktree + only pre-approved commands, everything else denied) —
+a Phase-5-grade security design pass of its own, which is why this is
+last. Doubly attractive after Phase 10: an overnight loop is where
+llama-server's stability and explicit windows matter most.
+
 ## Notes on sequencing
 
 Phases 1-2 are deliberately reliability-first rather than feature-first: the
