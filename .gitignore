@@ -3,3 +3,6 @@
 .DS_Store
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Local model weights parked in-repo (never committed)
+/models/

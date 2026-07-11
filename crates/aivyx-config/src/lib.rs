@@ -36,6 +36,56 @@ pub struct Settings {
     pub sandbox: SandboxSettings,
     pub git: GitSettings,
     pub repo_map: RepoMapSettings,
+    pub council: CouncilSettings,
+}
+
+/// Council mode (`/council <question>`): the configured members each answer
+/// independently, anonymously rank each other's answers, and the chairman
+/// synthesizes a recommendation. Members never receive tools, so the
+/// feature adds no permission surface. Off until configured: fewer than two
+/// members or no chairman means `/council` explains how to enable itself
+/// instead of running.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CouncilSettings {
+    pub members: Vec<CouncilMember>,
+    /// Deliberately no "first member chairs" fallback — which model gets
+    /// the last word should always be an explicit choice.
+    pub chairman: Option<CouncilMember>,
+    /// Token budget for the conversation-tail digest each member sees
+    /// alongside the question.
+    pub tail_budget_tokens: u32,
+}
+
+impl Default for CouncilSettings {
+    fn default() -> Self {
+        Self {
+            members: Vec::new(),
+            chairman: None,
+            // Enough recent conversation for members to see what's being
+            // decided without re-serving the whole window to every model.
+            tail_budget_tokens: 3072,
+        }
+    }
+}
+
+impl CouncilSettings {
+    /// The council only convenes fully configured — a lone member has
+    /// nobody to be ranked against, and without a chairman nothing may
+    /// enter the agent's history (per the Phase 11a persistence decision).
+    pub fn configured(&self) -> bool {
+        self.members.len() >= 2 && self.chairman.is_some()
+    }
+}
+
+/// One council seat: any OpenAI-compatible local endpoint, so a council can
+/// mix Ollama-swapped models with a resident llama-server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CouncilMember {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +488,56 @@ mod tests {
     #[test]
     fn require_enforcement_defaults_to_true() {
         assert!(SandboxSettings::default().require_enforcement);
+    }
+
+    #[test]
+    fn council_absent_from_config_means_not_configured() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.council.configured());
+        assert_eq!(settings.council.tail_budget_tokens, 3072);
+    }
+
+    #[test]
+    fn council_block_parses_members_and_chairman() {
+        let raw = r#"
+            [council]
+            tail_budget_tokens = 2048
+            members = [
+                { base_url = "http://localhost:11434/v1", model = "qwen3.5:9b" },
+                { base_url = "http://localhost:8080/v1", model = "resident" },
+            ]
+            chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(settings.council.configured());
+        assert_eq!(settings.council.members.len(), 2);
+        assert_eq!(settings.council.members[1].model, "resident");
+        assert_eq!(
+            settings.council.chairman.as_ref().unwrap().model,
+            "qwen3.6:27b"
+        );
+        assert_eq!(settings.council.tail_budget_tokens, 2048);
+    }
+
+    #[test]
+    fn council_needs_two_members_and_a_chairman_to_convene() {
+        let one_member = r#"
+            [council]
+            members = [{ base_url = "http://localhost:11434/v1", model = "solo" }]
+            chairman = { base_url = "http://localhost:11434/v1", model = "chair" }
+        "#;
+        let settings: Settings = toml::from_str(one_member).unwrap();
+        assert!(!settings.council.configured());
+
+        let no_chairman = r#"
+            [council]
+            members = [
+                { base_url = "http://localhost:11434/v1", model = "a" },
+                { base_url = "http://localhost:11434/v1", model = "b" },
+            ]
+        "#;
+        let settings: Settings = toml::from_str(no_chairman).unwrap();
+        assert!(!settings.council.configured());
     }
 
     #[test]

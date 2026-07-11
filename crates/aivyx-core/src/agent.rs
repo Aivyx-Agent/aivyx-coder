@@ -33,6 +33,10 @@ pub enum AgentEvent {
     /// The task list changed during this turn (the model called
     /// `set_tasks`) — carries the full new list for the TUI's task panel.
     TasksUpdated(Vec<Task>),
+    /// One block of council-mode output (a stage banner, a member's answer
+    /// or ranking, the chairman's synthesis, or a failure note) — the whole
+    /// deliberation streams through these; see `council::convene`.
+    CouncilNote(String),
 }
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from
@@ -174,6 +178,9 @@ pub struct Agent {
     /// Monotonic id source for tool calls synthesized from SEARCH/REPLACE
     /// blocks — they need ids that can't collide with the backend's.
     synthetic_seq: u64,
+    /// `/council` support when configured; `None` makes the command explain
+    /// how to enable itself instead of running.
+    council: Option<crate::council::Council>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -208,8 +215,16 @@ impl Agent {
             repo_map_text: None,
             edit_format: config.edit_format,
             synthetic_seq: 0,
+            council: None,
             events_tx,
         }
+    }
+
+    /// Enables `/council` (Phase 11a). The caller builds the seats — each
+    /// is any `LlmBackend`, typically Ollama-swapped models alongside the
+    /// resident daily driver.
+    pub fn set_council(&mut self, council: crate::council::Council) {
+        self.council = Some(council);
     }
 
     /// Enables the repository map: rendered per turn, appended to the
@@ -372,9 +387,69 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
-        let result = self.run_turn_inner(user_input, cwd, cancellation).await;
+        // Commands are intercepted here, before the input can enter LLM
+        // history — the raw `/council …` text is an instruction to aivyx,
+        // not part of the conversation the model should see.
+        let result = match crate::council::parse_command(&user_input) {
+            Some(subject) => {
+                let subject = subject.to_string();
+                self.run_council_turn(&subject, cancellation).await
+            }
+            None => self.run_turn_inner(user_input, cwd, cancellation).await,
+        };
         self.persist();
         result
+    }
+
+    /// Runs `/council`: convenes the configured council on `subject_arg`
+    /// (or on the last assistant message when bare), streams the whole
+    /// deliberation as `CouncilNote` events, and pushes only the chairman's
+    /// synthesis to history. Council failures are transcript notes, not
+    /// `AgentError`s — a failed second opinion must not look like a failed
+    /// turn.
+    async fn run_council_turn(
+        &mut self,
+        subject_arg: &str,
+        cancellation: CancellationToken,
+    ) -> Result<(), AgentError> {
+        let Some(council) = &self.council else {
+            self.emit(AgentEvent::CouncilNote(
+                "no council is configured — add at least two [council] members and a \
+                 chairman to config.toml (see the README's Council section)"
+                    .to_string(),
+            ));
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        };
+
+        let subject = if subject_arg.is_empty() {
+            match crate::council::last_assistant_text(&self.history) {
+                Some(text) => text,
+                None => {
+                    self.emit(AgentEvent::CouncilNote(
+                        "bare /council reviews the last assistant message, but there \
+                         isn't one yet — use /council <question> instead"
+                            .to_string(),
+                    ));
+                    self.emit(AgentEvent::TurnComplete);
+                    return Ok(());
+                }
+            }
+        } else {
+            subject_arg.to_string()
+        };
+
+        let budget_chars = (council.tail_budget_tokens as f64 * self.chars_per_token) as usize;
+        let digest = crate::council::tail_digest(&self.history, budget_chars);
+
+        let entry =
+            crate::council::convene(council, &subject, digest, &self.events_tx, &cancellation)
+                .await;
+        if let Some(message) = entry {
+            self.history.push(message);
+        }
+        self.emit(AgentEvent::TurnComplete);
+        Ok(())
     }
 
     /// Runs one user turn: sends the request, streams the response live via
@@ -1667,5 +1742,250 @@ mod tests {
         assert_eq!(agent.history.len(), 2);
         assert!(!agent.history_truncated);
         assert!(drain(&mut rx).is_empty());
+    }
+
+    // ----- council mode (Phase 11a) -----
+
+    fn council_seat(
+        model: &str,
+        responses: Vec<Vec<StreamEvent>>,
+    ) -> (crate::council::CouncilSeat, Arc<MockBackend>) {
+        let mock = Arc::new(MockBackend::new(responses));
+        (
+            crate::council::CouncilSeat {
+                model: model.to_string(),
+                backend: mock.clone(),
+            },
+            mock,
+        )
+    }
+
+    fn council_notes(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CouncilNote(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Long enough to clear MIN_ANSWER_CHARS in council.rs.
+    const ANSWER_A: &str = "Use tabs: accessibility tooling respects tab width settings.";
+    const ANSWER_B: &str = "Use spaces: rendering is identical everywhere, zero ambiguity.";
+    const RANKING: &str = "1. Advisor A — more concrete\n2. Advisor B — weaker rationale";
+    const SYNTHESIS: &str = "Recommendation: adopt spaces, matching the dominant ecosystem.";
+
+    #[tokio::test]
+    async fn council_command_without_configuration_notes_and_ends_the_turn() {
+        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+
+        agent
+            .run_turn(
+                "/council tabs or spaces?".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            council_notes(&events)
+                .iter()
+                .any(|n| n.contains("no council is configured"))
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(agent.history.is_empty(), "command must not enter history");
+        assert!(
+            main_mock.received.lock().unwrap().is_empty(),
+            "no LLM request may be made without a council"
+        );
+    }
+
+    #[tokio::test]
+    async fn council_runs_the_protocol_and_pushes_only_the_synthesis() {
+        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+        // Each member answers (stage 1), then ranks (stage 2).
+        let (seat_a, mock_a) = council_seat(
+            "model-a",
+            vec![text_response(ANSWER_A), text_response(RANKING)],
+        );
+        let (seat_b, _) = council_seat(
+            "model-b",
+            vec![text_response(ANSWER_B), text_response(RANKING)],
+        );
+        let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+        agent.set_council(crate::council::Council {
+            members: vec![seat_a, seat_b],
+            chairman: chair,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/council tabs or spaces?".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Only the chairman's synthesis enters history, as a marked
+        // user-role message; the raw command text never does.
+        assert_eq!(agent.history.len(), 1);
+        let entry = &agent.history[0];
+        assert_eq!(entry.role, Role::User);
+        let text = entry.text_content();
+        assert!(text.contains("[Council synthesis"));
+        assert!(text.contains(SYNTHESIS));
+        assert!(text.contains("model-chair"));
+        assert!(!text.contains("/council"));
+
+        // The whole deliberation streamed as notes.
+        let events = drain(&mut rx);
+        let notes = council_notes(&events);
+        assert!(notes.iter().any(|n| n.contains(ANSWER_A)));
+        assert!(notes.iter().any(|n| n.contains(ANSWER_B)));
+        assert!(notes.iter().any(|n| n.contains(RANKING)));
+        assert!(notes.iter().any(|n| n.contains(SYNTHESIS)));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+
+        // Members were asked twice (answer, rank), toollessly, with the
+        // advisor prompt; the agent's own backend was never touched.
+        let member_requests = mock_a.received.lock().unwrap();
+        assert_eq!(member_requests.len(), 2);
+        assert!(member_requests.iter().all(|r| r.tools.is_empty()));
+        assert!(member_requests[0].messages[0].text_content().contains("advisor"));
+        assert!(
+            member_requests[0].messages[1]
+                .text_content()
+                .contains("tabs or spaces?")
+        );
+        assert_eq!(chair_mock.received.lock().unwrap().len(), 1);
+        assert!(main_mock.received.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn council_below_quorum_leaves_no_history_entry() {
+        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+        // One usable answer, one empty (e.g. an all-thinking response).
+        let (seat_a, _) = council_seat("model-a", vec![text_response(ANSWER_A)]);
+        let (seat_b, _) = council_seat("model-b", vec![text_response("")]);
+        let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+        agent.set_council(crate::council::Council {
+            members: vec![seat_a, seat_b],
+            chairman: chair,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/council anything".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(agent.history.is_empty());
+        assert!(
+            chair_mock.received.lock().unwrap().is_empty(),
+            "an aborted council must not consult the chairman"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            council_notes(&events)
+                .iter()
+                .any(|n| n.contains("quorum"))
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    }
+
+    #[tokio::test]
+    async fn council_chairman_failure_leaves_no_history_entry() {
+        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+        let (seat_a, _) = council_seat(
+            "model-a",
+            vec![text_response(ANSWER_A), text_response(RANKING)],
+        );
+        let (seat_b, _) = council_seat(
+            "model-b",
+            vec![text_response(ANSWER_B), text_response(RANKING)],
+        );
+        let (chair, _) = council_seat("model-chair", vec![text_response("")]);
+        agent.set_council(crate::council::Council {
+            members: vec![seat_a, seat_b],
+            chairman: chair,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/council anything".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            agent.history.is_empty(),
+            "nothing unsynthesized may enter history"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            council_notes(&events)
+                .iter()
+                .any(|n| n.contains("no usable synthesis"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_council_reviews_the_last_assistant_message_with_a_digest() {
+        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+        agent.history.push(user_msg("should we rewrite the parser?"));
+        agent
+            .history
+            .push(assistant_msg("Plan: rewrite the parser with a PEG grammar."));
+        let (seat_a, mock_a) = council_seat(
+            "model-a",
+            vec![text_response(ANSWER_A), text_response(RANKING)],
+        );
+        let (seat_b, _) = council_seat(
+            "model-b",
+            vec![text_response(ANSWER_B), text_response(RANKING)],
+        );
+        let (chair, _) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+        agent.set_council(crate::council::Council {
+            members: vec![seat_a, seat_b],
+            chairman: chair,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/council".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let requests = mock_a.received.lock().unwrap();
+        let prompt = requests[0].messages[1].text_content();
+        assert!(
+            prompt.contains("PEG grammar"),
+            "bare /council must put the last assistant message before the council"
+        );
+        assert!(
+            prompt.contains("should we rewrite the parser?"),
+            "the conversation tail digest should accompany the question"
+        );
+        drop(requests);
+
+        // Synthesis landed on top of the existing history.
+        assert_eq!(agent.history.len(), 3);
+        drain(&mut rx);
     }
 }

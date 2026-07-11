@@ -189,6 +189,34 @@ WantedBy=default.target
 `allowed_commands` below); `run_shell` is always registered but every command
 still needs approval unless it exactly matches a pre-approved entry.
 
+## Council mode
+
+For hard design decisions, `/council <question>` puts the question to several
+local models at once (inspired by karpathy/llm-council, reinterpreted for
+local-only serving). Each configured member answers independently, the
+answers are anonymized and cross-ranked by the members themselves, and a
+chairman model synthesizes one recommendation. Bare `/council` convenes the
+council on the last assistant message — "review what you just proposed".
+
+- **Read-only by construction.** Members never receive tools, so a council
+  adds no permission surface and works identically in plan mode.
+- **Sequential on purpose.** One GPU: members run one at a time, and a
+  server like Ollama swaps models per request. A council trades minutes of
+  latency for a second (and third, and fourth) opinion — use it where that
+  trade is worth it.
+- **Only the synthesis persists.** The full deliberation renders in the
+  transcript; just the chairman's recommendation (with the identity reveal)
+  enters the conversation the model sees, so a council doesn't eat the
+  context window.
+- **Fails closed.** Members that error or answer emptily are skipped; fewer
+  than two usable answers aborts; if the chairman fails, nothing at all is
+  added to the conversation.
+
+Members see your question plus a token-budgeted digest of the recent
+conversation (`tail_budget_tokens`) — not your files, and not the repo map.
+Configure it with `[council]` (see below); unconfigured, `/council` just
+explains what it needs.
+
 ## Security model
 
 The agent assumes the LLM may be wrong or manipulated. Protection is layered —
@@ -329,6 +357,19 @@ checkpoints = true   # snapshot the worktree before every mutating tool call
 [repo_map]
 enabled = true       # append a ranked symbol map to the system prompt
 budget_tokens = 1024 # rough token budget the map may consume per request
+
+# /council — several local models answer, cross-rank, and a chairman
+# synthesizes. Off until at least two members AND a chairman are set. Any
+# OpenAI-compatible endpoint works per seat; with one GPU, pointing members
+# at Ollama (which swaps models per request) alongside a resident
+# llama-server daily driver is the intended shape.
+[council]
+tail_budget_tokens = 3072  # recent-conversation digest members see
+# members = [
+#   { base_url = "http://localhost:11434/v1", model = "qwen3.5:9b" },
+#   { base_url = "http://localhost:11434/v1", model = "ornith:9b" },
+# ]
+# chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
 ```
 
 ## Known limitations

@@ -706,16 +706,8 @@ security surface). None started; each wants its own design pass first.
 **11a — Council mode** (inspiration: karpathy/llm-council — multiple
 models answer, anonymously cross-rank, a chairman synthesizes; upstream
 uses OpenRouter/cloud). *Our interpretation, local-only*: a `/council
-<question>` TUI command for hard design decisions — the question plus
-relevant context goes to N configured **local** models (each just another
-`OpenAiCompatBackend`; sequential execution because one GPU, which Ollama's
-model-swapping serves fine even when the daily driver is llama-server),
-responses anonymized, each model ranks the others, the configured chairman
-(e.g. `qwen3.6:27b`) synthesizes into the transcript. Read-only by
-construction — council members get no tools — so it's plan-mode-native:
-exactly where a second opinion on a plan is worth the latency. Config:
-`[council] models = [...], chairman = "..."`. The hardware already fits:
-four local models are pulled and idle.
+<question>` TUI command for hard design decisions. Design pass complete
+and signed off — see the Phase 11a section below.
 
 **11b — Agent-maintained codebase wiki** (inspiration:
 langchain-ai/openwiki — a CLI that writes and maintains agent-facing repo
@@ -745,6 +737,98 @@ the worktree + only pre-approved commands, everything else denied) —
 a Phase-5-grade security design pass of its own, which is why this is
 last. Doubly attractive after Phase 10: an overnight loop is where
 llama-server's stability and explicit windows matter most.
+
+### Phase 11a — Council mode (designed + signed off 2026-07-11)
+
+Multiple local models independently answer a hard question, anonymously
+cross-rank each other's answers, and a chairman model synthesizes a
+recommendation into the conversation. Read-only by construction: council
+members receive **no tools**, so the feature is equally safe in normal
+and plan mode and adds zero permission-gate surface.
+
+Four design forks were put to the user and resolved (all on the
+recommended option):
+
+1. **Invocation — `/council` command only.** `/council <question>` works
+   in any mode; bare `/council` convenes the council on the last
+   assistant message (the "review this plan" ergonomic). No automatic
+   plan-mode offers in v1 — surface stays minimal, and the command is
+   intercepted in the agent loop *before* a normal turn starts, so the
+   raw command text never enters LLM history.
+2. **Membership — small members, big chairman, no service juggling.**
+   Default council: the pulled 9B-class models via Ollama's
+   swap-per-request (they fit alongside the resident llama-server daily
+   driver); chairman `qwen3.6:27b` via Ollama, accepting partial-CPU-
+   offload latency for its one synthesis call. Explicitly rejected: GPU
+   handover (stopping llama-server mid-council is stateful and
+   failure-prone — a crash leaves the daily driver down). A council is a
+   deliberately latency-tolerant feature; correctness of the deliberation
+   beats turn speed.
+3. **Context — question + token-budgeted conversation tail.** Members
+   see the question plus a bounded digest of the recent conversation
+   (`tail_budget_tokens`, default ~3k), built with the Phase 8
+   self-calibrating estimator. Not the repo map (N models × map tokens
+   per swap-in) and not the full history.
+4. **Persistence — synthesis only enters LLM history.** The full
+   deliberation (every answer, every ranking, the reveal table) renders
+   live in the TUI transcript; only the chairman's synthesis — as a
+   clearly-delimited user-role message with the anonymization reveal
+   appended — is pushed to history, so it survives resume and compaction
+   without a single council eating half a 16k window.
+
+**Protocol** (all stages sequential — one GPU):
+- *Stage 1, answers*: each member gets a shared advisor system prompt +
+  the tail digest + the question; plain `stream_chat`, no tools, text
+  collected (any literal `<think>…</think>` spans stripped defensively).
+- *Stage 2, ranking*: answers are shuffled (std `RandomState` hash
+  ordering — no new dependency) and labeled Advisor A/B/C…; each member
+  ranks all answers with one-line justifications. Anonymity is for the
+  models (no brand favoritism), not the user — the TUI shows real names
+  as each model runs.
+- *Stage 3, synthesis*: the chairman gets question + anonymized answers
+  + rankings and produces the final recommendation.
+
+**Failure handling** (fail closed, degrade loudly): a member that errors
+or times out is skipped with a transcript note; quorum is 2 collected
+answers, below which the council aborts with no history entry. A chairman
+failure also means **no history entry** — the raw deliberation stays
+visible in the transcript, but nothing unsynthesized is fed back to the
+agent. Ctrl+C cancels cleanly via the same `CancellationToken` as a
+normal turn. Council backends are built with a longer idle timeout than
+the interactive default (60s), because a cold Ollama load of a 17 GB
+chairman can exceed 60s before the first token.
+
+**Config** (`[council]`, absent = feature off — the command then explains
+how to enable it):
+
+```toml
+[council]
+members = [
+  { base_url = "http://localhost:11434/v1", model = "qwen3.5:9b" },
+  { base_url = "http://localhost:11434/v1", model = "ornith:9b" },
+  { base_url = "http://localhost:11434/v1", model = "lfm2.5" },
+]
+chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
+tail_budget_tokens = 3072
+```
+
+Each entry is just another `OpenAiCompatBackend` — the Phase 10 lesson
+that the generic `/v1` design needs zero per-provider code is what makes
+a mixed llama-server/Ollama council free.
+
+**Built + live-verified (2026-07-12).** 171 workspace tests (13 new:
+protocol, quorum, chairman-failure, bare-`/council`, anonymization,
+digest budgeting), clippy clean. Live E2E through the real TUI against
+Ollama with the design's exact membership: three member answers in
+25–52s each (swap-per-request as predicted), cross-rankings, and the
+qwen3.6:27b chairman synthesis — with llama-server not yet resident the
+chairman ran fully on-GPU. Verified at the session-file level: exactly
+one history entry (the marked synthesis), the raw `/council` command
+absent, and a `--resume` follow-up turn on the main backend correctly
+answering from the synthesis. One harness lesson re-learned: raw pty
+capture of ratatui output garbles wrapped lines under cell-level
+redraws — assert on the persisted session file, not the screen, when
+the claim is about history.
 
 ## Notes on sequencing
 

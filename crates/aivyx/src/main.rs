@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aivyx_config::Settings;
-use aivyx_core::{Agent, AgentConfig, EditFormat, session};
+use aivyx_core::{Agent, AgentConfig, Council, CouncilSeat, EditFormat, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
@@ -18,6 +18,11 @@ use tracing_subscriber::EnvFilter;
 /// Applied when an `allowed_commands` entry doesn't set its own
 /// `timeout_secs`.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+
+/// Council seats tolerate silence far longer than the interactive backend:
+/// an Ollama-swapped member may cold-load tens of GB (possibly partially
+/// into CPU RAM) before its first token.
+const COUNCIL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 const SYSTEM_PROMPT_PREAMBLE: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
 Mutating actions show the user an approval prompt automatically when you call the tool — briefly say \
@@ -265,6 +270,30 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
             settings.repo_map.budget_tokens,
         );
+    }
+
+    // `/council` needs ≥2 members and a chairman; anything less and the
+    // command explains itself instead (the agent handles the None case).
+    if settings.council.configured() {
+        let seat = |member: &aivyx_config::CouncilMember| CouncilSeat {
+            model: member.model.clone(),
+            backend: Arc::new(OpenAiCompatBackend::with_idle_timeout(
+                member.base_url.clone(),
+                member.model.clone(),
+                member.api_key.clone(),
+                COUNCIL_IDLE_TIMEOUT,
+            )),
+        };
+        let chairman = settings
+            .council
+            .chairman
+            .as_ref()
+            .expect("configured() guarantees a chairman");
+        agent.set_council(Council {
+            members: settings.council.members.iter().map(seat).collect(),
+            chairman: seat(chairman),
+            tail_budget_tokens: settings.council.tail_budget_tokens,
+        });
     }
 
     // Persistence is always on (it's what makes `--resume` possible after a

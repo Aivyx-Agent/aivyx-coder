@@ -28,6 +28,10 @@ enum ChatLine {
     ToolCall(String),
     ToolResult(String),
     Notice(String),
+    /// One block of `/council` deliberation output — visually distinct from
+    /// both the assistant and error notices, since a council's members are
+    /// not "aivyx" and their notes are not failures.
+    Council(String),
 }
 
 /// Owns the ratatui render loop. Takes an already-constructed `Agent` (the
@@ -238,6 +242,9 @@ impl App {
             }
             AgentEvent::TasksUpdated(tasks) => {
                 self.tasks = tasks;
+            }
+            AgentEvent::CouncilNote(text) => {
+                self.transcript.push(ChatLine::Council(text));
             }
         }
     }
@@ -563,6 +570,9 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             "  ! ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        ChatLine::Council(text) => {
+            prefixed_lines(text, "council> ", Style::default().fg(Color::Magenta))
+        }
     }
 }
 

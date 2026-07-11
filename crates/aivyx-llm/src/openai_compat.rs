@@ -38,6 +38,7 @@ pub struct OpenAiCompatBackend {
     model: String,
     api_key: Option<String>,
     http: reqwest::Client,
+    idle_timeout: Duration,
     debug_log: Option<Arc<Mutex<std::fs::File>>>,
 }
 
@@ -47,6 +48,19 @@ impl OpenAiCompatBackend {
         model: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        Self::with_idle_timeout(base_url, model, api_key, IDLE_TIMEOUT)
+    }
+
+    /// Like `new`, but with a caller-chosen silence tolerance. Council
+    /// seats use this: a swapped-in Ollama model that has to cold-load
+    /// tens of GB (possibly partially into CPU RAM) can legitimately take
+    /// past the interactive default before its first token.
+    pub fn with_idle_timeout(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // Bounds the gap `connect_timeout` and the SSE idle-timeout
@@ -54,7 +68,7 @@ impl OpenAiCompatBackend {
             // but never sends so much as a status line. Resets on every
             // successful read, so it never caps a legitimately long
             // generation — only true silence.
-            .read_timeout(IDLE_TIMEOUT)
+            .read_timeout(idle_timeout)
             .build()
             .expect("failed to build the HTTP client");
 
@@ -63,6 +77,7 @@ impl OpenAiCompatBackend {
             model: model.into(),
             api_key,
             http,
+            idle_timeout,
             debug_log: debug_log_from_env(),
         }
     }
@@ -139,8 +154,10 @@ impl LlmBackend for OpenAiCompatBackend {
         // `reqwest::Client::timeout`) means a slow-but-alive local model
         // can stream for as long as it needs to, while a truly hung
         // connection still gets caught.
-        let sse_stream =
-            tokio_stream::StreamExt::timeout(response.bytes_stream().eventsource(), IDLE_TIMEOUT);
+        let sse_stream = tokio_stream::StreamExt::timeout(
+            response.bytes_stream().eventsource(),
+            self.idle_timeout,
+        );
 
         let debug_log = self.debug_log.clone();
         let stream = sse_stream
