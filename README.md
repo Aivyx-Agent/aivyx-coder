@@ -117,7 +117,8 @@ exist when `-c` is on the command line:
 ```
 llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
   -c 16384 -ngl 99 --jinja --cache-reuse 256 \
-  --temp 1.0 --top-k 20 --top-p 0.95 --presence-penalty 1.5 \
+  --chat-template-kwargs '{"enable_thinking": false}' \
+  --temp 0.7 --top-k 20 --top-p 0.8 --presence-penalty 1.5 \
   --host 127.0.0.1 --port 8080
 ```
 
@@ -128,12 +129,22 @@ llama-server's `/props` and confirms the served window.
 
 **Sampling does not migrate from Ollama.** Ollama applies the Modelfile's
 sampling parameters server-side; llama-server uses its own generic
-defaults instead — and reasoning models are sensitive to this. Measured
-here: qwen3.5 without its recommended `--presence-penalty 1.5` fell into
-90-second reasoning loops that ended turns without acting, on tasks the
-same model handled in seconds under Ollama. Always pass the model
-family's recommended sampling flags (the values above are Qwen's; check
-your model's card — `ollama show <model>` lists what Ollama was using).
+defaults instead — and reasoning models are sensitive to this. Always
+pass the model family's recommended sampling flags (the values above are
+Qwen's non-thinking set; `ollama show <model>` lists what Ollama used).
+
+**Disable thinking for agent work.** Measured here: qwen3.5 on
+continuation turns (after a tool result) emits its next tool call *inside
+an unclosed think block*; llama-server's reasoning parser then classifies
+the entire action as `reasoning_content` and the turn ends having done
+nothing — and the same happens to prompted SEARCH/REPLACE blocks, so no
+edit format escapes it. `--reasoning-budget 0` is inert on templates
+without `enable_thinking` support; the switch that works is
+`--chat-template-kwargs '{"enable_thinking": false}'`. With thinking
+disabled, the aivyx edit benchmark went from 0/3 on affected tasks to
+9/9 overall at ~2s per edit — thinking buys nothing for tool-driving on
+this model class and costs both latency and, on llama-server, silent
+no-op turns.
 
 Prefer GGUFs from HuggingFace (`-hf repo:QUANT` downloads and caches
 them). Reusing Ollama's blob files directly (`ollama show --modelfile`
@@ -151,7 +162,8 @@ Description=llama-server for aivyx
 ExecStart=/home/you/Projects/llama.cpp/build/bin/llama-server \
   -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M -c 16384 -ngl 99 \
   --jinja --cache-reuse 256 \
-  --temp 1.0 --top-k 20 --top-p 0.95 --presence-penalty 1.5 \
+  --chat-template-kwargs '{"enable_thinking": false}' \
+  --temp 0.7 --top-k 20 --top-p 0.8 --presence-penalty 1.5 \
   --host 127.0.0.1 --port 8080
 Restart=on-failure
 [Install]

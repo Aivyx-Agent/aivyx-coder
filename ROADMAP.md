@@ -674,11 +674,28 @@ verification, all documented in README's Serving section:
 2. **Tool-call parsing is per-model-template**: verify per model, don't
    assume — the git E2E is the acceptance test for it.
 3. **Sampling does not migrate**: Ollama applies Modelfile sampling
-   server-side; llama-server uses generic defaults — qwen3.5 without its
-   recommended `--presence-penalty 1.5` fell into 90s reasoning loops
-   that ended turns without acting (diagnosed via a direct non-streaming
-   repro that exonerated the chat template). First A5 attempt caught
-   this; the corrected-sampling rerun is in flight.
+   server-side; llama-server uses generic defaults — carry the model
+   family's recommended flags across.
+4. **Reasoning models emit tool calls inside unclosed think blocks** on
+   continuation turns — llama-server's reasoning parser then classifies
+   the whole action as `reasoning_content` and the turn ends as a silent
+   no-op. Confirmed format-agnostic: prompted SEARCH/REPLACE blocks
+   vanish identically, independently corroborating Phase 2's
+   format-doesn't-matter verdict. `--reasoning-budget 0` is inert on
+   templates without `enable_thinking` support; the working switch is
+   `--chat-template-kwargs '{"enable_thinking": false}'` (verified at the
+   wire: 0 reasoning chunks, clean tool_calls deltas).
+
+**A5 verdict (attempt 4, thinking disabled, 3 tasks × 3 reps per format):
+native 9/9 — every task first-try, single-approval, ~2s each, 19.2s total.
+Prompted 6/9 (305s).** Against Ollama's best round (native 7/9, 221s),
+correctly-configured llama-server is both perfect on this benchmark and
+~10× faster — the serving configuration, not the model and not the edit
+format, was the dominant reliability variable all along. It took four
+serving-layer bugs to get here, and every one was found by the A/B harness
+acting as an acceptance test rather than by reading documentation. Phase
+2's native default is re-confirmed decisively (9/9 vs 6/9 under identical,
+finally-honest conditions). Part A complete.
 
 ### Phase 11 — Candidate directions (scoped 2026-07-11, user-proposed)
 
