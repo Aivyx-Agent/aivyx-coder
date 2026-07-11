@@ -15,15 +15,17 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+mod checkpoint;
 mod diff;
 mod path_resolve;
 mod process;
 mod tools;
 
+pub use checkpoint::GitCheckpointer;
 pub use process::CommandSpec;
 pub use tools::{
-    EditFileTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool,
-    WriteFileTool,
+    EditFileTool, GitCommitTool, GitReadTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool,
+    RunShellTool, SetTasksTool, WriteFileTool,
 };
 
 #[derive(Debug, Error)]
@@ -117,6 +119,10 @@ pub struct ToolExecutor {
     registry: ToolRegistry,
     gate: Arc<dyn PermissionGate>,
     confiner: Arc<dyn ExecutionConfiner>,
+    /// When set, the worktree is snapshotted before every mutating tool
+    /// call (see `checkpoint.rs`). `None` = disabled (config, or not a
+    /// git repository).
+    checkpointer: Option<Arc<GitCheckpointer>>,
 }
 
 impl ToolExecutor {
@@ -129,7 +135,12 @@ impl ToolExecutor {
             registry,
             gate,
             confiner,
+            checkpointer: None,
         }
+    }
+
+    pub fn set_checkpointer(&mut self, checkpointer: Arc<GitCheckpointer>) {
+        self.checkpointer = Some(checkpointer);
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -181,6 +192,16 @@ impl ToolExecutor {
             }
         }
 
+        // Snapshot the worktree before anything that can mutate outside the
+        // session — after the gate (denied calls change nothing worth
+        // checkpointing), before the effect. Best-effort: a failed
+        // checkpoint logs and the call proceeds.
+        if tool.mutates_outside_session()
+            && let Some(checkpointer) = &self.checkpointer
+        {
+            checkpointer.checkpoint(&call.name, &cancellation).await;
+        }
+
         let ctx = ToolExecutionContext {
             cwd: cwd.to_path_buf(),
             confiner: Arc::clone(&self.confiner),
@@ -210,6 +231,8 @@ mod tests {
         registry.register(Arc::new(GlobTool::new(vec![])));
         registry.register(Arc::new(RunShellTool));
         registry.register(Arc::new(SetTasksTool::new(Arc::default())));
+        registry.register(Arc::new(GitReadTool::new(vec![])));
+        registry.register(Arc::new(GitCommitTool::new(vec![])));
 
         let all: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
         let plan: Vec<String> = registry
@@ -218,7 +241,95 @@ mod tests {
             .map(|d| d.name)
             .collect();
 
-        assert_eq!(all.len(), 7);
-        assert_eq!(plan, vec!["read_file", "grep", "glob", "set_tasks"]);
+        assert_eq!(all.len(), 9);
+        assert_eq!(
+            plan,
+            vec!["read_file", "grep", "glob", "set_tasks", "git_read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_checkpoints_before_mutating_tools_only() {
+        use crate::checkpoint::test_support::{git, init_repo};
+        use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+        struct AllowAll;
+        #[async_trait]
+        impl PermissionGate for AllowAll {
+            async fn check(&self, _r: &PermissionRequest) -> PermissionDecision {
+                PermissionDecision::Allow
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        let mut executor = ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner));
+        executor.set_checkpointer(Arc::new(
+            GitCheckpointer::detect(&cwd, vec![]).await.unwrap(),
+        ));
+
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            id: ToolCallId("c".to_string()),
+            name: name.to_string(),
+            arguments: args,
+            source: ToolCallSource::Native,
+        };
+        async fn count_refs(dir: &std::path::Path) -> usize {
+            let out = tokio::process::Command::new("git")
+                .args(["for-each-ref", "refs/aivyx/checkpoints/"])
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        }
+
+        // A read dispatch: no checkpoint.
+        executor
+            .dispatch(
+                call("read_file", serde_json::json!({ "path": "tracked.txt" })),
+                &cwd,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(count_refs(&cwd).await, 0);
+
+        // A write dispatch: exactly one checkpoint, taken BEFORE the write
+        // (the snapshot holds the pre-write content).
+        executor
+            .dispatch(
+                call(
+                    "write_file",
+                    serde_json::json!({ "path": "tracked.txt", "content": "overwritten\n" }),
+                ),
+                &cwd,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(count_refs(&cwd).await, 1);
+        let ref_name = git(
+            &cwd,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/aivyx/checkpoints/",
+            ],
+        )
+        .await;
+        let snapshot = git(&cwd, &["show", &format!("{}:tracked.txt", ref_name.trim())]).await;
+        assert_eq!(snapshot, "v1\n", "checkpoint must hold pre-write content");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "overwritten\n"
+        );
     }
 }

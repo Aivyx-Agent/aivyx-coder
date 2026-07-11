@@ -38,7 +38,17 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const DEFAULT_READ_PATHS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
 /// Home-relative toolchain paths, joined against `$HOME` when set.
-const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup"];
+/// `.gitconfig`/`.config/git` matter beyond convenience: `git commit` needs
+/// the user's identity from global config, and git treats an *unreadable*
+/// (EACCES) existing config file as fatal — so without these grants every
+/// confined `git` invocation on a machine with a global config would die.
+const DEFAULT_HOME_READ_PATHS: &[&str] = &[".cargo", ".rustup", ".gitconfig", ".config/git"];
+
+/// Harmless character devices granted read+write. `/dev` is deliberately
+/// NOT granted wholesale (block devices, other users' ttys); but without at
+/// least `/dev/null` every shell construct like `2>/dev/null` dies with
+/// EACCES under the sandbox — a live-E2E finding, not a hypothetical.
+const DEVICE_RW_PATHS: &[&str] = &["/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"];
 
 /// Syscalls with no legitimate use in a coding agent's shell commands,
 /// blocked regardless of what Landlock's filesystem scoping already
@@ -143,19 +153,26 @@ impl LandlockConfiner {
         }
         read_candidates.push(cwd.to_path_buf());
         read_candidates.extend(extra_read_paths.iter().cloned());
-        let read_paths: Vec<PathBuf> = read_candidates
+        let mut read_paths: Vec<PathBuf> = read_candidates
             .iter()
             .flat_map(|root| grant_paths_excluding(root, deny_paths))
             .collect();
+        // Read side of the device grants below (read and write rules are
+        // separate Landlock rule sets, so both lists need the entries).
+        read_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
         let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             write_candidates.push(PathBuf::from(tmpdir));
         }
-        let write_paths: Vec<PathBuf> = write_candidates
+        let mut write_paths: Vec<PathBuf> = write_candidates
             .iter()
             .flat_map(|root| grant_paths_excluding(root, deny_paths))
             .collect();
+        // Individual device files, not subject to deny_paths carve-outs
+        // (they're fixed, well-known, and content-free); `path_beneath_rules`
+        // silently skips any that don't exist.
+        write_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
         let seccomp_program = build_seccomp_filter();
 

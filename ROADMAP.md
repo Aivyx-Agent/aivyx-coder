@@ -225,7 +225,7 @@ strategy for small local context windows per the research (cheap, no server,
 degrades gracefully) — prioritize it over embeddings/RAG, which the field has
 moved away from for code specifically.
 
-### Phase 7 — Git integration and checkpointing
+### Phase 7 — Git integration and checkpointing — ✅ done
 A git-ops tool (status/diff/log/commit), shelling out to the `git` CLI to
 match the user's real config/credentials (consistent with this project's
 existing choice for tool-vs-library tradeoffs). Open design question worth
@@ -236,6 +236,94 @@ step-by-step rewind (Cline's approach — less invasive to the user's actual
 history). Given this project's emphasis on transparency over magic, auto-commit
 to the real repo is the more consistent default, but flag it for confirmation
 before building.
+
+#### Phase 7 design (agreed 2026-07-11)
+
+**The flagged fork resolved — checkpoint refs, not auto-commit.** The
+analysis moved off the original auto-commit lean: a fourth option gives the
+same audit trail and rewind capability without its costs. Before each
+approved mutating tool call, the worktree is snapshotted to a commit object
+stored under `refs/aivyx/checkpoints/<timestamp>` via plumbing (a private
+persistent index at `.git/aivyx/index` + `write-tree`/`commit-tree`/
+`update-ref`) — never touching HEAD, the user's index, or the worktree.
+Fully transparent (plain git objects, inspectable with
+`git log refs/aivyx/checkpoints/...`, restorable with `git checkout <ref>
+-- <path>`), zero pollution of deliberate branch history, no dirty-worktree
+policy needed. Auto-commit was rejected because it interleaves agent noise
+into the user's own commit discipline; the shadow repo because hidden state
+cuts against this project's transparency ethos. (User confirmed both this
+and the commit-tool question below.)
+
+**Checkpoint details:**
+- Trigger: in `ToolExecutor::dispatch`, after the gate allows and before
+  `Tool::execute`, for any tool with `mutates_outside_session() == true` —
+  so arbitrary `run_shell` effects are covered, not just file tools.
+- **Security-critical: checkpoints exclude `deny_paths`** via
+  `:(exclude)` pathspecs on the internal `git add -A`. Without this, a
+  denied subpath inside the worktree (which Landlock carves out of the
+  kernel sandbox) would get copied into readable `.git` objects — and
+  `git show <checkpoint>:<denied-file>` would read denied content straight
+  through the kernel sandbox. Gets its own regression test.
+- Checkpoint commits use a fixed synthetic identity (env-forced
+  author/committer), so they work on machines with no git identity
+  configured; `.gitignore` is respected (no `target/` snapshots).
+- Dedup (skip if the tree oid matches the previous checkpoint) and
+  retention (keep the newest 50 refs, delete older — objects then age out
+  via normal gc). Best-effort: a checkpoint failure logs a warning and
+  never blocks the tool; a non-repo cwd disables checkpointing at startup
+  with one log line. Config: `[git] checkpoints = true`.
+- Restore UX is deliberately v1-manual (documented git commands); a TUI
+  rewind can come later — the objects are just git.
+
+**Tools — two, not one, because plan mode's tool filtering is static:**
+- `git_read` (`mode: status|diff|log`, optional `path`/`staged`/`count`):
+  read-only, auto-allowed, **available in plan mode** — exactly when
+  status/diff matter most. Fixed argv shapes built by the tool
+  (`status --short --branch`, `diff [--cached] [-- <path>]`,
+  `log --oneline -n <count≤50>`); never raw passthrough. Path arguments are
+  resolved to absolute paths first (immune to option/pathspec-magic
+  injection) and covered by the gate's deny_paths check; status/diff also
+  exclude deny_paths via pathspecs so a repo-internal denied subpath's
+  contents/names don't leak into model context.
+- `git_commit` (`message`, optional `paths`): stages (`git add -A
+  [-- paths]`) then commits. `PermissionTarget::Command` with the real argv
+  — deliberately NOT a `Path` target, so an Always-Allow can never blanket-
+  approve future commits (each message is a distinct cache key). The modal
+  preview is `git diff HEAD --stat` plus the untracked-file list — the
+  reviewer sees what's being committed at file granularity.
+- Both run through the existing confined `process::run` path (timeouts,
+  output caps, process-group kill). The confiner's default home read grants
+  gain `.gitconfig` and `.config/git` — commit needs the user's identity,
+  and this also fixes latent `git` breakage under `run_shell`. GPG signing
+  and hooks needing paths outside the sandbox are documented limitations.
+
+**Not doing in v1:** TUI rewind/restore UI; push/pull/branch tools (network
++ far larger blast radius — later phase, if at all); auto-generated commit
+messages (the model writes the message in the tool call; with slow local
+inference, per-edit message generation would be a UX tax anyway).
+
+**Built (2026-07-11), as designed.** Live-verified end-to-end with
+`qwen3.5:9b`: `git_read` status with no modal, an approved `write_file`
+leaving a checkpoint ref that held the *pre*-edit content, and `git_commit`
+through the preview modal landing in `git log` with a clean worktree.
+Findings from the live E2E, all fixed en route:
+- **The sandbox never granted `/dev`** — every `2>/dev/null` in a confined
+  shell command died with EACCES, a latent Phase 5 gap no unit test caught.
+  Fixed by granting exactly `/dev/null`/`zero`/`urandom`/`random` (not
+  `/dev` wholesale).
+- **The system prompt induced narrate-instead-of-call**: "explain what
+  you're about to do before calling" made the small model explain and end
+  its turn waiting for permission in chat. Reworded to "say what you're
+  doing, then call the tool in the same response — the approval UI only
+  appears once you call." Also added a "prefer dedicated tools over
+  run_shell" steer after watching the model reach for `run_shell git ...`
+  despite `git_read` being available.
+- Test-harness lesson recorded for future E2Es: PTY screen-scrape matching
+  must be scoped per-turn (a pattern happily matches the *previous* turn's
+  modal or the echo of the typed prompt), and a stale binary from a
+  `cd`-affected `cargo build` cost one full debugging round — build from
+  the workspace root and `strings`-check the binary when tool lists look
+  impossible.
 
 ### Phase 8 — Agentic UX — ✅ done
 A hard **plan mode** (read-only enforced at the permission layer — trivial on

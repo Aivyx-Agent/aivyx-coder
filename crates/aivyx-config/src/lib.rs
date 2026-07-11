@@ -34,6 +34,24 @@ pub struct Settings {
     pub backend: BackendSettings,
     pub permissions: PermissionSettings,
     pub sandbox: SandboxSettings,
+    pub git: GitSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitSettings {
+    /// Snapshot the worktree to `refs/aivyx/checkpoints/*` before every
+    /// mutating tool call, so any agent change (including arbitrary
+    /// `run_shell` effects) can be rewound with plain git commands. Never
+    /// touches HEAD, the index, or the worktree; silently disabled when the
+    /// working directory isn't a git repository.
+    pub checkpoints: bool,
+}
+
+impl Default for GitSettings {
+    fn default() -> Self {
+        Self { checkpoints: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

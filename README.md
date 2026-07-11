@@ -36,6 +36,25 @@ below), the agent compacts: oversized tool results are elided to head+tail
 excerpts first, then the oldest turns are dropped — with a visible notice,
 never silently.
 
+**Worktree checkpoints**: when the working directory is a git repository,
+the agent snapshots the entire worktree to `refs/aivyx/checkpoints/<ts>`
+*before every mutating tool call* (file writes, edits, and any
+`run_command`/`run_shell` execution) — via plumbing that never touches your
+HEAD, index, or worktree, respecting `.gitignore`, deduplicating identical
+states, and keeping the newest 50. To inspect or rewind:
+
+```
+git for-each-ref refs/aivyx/checkpoints/          # list checkpoints
+git log --oneline <ref>                           # see one in context
+git diff <ref>                                    # what changed since it
+git checkout <ref> -- <path>                      # restore one file
+git checkout <ref> -- .                           # restore everything
+```
+
+Disable with `[git] checkpoints = false`. Checkpoints use a synthetic
+`aivyx` author identity and never appear in your branch history — deleting
+a ref is enough to let its objects age out via normal `git gc`.
+
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
 task list (the task panel becomes the reviewable plan), but tools that touch
@@ -71,6 +90,8 @@ with running commands).
 | `run_command` | run one of a fixed, configured allowlist by name | prompt / pre-approved |
 | `run_shell` | run an arbitrary `sh -c` command | prompt / pre-approved |
 | `set_tasks` | replace the agent's own task list (shown in the TUI) | none (internal state only) |
+| `git_read` | git status / diff / log (read-only, fixed argv shapes) | none (auto-allowed) |
+| `git_commit` | stage + commit, with your identity/hooks/config | prompt, with a change-summary preview |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command
@@ -201,6 +222,9 @@ max_tool_iterations_per_turn = 25
 [sandbox]
 require_enforcement = true
 extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
+
+[git]
+checkpoints = true   # snapshot the worktree before every mutating tool call
 ```
 
 ## Known limitations
@@ -233,6 +257,13 @@ Deliberately not (yet) addressed — documented rather than hidden:
 - **`Tool::execute` bypass**: the "all tool calls go through the permission
   gate" property is enforced by convention (the executor is the only caller),
   not by the type system.
+- **Git specifics**: `git_commit` (re)stages the paths it commits, so a
+  carefully staged partial hunk within those paths is staged in full (the
+  modal preview shows the full scope first). Commit signing (GPG/SSH) and
+  hooks that read paths outside the sandbox's grants will fail under
+  confinement. `git_read`'s status/diff exclude `deny_paths` via pathspecs,
+  but `log` shows committed history as-is — anything already committed is
+  considered yours to see.
 
 See `ROADMAP.md` for what's planned next (repo map, git integration, richer
 agentic UX) and the project's own audit history.

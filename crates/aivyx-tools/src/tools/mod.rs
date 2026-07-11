@@ -1,4 +1,6 @@
 mod edit_file;
+mod git_commit;
+mod git_read;
 mod glob;
 mod grep;
 mod read_file;
@@ -8,6 +10,8 @@ mod set_tasks;
 mod write_file;
 
 pub use edit_file::EditFileTool;
+pub use git_commit::GitCommitTool;
+pub use git_read::GitReadTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read_file::ReadFileTool;
