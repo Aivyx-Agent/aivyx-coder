@@ -1,12 +1,12 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
 use crate::{
-    ActionKind, PermissionDecision, PermissionGate, PermissionPrompter, PermissionRequest,
-    PermissionTarget, PlanMode, UserResponse, path_is_denied,
+    ActionKind, AutonomousMode, PermissionDecision, PermissionGate, PermissionPrompter,
+    PermissionRequest, PermissionTarget, PlanMode, UserResponse, path_is_denied,
 };
 
 /// Told to the model on a plan-mode denial. This is a backstop message: in
@@ -15,6 +15,16 @@ use crate::{
 const PLAN_MODE_DENIAL: &str = "plan mode is active — no file modifications or command execution \
 until the user approves the plan and switches to Act mode (Ctrl+P). Explore with the read/search \
 tools and record your plan with set_tasks instead.";
+
+/// Told to the model when an autonomous-mode edit/write target resolves
+/// outside the worktree it was launched in. Unlike every other denial
+/// reason in this gate, this one has no interactive-mode equivalent to
+/// point back to (autonomous mode has no confirmation modal for a human to
+/// reject it from) — see the "gap found during design" note in the Phase
+/// 11c design doc for why this check exists at all.
+const AUTONOMOUS_OUTSIDE_CWD_DENIAL: &str =
+    "target is outside the autonomous session's worktree boundary — file edits in \
+     autonomous mode are confined to the working directory the session was launched in.";
 
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
@@ -63,6 +73,8 @@ pub struct ConfirmationGate {
     prompter: Arc<dyn PermissionPrompter>,
     deny_paths: Vec<PathBuf>,
     plan_mode: PlanMode,
+    autonomous_mode: AutonomousMode,
+    cwd: PathBuf,
     always_allow: Mutex<HashSet<PermissionKey>>,
 }
 
@@ -81,6 +93,8 @@ impl ConfirmationGate {
         deny_paths: Vec<PathBuf>,
         pre_approved_commands: Vec<(String, Vec<String>)>,
         plan_mode: PlanMode,
+        autonomous_mode: AutonomousMode,
+        cwd: PathBuf,
     ) -> Self {
         let always_allow = pre_approved_commands
             .into_iter()
@@ -90,6 +104,8 @@ impl ConfirmationGate {
             prompter,
             deny_paths,
             plan_mode,
+            autonomous_mode,
+            cwd,
             always_allow: Mutex::new(always_allow),
         }
     }
@@ -99,6 +115,21 @@ impl ConfirmationGate {
             return false;
         };
         path_is_denied(path, &self.deny_paths)
+    }
+
+    /// The autonomous-mode edit boundary: a `Write`/`Delete` action on a
+    /// `Path` target is only in-scope if the resolved path is at-or-under
+    /// `cwd`. Only meaningful for autonomous mode — interactive mode relies
+    /// on a human seeing the target in the confirmation modal instead (see
+    /// the Phase 11c design doc's "gap found during design" section).
+    fn is_outside_autonomous_worktree(&self, request: &PermissionRequest, cwd: &Path) -> bool {
+        if !matches!(request.action, ActionKind::Write | ActionKind::Delete) {
+            return false;
+        }
+        let PermissionTarget::Path(path) = &request.target else {
+            return false;
+        };
+        !path.starts_with(cwd)
     }
 }
 
@@ -133,6 +164,62 @@ impl PermissionGate for ConfirmationGate {
                 "permission denied: plan mode is active"
             );
             return PermissionDecision::Deny(Some(PLAN_MODE_DENIAL.to_string()));
+        }
+
+        // Autonomous mode: resolve deterministically, never prompt (there is
+        // no human to prompt). Checked before the Always-Allow cache lookup
+        // below because the cwd-boundary check applies to Write/Delete
+        // targets that the cache path doesn't otherwise examine.
+        if self.autonomous_mode.active() {
+            if self.is_outside_autonomous_worktree(request, &self.cwd) {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "permission denied: outside the autonomous worktree boundary"
+                );
+                return PermissionDecision::Deny(Some(AUTONOMOUS_OUTSIDE_CWD_DENIAL.to_string()));
+            }
+            return match &request.target {
+                // Already passed the cwd-boundary check above (or wasn't a
+                // Write/Delete-on-Path at all, e.g. a Read/Internal target
+                // reaching here would be unusual since tier 2 already
+                // caught those — but Other targets like set_tasks's aren't
+                // Path/Command, so they fall here too and must be allowed).
+                PermissionTarget::Path(_) | PermissionTarget::Other(_) => {
+                    tracing::info!(
+                        tool = %request.tool_name,
+                        action = ?request.action,
+                        target = ?request.target,
+                        "permission allowed (autonomous mode, within worktree)"
+                    );
+                    PermissionDecision::Allow
+                }
+                PermissionTarget::Command { .. } => {
+                    let key = PermissionKey::from_request(request);
+                    if self.always_allow.lock().unwrap().contains(&key) {
+                        tracing::info!(
+                            tool = %request.tool_name,
+                            action = ?request.action,
+                            target = ?request.target,
+                            "permission allowed (autonomous mode, pre-approved)"
+                        );
+                        PermissionDecision::AllowAlways
+                    } else {
+                        tracing::warn!(
+                            tool = %request.tool_name,
+                            action = ?request.action,
+                            target = ?request.target,
+                            "permission denied: not pre-approved and autonomous mode never prompts"
+                        );
+                        PermissionDecision::Deny(Some(
+                            "not pre-approved, and autonomous mode has no one to prompt — add \
+                             this to [[permissions.allowed_commands]] if it should be allowed"
+                                .to_string(),
+                        ))
+                    }
+                }
+            };
         }
 
         let key = PermissionKey::from_request(request);
@@ -221,6 +308,8 @@ mod tests {
             vec![PathBuf::from("/home/user/.ssh")],
             vec![],
             PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
         );
 
         let decision = gate
@@ -237,7 +326,14 @@ mod tests {
             response: UserResponse::Deny,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], PlanMode::new());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         let decision = gate
             .check(&read_request("/home/user/project/src/main.rs"))
@@ -253,7 +349,14 @@ mod tests {
             response: UserResponse::Deny,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], PlanMode::new());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         let request = PermissionRequest {
             tool_name: "set_tasks".to_string(),
@@ -274,7 +377,14 @@ mod tests {
             response: UserResponse::AllowAlways,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], PlanMode::new());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         let first = gate.check(&write_request("/home/user/project/a.rs")).await;
         assert_eq!(first, PermissionDecision::AllowAlways);
@@ -309,6 +419,8 @@ mod tests {
             vec![PathBuf::from("/home/user/.ssh")],
             vec![],
             PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
         );
 
         let decision = gate
@@ -329,7 +441,14 @@ mod tests {
             response: UserResponse::AllowAlways,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], PlanMode::new());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         let test_request = PermissionRequest {
             tool_name: "run_command".to_string(),
@@ -376,6 +495,8 @@ mod tests {
             vec![],
             vec![("cargo".to_string(), vec!["test".to_string()])],
             PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
         );
 
         let request = PermissionRequest {
@@ -424,6 +545,8 @@ mod tests {
             vec![],
             vec![("cargo".to_string(), vec!["test".to_string()])],
             plan_mode.clone(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
         );
 
         // Cache a write approval while still in Act mode.
@@ -467,7 +590,14 @@ mod tests {
         });
         let plan_mode = PlanMode::new();
         plan_mode.set_active(true);
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], plan_mode);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode,
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         let read = gate.check(&read_request("/home/user/project/a.rs")).await;
         assert_eq!(read, PermissionDecision::Allow);
@@ -499,6 +629,8 @@ mod tests {
             vec![PathBuf::from("/home/user/.ssh")],
             vec![],
             plan_mode,
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
         );
 
         let decision = gate.check(&write_request("/home/user/.ssh/config")).await;
@@ -515,7 +647,14 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let plan_mode = PlanMode::new();
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], plan_mode.clone());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode.clone(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         gate.check(&write_request("/home/user/project/a.rs")).await;
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
@@ -542,11 +681,220 @@ mod tests {
             response: UserResponse::Deny,
             calls: AtomicUsize::new(0),
         });
-        let gate = ConfirmationGate::new(prompter.clone(), vec![], vec![], PlanMode::new());
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
 
         gate.check(&write_request("/home/user/project/a.rs")).await;
         gate.check(&write_request("/home/user/project/a.rs")).await;
 
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_allows_edits_inside_cwd() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/src/a.rs"))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_edits_outside_cwd() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/etc/passwd")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+        let decision = gate.check(&request).await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("cwd") || reason.contains("worktree"), "reason: {reason}");
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_allows_pre_approved_commands_only() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![("cargo".to_string(), vec!["test".to_string()])],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let approved = PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+        assert_eq!(gate.check(&approved).await, PermissionDecision::AllowAlways);
+
+        let not_approved = PermissionRequest {
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["publish".to_string()],
+            },
+            ..approved
+        };
+        assert!(matches!(
+            gate.check(&not_approved).await,
+            PermissionDecision::Deny(_)
+        ));
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never fall back to prompting for an unapproved command"
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_git_commit_with_no_special_casing() {
+        // git_commit's target is a unique commit message every time (Phase 7's
+        // design specifically to prevent blanket-approval), so it can never be
+        // in the Always-Allow cache — this is a regression test proving the
+        // denial falls out of that existing property, not code that could
+        // later be "simplified" away.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let request = PermissionRequest {
+            tool_name: "git_commit".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "git".to_string(),
+                args: vec!["commit".to_string(), "-m".to_string(), "anything".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+        assert!(matches!(gate.check(&request).await, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_still_wins_over_autonomous_mode_if_both_are_active() {
+        // Defense in depth: this is not an expected state (autonomous and
+        // plan mode are mutually exclusive at the CLI level, enforced in
+        // main.rs), but if it ever happened, the stricter mode must win.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode,
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/src/a.rs"))
+            .await;
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a plan-mode denial, got {decision:?}");
+        };
+        assert!(reason.contains("plan mode"));
+    }
+
+    #[tokio::test]
+    async fn deny_paths_still_wins_over_autonomous_mode() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/project/secret")],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/secret/key"))
+            .await;
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a deny_paths denial, got {decision:?}");
+        };
+        assert!(reason.contains("deny_paths"));
     }
 }
