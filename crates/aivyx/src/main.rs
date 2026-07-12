@@ -230,6 +230,11 @@ async fn main() -> anyhow::Result<()> {
     if cli.auto.is_some() && cli.resume {
         anyhow::bail!("--auto and --resume cannot be used together (not supported yet)");
     }
+    if let Some(goal) = cli.auto.as_deref()
+        && goal.trim().is_empty()
+    {
+        anyhow::bail!("--auto requires a non-empty goal");
+    }
     let autonomous_mode = AutonomousMode::new();
     autonomous_mode.set_active(cli.auto.is_some());
     // Auto-approving edits is only defensible because deterministic
@@ -258,10 +263,24 @@ async fn main() -> anyhow::Result<()> {
         settings.sandbox.require_enforcement,
     );
     let mut executor = ToolExecutor::new(registry, gate, confiner);
+    let mut has_checkpointer = false;
     if settings.git.checkpoints
         && let Some(checkpointer) = GitCheckpointer::detect(&cwd, deny_paths.clone()).await
     {
         executor.set_checkpointer(Arc::new(checkpointer));
+        has_checkpointer = true;
+    }
+    // The discard/rewind safety net on exhausted verification (the entire
+    // basis for auto-approving edits in `--auto`) depends on a checkpointer
+    // being present — without one, `Agent`'s discard/rewind logic degrades
+    // silently to "leave the broken edits in place and keep going," which
+    // is not a safe default for an unattended run. Refuse to start rather
+    // than run degraded, same as the verification-command check above.
+    if cli.auto.is_some() && !has_checkpointer {
+        anyhow::bail!(
+            "--auto requires a git worktree with checkpoints enabled ([git] checkpoints = true, \
+             the default) — the discard/rewind safety net on exhausted verification depends on it"
+        );
     }
     let edit_format = match cli.edit_format.as_deref() {
         Some("native") => EditFormat::Native,

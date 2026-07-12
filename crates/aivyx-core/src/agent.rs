@@ -327,6 +327,14 @@ impl Agent {
         self.last_turn_paused
     }
 
+    /// Sends an informational notice into the transcript without going through
+    /// a model turn — used by the autonomous driver to report why it stopped
+    /// (goal achieved, budget exhausted, cancelled), since none of those are
+    /// otherwise visible once the loop stops producing turns.
+    pub fn notify(&self, message: impl Into<String>) {
+        self.emit(AgentEvent::Error(message.into()));
+    }
+
     /// Enables `/council` (Phase 11a). The caller builds the seats — each
     /// is any `LlmBackend`, typically Ollama-swapped models alongside the
     /// resident daily driver.
@@ -1357,6 +1365,25 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    #[test]
+    fn notify_emits_an_error_event_with_the_given_message() {
+        // `notify` is the autonomous driver's only way to report why it
+        // stopped (goal achieved / budget exhausted / cancelled) — it must
+        // reach the same channel the TUI's render loop already drains into
+        // the transcript, via the existing `AgentEvent::Error` ->
+        // `ChatLine::Notice` mapping in `aivyx-tui`.
+        let (agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+
+        agent.notify("autonomous run stopped: goal achieved after 3 iteration(s)");
+
+        let events = drain(&mut rx);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::Error(message)]
+                if message == "autonomous run stopped: goal achieved after 3 iteration(s)"
+        ));
     }
 
     #[tokio::test]

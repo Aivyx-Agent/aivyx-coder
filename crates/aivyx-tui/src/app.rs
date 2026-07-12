@@ -46,6 +46,28 @@ fn next_autonomous_message(last_turn_paused: bool, tasks: &[Task]) -> Option<Str
     Some("continue working toward the goal".to_string())
 }
 
+/// The three driver stop reasons each get their own message-building
+/// function (rather than inlining `format!` at each `agent.notify(...)`
+/// call site) purely so the message *content* is unit-testable — the
+/// driver loop itself lives inside a spawned task in `run()` and isn't a
+/// pure function, so it can't be exercised directly in a unit test.
+fn budget_exhausted_notice(iterations_used: u32, tasks: &[Task]) -> String {
+    let done_count = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
+    format!(
+        "autonomous run stopped: budget exhausted after {iterations_used} iteration(s) \
+         ({done_count}/{} tasks done)",
+        tasks.len()
+    )
+}
+
+fn cancelled_notice(iterations_used: u32) -> String {
+    format!("autonomous run stopped: cancelled by user after {iterations_used} iteration(s)")
+}
+
+fn goal_achieved_notice(iterations_used: u32) -> String {
+    format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
+}
+
 enum ChatLine {
     User(String),
     Assistant(String),
@@ -104,6 +126,8 @@ pub async fn run(
             let mut next_message = Some(autonomous.goal.clone());
             while let Some(message) = next_message.take() {
                 if iterations_used >= autonomous.max_iterations || Instant::now() >= deadline {
+                    let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
+                    agent.notify(budget_exhausted_notice(iterations_used, &tasks_snapshot));
                     break;
                 }
                 iterations_used += 1;
@@ -115,10 +139,14 @@ pub async fn run(
                 if cancellation.is_cancelled() {
                     // The user hit Ctrl+C wanting this to stop — do not
                     // send another message.
+                    agent.notify(cancelled_notice(iterations_used));
                     break;
                 }
                 let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
                 next_message = next_autonomous_message(agent.last_turn_paused(), &tasks_snapshot);
+                if next_message.is_none() {
+                    agent.notify(goal_achieved_notice(iterations_used));
+                }
             }
         } else {
             while let Some(input) = input_rx.recv().await {
@@ -846,5 +874,46 @@ mod tests {
             Some("continue working toward the goal".to_string()),
             "no tasks ever set -> keep going until budget exhausts, not stuck forever"
         );
+    }
+
+    // The driver loop that actually calls `agent.notify(...)` lives inside a
+    // `tokio::spawn`ed closure in `run()`, driving a real `Agent` through
+    // `run_turn` — it isn't a pure function, and constructing a real `Agent`
+    // here would require pulling in `aivyx-llm` (for a mock `LlmBackend`)
+    // and `aivyx-tools` (for `ToolExecutor`), neither of which is a
+    // dependency of this crate today. So instead these tests pin down the
+    // three notice-message builders the loop calls at each stop point —
+    // together with `goal_achieved`/`next_autonomous_message` above (which
+    // already cover *when* each path fires), this is what's practically
+    // testable without adding new test-only dependencies for one call site
+    // each.
+
+    #[test]
+    fn budget_exhausted_notice_reports_iterations_and_task_progress() {
+        let tasks = vec![done_task(1), done_task(2), pending_task(3)];
+        let message = budget_exhausted_notice(5, &tasks);
+        assert!(message.contains("budget exhausted"));
+        assert!(message.contains('5'));
+        assert!(message.contains("2/3 tasks done"));
+    }
+
+    #[test]
+    fn budget_exhausted_notice_handles_no_tasks_ever_set() {
+        let message = budget_exhausted_notice(3, &[]);
+        assert!(message.contains("0/0 tasks done"));
+    }
+
+    #[test]
+    fn cancelled_notice_reports_iterations() {
+        let message = cancelled_notice(2);
+        assert!(message.contains("cancelled by user"));
+        assert!(message.contains('2'));
+    }
+
+    #[test]
+    fn goal_achieved_notice_reports_iterations() {
+        let message = goal_achieved_notice(4);
+        assert!(message.contains("goal achieved"));
+        assert!(message.contains('4'));
     }
 }

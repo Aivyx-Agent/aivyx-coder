@@ -889,8 +889,10 @@ Querying `Agent` directly after each `run_turn()` call is race-free by
 construction, no cross-task inference needed.
 
 22 new tests (199 total, up from 177): gate-tier ordering and cwd-boundary
-tests (including a symlink-escaping-cwd case, matching the existing
-`deny_paths` test's rigor) in `aivyx-sandbox`, a real-git discard/rewind
+tests in `aivyx-sandbox` (the boundary check relies on `path_resolve`'s
+pre-existing symlink-escape resolution, exercised by
+`symlink_escaping_cwd_does_not_resolve_to_a_path_under_cwd`, rather than
+adding new symlink-specific gate tests), a real-git discard/rewind
 fixture in `aivyx-tools`, tool-list filtering and the pause/rewind
 integration in `aivyx-core`, driver-logic unit tests in `aivyx-tui`. Four
 live E2E checks through the real binary (qwen3.5:9B via the
