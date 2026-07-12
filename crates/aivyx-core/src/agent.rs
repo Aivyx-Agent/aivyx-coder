@@ -262,6 +262,12 @@ pub struct Agent {
     /// `run_turn_inner`'s completion check) so the feature never silently
     /// disables itself for the rest of the session.
     verify_retries: u32,
+    /// The checkpoint ref taken right before the first unverified edit of
+    /// the current batch — the rewind target if verification exhausts its
+    /// retries in autonomous mode. `None` when there's no unverified batch
+    /// in flight, or once it's resolved (pass or rewind). Interactive mode
+    /// never reads this field. See ROADMAP.md Phase 11c.
+    pre_experiment_ref: Option<String>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -309,6 +315,7 @@ impl Agent {
             verification: None,
             unverified_edits: false,
             verify_retries: 0,
+            pre_experiment_ref: None,
             events_tx,
         }
     }
@@ -876,6 +883,7 @@ impl Agent {
                         if passed {
                             self.unverified_edits = false;
                             self.verify_retries = 0;
+                            self.pre_experiment_ref = None;
                             self.emit(AgentEvent::TurnComplete);
                             return Ok(());
                         }
@@ -883,20 +891,57 @@ impl Agent {
                         // again next iteration instead of ending here.
                         continue;
                     }
-                    // Retries exhausted for this round of edits: end the
-                    // turn anyway (never block TurnComplete — the Phase 12
-                    // Part B "loud notice, not a block" decision) but
-                    // reset the retry budget rather than silently
-                    // disabling verification for the rest of the session;
-                    // `unverified_edits` stays true so the very next
-                    // attempt to end a turn re-triggers this same check.
+                    // Retries exhausted for this round of edits. Interactive
+                    // mode: end the turn anyway (never block TurnComplete —
+                    // the Phase 12 Part B "loud notice, not a block"
+                    // decision) with the worktree left as-is for a human to
+                    // inspect. Autonomous mode: no human is coming, so
+                    // additionally discard — rewind to the pre-experiment
+                    // checkpoint (Phase 11c) so the loop's next attempt
+                    // starts from known-good state instead of building on
+                    // top of a broken one.
                     self.verify_retries = 0;
-                    self.emit(AgentEvent::Error(format!(
-                        "verification (`{}`) still failing after {} attempt(s) — ending the \
-                         turn anyway. The worktree was checkpointed before each edit; `git log \
-                         refs/aivyx/checkpoints/` to inspect or rewind.",
-                        verification.command_name, verification.max_retries
-                    )));
+                    if self.autonomous_mode.active()
+                        && let Some(pre_experiment_ref) = self.pre_experiment_ref.take()
+                    {
+                        match self
+                            .executor
+                            .restore_to_checkpoint(&pre_experiment_ref, &cancellation)
+                            .await
+                        {
+                            Ok(()) => {
+                                self.unverified_edits = false;
+                                self.emit(AgentEvent::Error(format!(
+                                    "verification (`{}`) still failing after {} attempt(s) — \
+                                     discarded this round of edits and restored the worktree to \
+                                     the pre-experiment checkpoint.",
+                                    verification.command_name, verification.max_retries
+                                )));
+                            }
+                            Err(err) => {
+                                // Rewind itself failed (e.g. a git error) —
+                                // fall back to interactive mode's behavior:
+                                // leave the state as-is and say so loudly,
+                                // rather than silently pretending the
+                                // discard happened.
+                                self.emit(AgentEvent::Error(format!(
+                                    "verification (`{}`) still failing after {} attempt(s), and \
+                                     the automatic discard/rewind itself failed ({err}) — ending \
+                                     the turn with the worktree left as-is. The worktree was \
+                                     checkpointed before each edit; `git log \
+                                     refs/aivyx/checkpoints/` to inspect or rewind manually.",
+                                    verification.command_name, verification.max_retries
+                                )));
+                            }
+                        }
+                    } else {
+                        self.emit(AgentEvent::Error(format!(
+                            "verification (`{}`) still failing after {} attempt(s) — ending the \
+                             turn anyway. The worktree was checkpointed before each edit; `git \
+                             log refs/aivyx/checkpoints/` to inspect or rewind.",
+                            verification.command_name, verification.max_retries
+                        )));
+                    }
                 }
 
                 self.emit(AgentEvent::TurnComplete);
@@ -939,12 +984,23 @@ impl Agent {
                 // name list prompted mode already hides edit tools behind,
                 // rather than a second hardcoded pair.
                 let is_edit_call = PROMPTED_EDIT_HIDDEN_TOOLS.contains(&call.name.as_str());
+                let was_already_unverified = self.unverified_edits;
                 let result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
                     .await;
                 if is_edit_call && matches!(result.output, ToolOutput::Ok(_)) {
                     self.unverified_edits = true;
+                    if self.autonomous_mode.active() && !was_already_unverified {
+                        // First edit of a new batch: the checkpoint dispatch
+                        // just took (ToolExecutor::dispatch checkpoints
+                        // before every mutating call) is exactly "state
+                        // right before this edit" — remember it as the
+                        // rewind target if this batch's verification never
+                        // passes.
+                        self.pre_experiment_ref =
+                            self.executor.latest_checkpoint_ref(&cancellation).await;
+                    }
                 }
                 self.emit(AgentEvent::ToolResult(result.clone()));
                 self.history.push(Message {
@@ -2022,6 +2078,105 @@ mod tests {
         let received = mock.received.lock().unwrap();
         let system = received[0].messages[0].text_content();
         assert!(system.contains("unattended"), "system prompt: {system}");
+    }
+
+    async fn init_git_repo(dir: &Path) {
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@test.invalid"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&argv)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        // Real git repo, matching the checkpoint tests' own fixture style —
+        // the discard path exercises real GitCheckpointer plumbing, not a
+        // mock, since that's exactly the piece this test must prove works.
+        init_git_repo(dir.path()).await;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+        registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+            name: "verify".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()], // always fails
+            timeout: Duration::from_secs(5),
+        }])));
+
+        let write_call = vec![
+            StreamEvent::ToolCallComplete(ToolCall {
+                id: ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": "new.txt", "content": "hi\n" }),
+                source: ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let (tx, _rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![
+            write_call,
+            text_response("done"),
+            text_response("still trying"),
+        ]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let mut executor = ToolExecutor::new(registry, gate, confiner);
+        executor.set_checkpointer(Arc::new(
+            aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+                .await
+                .unwrap(),
+        ));
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 10,
+                ..Default::default()
+            },
+            Arc::default(),
+            PlanMode::new(),
+            autonomous_mode,
+            tx,
+        );
+        agent.set_verification("verify".to_string(), 1);
+
+        agent
+            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            !dir.path().join("new.txt").exists(),
+            "the file created by the discarded experiment must be gone after rewind"
+        );
     }
 
     // ----- enforced verification (Phase 12 Part B) -----
