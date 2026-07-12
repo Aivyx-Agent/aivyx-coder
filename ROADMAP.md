@@ -850,6 +850,65 @@ a Phase-5-grade security design pass of its own, which is why this is
 last. Doubly attractive after Phase 10: an overnight loop is where
 llama-server's stability and explicit windows matter most.
 
+**Built and live-verified (2026-07-12).** Followed the security-design
+pass this sketch called for (`docs/superpowers/specs/2026-07-12-phase-11c-autonomous-loop-design.md`,
+signed off before implementation) rather than building straight from this
+paragraph. `aivyx --auto "<goal>"`: `ConfirmationGate` gained a fourth tier
+— an `AutonomousMode` shared flag (mirroring `PlanMode` exactly, checked
+after the plan-mode deny and before the Always-Allow cache) that trades the
+interactive prompt for an unconditional trust profile: `write_file`/
+`edit_file` auto-allowed only inside `cwd` (a new gate-level boundary check
+— file edits have no Landlock scoping the way spawned commands do) and
+outside `deny_paths`; `run_command` auto-allowed only against the
+pre-seeded `allowed_commands` Always-Allow cache with no prompt fallback;
+`run_shell`/`git_commit` hidden from the model's tool list entirely and
+denied at the gate as a backstop (`git_commit`'s target is never cacheable,
+so it falls out of the existing cache-miss-denies rule with zero
+special-casing, exactly as designed). Exhausted verification retries now
+trigger a real discard: `Agent` records a `pre_experiment_ref` checkpoint
+the moment a batch of edits goes unverified, and on exhaustion (autonomous
+mode only) rewinds the worktree to it via two new `GitCheckpointer`
+methods (`latest_ref`, `restore_to` — `git add -A` into the private index
+then `git read-tree --reset -u`, the git plumbing the design doc
+deliberately left unverified pending real-git behavior; a reviewer caught
+that the first `restore_to` draft omitted `deny_paths` exclusion from the
+`git add -A` step, which would have deleted deny-listed files from disk on
+the first rewind — fixed to mirror `checkpoint_inner` before this shipped).
+
+One deviation from the design doc, called out explicitly rather than
+buried: the design framed the loop driver abstractly (react to
+`AgentEvent`s); the actual driver in `aivyx-tui::app::run` instead has
+`Agent` expose a synchronous `last_turn_paused()` accessor, queried by the
+same task that owns the turn's `CancellationToken` immediately after
+`run_turn()` returns. This sidesteps a real constraint neither the sketch
+above nor the design doc surfaced: `agent_events_rx` is an
+`mpsc::UnboundedReceiver`, which only supports one consumer, and the render
+loop already owns it — so the autonomous driver cannot also listen for
+`TurnPaused` on that channel without racing the render loop for events.
+Querying `Agent` directly after each `run_turn()` call is race-free by
+construction, no cross-task inference needed.
+
+22 new tests (199 total, up from 177): gate-tier ordering and cwd-boundary
+tests (including a symlink-escaping-cwd case, matching the existing
+`deny_paths` test's rigor) in `aivyx-sandbox`, a real-git discard/rewind
+fixture in `aivyx-tools`, tool-list filtering and the pause/rewind
+integration in `aivyx-core`, driver-logic unit tests in `aivyx-tui`. Four
+live E2E checks through the real binary (qwen3.5:9B via the
+Lemonade-managed llama-server from the Phase 10 acceptance setup), all
+passing: (1) happy path — goal achieved within budget, file created with
+exact expected content, driver stopped without a further "continue"; (2)
+cwd-boundary denial — asking the model to write to `/tmp` produced the
+"worktree boundary" denial in the transcript with no file created outside
+`cwd`; (3) discard/rewind — an always-failing verification command caused
+the file to exist transiently then disappear after retries exhausted, with
+the autonomous-specific "discarded this round of edits and restored the
+worktree" notice (not interactive mode's wording); (4) Ctrl+C — cancelling
+mid-generation of a deliberately slow turn (a long single-file write) left
+the target file never created and the driver idle afterward with no
+further turn started; a fast turn's cancellation window turned out to be
+sub-second on this model/hardware, so this check needed a slow goal to
+land reliably mid-stream rather than after the turn had already finished.
+
 ### Phase 11a — Council mode (designed + signed off 2026-07-11)
 
 Multiple local models independently answer a hard question, anonymously

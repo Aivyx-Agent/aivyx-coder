@@ -95,6 +95,37 @@ checkpoints already taken before each edit. The auto-triggered call is
 labeled `auto-verify:` in the transcript so it's never mistaken for
 something the model asked for itself.
 
+**Autonomous mode** (`aivyx --auto "<goal>"`): runs unattended — the TUI
+stays up so you can watch (and Ctrl+C at any point), but nothing waits on a
+permission modal. `ConfirmationGate` gains a dedicated autonomous-mode tier
+that trades the interactive prompt for a narrower, unconditional trust
+profile: `write_file`/`edit_file` are auto-allowed only when the resolved
+target is inside the process's `cwd` (a new boundary check — file edits
+have no Landlock scoping the way spawned commands do) and outside
+`deny_paths`; `run_command` is auto-allowed only for a pre-seeded
+`allowed_commands` entry; `run_shell` and `git_commit` are hidden from the
+model entirely and denied at the gate as a backstop if invoked anyway
+(`git_commit`'s target is never cacheable, so it falls out of the same
+cache-miss-denies rule with no special-casing). A driver loop sends the
+goal, continues on `AgentEvent::TurnPaused`, and stops once every task in
+the task list is `Done`, the iteration/wall-clock budget from `[autonomous]`
+is exhausted, or you cancel. If enforced verification (above) exhausts its
+retries, autonomous mode goes one step further than the interactive loud
+notice: it rewinds the worktree to the checkpoint taken before that batch
+of edits, discarding the failed experiment, and continues with remaining
+budget. Because auto-approving edits is only safe with a deterministic
+keep/discard signal, `--auto` refuses to start unless `[verification]
+command` is configured. Config:
+
+```toml
+[autonomous]
+max_iterations = 20      # total "continue" round-trips for the whole run
+max_duration_secs = 3600 # wall-clock ceiling for the whole run
+```
+
+Mutually exclusive with `--plan` and `--resume`. See ROADMAP.md's Phase 11c
+entry for the full trust-profile rationale and design forks.
+
 Build/test the workspace:
 
 ```
