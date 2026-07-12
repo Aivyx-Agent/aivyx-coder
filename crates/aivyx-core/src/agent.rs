@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
-use aivyx_sandbox::PlanMode;
+use aivyx_sandbox::{AutonomousMode, PlanMode};
 use aivyx_tools::ToolExecutor;
 use aivyx_types::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolOutput, ToolResult,
@@ -128,6 +128,24 @@ verification call may appear in your history — this is the agent enforcing you
 configured verification command, not something you called yourself. If it fails, fix the \
 issue based on its output; it will run again automatically once you stop making further edits.";
 
+/// The tools hidden from the model while autonomous mode is active — belt-
+/// and-braces with `ConfirmationGate`'s independent denial of both (Phase
+/// 11c): `run_shell` would almost always be denied anyway (only an exact
+/// `allowed_commands` match could pass), and `git_commit` is *always*
+/// denied in autonomous mode (checkpoints are the record; a human reviews
+/// and commits afterward) — offering either would just invite the small-
+/// model retry-loop-on-unavailable-action failure mode Phase 8 already
+/// found and designed plan mode around.
+const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit"];
+
+/// Appended to the system prompt while autonomous mode is active.
+const AUTONOMOUS_PROMPT: &str = "You are running unattended (autonomous mode): no human will \
+approve your actions. Edits inside the project directory are automatically approved — do not \
+wait for confirmation, it will never come. Verification runs automatically after your edits; if \
+it fails, fix the issue based on the output fed back to you. Use set_tasks to track your plan: \
+marking every task done is how you signal the goal is achieved and this session should stop. \
+Leaving tasks incomplete means you will be prompted to continue working toward the goal.";
+
 /// Configures the enforced verification loop (ROADMAP.md Phase 12 Part B):
 /// after file edits, before a turn is allowed to end, the named
 /// `allowed_commands` entry is auto-run via `run_command`.
@@ -203,6 +221,19 @@ pub struct Agent {
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
     plan_mode: PlanMode,
+    /// Read at every request assembly (tool list + system-prompt note) and
+    /// consulted by the discard/rewind path (Task 6); the gate holds its
+    /// own clone for enforcement. See ROADMAP.md Phase 11c.
+    autonomous_mode: AutonomousMode,
+    /// Set to `true` right before emitting `AgentEvent::TurnPaused`, `false`
+    /// at the start of every `run_turn`/`run_council_turn` call and right
+    /// before emitting `AgentEvent::TurnComplete`. Exists so a caller that
+    /// owns `agent: Agent` directly (the autonomous driver, Task 8) can
+    /// synchronously tell "did the turn I just ran pause or complete"
+    /// without racing the `AgentEvent` stream across tasks — see the Phase
+    /// 11c design doc / plan for why event-stream inference is unreliable
+    /// here.
+    last_turn_paused: bool,
     /// `(map, budget_tokens)` when the repo map is enabled; re-rendered
     /// once per turn (cheap after the first pass — only changed files
     /// re-parse) into `repo_map_text`.
@@ -235,6 +266,12 @@ pub struct Agent {
 }
 
 impl Agent {
+    // `AgentConfig` already groups the scalar knobs (see its doc comment);
+    // the remaining params are distinct collaborators (backend, executor,
+    // shared state handles, event sink) that don't share a natural group,
+    // and `autonomous_mode` (Phase 11c) tips this over clippy's default
+    // threshold of 7.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         llm: std::sync::Arc<dyn LlmBackend>,
         executor: ToolExecutor,
@@ -242,6 +279,7 @@ impl Agent {
         config: AgentConfig,
         tasks: Arc<Mutex<Vec<Task>>>,
         plan_mode: PlanMode,
+        autonomous_mode: AutonomousMode,
         events_tx: UnboundedSender<AgentEvent>,
     ) -> Self {
         Self {
@@ -261,6 +299,8 @@ impl Agent {
             tasks,
             session_path: None,
             plan_mode,
+            autonomous_mode,
+            last_turn_paused: false,
             repo_map: None,
             repo_map_text: None,
             edit_format: config.edit_format,
@@ -271,6 +311,13 @@ impl Agent {
             verify_retries: 0,
             events_tx,
         }
+    }
+
+    /// Whether the most recent `run_turn` call paused (Phase 12A's
+    /// `AgentEvent::TurnPaused`) rather than completing normally. See the
+    /// `last_turn_paused` field's doc comment for why this exists.
+    pub fn last_turn_paused(&self) -> bool {
+        self.last_turn_paused
     }
 
     /// Enables `/council` (Phase 11a). The caller builds the seats — each
@@ -365,6 +412,10 @@ impl Agent {
         if self.verification.is_some() && !self.plan_mode.active() {
             system.push_str("\n\n");
             system.push_str(VERIFICATION_PROMPT);
+        }
+        if self.autonomous_mode.active() {
+            system.push_str("\n\n");
+            system.push_str(AUTONOMOUS_PROMPT);
         }
         if let Some(map) = &self.repo_map_text {
             system.push_str("\n\n");
@@ -505,6 +556,11 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
+        // Reset before every turn: a stale `true` from a previous paused
+        // turn must not be misread as "this turn paused too" if this turn
+        // takes a different path (e.g. a /council command, which never
+        // pauses).
+        self.last_turn_paused = false;
         // Commands are intercepted here, before the input can enter LLM
         // history — the raw `/council …` text is an instruction to aivyx,
         // not part of the conversation the model should see.
@@ -610,6 +666,9 @@ impl Agent {
                     };
                     if self.edit_format == EditFormat::Prompted {
                         tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
+                    }
+                    if self.autonomous_mode.active() {
+                        tools.retain(|d| !AUTONOMOUS_HIDDEN_TOOLS.contains(&d.name.as_str()));
                     }
                     tools
                 },
@@ -911,6 +970,7 @@ impl Agent {
                 // history) is a pause, not a failure — see
                 // `AgentEvent::TurnPaused`'s doc comment and ROADMAP.md
                 // Phase 12 Part A.
+                self.last_turn_paused = true;
                 self.emit(AgentEvent::TurnPaused(format!(
                     "reached the {}-round-trip cap for this turn while still working — \
                      send another message to continue; nothing has been lost.",
@@ -1023,8 +1083,8 @@ mod tests {
     use std::time::Duration;
 
     use aivyx_sandbox::{
-        ActionKind, ExecutionConfiner, NoopConfiner, PermissionDecision, PermissionGate,
-        PermissionRequest, PermissionTarget, PlanMode,
+        ActionKind, AutonomousMode, ExecutionConfiner, NoopConfiner, PermissionDecision,
+        PermissionGate, PermissionRequest, PermissionTarget, PlanMode,
     };
     use aivyx_tools::{CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry};
     use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
@@ -1172,6 +1232,7 @@ mod tests {
             config,
             Arc::default(),
             PlanMode::new(),
+            AutonomousMode::new(),
             tx,
         );
         (agent, rx, mock)
@@ -1432,6 +1493,7 @@ mod tests {
             },
             Arc::default(),
             plan_mode.clone(),
+            AutonomousMode::new(),
             tx,
         );
 
@@ -1727,6 +1789,7 @@ mod tests {
             },
             Arc::clone(&tasks),
             PlanMode::new(),
+            AutonomousMode::new(),
             tx,
         );
 
@@ -1838,6 +1901,127 @@ mod tests {
         // Both round-trips actually reached the backend — resuming is a
         // real continuation, not a silently-dropped no-op.
         assert_eq!(mock.received.lock().unwrap().len(), 2);
+    }
+
+    // ----- autonomous mode (Phase 11c) -----
+
+    fn build_autonomous_agent(
+        responses: Vec<Vec<StreamEvent>>,
+        registry: ToolRegistry,
+    ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>, AutonomousMode) {
+        let (tx, rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(responses));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 10,
+                ..Default::default()
+            },
+            Arc::default(),
+            PlanMode::new(),
+            autonomous_mode.clone(),
+            tx,
+        );
+        (agent, rx, mock, autonomous_mode)
+    }
+
+    #[tokio::test]
+    async fn last_turn_paused_reflects_the_most_recent_turn_outcome() {
+        // build_autonomous_agent's max_tool_iterations (10) is too high to
+        // pause on a single tool call, so this test builds its own agent
+        // directly with max_tool_iterations: 1 instead of using that helper.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        let (tx, _rx2) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![vec![
+            StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 1,
+                ..Default::default()
+            },
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        assert!(!agent.last_turn_paused(), "false before any turn has run");
+        agent
+            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(agent.last_turn_paused(), "the 1-iteration cap must have paused this turn");
+
+        agent
+            .run_turn(
+                "continue".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        // Second call exhausts the mock queue -> a Stop response with no
+        // tool calls -> TurnComplete, not another pause.
+        assert!(!agent.last_turn_paused(), "a normal completion must clear the flag");
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_hides_run_shell_and_git_commit() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        registry.register(Arc::new(aivyx_tools::RunShellTool));
+        registry.register(Arc::new(aivyx_tools::GitCommitTool::new(vec![])));
+        registry.register(Arc::new(aivyx_tools::GitReadTool::new(vec![])));
+
+        let (mut agent, _rx, mock, _) =
+            build_autonomous_agent(vec![text_response("hi")], registry);
+
+        agent
+            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+        assert!(tool_names.contains(&"read_file"));
+        assert!(tool_names.contains(&"git_read"));
+        assert!(!tool_names.contains(&"run_shell"), "run_shell must be hidden");
+        assert!(!tool_names.contains(&"git_commit"), "git_commit must be hidden");
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_appends_the_autonomous_prompt_note() {
+        let (mut agent, _rx, mock, _) =
+            build_autonomous_agent(vec![text_response("hi")], ToolRegistry::new());
+
+        agent
+            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("unattended"), "system prompt: {system}");
     }
 
     // ----- enforced verification (Phase 12 Part B) -----
