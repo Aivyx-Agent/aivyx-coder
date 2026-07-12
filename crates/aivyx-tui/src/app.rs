@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
 use aivyx_sandbox::{PermissionRequest, PermissionTarget, PlanMode, UserResponse};
@@ -22,6 +23,29 @@ use crate::terminal::TerminalGuard;
 /// vertical space.
 const MAX_VISIBLE_TASKS: usize = 6;
 
+/// The autonomous driver's goal-achieved signal: every task in the list is
+/// `Done`, and there is at least one task — an empty list means the model
+/// never called `set_tasks` at all, which must not be misread as "nothing
+/// to do, stop immediately." See ROADMAP.md Phase 11c.
+fn goal_achieved(tasks: &[Task]) -> bool {
+    !tasks.is_empty() && tasks.iter().all(|t| t.status == TaskStatus::Done)
+}
+
+/// What the autonomous driver sends next, given whether the turn that just
+/// finished paused (Phase 12A) and the current task list. `None` means
+/// stop the loop (goal achieved) — the caller is responsible for the
+/// separate budget-exhaustion and cancellation stop conditions, which this
+/// function doesn't know about.
+fn next_autonomous_message(last_turn_paused: bool, tasks: &[Task]) -> Option<String> {
+    if last_turn_paused {
+        return Some("continue".to_string());
+    }
+    if goal_achieved(tasks) {
+        return None;
+    }
+    Some("continue working toward the goal".to_string())
+}
+
 enum ChatLine {
     User(String),
     Assistant(String),
@@ -39,6 +63,18 @@ enum ChatLine {
     Council(String),
 }
 
+/// Configures an unattended `--auto` session (ROADMAP.md Phase 11c). `tasks`
+/// is a clone of the same `Arc<Mutex<Vec<Task>>>` handle already shared
+/// between the `set_tasks` tool and the `Agent` — the driver reads it
+/// directly rather than waiting on an `AgentEvent::TasksUpdated` event, so
+/// its goal-achieved check always sees the current state.
+pub struct AutonomousRun {
+    pub goal: String,
+    pub max_iterations: u32,
+    pub max_duration: Duration,
+    pub tasks: Arc<Mutex<Vec<Task>>>,
+}
+
 /// Owns the ratatui render loop. Takes an already-constructed `Agent` (the
 /// caller built it with the `LlmBackend` + `ToolExecutor` it wants) and the
 /// receiving half of the channel that `Agent` was constructed with; `run`
@@ -50,17 +86,47 @@ pub async fn run(
     mut permission_rx: PermissionModalReceiver,
     restored: Option<SessionState>,
     plan_mode: PlanMode,
+    autonomous: Option<AutonomousRun>,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
 
     let background_cancellation = Arc::clone(&active_cancellation);
     tokio::spawn(async move {
-        while let Some(input) = input_rx.recv().await {
-            let cancellation = CancellationToken::new();
-            *background_cancellation.lock().unwrap() = Some(cancellation.clone());
-            let _ = agent.run_turn(input, &cwd, cancellation).await;
-            *background_cancellation.lock().unwrap() = None;
+        if let Some(autonomous) = autonomous {
+            // Autonomous mode drives itself — it never waits on input_rx
+            // (a human typing during an autonomous run has no effect
+            // beyond appearing in the transcript locally; Ctrl+C is the
+            // only supported intervention, matching the design doc's
+            // scope).
+            let deadline = Instant::now() + autonomous.max_duration;
+            let mut iterations_used = 0u32;
+            let mut next_message = Some(autonomous.goal.clone());
+            while let Some(message) = next_message.take() {
+                if iterations_used >= autonomous.max_iterations || Instant::now() >= deadline {
+                    break;
+                }
+                iterations_used += 1;
+                let cancellation = CancellationToken::new();
+                *background_cancellation.lock().unwrap() = Some(cancellation.clone());
+                let _ = agent.run_turn(message, &cwd, cancellation.clone()).await;
+                *background_cancellation.lock().unwrap() = None;
+
+                if cancellation.is_cancelled() {
+                    // The user hit Ctrl+C wanting this to stop — do not
+                    // send another message.
+                    break;
+                }
+                let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
+                next_message = next_autonomous_message(agent.last_turn_paused(), &tasks_snapshot);
+            }
+        } else {
+            while let Some(input) = input_rx.recv().await {
+                let cancellation = CancellationToken::new();
+                *background_cancellation.lock().unwrap() = Some(cancellation.clone());
+                let _ = agent.run_turn(input, &cwd, cancellation).await;
+                *background_cancellation.lock().unwrap() = None;
+            }
         }
     });
 
@@ -734,5 +800,51 @@ mod tests {
         let lines = target_lines(&target);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].to_string(), "Command: cargo test");
+    }
+
+    fn done_task(id: u32) -> Task {
+        Task {
+            id,
+            text: "x".to_string(),
+            status: TaskStatus::Done,
+        }
+    }
+
+    fn pending_task(id: u32) -> Task {
+        Task {
+            id,
+            text: "x".to_string(),
+            status: TaskStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn goal_achieved_requires_at_least_one_task_and_all_done() {
+        assert!(!goal_achieved(&[]), "no tasks ever set means never done");
+        assert!(!goal_achieved(&[done_task(1), pending_task(2)]));
+        assert!(goal_achieved(&[done_task(1), done_task(2)]));
+    }
+
+    #[test]
+    fn next_autonomous_message_chooses_correctly() {
+        assert_eq!(
+            next_autonomous_message(true, &[]),
+            Some("continue".to_string()),
+            "a paused turn always continues, regardless of task state"
+        );
+        assert_eq!(
+            next_autonomous_message(false, &[done_task(1)]),
+            None,
+            "goal achieved -> stop"
+        );
+        assert_eq!(
+            next_autonomous_message(false, &[pending_task(1)]),
+            Some("continue working toward the goal".to_string())
+        );
+        assert_eq!(
+            next_autonomous_message(false, &[]),
+            Some("continue working toward the goal".to_string()),
+            "no tasks ever set -> keep going until budget exhausts, not stuck forever"
+        );
     }
 }
