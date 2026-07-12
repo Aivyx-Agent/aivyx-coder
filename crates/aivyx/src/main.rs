@@ -296,6 +296,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Enforced verification (ROADMAP.md Phase 12 Part B): configuring the
+    // command alone is the opt-in, no separate enable flag. The name must
+    // match an `allowed_commands` entry (the same trust tier `run_command`
+    // itself uses) — warn loudly rather than silently doing nothing if it
+    // doesn't, since a typo here would otherwise look like the feature is
+    // enabled but never actually verify anything.
+    if let Some(command) = &settings.verification.command {
+        if command_specs.iter().any(|spec| &spec.name == command) {
+            agent.set_verification(command.clone(), settings.verification.max_auto_verify_retries);
+        } else {
+            tracing::warn!(
+                command = %command,
+                "verification.command does not match any [[permissions.allowed_commands]] \
+                 entry name — enforced verification is disabled until this is fixed"
+            );
+        }
+    }
+
     // Persistence is always on (it's what makes `--resume` possible after a
     // crash or an interrupted slow-model turn); only *restoring* is opt-in.
     let restored = match session::session_file_path(&cwd) {

@@ -83,6 +83,18 @@ Press `Ctrl+P` again to approve the plan and switch back to Act mode; a
 magenta `PLAN` badge in the status line shows the current stance. See
 "Security model" for why this is an enforced boundary, not a suggestion.
 
+**Enforced verification** (`[verification] command`, off by default): once
+configured, a turn that made file edits can't end silently unverified — the
+agent auto-runs the named `allowed_commands` entry via `run_command` before
+letting the model finish, feeding a failure back so the model can fix and
+retry (up to `max_auto_verify_retries`, default 3) rather than relying on
+the model choosing to verify its own work. A passing run costs no extra
+model round-trip; retries exhausted still ends the turn (never blocks
+completion) but with a loud, un-missable notice pointing at the worktree
+checkpoints already taken before each edit. The auto-triggered call is
+labeled `auto-verify:` in the transcript so it's never mistaken for
+something the model asked for itself.
+
 Build/test the workspace:
 
 ```
@@ -189,6 +201,52 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 ```
+
+Not every Qwen3 release has a thinking toggle at all: the `-Instruct-2507`
+line (e.g. `Qwen3-4B-Instruct-2507`) ships non-thinking only — no
+`enable_thinking` template variable, no `<think>` tags regardless of
+flags — so `--chat-template-kwargs` is simply inert there, not something
+to debug if it appears to do nothing.
+
+**Lemonade (distro-packaged alternative to a manual llama-server
+install).** [lemonade-sdk/lemonade](https://github.com/lemonade-sdk/lemonade)
+wraps llama.cpp (plus other backends) with model pull/load management and
+a distro package (CachyOS/Arch: `lemonade-server`, binary `lemonade` +
+`lemond` service) — its CUDA backend ships prebuilt binaries per compute
+capability, sidestepping the `GGML_CCACHE` build gotcha above entirely.
+Two things verified live (ROADMAP.md Phase 10) before pointing aivyx at
+it:
+
+- **Target the underlying llama-server port, not Lemonade's gateway
+  port.** Lemonade spawns a real `llama-server` process per loaded model
+  (find its port with `ss -tlnp | grep llama-server` or `ps aux | grep
+  llama-server`) alongside its own stable gateway (`lemonade config`'s
+  `port`, default 13305). The gateway's `/props` returns Lemonade's web-UI
+  HTML, not JSON, and its Ollama-compatible `/api/show` always reports
+  `"parameters": "num_ctx -1"` regardless of the model's actual loaded
+  context — aivyx's startup probe parses that as "Ollama's hidden
+  default" and emits a **false** truncation warning even when the model
+  is correctly configured. Pointing `base_url` at the real llama-server
+  port instead gets an accurate `/props` and a correct probe, identical
+  to a native llama-server install — the tradeoff is that this port isn't
+  a documented, stable Lemonade interface and may shift across restarts
+  or model reloads.
+- **`--llamacpp-args` needs single-quote-wrapping for flags carrying
+  embedded JSON.** Lemonade's own argument splitter strips bare double
+  quotes before they reach llama-server, so
+  `--llamacpp-args "--chat-template-kwargs {\"enable_thinking\":false}"`
+  silently breaks the JSON. Wrap the JSON in single quotes instead:
+  ```
+  lemonade load <model> --ctx-size 16384 \
+    --llamacpp-args "--chat-template-kwargs '{\"enable_thinking\":false}' \
+    --temp 0.7 --top-k 20 --top-p 0.8 --presence-penalty 1.5"
+  ```
+
+Once pointed correctly, everything else behaves exactly like a native
+llama-server install: `ctx_size`/`--ctx-size` is an explicit first-class
+control (no Ollama-style hidden default), and the Phase 10 acceptance
+benchmark reproduced the native 9/9 / prompted 6/9 result exactly against
+a Lemonade-managed `qwen3.5:9b`.
 
 ## Tools
 
@@ -377,6 +435,19 @@ checkpoints = true   # snapshot the worktree before every mutating tool call
 [repo_map]
 enabled = true       # append a ranked symbol map to the system prompt
 budget_tokens = 1024 # rough token budget the map may consume per request
+
+# Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
+# before a turn is allowed to end, auto-run this named allowed_commands
+# entry via run_command and let the model react to the result — fix and
+# retry on failure, or actually end the turn on success. Off by default;
+# setting `command` alone is the opt-in, no separate enable flag. `command`
+# must match a `[[permissions.allowed_commands]]` name, or a startup
+# warning fires and verification stays disabled.
+# [verification]
+# command = "test"            # references [[permissions.allowed_commands]]
+# max_auto_verify_retries = 3 # (edit, re-verify) cycles before giving up
+#                              # on this round of edits — never silently:
+#                              # the turn still ends, with a loud notice.
 
 # /council — several local models answer, cross-rank, and a chairman
 # synthesizes. Off until at least two members AND a chairman are set. Any

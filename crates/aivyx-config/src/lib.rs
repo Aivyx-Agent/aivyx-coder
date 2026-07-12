@@ -37,6 +37,32 @@ pub struct Settings {
     pub git: GitSettings,
     pub repo_map: RepoMapSettings,
     pub council: CouncilSettings,
+    pub verification: VerificationSettings,
+}
+
+/// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
+/// before a turn is allowed to end, auto-run this named
+/// `[[permissions.allowed_commands]]` entry (reusing that trust tier, not a
+/// new one) and let the model react to the result. `command` absent (the
+/// default) disables the feature entirely — setting it alone is the
+/// opt-in, deliberately no separate enable flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerificationSettings {
+    pub command: Option<String>,
+    /// How many (edit, re-verify) cycles may fail before the agent gives up
+    /// on this round of edits and lets the turn end anyway, with a loud
+    /// notice rather than silence. Clamped to a minimum of 1 by the agent.
+    pub max_auto_verify_retries: u32,
+}
+
+impl Default for VerificationSettings {
+    fn default() -> Self {
+        Self {
+            command: None,
+            max_auto_verify_retries: 3,
+        }
+    }
 }
 
 /// Council mode (`/council <question>`): the configured members each answer
@@ -495,6 +521,25 @@ mod tests {
         let settings: Settings = toml::from_str("").unwrap();
         assert!(!settings.council.configured());
         assert_eq!(settings.council.tail_budget_tokens, 3072);
+    }
+
+    #[test]
+    fn verification_absent_from_config_means_disabled() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(settings.verification.command.is_none());
+        assert_eq!(settings.verification.max_auto_verify_retries, 3);
+    }
+
+    #[test]
+    fn verification_command_parses_from_config() {
+        let raw = r#"
+            [verification]
+            command = "test"
+            max_auto_verify_retries = 5
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.verification.command.as_deref(), Some("test"));
+        assert_eq!(settings.verification.max_auto_verify_retries, 5);
     }
 
     #[test]

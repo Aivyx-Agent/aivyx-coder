@@ -19,16 +19,17 @@ directional, not committed fact, until spot-checked.
 *(Updated 2026-07-12 — the phase sections below carry the full history
 and evidence; this is the summary.)*
 
-**Shipped and live-verified** (Phases 1–8, 10 Part A, 11a; latest commit
-`8178422`): the full agent loop — streaming chat, native + prompted
-SEARCH/REPLACE edit formats (A/B-measured, native default), grep/glob
-search, `run_command`/`run_shell` behind real Landlock+seccomp
-confinement, git tools + automatic worktree checkpoint refs, tree-sitter
-repo map injection, session persistence/resume, context budget +
-compaction, plan mode (gate-enforced read-only), `/council` multi-model
-deliberation, and a startup probe of the *served* context window. 171
-workspace tests; every security-critical behavior also proven by live
-E2E against real serving.
+**Shipped and live-verified** (Phases 1–8, 10 Part A, 11a, 12): the full
+agent loop — streaming chat, native + prompted SEARCH/REPLACE edit formats
+(A/B-measured, native default), grep/glob search, `run_command`/`run_shell`
+behind real Landlock+seccomp confinement, git tools + automatic worktree
+checkpoint refs, tree-sitter repo map injection, session persistence/resume,
+context budget + compaction, plan mode (gate-enforced read-only), `/council`
+multi-model deliberation, a startup probe of the *served* context window,
+goal-bounded turn pausing instead of a hard iteration-cap failure, and
+enforced post-edit verification with automatic fix-and-retry. 177 workspace
+tests; every security-critical behavior also proven by live E2E against
+real serving.
 
 **Serving verdict (Phase 10)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
@@ -38,14 +39,24 @@ the speed on the edit benchmark. The daily driver runs llama-server via
 a systemd user unit; Ollama stays as the zero-setup default and serves
 the council's swap-per-request members.
 
+**Capability audit (2026-07-12)**: a broader audit against the project's
+actual end-goal — a high-end vibe-coding agent with a path to full
+autonomy — found the security/checkpoint foundation doesn't need a
+redesign for autonomy, only extension, but surfaced two structural gaps
+in the agent loop itself (a hard per-turn iteration cap instead of
+goal-bounded continuation, and an entirely emergent — never enforced —
+verification loop) plus five smaller gaps folded into Phase 9. Both
+structural gaps are now closed — see Phase 12 below.
+
 **In flight / next**: Phase 10 Part B — the SGLang constrained-decoding
 spike (xgrammar forcing schema-valid tool calls at generation time) —
 runs via the official docker image after the AUR package proved broken;
 AWQ weights are re-downloaded and shard-verified. A cheap vLLM compat
 pass (image pull + one E2E run) is queued separately, since vLLM is a
-README-claimed provider not yet live-tested. Then Phase 11b (agent
-wiki) design pass, Phase 11c (autonomous loop, needs its own security
-design pass), and the Phase 9 stretch items.
+README-claimed provider not yet live-tested. Then Phase 11b (agent wiki)
+design pass, Phase 11c (autonomous loop — its security-profile design
+pass is now unblocked by Phase 12's loop-mechanics work), and the
+remaining Phase 9 stretch items.
 
 ## What the research says a coding agent needs
 
@@ -605,7 +616,33 @@ the repo map and grep tools), MCP support for external tool integration,
 sub-agent delegation for context-isolated exploration, and an
 architect/editor model-pairing mode (a stronger model plans in prose, a
 faster local model executes the mechanical edit) — directly enabled once
-Phase 2's prompted edit format exists.
+Phase 2's prompted edit format exists. Per the capability audit below, the
+delegation and pairing items are prioritized above LSP/MCP: both compound
+with the project's existing small-context-window discipline (repo map,
+compaction, `LlmBackend` interchangeability already proven by council
+mode) rather than requiring new architecture to support.
+
+Surfaced by the same audit, not previously tracked here: **multi-language
+repo map support** (v1 is Rust-only — a real cap on general applicability
+for most real-world vibe-coding work, which skews TS/Python/Go-heavy, not
+just an incomplete nice-to-have); **multi-file/patch-based editing** with
+dedicated rename/move-with-import-fixup primitives (today's
+N-independent-`edit_file`-calls approach for a cross-file change has no
+atomicity across the set, multiplying the model's own documented
+reliability ceiling as the error surface rather than reducing it);
+**visible reasoning/thinking content in the TUI** (a reasoning-capable
+model's `delta.reasoning` is currently dropped silently by `WireDelta` in
+`aivyx-llm/src/openai_compat.rs` — serde's default behavior — unless
+`AIVYX_DEBUG_LOG` is on; there's no first-class way to see *why* the
+agent is about to do something before approving a mutating action);
+**structured verification output** (pass/fail extraction and cross-turn
+memory of which tests were already failing, instead of raw tail-capped
+text the model re-derives every turn — the current cap was tuned for
+compiler-error-style output, not noisy test-framework tails); and a
+**user-extensible hooks/command-macro layer** (`/council` is the only
+special-cased slash command today; no post-edit hooks, no user-defined
+command macros — core UX in comparable tools, though it doesn't block
+autonomy the way Phase 12/11c's gaps do).
 
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
@@ -712,6 +749,46 @@ serving-layer bugs to get here, and every one was found by the A/B harness
 acting as an acceptance test rather than by reading documentation. Phase
 2's native default is re-confirmed decisively (9/9 vs 6/9 under identical,
 finally-honest conditions). Part A complete.
+
+**Lemonade re-verification (2026-07-12).**
+[lemonade-sdk/lemonade](https://github.com/lemonade-sdk/lemonade) — a
+distro-packaged (CachyOS `lemonade-server`) llama.cpp process manager with
+its own OpenAI-compatible gateway — was evaluated as a lower-friction
+alternative to the manual llama-server install above (its CUDA backend
+ships prebuilt per-compute-capability binaries, sidestepping the
+`GGML_CCACHE` build gotcha entirely). Two integration findings, both now
+documented in README's Serving section:
+1. The context-window probe (`aivyx-llm::probe`) must target the real
+   llama-server process Lemonade spawns, not its gateway port — the
+   gateway's Ollama-compat `/api/show` always reports `num_ctx -1`, which
+   the probe parses as "Ollama's hidden default," producing a **false**
+   truncation warning even when the model is correctly configured.
+   Confirmed both directions live: a deliberately-mismatched
+   `context_tokens` correctly triggered the real warning against the
+   underlying port, and the correct value produced silence.
+2. `--llamacpp-args` requires single-quote-wrapping any flag carrying
+   embedded JSON (`--chat-template-kwargs`) — Lemonade's argument splitter
+   strips bare double quotes before they reach llama-server.
+
+With both resolved, and README's documented Qwen non-thinking sampling
+flags applied (`--temp 0.7 --top-k 20 --top-p 0.8 --presence-penalty
+1.5`), re-ran the A5 edit-format benchmark against a Lemonade-managed
+`qwen3.5:9b` (3 tasks × 3 reps, live through the real `aivyx` binary via a
+purpose-built pty harness, graded from on-disk file state — not the
+screen, per the harness lessons elsewhere in this document): **native
+9/9 (45.5s total), prompted 6/9 (204.9s total)** — reproducing the
+original A5 verdict exactly on an independently-managed serving path. The
+3 prompted failures split into the two already-documented signatures: one
+~95s+ reasoning stall (GPU confirmed actively generating at 93% util, not
+hung) and two fast (10-13s) zero-tool-call turns where the model answered
+in prose without ever emitting a SEARCH/REPLACE block — both consistent
+with Phase 2's model-side agentic-reliability finding, not new plumbing
+bugs.
+
+Separately confirmed: `Qwen3-4B-Instruct-2507` (a non-thinking-only Qwen3
+release) has no `enable_thinking` template variable at all —
+`--chat-template-kwargs` is a no-op for that model family, not something
+to debug if it appears inert.
 
 **Part B status (2026-07-12): unblocked, environment rebuilt, spike
 pending.** The first attempt was aborted by machine-level data corruption
@@ -865,7 +942,241 @@ capture of ratatui output garbles wrapped lines under cell-level
 redraws — assert on the persisted session file, not the screen, when
 the claim is about history.
 
+## Capability audit — gaps toward a Full Autonomous High-End Coding Agent (2026-07-12)
+
+An audit against the project's stated end-goal (a high-end vibe-coding
+agent for an end user, with a path to full autonomy), separate from and
+broader than the routine security audits referenced elsewhere in this
+document. Foundation verdict first, then gaps ranked by how structural
+they are; the smaller ones are folded into Phase 9 above, the two
+structural ones become Phase 12 below.
+
+**Foundation holds up.** The permission-gate → checkpoint → sandbox
+pipeline doesn't need a redesign for autonomy, only extension:
+`PlanMode`'s pattern (a shared flag the gate enforces independently of
+what's offered to the model) is exactly the shape an autonomous trust
+profile would take; checkpoints are already the keep/discard primitive
+Phase 11c's experiment loop needs; `allowed_commands` is already the
+pre-approved-execution tier; `Tool::execute` being reachable only through
+`ToolExecutor::dispatch` means new tools (LSP, refactor primitives,
+sub-agents) can't accidentally bypass the security model. Worth stating
+plainly because it changes what "closing the gap" actually costs —
+additive work, not a rewrite.
+
+**Gap 1 (most structural) — the turn loop fails on a cap, not a goal
+boundary.** `run_turn_inner`'s loop is bounded by `max_tool_iterations`
+(default 25) per *user turn*; hitting it returns
+`AgentError::MaxIterationsExceeded` rather than pausing gracefully.
+Checked against the actual code before writing this down (this project's
+own habit — see Phase 5's bubblewrap re-check, Phase 2's
+plan-vs-evidence check): state is *not* lost — `run_turn`'s wrapper calls
+`self.persist()` unconditionally regardless of the `Result`, and every
+tool call/result up to the cap is already in history — so in interactive
+use a human can just send another message and the agent picks up where
+it left off. The real gap is (a) this is presented as a failure
+(`AgentEvent::Error` + `Err`) rather than a natural pause, which is
+misleading UX today, and (b) in an *unattended* run there is no one to
+send that next message, so an autonomous session would simply stop at 25
+round-trips with no continuation mechanism at all.
+
+**Gap 2 — verification is 100% emergent, never enforced.** The tools to
+close an edit→build→test→fix loop all exist (`run_command`, checkpoints
+to roll back a bad attempt), but nothing requires the model to actually
+use them before ending a turn. This directly contradicts the project's
+own cited research finding ("verification loops are the biggest lever
+for actual task success... a deterministic compiler/test-runner as the
+feedback signal is more reliable for a weak local model than asking it
+to self-critique") — Phase 4 built the *tool*, nothing yet builds the
+*policy*, and this project's own benchmarks (Phase 2, Phase 10) already
+show 9B-class models won't reliably self-verify unprompted.
+
+Gaps 1 and 2 are close to a shared prerequisite for Phase 11c's
+experiment loop, which needs both a continuation mechanism and a
+deterministic verify step to do keep/discard at all — scoped together as
+Phase 12 below, ahead of 11c.
+
+Already-tracked gaps (LSP, MCP, sub-agent delegation, architect/editor
+pairing, the wiki, the autonomous loop itself) aren't re-litigated here —
+see Phase 9 and Phase 11b/11c — except to sharpen priority: sub-agent
+delegation and architect/editor pairing are higher-leverage than they
+look, because they compound with what this project already does well
+rather than requiring new architecture.
+
+### Phase 12 — Agent loop foundations: goal-bounded continuation + enforced verification — ✅ done
+
+Surfaced by the capability audit above as the actual prerequisite to
+Phase 11c, ahead of the security-profile work: an autonomous loop is
+pointless without (a) a way to keep working past today's per-turn
+iteration cap without a human re-prompting, and (b) a verification step
+that runs whether or not the model chooses to call it. Both close gaps in
+the *existing* interactive product too, not just the future autonomous
+one — scoping them together because Phase 11c's "keep or discard"
+experiment loop needs exactly this pairing (continue working, then
+deterministically check the result) as its core primitive.
+
+**Part A — turn-loop continuation.**
+
+Design (signed off 2026-07-12, not yet built):
+- Keep `max_tool_iterations` as a per-round-trip safety valve (protects
+  against a single response accidentally looping forever), but stop
+  treating hitting it as an `AgentError`. On hitting the cap while the
+  model was still actively issuing tool calls (i.e. not a natural
+  no-more-tool-calls stop), emit a new event — `AgentEvent::TurnPaused`
+  or similar — distinct from both `TurnComplete` and `Error`, carrying
+  whatever the task list currently shows as progress. The TUI renders
+  this distinctly from an actual error (no red `!` notice — something
+  closer to the plan-mode toggle notice).
+- In interactive mode, this alone fixes the misleading-failure UX: the
+  session is already resumable by construction (`--resume`, or simply
+  continuing to type in the same running session — history is already
+  intact in memory, not just on disk).
+- For autonomous use (still gated behind Phase 11c's own trust-profile
+  design, not unblocked by this phase alone): a *second*, coarser budget
+  — wall-clock and/or total-tool-call count for the whole unattended
+  session, distinct from the existing per-round-trip cap — governs when
+  an autonomous run auto-continues (re-enter the loop with a synthesized
+  "continue" turn reusing persisted history) versus when it must stop and
+  surface a report. This is Phase 11c's territory to design in full (it
+  also owns what tool calls are permitted with no human at the modal);
+  Phase 12 only needs the *loop mechanism* itself to support being
+  re-entered without erroring, so 11c isn't also fighting the turn loop's
+  shape when it lands.
+- **Decided (2026-07-12): keep a hard ceiling.**
+  `AgentError::MaxIterationsExceeded` doesn't disappear — it's repurposed
+  rather than removed. The per-round-trip `max_tool_iterations` cap
+  hitting mid-work now emits `AgentEvent::TurnPaused` (graceful,
+  resumable, not an error) as designed above; the hard error fires only
+  when the coarser autonomous-session budget is *also* exhausted with no
+  natural stopping point reached — the last-resort ceiling moves up a
+  level rather than disappearing. An unbounded loop stays a real
+  resource-exhaustion risk independent of the pause-vs-fail UX question,
+  so something must still be able to say no.
+
+**Part A built and live-verified (2026-07-12).** New
+`AgentEvent::TurnPaused(String)` and matching `ChatLine::Paused` (blue,
+`"  ~ paused: "` prefix — deliberately not `Notice`'s red/bold, which
+today also carries real errors and the plan-mode toggle). The
+per-round-trip cap-hit site in `run_turn_inner` emits this and returns
+`Ok(())` instead of constructing `AgentError::MaxIterationsExceeded`;
+that variant stays defined (per the decision above) but is now
+unconstructed anywhere in the crate — confirmed `cargo build`/`clippy`
+raise no dead-code warning (it's a `pub` enum reachable outside the
+crate). Two rewritten/new unit tests cover the pause firing without an
+`Err` and without dropping any dispatched tool call from history, and a
+follow-up `run_turn` call cleanly resuming the same conversation. Live
+E2E through the real binary (qwen3.5:9B via the Lemonade-managed
+llama-server from the acceptance benchmark above, `max_tool_iterations`
+forced to 1): the transcript showed the tool call, its result, and then
+the blue paused notice — never the red error style — with the status
+line back to `ready` afterward, confirming the fix end-to-end rather than
+just at the unit level.
+
+**Part B — enforced verification.**
+
+Design (signed off 2026-07-12, not yet built):
+- **Decided (2026-07-12): config surface is just `[verification] command
+  = "test"`** (references an existing `[[permissions.allowed_commands]]`
+  entry by name — reusing the existing trust tier rather than inventing a
+  new one) — **no separate enable flag.** Configuring the command *is*
+  the opt-in, matching how `allowed_commands` itself works (empty/off by
+  default, but adding an entry makes it live immediately) and avoiding a
+  silent trap where someone defines a verification command expecting
+  enforcement and gets nothing because they missed a second flag. Still
+  "off until configured" for any project that hasn't set `[verification]`
+  at all, so existing users see no behavior change.
+- Mechanism: track, per turn, whether a mutating file-tool call
+  (`write_file`/`edit_file`) has happened since the last successful
+  verification run. When the model produces a response with no further
+  tool calls (today's `TurnComplete` signal) while that's true and a
+  `[verification] command` is configured, don't end the turn yet —
+  synthesize a verification `ToolCall` the same way prompted-mode
+  SEARCH/REPLACE blocks already get synthesized into real tool calls (a
+  new
+  `ToolCallSource` variant alongside `Native`/`TextFallback` — the
+  pattern already exists and dispatches through the exact same
+  gate/checkpoint path with no new security surface), dispatch it, and
+  feed the result back into history so the model can react —
+  fix-and-retry on failure, or naturally end the turn on success. Bounded
+  by the existing `max_tool_iterations`/`MAX_TOOL_CALLS_PER_RESPONSE`
+  caps, so this can't loop forever either; add `max_auto_verify_retries`
+  as its own explicit cap so a stuck fix-loop surfaces to the human
+  distinctly from a generic iteration-cap hit.
+- Never fires in plan mode (no mutating calls happen there by
+  construction) or when nothing was actually edited this turn (a
+  read-only Q&A turn shouldn't force a test run).
+- On repeated verification failure, surface the existing checkpoint refs
+  as the recovery path ("still failing after N attempts — the worktree
+  was checkpointed before each edit; `git log refs/aivyx/checkpoints/` to
+  inspect or rewind") rather than building any new rewind mechanism —
+  Phase 7 already owns that primitive.
+- **Decided (2026-07-12): a failed final verification (retries exhausted)
+  completes the turn with a loud, un-missable notice, not a block.**
+  `TurnComplete` still fires — consistent with every other "never
+  silent" pattern already in this codebase (truncation notices,
+  plan-mode toggles, denial reasons) — but carries a prominent notice
+  that verification never passed, plus the checkpoint-recovery hint
+  above. Keeps the transparency-over-magic principle intact (the same
+  one Phase 7 leaned on for the auto-commit question): the agent hands
+  control back rather than unilaterally deciding the turn can't end, and
+  the user decides what happens next.
+
+**Part B built and live-verified (2026-07-12).** New
+`ToolCallSource::AutoVerification` (the same "synthesize a real `ToolCall`"
+pattern prompted-mode SEARCH/REPLACE blocks already established — a
+synthetic assistant message carrying the one call, dispatched through the
+unchanged executor/gate/checkpoint path, then its result — needed because
+OpenAI-compatible wire format requires every `Role::Tool` result to
+correspond to a preceding assistant `tool_calls` entry). New
+`[verification]` config (`command`, `max_auto_verify_retries`) and
+`Agent::set_verification`; `main.rs` warns at startup rather than silently
+doing nothing if `command` doesn't match an `allowed_commands` name. The
+synthesized call targets the existing `run_command` tool by name, so it
+inherits that tool's pre-approval seeding automatically — no new
+permission-gate surface. Pass/fail is read from `run_command`'s own
+formatted-output verdict marker (`(success)`/`(failed)`) since a failing
+command is normal `Ok` output for that tool, not a tool-level error — the
+only signal available without changing that tool's contract, and a
+documented fragile coupling to `aivyx_tools::process::format_output`'s
+exact wording. `unverified_edits`/`verify_retries` are `Agent` fields, not
+per-turn locals, deliberately spanning turn boundaries — a turn pausing
+mid-edit (Part A) must not let unverified edits be silently forgotten by
+whichever turn continues it — and `verify_retries` resets to 0 both on a
+pass and on exhaustion (never on a mid-attempt continue), so the feature
+can't silently disable itself for the rest of the session after one bad
+run. A new `VERIFICATION_PROMPT` system-prompt note (mirroring the
+existing plan-mode/edit-format notes) tells the model the auto-injected
+`run_command` call in its own history isn't something it called itself.
+One implementation-level clarification beyond the original design text: on
+a *passing* verification the turn completes immediately without spending
+an extra model round-trip (the design's "naturally end the turn on
+success" read as "no extra chattiness needed," not "ask the model to
+confirm the pass") — only a *failing* verification spends a round-trip, so
+the model can see the failure and react. Three new unit tests (pass with
+no extra round-trip, fail-until-exhausted with the correct retry count and
+notice text, and never-fires-when-nothing-was-edited) plus two in
+`aivyx-config` for the config parsing; 177 workspace tests, clippy clean.
+Live E2E through the real binary (the same Lemonade-managed qwen3.5:9B):
+asked it to create a file containing a specific word, verification
+configured to grep for that word — the transcript showed the write, the
+model's own "Done!", and then, unprompted, `auto-verify:
+run_command({"command":"verify"})` → `exit status: 0 (success)` → turn
+complete, with no permission modal (the pre-approval reuse working
+exactly as designed) and no extra round-trip.
+
+No open questions remain in either part. **Sequencing**: both parts land
+together (they share the "the model isn't the one deciding when a turn
+actually ends" premise) before Phase 11c's
+security-profile design pass begins — 11c can then focus entirely on the
+permission-tier question instead of also inventing loop mechanics.
+
 ## Notes on sequencing
+
+Phase 12 is scoped ahead of Phase 11c deliberately: the capability audit
+above found the autonomous loop's actual prerequisite isn't just a
+security-profile redesign but two loop-mechanics gaps (goal-bounded
+continuation, enforced verification) that 11c would otherwise have to
+solve inline while also doing its own security work — cheaper to land
+them as their own pass first.
 
 Phases 1-2 are deliberately reliability-first rather than feature-first: the
 research and this project's own capability testing agree that adding tool

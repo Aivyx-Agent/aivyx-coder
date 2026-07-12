@@ -23,6 +23,16 @@ pub enum AgentEvent {
     ToolResult(ToolResult),
     TurnComplete,
     Error(String),
+    /// The per-round-trip iteration cap (`max_tool_iterations`) was hit
+    /// while the model was still actively issuing tool calls — not a
+    /// natural no-more-tool-calls stop. Deliberately distinct from both
+    /// `TurnComplete` and `Error`: nothing was lost (every dispatched tool
+    /// call already has a matching result in history, and the session
+    /// persists as usual), so this is a pause the user can resume from by
+    /// sending another message, not a failure. See ROADMAP.md Phase 12
+    /// Part A — `AgentError::MaxIterationsExceeded` is reserved for a
+    /// future, coarser autonomous-session budget (Phase 11c) instead.
+    TurnPaused(String),
     /// The backend's reported prompt-token count for the most recent
     /// request, against the configured context window — drives the TUI's
     /// live budget indicator.
@@ -110,6 +120,26 @@ including indentation. Keep each block small and focused; use several blocks for
 changes. To create a new file, leave the SEARCH section empty. Each block is applied only \
 after the user approves it, and you will receive a result for each block.";
 
+/// Appended to the system prompt whenever `[verification]` is configured, so
+/// the model isn't confused seeing a `run_command` call in its own history
+/// that it doesn't remember making — see ROADMAP.md Phase 12 Part B.
+const VERIFICATION_PROMPT: &str = "After you finish making file edits, an automatic run_command \
+verification call may appear in your history — this is the agent enforcing your project's \
+configured verification command, not something you called yourself. If it fails, fix the \
+issue based on its output; it will run again automatically once you stop making further edits.";
+
+/// Configures the enforced verification loop (ROADMAP.md Phase 12 Part B):
+/// after file edits, before a turn is allowed to end, the named
+/// `allowed_commands` entry is auto-run via `run_command`.
+#[derive(Debug, Clone)]
+struct VerificationConfig {
+    command_name: String,
+    /// Clamped to a minimum of 1 by `Agent::set_verification` — a 0 here
+    /// would report "still failing" without ever actually attempting a
+    /// verification run.
+    max_retries: u32,
+}
+
 /// Scalar knobs for an `Agent`, grouped so `Agent::new`'s arity stays sane
 /// as configuration accumulates (it has grown every phase so far).
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +166,13 @@ impl Default for AgentConfig {
 pub enum AgentError {
     #[error("llm backend error: {0}")]
     Llm(#[from] LlmError),
+    /// Reserved for a future, coarser autonomous-session budget (Phase
+    /// 11c) — the per-round-trip `max_tool_iterations` cap no longer
+    /// constructs this (see `AgentEvent::TurnPaused`, ROADMAP.md Phase 12
+    /// Part A): hitting that cap mid-work is a resumable pause, not a
+    /// failure. Kept as a real hard ceiling for whatever unattended-budget
+    /// check Phase 11c adds, so an unbounded autonomous loop still has
+    /// something able to say no.
     #[error("maximum tool iterations ({0}) exceeded for this turn")]
     MaxIterationsExceeded(u32),
     #[error("response exceeded the maximum allowed size and was aborted")]
@@ -181,6 +218,19 @@ pub struct Agent {
     /// `/council` support when configured; `None` makes the command explain
     /// how to enable itself instead of running.
     council: Option<crate::council::Council>,
+    /// `[verification]` support (ROADMAP.md Phase 12 Part B); `None`
+    /// disables the feature entirely.
+    verification: Option<VerificationConfig>,
+    /// Set whenever a `write_file`/`edit_file` call succeeds; cleared only
+    /// by a passing verification run. Deliberately spans turn boundaries —
+    /// a turn pausing mid-edit (Phase 12 Part A) must not let unverified
+    /// edits be silently forgotten by whichever turn continues it.
+    unverified_edits: bool,
+    /// How many (edit, re-verify) cycles have failed since edits last
+    /// became unverified; reset to 0 both on a pass and on exhaustion (see
+    /// `run_turn_inner`'s completion check) so the feature never silently
+    /// disables itself for the rest of the session.
+    verify_retries: u32,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -216,6 +266,9 @@ impl Agent {
             edit_format: config.edit_format,
             synthetic_seq: 0,
             council: None,
+            verification: None,
+            unverified_edits: false,
+            verify_retries: 0,
             events_tx,
         }
     }
@@ -225,6 +278,19 @@ impl Agent {
     /// resident daily driver.
     pub fn set_council(&mut self, council: crate::council::Council) {
         self.council = Some(council);
+    }
+
+    /// Enables enforced verification (Phase 12 Part B): `command_name` must
+    /// name an entry the `run_command` tool was built with (the caller's
+    /// responsibility to keep in sync with `[[permissions.allowed_commands]]`
+    /// — see `main.rs`'s startup validation warning). `max_retries` is
+    /// clamped to a minimum of 1, matching the same "a misconfigured 0 would
+    /// otherwise be silently wrong" reasoning as `max_tool_iterations`.
+    pub fn set_verification(&mut self, command_name: String, max_retries: u32) {
+        self.verification = Some(VerificationConfig {
+            command_name,
+            max_retries: max_retries.max(1),
+        });
     }
 
     /// Enables the repository map: rendered per turn, appended to the
@@ -293,6 +359,12 @@ impl Agent {
             // would just invite blocks the gate then has to bounce.
             system.push_str("\n\n");
             system.push_str(EDIT_FORMAT_PROMPT);
+        }
+        // Not taught during plan mode — no edits happen there, so
+        // verification can never actually fire (see `run_turn_inner`).
+        if self.verification.is_some() && !self.plan_mode.active() {
+            system.push_str("\n\n");
+            system.push_str(VERIFICATION_PROMPT);
         }
         if let Some(map) = &self.repo_map_text {
             system.push_str("\n\n");
@@ -377,6 +449,52 @@ impl Agent {
         });
     }
 
+    /// Synthesizes and dispatches the configured `[verification] command`
+    /// via the `run_command` tool — reusing its existing trust tier (the
+    /// name must already be pre-approved through
+    /// `[[permissions.allowed_commands]]`) rather than inventing a new one
+    /// — pushing both the synthetic call and its result into history
+    /// exactly like a normal round-trip: a synthetic assistant message
+    /// carrying the one call (needed because OpenAI-compatible wire format
+    /// requires every `Role::Tool` result to correspond to a preceding
+    /// assistant `tool_calls` entry — the same reason prompted-mode
+    /// SEARCH/REPLACE blocks get synthesized into real calls), then the
+    /// dispatched result. Returns whether the command reported success.
+    /// See ROADMAP.md Phase 12 Part B.
+    async fn run_auto_verification(
+        &mut self,
+        command_name: &str,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        self.synthetic_seq += 1;
+        let call = ToolCall {
+            id: ToolCallId(format!("auto-verify-{}", self.synthetic_seq)),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "command": command_name }),
+            source: ToolCallSource::AutoVerification,
+        };
+        self.emit(AgentEvent::ToolCallDetected(call.clone()));
+        self.history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(call.clone())],
+            tool_call_id: None,
+        });
+
+        let result = self
+            .executor
+            .dispatch(call, cwd, cancellation.clone())
+            .await;
+        self.emit(AgentEvent::ToolResult(result.clone()));
+        let passed = matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+        self.history.push(Message {
+            role: Role::Tool,
+            tool_call_id: Some(result.call_id.clone()),
+            content: vec![ContentBlock::ToolResult(result)],
+        });
+        passed
+    }
+
     /// Runs one user turn to completion, then persists the session — the
     /// wrapper ensures *every* exit path of the inner loop (normal, error,
     /// iteration-cap, cancellation) saves, without threading a save into
@@ -454,8 +572,10 @@ impl Agent {
 
     /// Runs one user turn: sends the request, streams the response live via
     /// `AgentEvent`s, executes any tool calls the model makes, and repeats
-    /// until the model produces a final answer with no further tool calls
-    /// (or `max_tool_iterations` is hit).
+    /// until the model produces a final answer with no further tool calls —
+    /// or `max_tool_iterations` is hit, in which case the turn pauses
+    /// (`AgentEvent::TurnPaused`) rather than failing; nothing dispatched so
+    /// far is lost, and a further `run_turn` call continues from here.
     async fn run_turn_inner(
         &mut self,
         user_input: String,
@@ -685,6 +805,41 @@ impl Agent {
                 if had_malformed_blocks {
                     continue;
                 }
+
+                if self.unverified_edits
+                    && let Some(verification) = self.verification.clone()
+                {
+                    if self.verify_retries < verification.max_retries {
+                        self.verify_retries += 1;
+                        let passed = self
+                            .run_auto_verification(&verification.command_name, cwd, &cancellation)
+                            .await;
+                        if passed {
+                            self.unverified_edits = false;
+                            self.verify_retries = 0;
+                            self.emit(AgentEvent::TurnComplete);
+                            return Ok(());
+                        }
+                        // Failed: let the model see the result and try
+                        // again next iteration instead of ending here.
+                        continue;
+                    }
+                    // Retries exhausted for this round of edits: end the
+                    // turn anyway (never block TurnComplete — the Phase 12
+                    // Part B "loud notice, not a block" decision) but
+                    // reset the retry budget rather than silently
+                    // disabling verification for the rest of the session;
+                    // `unverified_edits` stays true so the very next
+                    // attempt to end a turn re-triggers this same check.
+                    self.verify_retries = 0;
+                    self.emit(AgentEvent::Error(format!(
+                        "verification (`{}`) still failing after {} attempt(s) — ending the \
+                         turn anyway. The worktree was checkpointed before each edit; `git log \
+                         refs/aivyx/checkpoints/` to inspect or rewind.",
+                        verification.command_name, verification.max_retries
+                    )));
+                }
+
                 self.emit(AgentEvent::TurnComplete);
                 return Ok(());
             }
@@ -719,10 +874,19 @@ impl Agent {
                     continue;
                 }
 
+                // Captured before the move below — feeds
+                // `unverified_edits` for the enforced-verification check at
+                // the top of this loop (Phase 12 Part B). Reuses the same
+                // name list prompted mode already hides edit tools behind,
+                // rather than a second hardcoded pair.
+                let is_edit_call = PROMPTED_EDIT_HIDDEN_TOOLS.contains(&call.name.as_str());
                 let result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
                     .await;
+                if is_edit_call && matches!(result.output, ToolOutput::Ok(_)) {
+                    self.unverified_edits = true;
+                }
                 self.emit(AgentEvent::ToolResult(result.clone()));
                 self.history.push(Message {
                     role: Role::Tool,
@@ -741,9 +905,18 @@ impl Agent {
             }
 
             if iteration == self.max_tool_iterations {
-                let err = AgentError::MaxIterationsExceeded(self.max_tool_iterations);
-                self.emit(AgentEvent::Error(err.to_string()));
-                return Err(err);
+                // Hitting the cap while the model was still actively
+                // dispatching tool calls (every call up to and including
+                // this iteration already has a matching result in
+                // history) is a pause, not a failure — see
+                // `AgentEvent::TurnPaused`'s doc comment and ROADMAP.md
+                // Phase 12 Part A.
+                self.emit(AgentEvent::TurnPaused(format!(
+                    "reached the {}-round-trip cap for this turn while still working — \
+                     send another message to continue; nothing has been lost.",
+                    self.max_tool_iterations
+                )));
+                return Ok(());
             }
         }
 
@@ -832,16 +1005,28 @@ fn elide(text: &str, cap: usize) -> String {
     )
 }
 
+/// Parses `run_command`'s formatted output (see
+/// `aivyx_tools::process::format_output`) for its pass/fail verdict. A
+/// non-zero exit is normal `Ok` output for that tool — a failing test run
+/// is expected, informative verification-loop data, not a tool-level error
+/// — so this string check on the embedded verdict marker is the only signal
+/// available without changing that tool's contract. Coupled to the exact
+/// wording `format_output` emits; keep the two in sync if either changes.
+fn command_reported_success(output: &str) -> bool {
+    output.contains("exit status:") && output.contains("(success)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Duration;
 
     use aivyx_sandbox::{
         ActionKind, ExecutionConfiner, NoopConfiner, PermissionDecision, PermissionGate,
         PermissionRequest, PermissionTarget, PlanMode,
     };
-    use aivyx_tools::{Tool, ToolError, ToolExecutionContext, ToolRegistry};
+    use aivyx_tools::{CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry};
     use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
     use futures::stream::BoxStream;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -1570,9 +1755,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_tool_iterations_is_enforced() {
+    async fn max_tool_iterations_pauses_the_turn_without_losing_history() {
         // Both responses request a tool and never give a final answer, so the
-        // loop must terminate on the iteration cap.
+        // loop must stop at the iteration cap — as a pause (ROADMAP.md Phase
+        // 12 Part A), not an error: the turn itself must still return `Ok`.
         let looping = || {
             vec![
                 StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
@@ -1581,13 +1767,231 @@ mod tests {
                 },
             ]
         };
-        let (mut agent, _rx, _) = build_agent(vec![looping(), looping()], ToolRegistry::new(), 2);
+        let (mut agent, mut rx, _) = build_agent(vec![looping(), looping()], ToolRegistry::new(), 2);
 
-        let result = agent
+        agent
             .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await;
+            .await
+            .unwrap();
 
-        assert!(matches!(result, Err(AgentError::MaxIterationsExceeded(2))));
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnPaused(msg) if msg.contains("2-round-trip"))),
+            "expected a TurnPaused event, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
+            "a paused turn must not also claim completion"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "hitting the cap mid-work is a pause, not an error"
+        );
+        // Every dispatched tool call up to the cap still has a matching
+        // result — nothing lost by pausing instead of failing.
+        assert_eq!(count_tool_calls(&agent.history), 2);
+        assert_eq!(count_tool_results(&agent.history), 2);
+    }
+
+    #[tokio::test]
+    async fn a_paused_turn_resumes_cleanly_from_a_follow_up_message() {
+        // After pausing on the cap, the agent's history/session already hold
+        // everything dispatched so far; a plain follow-up `run_turn` call
+        // (exactly what an interactive user would send next) must continue
+        // the same conversation rather than starting over or erroring.
+        let looping = vec![
+            StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let (mut agent, mut rx, mock) =
+            build_agent(vec![looping, text_response("done")], ToolRegistry::new(), 1);
+
+        agent
+            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnPaused(_)))
+        );
+
+        agent
+            .run_turn(
+                "continue".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnComplete))
+        );
+        assert_eq!(agent.history.last().unwrap().text_content(), "done");
+        // Both round-trips actually reached the backend — resuming is a
+        // real continuation, not a silently-dropped no-op.
+        assert_eq!(mock.received.lock().unwrap().len(), 2);
+    }
+
+    // ----- enforced verification (Phase 12 Part B) -----
+
+    fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
+        CommandSpec {
+            name: name.to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), if exit_ok { "exit 0" } else { "exit 1" }.to_string()],
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn auto_verify_calls(history: &[Message]) -> usize {
+        history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolCall(c) if c.source == ToolCallSource::AutoVerification
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+            "verify", true,
+        )])));
+
+        let write_call = vec![
+            StreamEvent::ToolCallComplete(ToolCall {
+                id: ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+                source: ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let (mut agent, mut rx, mock) = build_agent(
+            vec![write_call, text_response("done")],
+            registry,
+            10,
+        );
+        agent.set_verification("verify".to_string(), 3);
+
+        agent
+            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "a passing verification must not surface a failure notice"
+        );
+        assert_eq!(
+            auto_verify_calls(&agent.history),
+            1,
+            "exactly one auto-verification call expected"
+        );
+        assert!(!agent.unverified_edits);
+        assert_eq!(agent.verify_retries, 0);
+        // Verification passing must not cost the model another round-trip
+        // beyond the two real ones (the edit, then the model's own
+        // no-more-tool-calls response) — it's dispatched directly, not
+        // through another `stream_chat` call.
+        assert_eq!(mock.received.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+            "verify", false,
+        )])));
+
+        let write_call = vec![
+            StreamEvent::ToolCallComplete(ToolCall {
+                id: ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+                source: ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        // One response ends the model's tool calls, then one more scripted
+        // no-op response per retry (the loop re-enters the model after
+        // each failed verification so it can react).
+        let (mut agent, mut rx, _) = build_agent(
+            vec![
+                write_call,
+                text_response("done"),
+                text_response("trying again"),
+                text_response("still trying"),
+            ],
+            registry,
+            10,
+        );
+        agent.set_verification("verify".to_string(), 2);
+
+        agent
+            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Error(msg) if msg.contains("still failing after 2 attempt"))
+            ),
+            "expected the exhausted-retries notice, got {events:?}"
+        );
+        assert_eq!(
+            auto_verify_calls(&agent.history),
+            2,
+            "exactly max_auto_verify_retries auto-verification attempts expected"
+        );
+        // The retry budget resets so the feature isn't silently disabled
+        // for the rest of the session, but the edits remain genuinely
+        // unverified — the very next attempt to end a turn must re-check.
+        assert_eq!(agent.verify_retries, 0);
+        assert!(agent.unverified_edits);
+    }
+
+    #[tokio::test]
+    async fn verification_never_fires_when_nothing_was_edited() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+            "verify", true,
+        )])));
+        let (mut agent, _rx, _) = build_agent(vec![text_response("hi there")], registry, 10);
+        agent.set_verification("verify".to_string(), 3);
+
+        agent
+            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(auto_verify_calls(&agent.history), 0);
+        assert!(!agent.unverified_edits);
     }
 
     #[tokio::test]

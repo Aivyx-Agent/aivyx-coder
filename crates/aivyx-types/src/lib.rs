@@ -60,6 +60,10 @@ impl std::fmt::Display for ToolCallId {
 pub enum ToolCallSource {
     Native,
     TextFallback,
+    /// Synthesized by the agent itself, not the model — the enforced
+    /// `[verification] command` auto-invoked after file edits, before a
+    /// turn is allowed to end. See ROADMAP.md Phase 12 Part B.
+    AutoVerification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

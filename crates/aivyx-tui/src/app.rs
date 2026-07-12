@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
 use aivyx_sandbox::{PermissionRequest, PermissionTarget, PlanMode, UserResponse};
-use aivyx_types::{ContentBlock, Message, Role, ToolOutput};
+use aivyx_types::{ContentBlock, Message, Role, ToolCallSource, ToolOutput};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -28,6 +28,11 @@ enum ChatLine {
     ToolCall(String),
     ToolResult(String),
     Notice(String),
+    /// A turn paused on the iteration cap while still working — deliberately
+    /// styled distinctly from `Notice` (which today also carries real
+    /// errors and is red/bold): nothing failed, the session is resumable by
+    /// just sending another message. See `AgentEvent::TurnPaused`.
+    Paused(String),
     /// One block of `/council` deliberation output — visually distinct from
     /// both the assistant and error notices, since a council's members are
     /// not "aivyx" and their notes are not failures.
@@ -223,8 +228,16 @@ impl App {
                 }
             }
             AgentEvent::ToolCallDetected(call) => {
+                // Auto-verification calls are the agent's own doing, not
+                // the model's — labeled distinctly so the transcript never
+                // implies the model asked for this itself.
+                let prefix = if call.source == ToolCallSource::AutoVerification {
+                    "auto-verify: "
+                } else {
+                    ""
+                };
                 self.transcript.push(ChatLine::ToolCall(format!(
-                    "{}({})",
+                    "{prefix}{}({})",
                     call.name, call.arguments
                 )));
             }
@@ -235,6 +248,10 @@ impl App {
             AgentEvent::TurnComplete => self.streaming_active = false,
             AgentEvent::Error(message) => {
                 self.transcript.push(ChatLine::Notice(message));
+                self.streaming_active = false;
+            }
+            AgentEvent::TurnPaused(message) => {
+                self.transcript.push(ChatLine::Paused(message));
                 self.streaming_active = false;
             }
             AgentEvent::ContextUsage { used, limit } => {
@@ -379,8 +396,13 @@ fn seed_transcript(history: &[Message]) -> Vec<ChatLine> {
                             lines.push(ChatLine::Assistant(text.clone()));
                         }
                         ContentBlock::ToolCall(call) => {
+                            let prefix = if call.source == ToolCallSource::AutoVerification {
+                                "auto-verify: "
+                            } else {
+                                ""
+                            };
                             lines.push(ChatLine::ToolCall(format!(
-                                "{}({})",
+                                "{prefix}{}({})",
                                 call.name, call.arguments
                             )));
                         }
@@ -570,6 +592,11 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             "  ! ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        // Deliberately not red/bold like Notice — a paused turn hasn't
+        // failed, and shouldn't read like it has.
+        ChatLine::Paused(text) => {
+            prefixed_lines(text, "  ~ paused: ", Style::default().fg(Color::Blue))
+        }
         ChatLine::Council(text) => {
             prefixed_lines(text, "council> ", Style::default().fg(Color::Magenta))
         }
