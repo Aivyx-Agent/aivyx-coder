@@ -58,13 +58,12 @@ pub fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
         return (fm, content);
     };
     let Some(close_at) = after_open.find("\n---\n") else {
-        // The block runs to the end of the file with no trailing body.
-        if let Some(block) = after_open.strip_suffix("\n---\n") {
-            parse_frontmatter_lines(block, &mut fm);
-            return (fm, "");
-        }
         // No closing marker at all — treat the whole thing as an
-        // unrecognized body rather than guessing.
+        // unrecognized body rather than guessing. (A frontmatter block
+        // that runs to end-of-file with no trailing body, e.g.
+        // "---\nkey: value\n---\n", is already handled by the `find`
+        // success path above — its closing "\n---\n" is still found,
+        // just with an empty remainder after it.)
         return (fm, content);
     };
     let (block, rest) = after_open.split_at(close_at);
