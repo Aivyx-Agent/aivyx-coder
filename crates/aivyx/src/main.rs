@@ -5,7 +5,7 @@ use std::time::Duration;
 use aivyx_config::Settings;
 use aivyx_core::{Agent, AgentConfig, Council, CouncilSeat, EditFormat, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
-use aivyx_sandbox::{ConfirmationGate, PermissionGate, PlanMode};
+use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
     CommandSpec, EditFileTool, GitCheckpointer, GitCommitTool, GitReadTool, GlobTool, GrepTool,
     ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry,
@@ -103,6 +103,14 @@ struct Cli {
     #[arg(long)]
     plan: bool,
 
+    /// Run unattended toward a goal: no permission modals, edits and
+    /// pre-approved commands auto-resolve, and the loop continues on its
+    /// own until the goal is achieved (every task marked done) or the
+    /// [autonomous] budget is exhausted. Mutually exclusive with --plan and
+    /// --resume. Requires [verification].command to be configured.
+    #[arg(long)]
+    auto: Option<String>,
+
     /// Override config.toml's backend edit_format ("native" or "prompted")
     /// for this session — mainly for comparing the two on a given model.
     #[arg(long, value_parser = ["native", "prompted"])]
@@ -139,7 +147,14 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let deny_paths = settings.permissions.resolved_deny_paths();
-    let cwd = std::env::current_dir()?;
+    // Canonicalized once and reused everywhere `cwd` is needed (sandbox
+    // confiner, checkpointer, repo map, session path, and — critically —
+    // `ConfirmationGate`'s cwd-boundary check below): `current_dir()` does
+    // not resolve symlinks, and the gate's `starts_with` comparison is
+    // against symlink-canonicalized tool target paths, so an uncanonicalized
+    // cwd could cause it to spuriously deny legitimate in-worktree edits
+    // when the process is launched from a path involving a symlink.
+    let cwd = std::env::current_dir()?.canonicalize()?;
 
     let command_specs: Vec<CommandSpec> = settings
         .permissions
@@ -204,12 +219,37 @@ async fn main() -> anyhow::Result<()> {
     let plan_mode = PlanMode::new();
     plan_mode.set_active(cli.plan);
 
+    // --auto and --plan are contradictory (unattended action-taking vs.
+    // enforced read-only); --auto and --resume are unsupported together in
+    // this version (autonomous session state — unverified edits, retry
+    // counts, the pre-experiment checkpoint ref — isn't part of
+    // SessionState yet; see the Phase 11c design doc's non-goals).
+    if cli.auto.is_some() && cli.plan {
+        anyhow::bail!("--auto and --plan cannot be used together");
+    }
+    if cli.auto.is_some() && cli.resume {
+        anyhow::bail!("--auto and --resume cannot be used together (not supported yet)");
+    }
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(cli.auto.is_some());
+    // Auto-approving edits is only defensible because deterministic
+    // verification is the safety net — without it, "autonomous" would mean
+    // "unchecked." Refuse to start rather than run degraded.
+    if cli.auto.is_some() && settings.verification.command.is_none() {
+        anyhow::bail!(
+            "--auto requires [verification].command to be configured — auto-approving edits \
+             with no verification check is not supported"
+        );
+    }
+
     let (prompter, permission_rx) = aivyx_tui::permission_channel();
     let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
         Arc::new(prompter),
         deny_paths.clone(),
         pre_approved_commands,
         plan_mode.clone(),
+        autonomous_mode.clone(),
+        cwd.clone(),
     ));
     let confiner = aivyx_sandbox::default_confiner(
         &cwd,
@@ -262,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Arc::clone(&tasks),
         plan_mode.clone(),
+        autonomous_mode.clone(),
         events_tx,
     );
 
@@ -341,7 +382,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    aivyx_tui::run(agent, events_rx, cwd, permission_rx, restored, plan_mode).await
+    let autonomous_run = cli.auto.map(|goal| aivyx_tui::AutonomousRun {
+        goal,
+        max_iterations: settings.autonomous.max_iterations,
+        max_duration: Duration::from_secs(settings.autonomous.max_duration_secs),
+        tasks: Arc::clone(&tasks),
+    });
+    aivyx_tui::run(
+        agent,
+        events_rx,
+        cwd,
+        permission_rx,
+        restored,
+        plan_mode,
+        autonomous_run,
+    )
+    .await
 }
 
 /// Best-effort check, used only to decide whether to warn about sending
