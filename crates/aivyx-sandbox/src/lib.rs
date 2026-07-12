@@ -97,6 +97,35 @@ impl PlanMode {
     }
 }
 
+/// Shared autonomous-mode flag: while active, `ConfirmationGate` resolves
+/// every decision deterministically (pre-approved commands and in-worktree
+/// edits allowed, everything else denied) instead of prompting — there is
+/// no human to prompt. Set once at startup from the `--auto` CLI flag; not
+/// expected to toggle mid-session (unlike `PlanMode`, no keybinding flips
+/// it), but the same shared-flag shape keeps `ConfirmationGate`'s
+/// consumption pattern uniform. See docs/superpowers/specs/
+/// 2026-07-12-phase-11c-autonomous-loop-design.md.
+///
+/// `Relaxed` ordering, same rationale as `PlanMode`: no data is published
+/// through this flag, so there is nothing for a stricter ordering to
+/// synchronize.
+#[derive(Debug, Clone, Default)]
+pub struct AutonomousMode(Arc<AtomicBool>);
+
+impl AutonomousMode {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn active(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.0.store(active, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserResponse {
     Allow,
@@ -185,5 +214,26 @@ impl PermissionGate for AlwaysDenyGate {
         PermissionDecision::Deny(Some(
             "no permission gate is configured (fail-closed default)".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autonomous_mode_starts_inactive_and_can_be_activated() {
+        let mode = AutonomousMode::new();
+        assert!(!mode.active());
+        mode.set_active(true);
+        assert!(mode.active());
+    }
+
+    #[test]
+    fn autonomous_mode_clones_share_state() {
+        let mode = AutonomousMode::new();
+        let clone = mode.clone();
+        mode.set_active(true);
+        assert!(clone.active(), "clones must observe the same underlying flag");
     }
 }
