@@ -5,6 +5,7 @@ use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, To
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{AutonomousMode, PlanMode};
 use aivyx_tools::ToolExecutor;
+use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolOutput, ToolResult,
 };
@@ -584,7 +585,10 @@ impl Agent {
                 let subject = subject.to_string();
                 self.run_council_turn(&subject, cancellation).await
             }
-            None => self.run_turn_inner(user_input, cwd, cancellation).await,
+            None => match crate::wiki::parse_command(&user_input) {
+                Some(command) => self.run_wiki_turn(command, cwd, cancellation).await,
+                None => self.run_turn_inner(user_input, cwd, cancellation).await,
+            },
         };
         self.persist();
         result
@@ -637,6 +641,135 @@ impl Agent {
         if let Some(message) = entry {
             self.history.push(message);
         }
+        self.emit(AgentEvent::TurnComplete);
+        Ok(())
+    }
+
+    /// Runs `/wiki` (Phase 11b): resolves `command` into the pages that
+    /// need regenerating, then drives one turn per page through
+    /// `run_wiki_turn_for_pages`. See `aivyx_tools::wiki` for the
+    /// staleness/frontmatter mechanics and `crate::wiki` for this project's
+    /// fixed page skeleton.
+    async fn run_wiki_turn(
+        &mut self,
+        command: crate::wiki::WikiCommand,
+        cwd: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<(), AgentError> {
+        let wiki_dir = cwd.join(crate::wiki::WIKI_DIR);
+        let specs = crate::wiki::page_specs(cwd);
+
+        let pages: Vec<StalePage> = match command {
+            crate::wiki::WikiCommand::Batch => {
+                aivyx_tools::wiki::stale_pages(cwd, &wiki_dir, &specs, &cancellation).await
+            }
+            crate::wiki::WikiCommand::Forced(name) => {
+                let Some(spec) = specs.iter().find(|s| s.name == name) else {
+                    let valid: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+                    self.emit(AgentEvent::Error(format!(
+                        "unknown wiki page '{name}' — valid pages: {}",
+                        valid.join(", ")
+                    )));
+                    self.emit(AgentEvent::TurnComplete);
+                    return Ok(());
+                };
+                vec![StalePage {
+                    name: spec.name.clone(),
+                    covers: spec.covers.clone(),
+                    reason: aivyx_tools::wiki::StaleReason::Forced,
+                }]
+            }
+        };
+
+        if pages.is_empty() {
+            self.emit(AgentEvent::Error(
+                "wiki is up to date, nothing to regenerate".to_string(),
+            ));
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+
+        self.run_wiki_turn_for_pages(pages, cwd, cancellation).await
+    }
+
+    /// Drives one turn per page in `pages`, in order — split out from
+    /// `run_wiki_turn` so tests can exercise a known page list directly
+    /// without depending on filesystem-driven staleness discovery. Reuses
+    /// `run_turn_inner` (not `run_turn`, so a synthesized instruction is
+    /// never re-checked against `/council`/`/wiki`), continuing on
+    /// `TurnPaused` exactly like a normal multi-round-trip turn. A page
+    /// whose turn ends in error, or whose `write_file` call never actually
+    /// happened, is skipped (left stale for the next `/wiki` run) rather
+    /// than aborting pages still queued behind it.
+    async fn run_wiki_turn_for_pages(
+        &mut self,
+        pages: Vec<StalePage>,
+        cwd: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<(), AgentError> {
+        let wiki_dir = cwd.join(crate::wiki::WIKI_DIR);
+
+        for page in pages {
+            if cancellation.is_cancelled() {
+                break;
+            }
+
+            let covers_list: String = page
+                .covers
+                .iter()
+                .map(|c| format!("  - \"{c}\"\n"))
+                .collect();
+            let instruction = format!(
+                "Regenerate the wiki page `{}/{}.md`. It should document: {}. Write clear, \
+                 accurate Markdown covering what this part of the codebase does, its key \
+                 types/functions, and how it's used — a reader with no context should be able \
+                 to orient quickly. Start the file with frontmatter exactly in this form (fill \
+                 in `summary` with a genuinely useful one-line description; \
+                 `generated_at_commit` and `covers` will be overwritten automatically \
+                 afterward, so their values here don't matter):\n\
+                 ---\n\
+                 generated_at_commit: (placeholder)\n\
+                 covers:\n{covers_list}\
+                 summary: \"...\"\n\
+                 ---\n\
+                 Then the page body. Call write_file with the complete file content in one \
+                 call.",
+                crate::wiki::WIKI_DIR,
+                page.name,
+                page.covers.join(", "),
+            );
+
+            self.last_turn_paused = false;
+            let mut result = self.run_turn_inner(instruction, cwd, cancellation.clone()).await;
+            while result.is_ok() && self.last_turn_paused && !cancellation.is_cancelled() {
+                self.last_turn_paused = false;
+                result = self
+                    .run_turn_inner("continue".to_string(), cwd, cancellation.clone())
+                    .await;
+            }
+
+            if cancellation.is_cancelled() {
+                break;
+            }
+            if result.is_err() {
+                // `run_turn_inner` already emitted an `AgentEvent::Error`
+                // describing the failure — this page just stays stale for
+                // the next `/wiki` run.
+                continue;
+            }
+
+            if let Err(err) =
+                aivyx_tools::wiki::stamp_page(&wiki_dir, cwd, &page.name, &page.covers, &cancellation)
+                    .await
+            {
+                self.emit(AgentEvent::Error(format!(
+                    "page `{}` did not save correctly ({err}) — it will be retried on the next \
+                     /wiki run",
+                    page.name
+                )));
+            }
+        }
+
         self.emit(AgentEvent::TurnComplete);
         Ok(())
     }
@@ -2204,6 +2337,293 @@ mod tests {
             !dir.path().join("new.txt").exists(),
             "the file created by the discarded experiment must be gone after rewind"
         );
+    }
+
+    // ----- /wiki (Phase 11b) -----
+
+    fn stale(name: &str, covers: &[&str]) -> aivyx_tools::wiki::StalePage {
+        aivyx_tools::wiki::StalePage {
+            name: name.to_string(),
+            covers: covers.iter().map(|s| s.to_string()).collect(),
+            reason: aivyx_tools::wiki::StaleReason::Missing,
+        }
+    }
+
+    fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallComplete(ToolCall {
+                id: ToolCallId(id.to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({ "path": path, "content": content }),
+                source: ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn wiki_batch_regenerates_missing_pages_and_stamps_frontmatter() {
+        // Uses `run_wiki_turn_for_pages` directly (an explicit page list)
+        // rather than the full `run_wiki_turn` → `page_specs`/`stale_pages`
+        // chain — that chain is already covered by Task 2's aivyx-tools
+        // tests and by the dispatch-specific tests below; this test's job
+        // is purely "given a page needs regenerating, is the orchestration
+        // (one turn, then stamp) correct."
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (tx, _rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![
+            write_call(
+                "c1",
+                "docs/wiki/aivyx-core.md",
+                "---\nsummary: \"Turn loop.\"\n---\n# aivyx-core\nBody.\n",
+            ),
+            text_response("done"), // no more tool calls: the page's turn ends
+        ]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig { max_tool_iterations: 10, ..Default::default() },
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        agent
+            .run_wiki_turn_for_pages(
+                vec![stale("aivyx-core", &["crates/aivyx-core"])],
+                dir.path(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(dir.path().join("docs/wiki/aivyx-core.md")).unwrap();
+        let (fm, body) = aivyx_tools::wiki::parse_frontmatter(&written);
+        assert!(fm.generated_at_commit.is_some(), "frontmatter must be stamped");
+        assert_eq!(fm.covers, vec!["crates/aivyx-core"]);
+        assert_eq!(fm.summary.as_deref(), Some("Turn loop."));
+        assert_eq!(body, "# aivyx-core\nBody.\n");
+    }
+
+    #[tokio::test]
+    async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing() {
+        // No `crates/` directory at all in this tempdir, so
+        // `crate::wiki::page_specs` (Task 3) discovers exactly one page:
+        // `architecture-overview` (matches
+        // `page_specs_handles_a_missing_crates_directory_gracefully`'s
+        // behavior) — stamping *that* page at the real current HEAD is what
+        // makes `stale_pages` report nothing stale.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+        let wiki_dir = dir.path().join("docs/wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        // `covers` is deliberately omitted here: `stale_pages` only reads
+        // `generated_at_commit` back from a page's own frontmatter — the
+        // covered paths it diffs against come from `spec.covers`
+        // (`crate::wiki::ARCHITECTURE_OVERVIEW_COVERS` for this page), not
+        // from the file on disk. Since `generated_at_commit` here equals
+        // the repo's current HEAD with no commits made since, `git diff
+        // --name-only <head> HEAD -- <anything>` is trivially empty
+        // regardless of whether those covered paths exist in this minimal
+        // fixture repo.
+        std::fs::write(
+            wiki_dir.join("architecture-overview.md"),
+            format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
+        )
+        .unwrap();
+
+        let registry = ToolRegistry::new(); // no write_file registered: none must be called
+        let (tx, mut rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![]));
+        let llm: Arc<dyn LlmBackend> = mock;
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig::default(),
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        agent
+            .run_wiki_turn(crate::wiki::WikiCommand::Batch, dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("up to date"))));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    }
+
+    #[tokio::test]
+    async fn wiki_forced_invocation_with_unknown_page_name_rejects_with_no_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+
+        let registry = ToolRegistry::new();
+        let (tx, mut rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig::default(),
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        agent
+            .run_wiki_turn(
+                crate::wiki::WikiCommand::Forced("not-a-real-page".to_string()),
+                dir.path(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("unknown wiki page"))));
+        assert_eq!(mock.received.lock().unwrap().len(), 0, "no turn should have been sent to the backend");
+    }
+
+    #[tokio::test]
+    async fn wiki_continues_to_the_next_page_after_one_page_writes_nothing() {
+        // `run_wiki_turn_for_pages` takes an explicit page list, so there's
+        // no dependency on `page_specs`' filesystem-driven crate discovery
+        // here — no `crates/` subdirectories need to exist.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (tx, _rx) = unbounded_channel();
+        // Page "alpha" (processed first, in list order) never calls
+        // write_file — just prose, so its turn ends after one request.
+        // Page "beta" does call write_file, which forces a *second* request
+        // for that turn (the model needs a follow-up round-trip after a
+        // tool call to produce the "nothing more to do" response that ends
+        // the turn) — three requests total, not two.
+        let mock = Arc::new(MockBackend::new(vec![
+            text_response("I looked around but decided not to write anything."),
+            write_call("c1", "docs/wiki/beta.md", "---\nsummary: \"Beta.\"\n---\nBeta body.\n"),
+            text_response("done"),
+        ]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig { max_tool_iterations: 10, ..Default::default() },
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        let pages = vec![stale("alpha", &["crates/alpha"]), stale("beta", &["crates/beta"])];
+        agent
+            .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            !dir.path().join("docs/wiki/alpha.md").exists(),
+            "a page the model never wrote must not appear on disk"
+        );
+        assert!(
+            dir.path().join("docs/wiki/beta.md").exists(),
+            "the next page must still be attempted after a prior page wrote nothing"
+        );
+        assert_eq!(
+            mock.received.lock().unwrap().len(),
+            3,
+            "both pages must have been attempted (1 request for alpha, 2 for beta)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_dispatches_wiki_commands_before_normal_turn_processing() {
+        // Reuses the "nothing stale" fixture from
+        // `wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing`
+        // so this test can also assert zero LLM calls happened. What's
+        // distinct here: routing through the public `Agent::run_turn` entry
+        // point (every real caller's entry point), not `run_wiki_turn`
+        // directly — confirming the interception wiring added to
+        // `run_turn`'s own dispatch `match` in this task actually fires.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+        let wiki_dir = dir.path().join("docs/wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        let head = tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        std::fs::write(
+            wiki_dir.join("architecture-overview.md"),
+            format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
+        )
+        .unwrap();
+
+        let registry = ToolRegistry::new();
+        let (mut agent, mut rx, mock) = build_agent(vec![], registry, 10);
+
+        agent
+            .run_turn("/wiki".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.received.lock().unwrap().len(),
+            0,
+            "with nothing stale, /wiki must short-circuit before any LLM call"
+        );
+        // `agent.history` is empty in this scenario (no turn ever ran), so
+        // this is a vacuous-but-real regression guard: it would fail the
+        // moment a future change pushed the raw command into history before
+        // the staleness check.
+        assert!(
+            !agent.history.iter().any(|m| m.text_content().contains("/wiki")),
+            "the raw /wiki command text must never enter LLM history"
+        );
+        let _ = drain(&mut rx);
     }
 
     // ----- enforced verification (Phase 12 Part B) -----
