@@ -207,6 +207,15 @@ pub async fn stale_pages(
             continue;
         };
 
+        if spec.covers.is_empty() {
+            out.push(StalePage {
+                name: spec.name.clone(),
+                covers: spec.covers.clone(),
+                reason: StaleReason::Stale,
+            });
+            continue;
+        }
+
         let mut args: Vec<&str> = vec!["diff", "--name-only", &commit, "HEAD", "--"];
         args.extend(spec.covers.iter().map(String::as_str));
         let is_stale = match git(cwd, &args, cancellation).await {
@@ -435,6 +444,47 @@ mod git_tests {
             dir.path(),
             &wiki_dir,
             &[spec("aivyx-core", &["crates/aivyx-core"])],
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].reason, StaleReason::Stale);
+    }
+
+    #[tokio::test]
+    async fn stale_pages_treats_empty_covers_as_stale_without_running_an_unrestricted_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let generated_at = run_git(dir.path(), &["rev-parse", "HEAD"], &[])
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let wiki_dir = dir.path().join("docs/wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        std::fs::write(
+            page_path(&wiki_dir, "empty-covers"),
+            format!("---\ngenerated_at_commit: {generated_at}\n---\nbody\n"),
+        )
+        .unwrap();
+
+        // A commit that happens after the page was generated, touching
+        // something totally unrelated to this page — if the empty-covers
+        // guard weren't in place, an unrestricted `git diff -- ` (no
+        // pathspec) would still see this and incorrectly mark the page
+        // stale for the right *conclusion* but the wrong *reason*; this
+        // test's real point is proving the function takes the dedicated
+        // empty-covers path rather than reaching the git-diff call at all,
+        // which the guard achieves regardless of what else changed.
+        std::fs::write(dir.path().join("unrelated.txt"), "noise\n").unwrap();
+        commit_all(dir.path(), "unrelated change").await;
+
+        let result = stale_pages(
+            dir.path(),
+            &wiki_dir,
+            &[spec("empty-covers", &[])],
             &CancellationToken::new(),
         )
         .await;
