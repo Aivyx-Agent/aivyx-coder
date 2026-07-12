@@ -143,6 +143,31 @@ impl ToolExecutor {
         self.checkpointer = Some(checkpointer);
     }
 
+    /// The most recent checkpoint ref, or `None` if no checkpointer is
+    /// configured (checkpointing disabled, or `cwd` isn't a git repo) or
+    /// none has been taken yet. `Agent` (Phase 11c's autonomous discard
+    /// path) uses this to remember "state right before the first unverified
+    /// edit" without needing to know `GitCheckpointer` exists.
+    pub async fn latest_checkpoint_ref(&self, cancellation: &CancellationToken) -> Option<String> {
+        self.checkpointer.as_ref()?.latest_ref(cancellation).await
+    }
+
+    /// Restores the worktree to `ref_name` — see
+    /// `GitCheckpointer::restore_to` for exactly what that means. `Err` if
+    /// no checkpointer is configured (nothing to restore from) or the
+    /// underlying git operation fails.
+    pub async fn restore_to_checkpoint(
+        &self,
+        ref_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let checkpointer = self
+            .checkpointer
+            .as_ref()
+            .ok_or("no checkpointer is configured")?;
+        checkpointer.restore_to(ref_name, cancellation).await
+    }
+
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.registry.definitions()
     }
@@ -331,5 +356,70 @@ mod tests {
             std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
             "overwritten\n"
         );
+    }
+
+    #[tokio::test]
+    async fn latest_checkpoint_ref_and_restore_delegate_to_the_checkpointer() {
+        use crate::checkpoint::test_support::init_repo;
+        use aivyx_sandbox::NoopConfiner;
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let registry = ToolRegistry::new();
+        let mut executor = ToolExecutor::new(
+            registry,
+            Arc::new(AllowAllForThisTest),
+            Arc::new(NoopConfiner),
+        );
+
+        // No checkpointer configured: both wrappers degrade gracefully.
+        assert!(
+            executor
+                .latest_checkpoint_ref(&CancellationToken::new())
+                .await
+                .is_none()
+        );
+        assert!(
+            executor
+                .restore_to_checkpoint("whatever", &CancellationToken::new())
+                .await
+                .is_err()
+        );
+
+        executor.set_checkpointer(Arc::new(
+            GitCheckpointer::detect(&cwd, vec![]).await.unwrap(),
+        ));
+        std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+        executor
+            .checkpointer
+            .as_ref()
+            .unwrap()
+            .checkpoint("test", &CancellationToken::new())
+            .await;
+
+        let ref_name = executor
+            .latest_checkpoint_ref(&CancellationToken::new())
+            .await
+            .expect("a checkpoint was just taken");
+
+        std::fs::write(cwd.join("tracked.txt"), "broken\n").unwrap();
+        executor
+            .restore_to_checkpoint(&ref_name, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    struct AllowAllForThisTest;
+    #[async_trait]
+    impl PermissionGate for AllowAllForThisTest {
+        async fn check(&self, _r: &PermissionRequest) -> aivyx_sandbox::PermissionDecision {
+            aivyx_sandbox::PermissionDecision::Allow
+        }
     }
 }
