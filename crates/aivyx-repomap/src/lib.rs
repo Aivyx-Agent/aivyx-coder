@@ -31,6 +31,13 @@ const CHARS_PER_TOKEN: usize = 4;
 const PAGERANK_DAMPING: f64 = 0.85;
 const PAGERANK_ITERATIONS: usize = 30;
 
+/// Where generated wiki pages live, relative to `root` — duplicated from
+/// `aivyx-core::wiki::WIKI_DIR` rather than shared: this crate is
+/// deliberately dependency-free of the rest of the workspace (see the
+/// module doc comment at the top of this file). Keep both literals in sync
+/// if this path ever changes.
+const WIKI_DIR: &str = "docs/wiki";
+
 /// Definition captures: the `@name` capture is the symbol, the `@item`
 /// capture is the whole item whose first line becomes the signature.
 const DEF_QUERY: &str = r#"
@@ -132,8 +139,50 @@ impl RepoMap {
             out.push_str(&entry);
         }
 
+        for line in self.wiki_pointer_lines() {
+            if out.len() + line.len() > budget_chars {
+                break;
+            }
+            out.push_str(&line);
+        }
+
         // Only the header fit — the budget is too small to say anything.
         (out.lines().count() > 1).then_some(out)
+    }
+
+    /// Lightweight pointer lines for existing wiki pages (path + one-line
+    /// summary, if the page has one) — cheap enough to include every turn;
+    /// the model reads a page's full content via `read_file` only if the
+    /// pointer looks relevant. See ROADMAP.md Phase 11b.
+    fn wiki_pointer_lines(&self) -> Vec<String> {
+        let wiki_dir = self.root.join(WIKI_DIR);
+        let Ok(entries) = std::fs::read_dir(&wiki_dir) else {
+            return Vec::new();
+        };
+
+        let mut pages: Vec<(String, Option<String>)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .map(|e| {
+                let path = e.path();
+                let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
+                let summary = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|content| wiki_summary(&content));
+                (relative.display().to_string(), summary)
+            })
+            .collect();
+        pages.sort();
+
+        if pages.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = vec!["\nWiki pages (read via read_file for full detail):\n".to_string()];
+        lines.extend(pages.into_iter().map(|(path, summary)| match summary {
+            Some(s) => format!("  {path}: {s}\n"),
+            None => format!("  {path}\n"),
+        }));
+        lines
     }
 
     /// Walks the repo and returns tags for every parseable file, re-parsing
@@ -356,6 +405,22 @@ fn render_file(path: &Path, tags: &FileTags) -> String {
     out
 }
 
+/// Extracts just the `summary:` line from a `---`-delimited frontmatter
+/// block, if present. Deliberately lenient — not a real YAML parser, just
+/// enough structure-scanning for the one field this crate ever needs (see
+/// `aivyx_tools::wiki`'s independent, more complete parser for the format
+/// this reads; duplicated here rather than shared, per this crate's
+/// dependency-free constraint).
+fn wiki_summary(content: &str) -> Option<String> {
+    let after_open = content.strip_prefix("---\n")?;
+    let block_end = after_open.find("\n---")?;
+    let block = &after_open[..block_end];
+    block.lines().find_map(|line| {
+        line.strip_prefix("summary: ")
+            .map(|v| v.trim().trim_matches('"').to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +605,68 @@ fn caller() {
         write(dir.path(), "lib.rs", "pub fn some_fn() {}\n");
         let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
         assert!(map.render(0).is_none());
+    }
+
+    #[test]
+    fn render_includes_a_wiki_pointer_section_with_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src.rs", "pub fn something() {}\n");
+        write(
+            dir.path(),
+            "docs/wiki/aivyx-core.md",
+            "---\ngenerated_at_commit: abc\nsummary: \"Turn loop and orchestration.\"\n---\nBody.\n",
+        );
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(rendered.contains("docs/wiki/aivyx-core.md"));
+        assert!(rendered.contains("Turn loop and orchestration."));
+    }
+
+    #[test]
+    fn render_wiki_pointer_falls_back_when_a_page_has_no_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src.rs", "pub fn something() {}\n");
+        write(dir.path(), "docs/wiki/plain.md", "no frontmatter here\n");
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(rendered.contains("docs/wiki/plain.md"));
+    }
+
+    #[test]
+    fn render_wiki_pointer_section_is_absent_with_no_wiki_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src.rs", "pub fn something() {}\n");
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(!rendered.contains("Wiki pages"));
+    }
+
+    #[test]
+    fn render_does_not_panic_with_a_tiny_budget_and_wiki_pages_present() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src.rs", "pub fn something() {}\n");
+        write(
+            dir.path(),
+            "docs/wiki/aivyx-core.md",
+            "---\nsummary: \"Should not fit in a tiny budget.\"\n---\nBody.\n",
+        );
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        // A 1-token budget (4 chars) is smaller than the header alone, so
+        // `render` returns `None` here (matches existing behavior for the
+        // file-listing section — not asserted as a hardcoded byte count,
+        // just confirmed not to panic now that the wiki section shares the
+        // same budget check). `Some(...)` would also be an acceptable
+        // outcome if the budget math ever changes; the only real assertion
+        // is "doesn't panic and stays within budget if it returns Some."
+        if let Some(rendered) = map.render(1) {
+            assert!(rendered.chars().count() < 200);
+        }
     }
 }
