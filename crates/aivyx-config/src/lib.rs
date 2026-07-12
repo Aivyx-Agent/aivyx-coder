@@ -38,6 +38,7 @@ pub struct Settings {
     pub repo_map: RepoMapSettings,
     pub council: CouncilSettings,
     pub verification: VerificationSettings,
+    pub autonomous: AutonomousSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -61,6 +62,30 @@ impl Default for VerificationSettings {
         Self {
             command: None,
             max_auto_verify_retries: 3,
+        }
+    }
+}
+
+/// Autonomous mode (`--auto "<goal>"`, ROADMAP.md Phase 11c): hard stops
+/// for the unattended loop, independent of and in addition to
+/// `permissions.max_tool_iterations_per_turn` (which bounds a single
+/// turn's round-trips, not the whole autonomous session). Conservative
+/// defaults so a bare `--auto` without further tuning cannot run
+/// indefinitely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutonomousSettings {
+    /// Total "continue" round-trips for the whole autonomous run.
+    pub max_iterations: u32,
+    /// Wall-clock ceiling, in seconds, for the whole autonomous run.
+    pub max_duration_secs: u64,
+}
+
+impl Default for AutonomousSettings {
+    fn default() -> Self {
+        Self {
+            max_iterations: 20,
+            max_duration_secs: 3600,
         }
     }
 }
@@ -540,6 +565,25 @@ mod tests {
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.verification.command.as_deref(), Some("test"));
         assert_eq!(settings.verification.max_auto_verify_retries, 5);
+    }
+
+    #[test]
+    fn autonomous_settings_have_conservative_defaults() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.autonomous.max_iterations, 20);
+        assert_eq!(settings.autonomous.max_duration_secs, 3600);
+    }
+
+    #[test]
+    fn autonomous_settings_parse_from_config() {
+        let raw = r#"
+            [autonomous]
+            max_iterations = 5
+            max_duration_secs = 600
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.autonomous.max_iterations, 5);
+        assert_eq!(settings.autonomous.max_duration_secs, 600);
     }
 
     #[test]
