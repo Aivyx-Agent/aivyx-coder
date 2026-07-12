@@ -112,7 +112,27 @@ the fix is a derived model (see the config reference below).
 
 **llama-server (recommended for serious use).** Same GGUF models and
 kernels as Ollama, everything explicit — the hidden-window trap can't
-exist when `-c` is on the command line:
+exist when `-c` is on the command line.
+
+*Installing it*: use your distro's packaged build where one exists (Arch:
+AUR `llama.cpp-cuda`, which installs `/usr/bin/llama-server`), or the
+prebuilt binaries from ggml-org's releases, or a source build. One
+CUDA-build gotcha that has bitten twice here: ggml's cmake auto-adopts any
+`ccache`/`sccache` it finds on PATH (`GGML_CCACHE` defaults ON), and
+sccache-wrapped nvcc corrupts parallel builds with
+`fatbinary: Could not open input file '*.cubin'` errors. Disable it
+explicitly — for the AUR package:
+
+```
+LLAMA_BUILD_EXTRA_ARGS="-DGGML_CCACHE=OFF -DCMAKE_CUDA_ARCHITECTURES=89" makepkg -si
+```
+
+(arch `89` = RTX 40-series; use your GPU's compute capability. AUR helpers
+don't always pass environment through to `build()` — if the build fails
+with the cubin error, check `GGML_CCACHE` in the build dir's
+`CMakeCache.txt` and prefer running `makepkg` directly.)
+
+*Running it*:
 
 ```
 llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
@@ -159,7 +179,7 @@ Example systemd user unit (`~/.config/systemd/user/llama-server.service`):
 [Unit]
 Description=llama-server for aivyx
 [Service]
-ExecStart=/home/you/Projects/llama.cpp/build/bin/llama-server \
+ExecStart=/usr/bin/llama-server \
   -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M -c 16384 -ngl 99 \
   --jinja --cache-reuse 256 \
   --chat-template-kwargs '{"enable_thinking": false}' \

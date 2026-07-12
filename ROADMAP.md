@@ -16,20 +16,36 @@ directional, not committed fact, until spot-checked.
 
 ## Where things stand today
 
-**Built and working** (foundation + ConfirmationGate passes, commits
-`e958cdb`, `146dd22`, `23cfbd8`):
-- Streaming chat against any OpenAI-compatible local backend (Ollama/vLLM/llama.cpp), multi-turn history, cancellation (partially — see gaps).
-- `read_file` / `write_file` / `edit_file`, each behind `ConfirmationGate`: `deny_paths` hard-block (now symlink-safe), reads auto-allow, everything else prompts with a per-exact-target Always-Allow cache, diff preview via `similar`.
-- A ratatui TUI with a live-streaming chat view and a permission-confirmation modal.
+*(Updated 2026-07-12 — the phase sections below carry the full history
+and evidence; this is the summary.)*
 
-**Verified real-world behavior** (see memory: `project_aivyx_coder_ornith_capability_test`):
-- A 9B model (`ornith:9b`) completes one clean read→act tool cycle, then reliably degrades — gets stuck re-reading the same file and eventually hallucinates content that isn't there, rather than taking further action.
-- A 27B model (`qwen3.6:27b`) completes a full 5-turn edit task correctly, ~7x slower per call.
-- Ollama itself can panic under sustained multi-tool-call load (external bug, not ours) — our error handling degraded gracefully when it did.
+**Shipped and live-verified** (Phases 1–8, 10 Part A, 11a; latest commit
+`8178422`): the full agent loop — streaming chat, native + prompted
+SEARCH/REPLACE edit formats (A/B-measured, native default), grep/glob
+search, `run_command`/`run_shell` behind real Landlock+seccomp
+confinement, git tools + automatic worktree checkpoint refs, tree-sitter
+repo map injection, session persistence/resume, context budget +
+compaction, plan mode (gate-enforced read-only), `/council` multi-model
+deliberation, and a startup probe of the *served* context window. 171
+workspace tests; every security-critical behavior also proven by live
+E2E against real serving.
 
-**Phase 1 hardening complete** (this pass): cancellation now propagates through the tool-dispatch loop and the next LLM request; `max_tool_iterations_per_turn` is wired from config (clamped to a minimum of 1); the LLM client has a connect timeout, an idle-stream timeout, and a size cap on accumulated response text; a truncated (`length`/`error` finish reason) response now surfaces as a visible error instead of looking like a normal empty turn; `TerminalGuard` no longer leaks raw mode on partial init failure and `restore_terminal` attempts both cleanup steps independently; tool-result/tool-call/notice transcript lines preserve embedded newlines instead of rendering as one concatenated wall of text; the auto-scroll offset is computed from ratatui's own post-wrap row count instead of pre-wrap logical line count; `write_file` now shows an explicit warning instead of a silent/ambiguous prompt when overwriting an existing binary file; and `SYSTEM_PROMPT`'s tool list is derived from `ToolExecutor::definitions()` so it can't drift. Deliberately deferred (narrow/theoretical, documented in the plan rather than fixed): the `edit_file` TOCTOU, case-sensitive path comparison, relative `deny_paths` entries, the `path_resolve`/`aivyx-config` home-dir divergence, `Tool::execute`'s type-system bypassability, and a couple of efficiency-only findings (history-cloning cost, full-transcript-rebuild-per-redraw). A follow-up review of this same pass caught 5 real regressions it had introduced (a cancellation/history-corruption bug, an off-by-2 in the new scroll fix, an empty-tool-result rendering bug, a `TerminalGuard` alt-screen leak, and an unbounded pre-first-byte hang) — all fixed and live-verified, see memory `project-aivyx-coder-phase1-hardening`.
+**Serving verdict (Phase 10)**: the serving configuration — not the
+model, not the edit format — was the dominant reliability variable.
+Correctly-configured llama-server (explicit 16k window, thinking
+disabled) took the same qwen3.5:9b from Ollama's best 7/9 to 9/9 at ~10×
+the speed on the edit benchmark. The daily driver runs llama-server via
+a systemd user unit; Ollama stays as the zero-setup default and serves
+the council's swap-per-request members.
 
-**Phase 2 investigated, not built** (see the Phase 2 section below and memory `project-aivyx-coder-phase2-investigation`): confirmed via a new raw wire-traffic logger that the `ornith:9b` degradation is a model-generation failure (hallucinated procedural rules, indecision spiraling, then a bare `finish_reason: stop` with no tool call) rather than a client bug or an edit-format problem — no engineering fix identified at this layer.
+**In flight / next**: Phase 10 Part B — the SGLang constrained-decoding
+spike (xgrammar forcing schema-valid tool calls at generation time) —
+runs via the official docker image after the AUR package proved broken;
+AWQ weights are re-downloaded and shard-verified. A cheap vLLM compat
+pass (image pull + one E2E run) is queued separately, since vLLM is a
+README-claimed provider not yet live-tested. Then Phase 11b (agent
+wiki) design pass, Phase 11c (autonomous loop, needs its own security
+design pass), and the Phase 9 stretch items.
 
 ## What the research says a coding agent needs
 
@@ -697,11 +713,30 @@ acting as an acceptance test rather than by reading documentation. Phase
 2's native default is re-confirmed decisively (9/9 vs 6/9 under identical,
 finally-honest conditions). Part A complete.
 
+**Part B status (2026-07-12): unblocked, environment rebuilt, spike
+pending.** The first attempt was aborted by machine-level data corruption
+(RAM path; memtest86+ later passed clean after the fix — full story in
+memory `project_jarvis_home_disk_corruption`), which corrupted the AWQ
+shards mid-load. Environment now: AWQ weights re-downloaded and
+shard-verified against upstream sha256s; serving migrated from the
+deleted source build to the packaged AUR `llama.cpp-cuda` (b9966 —
+build requires `GGML_CCACHE=OFF`, see README Serving); SGLang will run
+from the official `lmsysorg/sglang` docker image after the AUR package
+proved broken (host needs only repo-packaged `nvidia-container-toolkit`
++ docker). Launch recipe from the first attempt carries over: thinking
+disabled via patched chat template, `--tool-call-parser qwen3_coder`
+(QuantTrio's template uses the qwen3-coder XML format), xgrammar
+backend. Follow-on item outside the spike's scope: a vLLM compat pass
+(official image + one map/git E2E) — the one README-claimed provider
+never live-tested.
+
 ### Phase 11 — Candidate directions (scoped 2026-07-11, user-proposed)
 
 Three external projects, each reinterpreted onto primitives aivyx already
 has rather than ported. Recommended build order: 11a → 11b → 11c (rising
-security surface). None started; each wants its own design pass first.
+security surface), each behind its own design pass with user sign-off.
+Status: **11a shipped and live-verified** (see its section below); 11b
+and 11c not started.
 
 **11a — Council mode** (inspiration: karpathy/llm-council — multiple
 models answer, anonymously cross-rank, a chairman synthesizes; upstream
