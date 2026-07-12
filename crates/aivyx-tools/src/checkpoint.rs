@@ -172,6 +172,63 @@ impl GitCheckpointer {
         Ok(())
     }
 
+    /// The most recent checkpoint ref, or `None` if none have been taken
+    /// yet. Reuses `for-each-ref`'s default lexical sort — checkpoint ref
+    /// names are zero-padded-millis-prefixed, so lexical order is
+    /// chronological order, the same property `prune` above already relies
+    /// on for its retention cutoff.
+    pub async fn latest_ref(&self, cancellation: &CancellationToken) -> Option<String> {
+        let list_args: Vec<String> = vec![
+            "for-each-ref".into(),
+            "--format=%(refname)".into(),
+            "refs/aivyx/checkpoints/".into(),
+        ];
+        let refs = self.git(&list_args, &[], cancellation).await.ok()?;
+        refs.lines().rfind(|l| !l.is_empty()).map(str::to_string)
+    }
+
+    /// Restores the worktree to exactly match `ref_name`'s tree — including
+    /// deleting files created since that checkpoint, which a plain
+    /// `git checkout <ref> -- .` would not do. Uses the same private index
+    /// checkpointing itself uses (`GIT_INDEX_FILE`-scoped), never touching
+    /// the user's real index, HEAD, or branch. See the Phase 11c design doc
+    /// for why this exact sequence (stage the current dirty state, then
+    /// `read-tree --reset -u`) is needed rather than a simpler checkout.
+    pub async fn restore_to(
+        &self,
+        ref_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let index_dir = self.git_dir.join("aivyx");
+        std::fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
+        let index = index_dir.join("index");
+        let index_env: Vec<(&str, &str)> =
+            vec![("GIT_INDEX_FILE", index.to_str().ok_or("non-utf8 git dir")?)];
+
+        // Stage the CURRENT (post-experiment, possibly broken) worktree
+        // into the private index first, so read-tree below knows what to
+        // remove as well as what to restore — its deletion logic diffs the
+        // index it's resetting FROM against the tree it's resetting TO.
+        let add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        self.git(&add_args, &index_env, cancellation).await?;
+
+        let reset_args: Vec<String> = vec![
+            "read-tree".into(),
+            "--reset".into(),
+            "-u".into(),
+            ref_name.to_string(),
+        ];
+        self.git(&reset_args, &index_env, cancellation).await?;
+
+        // The dedup cache no longer reflects the worktree (which just
+        // changed out from under it) — invalidate rather than compute the
+        // restored tree's oid; a harmless extra checkpoint next time beats
+        // a false "identical, skip it" that would silently miss a real
+        // change.
+        *self.last_tree.lock().unwrap() = None;
+        Ok(())
+    }
+
     async fn git(
         &self,
         args: &[String],
@@ -408,5 +465,98 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(content, "v4\n");
+    }
+
+    #[tokio::test]
+    async fn latest_ref_returns_the_most_recent_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        assert!(
+            cp.latest_ref(&CancellationToken::new()).await.is_none(),
+            "no checkpoints taken yet"
+        );
+
+        std::fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let first = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        std::fs::write(dir.path().join("tracked.txt"), "v3\n").unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let second = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        assert_ne!(first, second, "the ref must advance after a new checkpoint");
+    }
+
+    #[tokio::test]
+    async fn restore_to_reverts_modified_content() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        let before = cp.latest_ref(&CancellationToken::new()).await;
+        assert!(before.is_none());
+
+        // Checkpoint the known-good state, then make a bad edit.
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "broken\n").unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "v1\n",
+            "content must revert to what the checkpoint captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_to_deletes_files_added_since_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        // Simulate a discarded experiment that created a brand-new file —
+        // this is exactly what a plain `git checkout <ref> -- .` would fail
+        // to clean up, since checkout only updates paths present in <ref>.
+        std::fs::write(dir.path().join("newly_created.txt"), "oops\n").unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            !dir.path().join("newly_created.txt").exists(),
+            "restore_to must delete files created since the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_to_leaves_head_and_index_untouched() {
+        // Same promise checkpointing itself makes — a rewind must not
+        // surprise the user's own git workflow.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        let head_before = run_git(dir.path(), &["rev-parse", "HEAD"], &[]).await.unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "broken\n").unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let head_after = run_git(dir.path(), &["rev-parse", "HEAD"], &[]).await.unwrap();
+        assert_eq!(head_before, head_after);
+        // The real index must show no staged changes from the restore.
+        let status = run_git(dir.path(), &["status", "--porcelain"], &[]).await.unwrap();
+        assert_eq!(status.trim(), "", "restore_to must not touch the real index");
     }
 }
