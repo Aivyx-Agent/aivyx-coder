@@ -194,6 +194,13 @@ impl GitCheckpointer {
     /// the user's real index, HEAD, or branch. See the Phase 11c design doc
     /// for why this exact sequence (stage the current dirty state, then
     /// `read-tree --reset -u`) is needed rather than a simpler checkout.
+    /// `deny_paths` are never touched, matching what checkpointing itself
+    /// excludes. Note this "exactly match" promise inherits the same
+    /// limitation checkpointing has for gitignored paths: `git add -A` (no
+    /// `--force`) never stages ignored content, so a gitignored file
+    /// created since the checkpoint (e.g. a stray `target/` artifact or
+    /// `.env`) is neither captured by checkpoints nor removed by restore —
+    /// it silently survives.
     pub async fn restore_to(
         &self,
         ref_name: &str,
@@ -209,7 +216,13 @@ impl GitCheckpointer {
         // into the private index first, so read-tree below knows what to
         // remove as well as what to restore — its deletion logic diffs the
         // index it's resetting FROM against the tree it's resetting TO.
-        let add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        // deny_paths are excluded exactly as checkpoint_inner excludes them:
+        // a checkpoint's tree never contains a deny-listed path, so without
+        // this exclusion a deny-listed file that currently exists on disk
+        // would show up as "present in FROM-index, absent from target tree"
+        // and get deleted by read-tree below.
+        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        add_args.extend(exclude_pathspecs(&self.cwd, &self.deny_paths));
         self.git(&add_args, &index_env, cancellation).await?;
 
         let reset_args: Vec<String> = vec![
@@ -547,7 +560,29 @@ mod tests {
         let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
 
         let head_before = run_git(dir.path(), &["rev-parse", "HEAD"], &[]).await.unwrap();
-        std::fs::write(dir.path().join("tracked.txt"), "broken\n").unwrap();
+
+        // Stage a real-index change that does NOT match what the checkpoint
+        // captured (the checkpoint saw "v1\n"; here the REAL index — no
+        // GIT_INDEX_FILE override — gets "staged-by-user\n"). If restore_to
+        // ever leaked into using the real index instead of its private one,
+        // this staged state would be clobbered by the read-tree reset; the
+        // final assertions below would then fail.
+        std::fs::write(dir.path().join("tracked.txt"), "staged-by-user\n").unwrap();
+        run_git(dir.path(), &["add", "tracked.txt"], &[])
+            .await
+            .unwrap();
+        // `ls-files -s` reports the blob oid actually recorded in the real
+        // index (stage 0) — unlike `status --porcelain`, it isn't also
+        // sensitive to worktree content, so it isolates "did the real index
+        // change" from "did the worktree change" (which restore_to is
+        // *supposed* to do).
+        let indexed_blob_before = run_git(dir.path(), &["ls-files", "-s", "tracked.txt"], &[])
+            .await
+            .unwrap();
+        assert!(
+            indexed_blob_before.starts_with("100644 "),
+            "sanity check: tracked.txt should be staged in the real index: {indexed_blob_before}"
+        );
 
         cp.restore_to(&good_ref, &CancellationToken::new())
             .await
@@ -555,8 +590,59 @@ mod tests {
 
         let head_after = run_git(dir.path(), &["rev-parse", "HEAD"], &[]).await.unwrap();
         assert_eq!(head_before, head_after);
-        // The real index must show no staged changes from the restore.
-        let status = run_git(dir.path(), &["status", "--porcelain"], &[]).await.unwrap();
-        assert_eq!(status.trim(), "", "restore_to must not touch the real index");
+        // The real index's staged blob must survive restore_to byte-for-byte
+        // — proving restore_to operated on its own private index, not this
+        // one. (The worktree file itself is expected to change — that's
+        // restore_to doing its job — so we deliberately don't assert on
+        // worktree content or on `status --porcelain` here.)
+        let indexed_blob_after = run_git(dir.path(), &["ls-files", "-s", "tracked.txt"], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_blob_before, indexed_blob_after,
+            "restore_to must not touch the real index"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "v1\n",
+            "restore_to must still restore the worktree content from the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_to_does_not_delete_denied_subpaths() {
+        // Regression guard: restore_to's internal `add -A -- .` must exclude
+        // deny_paths the same way checkpoint_inner does. A checkpoint's tree
+        // never contains a deny-listed path, so without the exclusion, a
+        // deny-listed file that exists on disk would look like "present in
+        // the FROM-index, absent from the target tree" and get deleted by
+        // `read-tree --reset -u`.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let secret_dir = dir.path().join("secret");
+        std::fs::create_dir(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("key"), "TOP-SECRET\n").unwrap();
+
+        let cwd = dir.path().canonicalize().unwrap();
+        let deny = vec![cwd.join("secret")];
+        let cp = GitCheckpointer::detect(&cwd, deny).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        std::fs::write(dir.path().join("tracked.txt"), "broken\n").unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            secret_dir.join("key").exists(),
+            "restore_to must never delete a deny-listed path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret_dir.join("key")).unwrap(),
+            "TOP-SECRET\n",
+            "deny-listed content must survive restore_to unchanged"
+        );
     }
 }
