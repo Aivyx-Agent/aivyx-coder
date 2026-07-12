@@ -63,6 +63,16 @@ const MAX_ASSISTANT_TEXT_BYTES: usize = 10 * 1024 * 1024;
 /// noticing until well after the fact.
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 20;
 
+/// A single `/wiki` page's turn can pause (`AgentEvent::TurnPaused`) and
+/// auto-continue at most this many times before the page is abandoned for
+/// this run (left stale, retried on the next `/wiki` invocation) rather
+/// than looping forever. Interactive turns have no such cap because a human
+/// is the natural circuit breaker on `TurnPaused`; `/wiki`'s per-page
+/// auto-continue has no human in that loop, so it needs its own bound —
+/// the same reason Phase 11c's autonomous driver caps its own
+/// continuation loop (see `aivyx-tui`'s `AutonomousRun`).
+const MAX_WIKI_PAGE_CONTINUATIONS: u32 = 5;
+
 /// Compaction fires when the estimated prompt exceeds this fraction of the
 /// context window, and reduces it back below `COMPACT_LOW_WATER` — a gap so
 /// it doesn't re-trigger every single turn once near the ceiling.
@@ -697,10 +707,12 @@ impl Agent {
     /// without depending on filesystem-driven staleness discovery. Reuses
     /// `run_turn_inner` (not `run_turn`, so a synthesized instruction is
     /// never re-checked against `/council`/`/wiki`), continuing on
-    /// `TurnPaused` exactly like a normal multi-round-trip turn. A page
-    /// whose turn ends in error, or whose `write_file` call never actually
-    /// happened, is skipped (left stale for the next `/wiki` run) rather
-    /// than aborting pages still queued behind it.
+    /// `TurnPaused` exactly like a normal multi-round-trip turn, up to
+    /// `MAX_WIKI_PAGE_CONTINUATIONS` auto-continues. A page whose turn ends
+    /// in error, whose `write_file` call never actually happened, or that
+    /// is still pausing after the continuation cap, is skipped (left stale
+    /// for the next `/wiki` run) rather than aborting pages still queued
+    /// behind it.
     async fn run_wiki_turn_for_pages(
         &mut self,
         pages: Vec<StalePage>,
@@ -741,7 +753,17 @@ impl Agent {
 
             self.last_turn_paused = false;
             let mut result = self.run_turn_inner(instruction, cwd, cancellation.clone()).await;
+            let mut continuations_sent = 0u32;
             while result.is_ok() && self.last_turn_paused && !cancellation.is_cancelled() {
+                if continuations_sent >= MAX_WIKI_PAGE_CONTINUATIONS {
+                    // Still paused after the cap's worth of "continue"
+                    // attempts — stop driving this page. `result` and
+                    // `self.last_turn_paused` are left exactly as the last
+                    // iteration set them, so the check below recognizes
+                    // this as the cap-reached case (Ok + still paused).
+                    break;
+                }
+                continuations_sent += 1;
                 self.last_turn_paused = false;
                 result = self
                     .run_turn_inner("continue".to_string(), cwd, cancellation.clone())
@@ -750,6 +772,14 @@ impl Agent {
 
             if cancellation.is_cancelled() {
                 break;
+            }
+            if result.is_ok() && self.last_turn_paused {
+                self.emit(AgentEvent::Error(format!(
+                    "page `{}` paused too many times ({} continuation attempts) — leaving it \
+                     stale for the next /wiki run",
+                    page.name, MAX_WIKI_PAGE_CONTINUATIONS
+                )));
+                continue;
             }
             if result.is_err() {
                 // `run_turn_inner` already emitted an `AgentEvent::Error`
@@ -2573,6 +2603,89 @@ mod tests {
             mock.received.lock().unwrap().len(),
             3,
             "both pages must have been attempted (1 request for alpha, 2 for beta)"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiki_page_that_keeps_pausing_is_abandoned_after_the_continuation_cap() {
+        // `max_tool_iterations: 1` means any response containing a tool call
+        // exhausts the cap on its very first iteration, so `run_turn_inner`
+        // pauses (`AgentEvent::TurnPaused`) every single time — the model
+        // never reaches a natural "no more tool calls" completion for the
+        // "stuck" page. Without the cap under test, `run_wiki_turn_for_pages`
+        // would send "continue" forever; with it, the page is abandoned
+        // after `MAX_WIKI_PAGE_CONTINUATIONS` continuations (1 initial
+        // request + `MAX_WIKI_PAGE_CONTINUATIONS` continues) and the batch
+        // moves on to the next page.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (tx, mut rx) = unbounded_channel();
+        let mut responses = Vec::new();
+        for i in 0..(MAX_WIKI_PAGE_CONTINUATIONS + 1) {
+            // Always a tool call, never a plain final answer, so "stuck"
+            // never naturally completes — every one of these iterations
+            // must pause under `max_tool_iterations: 1`.
+            responses.push(write_call(
+                &format!("stuck-{i}"),
+                "docs/wiki/stuck.md",
+                "---\nsummary: \"Stuck.\"\n---\nBody.\n",
+            ));
+        }
+        // "beta" completes on its very first request with no tool calls,
+        // proving the batch moved on past "stuck" rather than looping on it
+        // forever or aborting the whole batch.
+        responses.push(text_response("done"));
+
+        let mock = Arc::new(MockBackend::new(responses));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig { max_tool_iterations: 1, ..Default::default() },
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+
+        let pages = vec![stale("stuck", &["crates/stuck"]), stale("beta", &["crates/beta"])];
+        agent
+            .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Bounds the request count: proves the cap actually stopped the
+        // "continue" loop (1 initial + MAX_WIKI_PAGE_CONTINUATIONS continues
+        // for "stuck") rather than the test merely happening to terminate,
+        // and that exactly one further request (for "beta") followed —
+        // i.e. the stuck page didn't swallow the rest of the batch.
+        assert_eq!(
+            mock.received.lock().unwrap().len() as u32,
+            MAX_WIKI_PAGE_CONTINUATIONS + 2,
+            "expected MAX_WIKI_PAGE_CONTINUATIONS + 1 requests for the stuck page plus 1 for \
+             beta, not more"
+        );
+
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error(m)
+                    if m.contains("stuck") && m.contains("leaving it stale")
+            )),
+            "expected a notice naming the abandoned page, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
+            "the batch must still finish after abandoning one page"
         );
     }
 
