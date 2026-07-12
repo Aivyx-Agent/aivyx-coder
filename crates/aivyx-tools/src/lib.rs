@@ -20,7 +20,7 @@ mod diff;
 mod path_resolve;
 mod process;
 mod tools;
-mod wiki;
+pub mod wiki;
 
 pub use checkpoint::GitCheckpointer;
 pub use process::CommandSpec;

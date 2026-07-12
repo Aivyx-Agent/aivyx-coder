@@ -272,7 +272,11 @@ pub(crate) fn exclude_pathspecs(cwd: &Path, deny_paths: &[PathBuf]) -> Vec<Strin
 /// One plumbing invocation: trusted fixed argv (never model-controlled),
 /// writing only under `.git`, so it runs unconfined; `kill_on_drop` +
 /// timeout bound it instead.
-async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+pub(crate) async fn run_git(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, String> {
     let mut command = tokio::process::Command::new("git");
     command
         .args(args)
