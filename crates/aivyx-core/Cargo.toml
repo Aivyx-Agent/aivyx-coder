@@ -10,8 +10,10 @@ aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+async-trait = "0.1.89"
 directories = "6.0.0"
 futures = "0.3.32"
+schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
@@ -20,5 +22,4 @@ tokio-util = "0.7.18"
 tracing = "0.1.44"
 
 [dev-dependencies]
-async-trait = "0.1.89"
 tempfile = "3.27.0"

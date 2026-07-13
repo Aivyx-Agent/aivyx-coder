@@ -57,6 +57,7 @@ dependencies = [
  "async-trait",
  "directories",
  "futures",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
