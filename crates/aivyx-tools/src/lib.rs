@@ -80,7 +80,7 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolOutput, ToolError>;
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -414,6 +414,22 @@ mod tests {
             std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
             "v2\n"
         );
+    }
+
+    #[test]
+    fn cloned_registry_is_independent_of_the_original() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+
+        let sub_registry = registry.clone();
+        // Registering onto the original after cloning must not affect the
+        // already-taken clone — this is what lets main.rs snapshot "every
+        // tool so far" for a sub-agent's registry, then keep adding
+        // parent-only tools (like delegate_task itself) onto the original.
+        registry.register(Arc::new(WriteFileTool));
+
+        assert_eq!(sub_registry.definitions().len(), 1);
+        assert_eq!(registry.definitions().len(), 2);
     }
 
     struct AllowAllForThisTest;
