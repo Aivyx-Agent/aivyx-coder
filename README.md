@@ -142,6 +142,20 @@ command` is configured it auto-runs once per regenerated page (not once per
 first-run, full-skeleton regeneration. See ROADMAP.md's Phase 11b entry for
 the full design rationale.
 
+**Sub-agent delegation** (`delegate_task`): a tool the model can call
+mid-turn to hand a bounded task to a fresh, isolated agent — full tool
+access, the same `ConfirmationGate`/checkpoint/plan-mode boundary as the
+main session, but a completely separate conversation history, so
+exploring or working on something unfamiliar doesn't clutter the main
+session's own context window. Only the sub-agent's final text answer
+enters the main session's history; its own tool calls/results/reasoning
+render live in the transcript (prefixed `sub-agent>`, visually distinct)
+but never join history directly. Bounded by `[sub_agent] max_iterations`
+(default 10); a sub-agent that runs out of budget still returns its
+best-effort partial result rather than failing outright. Delegation is
+capped at one level — a sub-agent's own tool list never includes
+`delegate_task`.
+
 Build/test the workspace:
 
 ```

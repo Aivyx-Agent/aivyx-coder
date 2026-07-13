@@ -644,6 +644,71 @@ special-cased slash command today; no post-edit hooks, no user-defined
 command macros — core UX in comparable tools, though it doesn't block
 autonomy the way Phase 12/11c's gaps do).
 
+**Sub-agent delegation built and live-verified (2026-07-13).** Followed a
+full design pass
+(`docs/superpowers/specs/2026-07-13-subagent-delegation-design.md`) before
+implementation, mirroring how 11a/11b/11c were each signed off first.
+Shipped: `delegate_task`, a tool the model calls mid-turn to spawn a
+fresh, isolated `Agent` — full tool access, the exact same trust boundary
+as the parent (`ConfirmationGate`, checkpointer, plan/autonomous mode
+flags all shared, not a restricted copy), but a completely separate
+conversation history, so exploring or working on something unfamiliar
+never clutters the calling session's own context window. `DelegateTaskTool`
+is defined in `aivyx-core`, not alongside the other tools in
+`aivyx-tools` — `aivyx-tools` has no dependency on `aivyx-core`/`aivyx-llm`
+(the graph runs the other way), so a type needing `Agent` and
+`LlmBackend` in scope simultaneously with the `aivyx_tools::Tool` trait it
+implements can only live where all three are already visible. Every
+session-stable dependency the tool needs is bundled into a
+`DelegateTaskConfig` struct baked in once at registration time, rather
+than threading anything through `ToolExecutionContext` (which stays
+untouched, along with every other `Tool` impl). The sub-agent's own
+activity streams live into the transcript (prefixed `sub-agent>`,
+visually distinct) via a spawned background task that drains the
+sub-agent's private `AgentEvent` channel and forwards each event wrapped
+in a new `AgentEvent::SubAgentActivity` variant — `/council`'s simpler
+same-channel precedent didn't transfer directly, since council emits its
+own coarse-grained notes rather than forwarding a separate nested agent's
+full token-by-token stream. Bounded by `[sub_agent] max_iterations`
+(default 10); a sub-agent that exhausts its budget still returns a
+best-effort partial result, never an error. Delegation is capped at one
+level: a sub-agent's own tool list is snapshotted from the parent's
+*before* `delegate_task` is registered onto it, so recursion is
+structurally impossible rather than merely policy-excluded.
+
+Three real corrections to the original design were found and resolved
+during implementation, each disclosed rather than silently smoothed over:
+the `ToolExecutionContext`-extension approach the design first proposed
+turned out to be unnecessary (every dependency is session-stable, so
+baking it into the tool's own constructor — matching the existing
+`RunCommandTool` pattern — touches zero other call sites); the crate
+placement moved from the originally-assumed `aivyx-tools` to `aivyx-core`
+once the dependency-graph direction was checked; and — found during
+implementation itself, not design — the nested sub-agent's own
+`max_tool_iterations` must be pinned to exactly `1` rather than reusing
+the same `max_iterations` value as the outer continuation-loop bound,
+since setting both to the same number would let total round-trips reach
+`max_iterations²` in the worst case instead of `max_iterations`.
+
+12 new tests (243 total, up from 231): real behavior against a mock
+`LlmBackend` and real `Agent`/`ToolExecutor` construction (nested-agent
+completion, cap exhaustion returning `Ok` not `Error`, recursion
+structurally absent from a sub-agent's own tool list, plan-mode
+filtering, a genuine backend error surfacing correctly), plus TUI
+rendering tests for `ChatLine::SubAgent`. Three live E2E checks through
+the real binary (qwen3.5:9B via the Lemonade-managed llama-server), all
+passing: (1) a sub-agent explored an unfamiliar crate and reported back —
+confirmed via the persisted session file that only the `delegate_task`
+call and its distilled text result entered the parent's history, none of
+the sub-agent's own tool calls; (2) a sub-agent's `write_file` call
+triggered the identical confirmation modal (`Tool: write_file`, diff
+preview) any other write would, proving the shared `ConfirmationGate`
+rather than a bypassed one; (3) under `--plan`, the sub-agent's own
+tool list was filtered to read-only before ever reaching the gate — the
+model itself reported "the available tools only support reading files,
+not creating them," confirming graceful degradation rather than a
+silent per-call denial.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
