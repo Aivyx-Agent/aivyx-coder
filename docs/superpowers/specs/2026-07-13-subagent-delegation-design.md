@@ -90,7 +90,23 @@ max_iterations)` holds everything it needs as its own fields;
 its tests — the only per-call input `delegate_task` needs beyond what
 `ToolExecutionContext` already provides (`cwd`, `cancellation`) is the
 `task` argument itself, already available via `execute()`'s existing
-`arguments: Value` parameter. `DelegateTaskTool::execute()` uses its own
+`arguments: Value` parameter.
+
+**Crate placement (also revised during plan-writing):** `aivyx-tools` has
+no dependency on `aivyx-core` or `aivyx-llm` — the dependency graph runs
+the other way (`aivyx-core` depends on `aivyx-tools`, `aivyx-llm`, and
+`aivyx-repomap`). `DelegateTaskTool` needs `aivyx_tools::Tool` (the trait
+it implements), `aivyx_llm::LlmBackend`, and `aivyx_core::Agent` (to
+construct the nested agent) simultaneously in scope, which only
+`aivyx-core` can see all three of. `DelegateTaskTool` is therefore defined
+in `aivyx-core` (e.g. `crates/aivyx-core/src/delegate.rs`), implementing
+the foreign `aivyx_tools::Tool` trait for a type local to `aivyx-core` —
+allowed under Rust's orphan rule — rather than living alongside the
+simple, LLM-agnostic tools in `crates/aivyx-tools/src/tools/`. This also
+better matches what the tool actually is: an Agent-level orchestration
+mechanism, not a dumb filesystem/process action.
+
+`DelegateTaskTool::execute()` uses its own
 held fields to construct a fresh `ToolExecutor` (sharing the parent's
 `gate`, `confiner`, `checkpointer`) and a fresh `Agent` on top of it
 (sharing the parent's `llm`, `repo_map`, `events_tx`) — drive it turn by
@@ -216,3 +232,4 @@ Mirrors the `/council`/`/wiki` precedent:
 | Context seed | Task description only — no parent-conversation digest |
 | `ToolExecutionContext` gap | Baked into `DelegateTaskTool::new(...)` at registration time instead — matches `RunCommandTool`'s existing config-at-construction pattern, zero changes to `ToolExecutionContext`/`ToolExecutor`/any other `Tool` impl (revised during plan-writing after the field-extension approach turned out to touch 8 existing construction sites for no per-call benefit — every dependency is session-stable, not per-call) |
 | `delegate_task`'s own gate treatment | Always auto-allowed (`Internal`/`Other`), offered during plan mode (degrades gracefully via the shared `PlanMode` flag) |
+| Crate placement | Defined in `aivyx-core` (e.g. `delegate.rs`), not `aivyx-tools/src/tools/` — `aivyx-tools` has no dependency on `aivyx-core`/`aivyx-llm`, so it cannot see `Agent` or `LlmBackend` at all; only `aivyx-core` can see both plus the `aivyx_tools::Tool` trait it implements (revised during plan-writing) |
