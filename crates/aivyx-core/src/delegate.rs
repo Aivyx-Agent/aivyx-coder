@@ -169,7 +169,15 @@ impl Tool for DelegateTaskTool {
         // and — since `AgentEvent` doesn't expose the sub-agent's
         // assembled response text directly — also accumulates
         // `TextDelta` content into `accumulated`, which is what this
-        // tool call ultimately returns.
+        // tool call ultimately returns. Note this is *every* TextDelta
+        // across every internal round-trip, not just the sub-agent's
+        // final turn — a sub-agent that narrates between tool calls
+        // ("let me check X...") has that narration folded in alongside
+        // its actual final summary. Mild context bloat, not a
+        // correctness issue (the system prompt nudges toward one final
+        // summary); isolating just the last turn's text would need
+        // tracking turn boundaries here, left as a possible future
+        // refinement.
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
         let accumulated = Arc::new(std::sync::Mutex::new(String::new()));
         let accumulated_for_task = Arc::clone(&accumulated);
