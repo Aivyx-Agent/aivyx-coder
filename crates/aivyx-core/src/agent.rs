@@ -48,6 +48,11 @@ pub enum AgentEvent {
     /// or ranking, the chairman's synthesis, or a failure note) — the whole
     /// deliberation streams through these; see `council::convene`.
     CouncilNote(String),
+    /// One block of architect-mode output (the planning-in-progress note,
+    /// the produced plan, or a failure note) — mirrors `CouncilNote`
+    /// exactly, but for the single-seat architect/editor pairing feature.
+    /// See `crate::architect::plan`.
+    ArchitectNote(String),
     /// One event produced by a `delegate_task` sub-agent's own turn loop,
     /// forwarded verbatim from its private `AgentEvent` channel so it can
     /// render in the transcript distinguished from the parent's own
@@ -268,6 +273,9 @@ pub struct Agent {
     /// `/council` support when configured; `None` makes the command explain
     /// how to enable itself instead of running.
     council: Option<crate::council::Council>,
+    /// `/architect` support when configured; `None` makes the command
+    /// explain how to enable itself instead of running.
+    architect: Option<crate::architect::Architect>,
     /// `[verification]` support (ROADMAP.md Phase 12 Part B); `None`
     /// disables the feature entirely.
     verification: Option<VerificationConfig>,
@@ -331,6 +339,7 @@ impl Agent {
             edit_format: config.edit_format,
             synthetic_seq: 0,
             council: None,
+            architect: None,
             verification: None,
             unverified_edits: false,
             verify_retries: 0,
@@ -359,6 +368,12 @@ impl Agent {
     /// resident daily driver.
     pub fn set_council(&mut self, council: crate::council::Council) {
         self.council = Some(council);
+    }
+
+    /// Enables `/architect` (ROADMAP.md Phase 9). The caller builds the
+    /// seat from config — see `crate::architect::Architect`.
+    pub fn set_architect(&mut self, architect: crate::architect::Architect) {
+        self.architect = Some(architect);
     }
 
     /// Enables enforced verification (Phase 12 Part B): `command_name` must
@@ -605,7 +620,13 @@ impl Agent {
             }
             None => match crate::wiki::parse_command(&user_input) {
                 Some(command) => self.run_wiki_turn(command, cwd, cancellation).await,
-                None => self.run_turn_inner(user_input, cwd, cancellation).await,
+                None => match crate::architect::parse_command(&user_input) {
+                    Some(subject) => {
+                        let subject = subject.to_string();
+                        self.run_architect_turn(&subject, cwd, cancellation).await
+                    }
+                    None => self.run_turn_inner(user_input, cwd, cancellation).await,
+                },
             },
         };
         self.persist();
@@ -661,6 +682,75 @@ impl Agent {
         }
         self.emit(AgentEvent::TurnComplete);
         Ok(())
+    }
+
+    /// Runs `/architect`: makes one planning call to the configured
+    /// architect, then hands the plan directly to `run_turn_inner` so the
+    /// primary (editor) model begins acting on it in the same call — one
+    /// continuous action, no re-prompt needed. A missing task argument or
+    /// any planning failure ends the turn without ever invoking the editor.
+    async fn run_architect_turn(
+        &mut self,
+        subject: &str,
+        cwd: &Path,
+        cancellation: CancellationToken,
+    ) -> Result<(), AgentError> {
+        if self.architect.is_none() {
+            self.emit(AgentEvent::ArchitectNote(
+                "no architect is configured — add [architect] base_url and model to \
+                 config.toml (see the README's Architect/editor section)"
+                    .to_string(),
+            ));
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+        if subject.trim().is_empty() {
+            self.emit(AgentEvent::ArchitectNote(
+                "usage: /architect <task> — describe the task you want planned, e.g. \
+                 /architect refactor the auth module to use the new token type"
+                    .to_string(),
+            ));
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+
+        self.refresh_repo_map().await;
+        let architect = self.architect.as_ref().expect("checked above");
+        let budget_chars =
+            (architect.tail_budget_tokens as f64 * self.chars_per_token) as usize;
+        let digest = crate::council::tail_digest(&self.history, budget_chars);
+
+        let mut context = String::new();
+        if let Some(map) = &self.repo_map_text {
+            context.push_str(map);
+            context.push_str("\n\n");
+        }
+        if let Some(digest) = &digest {
+            context.push_str(digest);
+        }
+        let context = if context.is_empty() { None } else { Some(context) };
+
+        let seat = &self.architect.as_ref().expect("checked above").seat;
+        let plan_text = crate::architect::plan(
+            seat,
+            subject,
+            context,
+            &self.events_tx,
+            &cancellation,
+        )
+        .await;
+
+        let Some(plan_text) = plan_text else {
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        };
+        let model_name = seat.model.clone();
+
+        let formatted = format!(
+            "[Architect plan — {model_name} planned this task; you are executing it]\n\n\
+             Task: {subject}\n\nPlan:\n{plan_text}"
+        );
+        self.run_turn_inner(formatted, cwd, cancellation).await
     }
 
     /// Runs `/wiki` (Phase 11b): resolves `command` into the pages that
@@ -3112,6 +3202,264 @@ mod tests {
             main_mock.received.lock().unwrap().is_empty(),
             "no LLM request may be made without a council"
         );
+    }
+
+    // ----- architect/editor pairing (Phase 9) -----
+
+    fn architect_seat(
+        model: &str,
+        responses: Vec<Vec<StreamEvent>>,
+    ) -> (crate::architect::ArchitectSeat, Arc<MockBackend>) {
+        let mock = Arc::new(MockBackend::new(responses));
+        (
+            crate::architect::ArchitectSeat {
+                model: model.to_string(),
+                backend: mock.clone(),
+            },
+            mock,
+        )
+    }
+
+    fn architect_notes(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ArchitectNote(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Long enough to clear MIN_ANSWER_CHARS in council.rs.
+    const PLAN_TEXT: &str = "1. Add a TokenV2 struct in auth/token.rs. 2. Update verify() to accept it.";
+
+    #[tokio::test]
+    async fn architect_command_without_configuration_notes_and_ends_the_turn() {
+        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+
+        agent
+            .run_turn(
+                "/architect refactor auth".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            architect_notes(&events)
+                .iter()
+                .any(|n| n.contains("no architect is configured"))
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(agent.history.is_empty(), "command must not enter history");
+        assert!(
+            main_mock.received.lock().unwrap().is_empty(),
+            "no LLM request may be made without an architect"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_architect_command_notes_usage_and_ends_the_turn() {
+        let (mut agent, mut rx, _main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+        let (seat, _) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+        agent.set_architect(crate::architect::Architect {
+            seat,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn("/architect".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(architect_notes(&events).iter().any(|n| n.contains("usage:")));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(agent.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn architect_plan_hands_off_to_the_editor_in_the_same_turn() {
+        // The editor's mock backend replies with one tool call (read_file)
+        // then a plain stop, so the test can prove the hand-off actually
+        // reached the tool-dispatch loop, not just that text was injected.
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        let editor_responses = vec![
+            vec![StreamEvent::ToolCallComplete(tool_call("c1", "read_file"))],
+            text_response("done"),
+        ];
+        let (mut agent, mut rx, editor_mock) = build_agent(editor_responses, registry, 10);
+        let (seat, architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+        agent.set_architect(crate::architect::Architect {
+            seat,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/architect refactor the auth module".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            architect_mock.received.lock().unwrap().len(),
+            1,
+            "the architect backend must be called exactly once"
+        );
+        assert_eq!(
+            editor_mock.received.lock().unwrap().len(),
+            2,
+            "the editor backend must run its normal iteration loop after the hand-off"
+        );
+
+        // History carries the injected plan message and the editor's own
+        // tool-call round-trip, in that order — proving the hand-off is one
+        // continuous turn, not two disjoint actions.
+        let plan_index = agent
+            .history
+            .iter()
+            .position(|m| {
+                m.content.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.contains("[Architect plan")))
+            })
+            .expect("plan message must be in history");
+        assert!(
+            agent.history[plan_index]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(PLAN_TEXT))),
+            "injected message must contain the architect's plan text"
+        );
+        assert_eq!(count_tool_calls(&agent.history[plan_index..]), 1);
+
+        let events = drain(&mut rx);
+        assert!(
+            architect_notes(&events).iter().any(|n| n.contains(PLAN_TEXT)),
+            "the plan must stream live as an ArchitectNote"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCallDetected(_))));
+    }
+
+    #[tokio::test]
+    async fn architect_backend_failure_ends_the_turn_without_invoking_the_editor() {
+        let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+        let (seat, architect_mock) = architect_seat("model-architect", vec![]);
+        agent.set_architect(crate::architect::Architect {
+            seat,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/architect refactor auth".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            architect_notes(&events)
+                .iter()
+                .any(|n| n.contains("no usable plan")),
+            "an empty response (below MIN_ANSWER_CHARS) must be treated as a failure"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+        assert!(agent.history.is_empty());
+        assert_eq!(architect_mock.received.lock().unwrap().len(), 1);
+        assert!(
+            editor_mock.received.lock().unwrap().is_empty(),
+            "the editor must never be invoked after a failed plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn architect_plan_mode_regression_editor_only_gets_read_only_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(aivyx_tools::ReadFileTool));
+        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let (tx, mut rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(vec![text_response("noted")]));
+        let llm: Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(registry, gate, confiner);
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system",
+            AgentConfig {
+                max_tool_iterations: 10,
+                ..Default::default()
+            },
+            Arc::default(),
+            plan_mode,
+            AutonomousMode::new(),
+            tx,
+        );
+        let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+        agent.set_architect(crate::architect::Architect {
+            seat,
+            tail_budget_tokens: 3072,
+        });
+
+        agent
+            .run_turn(
+                "/architect refactor auth".to_string(),
+                Path::new("."),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let tool_names: Vec<&str> = received[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(tool_names.contains(&"read_file"));
+        assert!(
+            !tool_names.contains(&"write_file"),
+            "plan mode must still filter the editor's own tool list after an architect hand-off"
+        );
+        drop(rx.try_recv()); // drain isn't needed for this assertion; silence unused warning
+    }
+
+    #[tokio::test]
+    async fn architect_planning_cancellation_ends_the_turn_without_invoking_the_editor() {
+        let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+        let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+        agent.set_architect(crate::architect::Architect {
+            seat,
+            tail_budget_tokens: 3072,
+        });
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        agent
+            .run_turn(
+                "/architect refactor auth".to_string(),
+                Path::new("."),
+                cancellation,
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            architect_notes(&events)
+                .iter()
+                .any(|n| n.contains("cancelled")),
+            "a pre-cancelled token must abort planning with an explanatory note"
+        );
+        assert!(agent.history.is_empty());
+        assert!(editor_mock.received.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

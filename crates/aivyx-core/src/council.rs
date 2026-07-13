@@ -25,7 +25,7 @@ const MAX_COUNCIL_TEXT_BYTES: usize = 512 * 1024;
 /// count toward quorum — an empty or near-empty answer (e.g. a reasoning
 /// model that spent its whole response inside an unclosed think block) is a
 /// member failure, not a contribution.
-const MIN_ANSWER_CHARS: usize = 20;
+pub(crate) const MIN_ANSWER_CHARS: usize = 20;
 
 const ADVISOR_PROMPT: &str = "You are one advisor on a council of several independent AI models, \
      consulted on a difficult software or design question. Answer on your \
@@ -161,7 +161,7 @@ fn render_for_digest(message: &Message) -> Option<String> {
 /// that some serving paths leak into content verbatim — the Phase 10 lesson
 /// that reasoning markup shows up where you least expect it, applied
 /// defensively here since council answers skip all tool-call parsing.
-fn strip_think(text: &str) -> String {
+pub(crate) fn strip_think(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<think>") {
@@ -401,7 +401,7 @@ fn advisor_label(position: usize) -> String {
     }
 }
 
-enum CollectError {
+pub(crate) enum CollectError {
     Cancelled,
     Backend(String),
 }
@@ -409,7 +409,7 @@ enum CollectError {
 /// Streams one no-tools chat call to completion and returns the
 /// accumulated text. Tool-call and usage events are ignored — members are
 /// never offered tools, and there's no context indicator to feed here.
-async fn collect_text(
+pub(crate) async fn collect_text(
     backend: &dyn LlmBackend,
     request: ChatRequest,
     cancellation: &CancellationToken,
