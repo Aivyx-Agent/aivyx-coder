@@ -812,8 +812,10 @@ never live-tested.
 Three external projects, each reinterpreted onto primitives aivyx already
 has rather than ported. Recommended build order: 11a → 11b → 11c (rising
 security surface), each behind its own design pass with user sign-off.
-Status: **11a shipped and live-verified** (see its section below); 11b
-and 11c not started.
+Status: **all three shipped and live-verified** — 11a (2026-07-11), 11c
+(2026-07-13, built out of the recommended order once the capability audit
+found it needed Phase 12's loop-mechanics prerequisites first), and 11b
+(2026-07-13, see its section below).
 
 **11a — Council mode** (inspiration: karpathy/llm-council — multiple
 models answer, anonymously cross-rank, a chairman synthesizes; upstream
@@ -832,6 +834,65 @@ context when relevant. This mechanizes the project's own
 "document design as we go" discipline. Open questions for its design pass:
 injection policy vs budget, and staleness detection (git_read diffing
 since the last wiki update is already enough plumbing).
+
+**Built and live-verified (2026-07-13).** Followed a full design pass
+(`docs/superpowers/specs/2026-07-13-phase-11b-agent-wiki-design.md`) before
+implementation, mirroring how 11a and 11c were each signed off first. Not a
+security-critical change — no new `ConfirmationGate` tier, every
+`write_file` call goes through the existing confirmation modal unchanged.
+Built: a deterministic staleness/frontmatter module in `aivyx-tools`
+(`aivyx_tools::wiki`) that diffs each page's recorded generation commit
+against HEAD, scoped to that page's covered paths via plain git pathspecs
+(not globs — `git diff -- <pathspec>` already matches a directory prefix
+recursively); a fixed page skeleton in `aivyx-core`
+(`aivyx_core::wiki::page_specs`) — `architecture-overview.md` plus one page
+per workspace crate, crate pages discovered from `crates/*/Cargo.toml`
+rather than hand-maintained; and `Agent::run_wiki_turn`, which drives one
+turn per stale page directly through `run_turn_inner` (not the public
+`run_turn`, so a synthesized per-page instruction is never re-checked
+against `/council`/`/wiki`), reusing the exact `TurnPaused`-continuation
+mechanism Phase 12/11c already built. The repo map gained a lightweight
+pointer-list section (page path + one-line summary) inside its *existing*
+token budget — no new budget parameter, full page content stays
+`read_file`-on-demand.
+
+One deviation from the design doc, disclosed rather than silently
+resolved: `architecture-overview.md`'s covered paths are a fixed constant
+picked once at implementation time, not re-curated by the model on every
+`/wiki` run as the design doc's more abstract framing suggested — keeps
+staleness fully deterministic and avoids a fragile model-authored-
+frontmatter-parsing path for a field whose correctness the whole staleness
+mechanism depends on. `generated_at_commit`/`covers` are always stamped by
+code after a page's turn completes, never trusted from what the model
+wrote; only a model-provided `summary` is preserved (falling back to a
+default when absent).
+
+27 new tests (231 total, up from 204): real-git fixture tests for
+staleness/stamping in `aivyx-tools` (mirroring `checkpoint.rs`'s own
+style), `parse_command` tests mirroring `council::parse_command`'s
+exactly, `Agent::run_wiki_turn` tested with a mock `LlmBackend` plus real
+git repos (no pty needed — the reason this orchestration lives in
+`aivyx-core`, not `aivyx-tui`), repo-map render tests. Per-task review
+caught three Important findings, all inherited from the plan's own
+reference code and all fixed before merge: a dead unreachable branch in
+the frontmatter parser, an unguarded empty-`covers` pathspec in
+`stale_pages` that would have silently become an unrestricted whole-repo
+diff, and — the substantive one — an unbounded per-page auto-continue loop
+with no cap on `TurnPaused` cycles (`/wiki` has no human at the pause the
+way interactive mode does; fixed with a `MAX_WIKI_PAGE_CONTINUATIONS`
+cap, the same shape as 11c's own autonomous-loop budget). Four live E2E
+checks through the real binary (qwen3.5:9B via the Lemonade-managed
+llama-server), all passing: (1) first run on a fresh 2-crate scratch
+workspace generated all 3 pages (`architecture-overview` + one per crate),
+each correctly stamped with the real HEAD commit and a preserved
+model-written summary; (2) touching one crate and re-running `/wiki`
+regenerated only that crate's page, leaving the other two untouched at
+their original commit; (3) `/wiki <page>` force-regenerated an
+already-up-to-date page regardless of staleness; (4) sending Ctrl+C
+mid-batch stopped the run without processing further queued pages, and a
+subsequent bare `/wiki` picked up exactly the page that was interrupted —
+confirming the idempotent-resume property (no persisted queue state
+needed) the design relied on.
 
 **11c — Autonomous research loop** (inspiration: karpathy/autoresearch —
 an agent iterates on a training script overnight against one metric with a

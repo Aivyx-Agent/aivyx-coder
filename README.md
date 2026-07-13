@@ -126,6 +126,19 @@ max_duration_secs = 3600 # wall-clock ceiling for the whole run
 Mutually exclusive with `--plan` and `--resume`. See ROADMAP.md's Phase 11c
 entry for the full trust-profile rationale and design forks.
 
+**Agent-maintained wiki** (`/wiki`, `/wiki <page>`): generates and keeps
+`docs/wiki/*.md` up to date — one page per workspace crate plus
+`architecture-overview.md` — using the agent's normal gated tools, no new
+trust tier. Bare `/wiki` regenerates only pages whose covered source files
+changed since they were last generated (tracked per-page, in each page's
+frontmatter, against the commit it was generated at — not against
+uncommitted changes); `/wiki <page>` forces one page regardless of
+staleness. Every page write still goes through the standard confirmation
+modal. The repo map lists existing pages (path + one-line summary) as
+pointers so the model can `read_file` the relevant one on demand, at no new
+token-budget cost. See ROADMAP.md's Phase 11b entry for the full design
+rationale.
+
 Build/test the workspace:
 
 ```
