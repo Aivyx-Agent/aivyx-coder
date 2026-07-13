@@ -89,6 +89,11 @@ enum ChatLine {
     /// sub-agent's mutations still trigger real confirmation modals and
     /// need visible lead-up explaining what's being attempted and why.
     SubAgent(String),
+    /// One block of `/architect` output (the planning-in-progress note or
+    /// the produced plan) — visually distinct from `Council`'s
+    /// deliberation and the parent's own transcript, since the architect is
+    /// a separate model producing a plan, not "aivyx" speaking.
+    Architect(String),
 }
 
 /// Configures an unattended `--auto` session (ROADMAP.md Phase 11c). `tasks`
@@ -363,6 +368,9 @@ impl App {
             AgentEvent::CouncilNote(text) => {
                 self.transcript.push(ChatLine::Council(text));
             }
+            AgentEvent::ArchitectNote(text) => {
+                self.transcript.push(ChatLine::Architect(text));
+            }
             AgentEvent::SubAgentActivity(inner) => {
                 self.transcript.push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
@@ -549,6 +557,7 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::TasksUpdated(_)
         | AgentEvent::CouncilNote(_)
+        | AgentEvent::ArchitectNote(_)
         | AgentEvent::SubAgentActivity(_) => String::new(),
     }
 }
@@ -723,6 +732,9 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ChatLine::Council(text) => {
             prefixed_lines(text, "council> ", Style::default().fg(Color::Magenta))
         }
+        ChatLine::Architect(text) => {
+            prefixed_lines(text, "architect> ", Style::default().fg(Color::Cyan))
+        }
         ChatLine::SubAgent(text) => {
             if text.is_empty() {
                 return Vec::new();
@@ -817,6 +829,22 @@ mod tests {
             app.transcript.last(),
             Some(ChatLine::SubAgent(text)) if text.contains("read_file")
         ));
+    }
+
+    #[test]
+    fn architect_note_renders_as_a_distinguished_chat_line() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ArchitectNote(
+            "plan from model-architect:\n1. Add TokenV2.".to_string(),
+        ));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Architect(text)) if text.contains("Add TokenV2")
+        ));
+
+        let lines = chat_line_to_lines(app.transcript.last().unwrap());
+        assert!(lines[0].to_string().starts_with("architect> "));
     }
 
     #[test]
