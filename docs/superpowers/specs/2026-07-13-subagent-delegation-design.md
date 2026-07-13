@@ -75,15 +75,25 @@ to reach back up into Agent-level machinery (an `LlmBackend`, a way to
 emit `AgentEvent`s, a bounded sub-agent tool registry) that the `Tool`
 trait was deliberately kept ignorant of.
 
-**Resolution:** `ToolExecutionContext` gains one new field carrying what a
-sub-agent needs to spin itself up: the shared `llm: Arc<dyn LlmBackend>`,
-an `events_tx: UnboundedSender<AgentEvent>` for live streaming, the
-sub-agent's own tool registry (the parent's registry minus `delegate_task`
-itself, so recursion is structurally impossible rather than merely
-policy-excluded), and the configured `max_iterations`. Every other tool
-ignores this field entirely; `DelegateTaskTool::execute()` uses it to
-construct a fresh `Agent` internally — sharing the parent's `gate`,
-`confiner`, `checkpointer`, and (if enabled) `repo_map` — drive it turn by
+**Resolution (revised during plan-writing — see Decision log):** every
+one of these dependencies (`LlmBackend`, `PermissionGate`,
+`ExecutionConfiner`, the checkpointer, the repo map, the events sender,
+the sub-agent registry, `max_iterations`) is stable for the whole
+session — constructed once in `main.rs`, never varying call to call. This
+is exactly the shape `RunCommandTool::new(command_specs)` already
+established: tool-specific configuration baked into the tool's own struct
+at registration time, not threaded through the generic
+`ToolExecutionContext` every tool receives. `DelegateTaskTool::new(llm,
+gate, confiner, checkpointer, repo_map, events_tx, sub_agent_registry,
+max_iterations)` holds everything it needs as its own fields;
+`ToolExecutionContext` is untouched, and so is every other `Tool` impl and
+its tests — the only per-call input `delegate_task` needs beyond what
+`ToolExecutionContext` already provides (`cwd`, `cancellation`) is the
+`task` argument itself, already available via `execute()`'s existing
+`arguments: Value` parameter. `DelegateTaskTool::execute()` uses its own
+held fields to construct a fresh `ToolExecutor` (sharing the parent's
+`gate`, `confiner`, `checkpointer`) and a fresh `Agent` on top of it
+(sharing the parent's `llm`, `repo_map`, `events_tx`) — drive it turn by
 turn until either a natural final answer or the iteration cap, and return
 its final text as the tool's `ToolOutput::Ok(text)`.
 
@@ -204,5 +214,5 @@ Mirrors the `/council`/`/wiki` precedent:
 | Budget | New dedicated `[sub_agent] max_iterations` config, smaller default than the parent's per-turn cap |
 | Cap exhaustion | Best-effort partial result with a clear cutoff notice, never an error |
 | Context seed | Task description only — no parent-conversation digest |
-| `ToolExecutionContext` gap | Extended with one new field (LLM backend, event sender, sub-agent registry, budget), ignored by every other tool |
+| `ToolExecutionContext` gap | Baked into `DelegateTaskTool::new(...)` at registration time instead — matches `RunCommandTool`'s existing config-at-construction pattern, zero changes to `ToolExecutionContext`/`ToolExecutor`/any other `Tool` impl (revised during plan-writing after the field-extension approach turned out to touch 8 existing construction sites for no per-call benefit — every dependency is session-stable, not per-call) |
 | `delegate_task`'s own gate treatment | Always auto-allowed (`Internal`/`Other`), offered during plan mode (degrades gracefully via the shared `PlanMode` flag) |
