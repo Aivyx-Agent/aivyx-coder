@@ -172,24 +172,6 @@ async fn main() -> anyhow::Result<()> {
     // mutator) and the agent (which renders and persists the list).
     let tasks: Arc<std::sync::Mutex<Vec<session::Task>>> = Arc::default();
 
-    let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(ReadFileTool));
-    registry.register(Arc::new(WriteFileTool));
-    registry.register(Arc::new(EditFileTool));
-    registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
-    registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
-    registry.register(Arc::new(RunShellTool));
-    registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
-    registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
-    registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
-
-    // Only registered when configured — an always-erroring tool offered to
-    // the model would just be confusing noise for a project that hasn't
-    // opted into any commands.
-    if !command_specs.is_empty() {
-        registry.register(Arc::new(RunCommandTool::new(command_specs.clone())));
-    }
-
     // Each configured command is pre-approved in two forms: the direct
     // `(program, args)` invocation `run_command` uses, and the `sh -c
     // "<program> <args>"` form `run_shell` always wraps commands in — the
@@ -262,14 +244,14 @@ async fn main() -> anyhow::Result<()> {
         &deny_paths,
         settings.sandbox.require_enforcement,
     );
-    let mut executor = ToolExecutor::new(registry, gate, confiner);
-    let mut has_checkpointer = false;
+
+    let mut checkpointer: Option<Arc<GitCheckpointer>> = None;
     if settings.git.checkpoints
-        && let Some(checkpointer) = GitCheckpointer::detect(&cwd, deny_paths.clone()).await
+        && let Some(detected) = GitCheckpointer::detect(&cwd, deny_paths.clone()).await
     {
-        executor.set_checkpointer(Arc::new(checkpointer));
-        has_checkpointer = true;
+        checkpointer = Some(Arc::new(detected));
     }
+    let has_checkpointer = checkpointer.is_some();
     // The discard/rewind safety net on exhausted verification (the entire
     // basis for auto-approving edits in `--auto`) depends on a checkpointer
     // being present — without one, `Agent`'s discard/rewind logic degrades
@@ -282,6 +264,38 @@ async fn main() -> anyhow::Result<()> {
              the default) — the discard/rewind safety net on exhausted verification depends on it"
         );
     }
+
+    // Constructed here (rather than left inline at the `agent.set_repo_map`
+    // call site, as before) so `delegate_task`'s sub-agent can share the
+    // exact same `Arc<RepoMap>` — a fresh second `RepoMap` would duplicate
+    // the parse cache for no benefit, since both agents walk the same cwd.
+    let repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)> = settings.repo_map.enabled.then(|| {
+        (
+            Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
+            settings.repo_map.budget_tokens,
+        )
+    });
+
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ReadFileTool));
+    registry.register(Arc::new(WriteFileTool));
+    registry.register(Arc::new(EditFileTool));
+    registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
+    registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
+    registry.register(Arc::new(RunShellTool));
+    registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
+    registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
+    registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
+
+    // Only registered when configured — an always-erroring tool offered to
+    // the model would just be confusing noise for a project that hasn't
+    // opted into any commands.
+    if !command_specs.is_empty() {
+        registry.register(Arc::new(RunCommandTool::new(command_specs.clone())));
+    }
+
     let edit_format = match cli.edit_format.as_deref() {
         Some("native") => EditFormat::Native,
         Some("prompted") => EditFormat::Prompted,
@@ -290,9 +304,47 @@ async fn main() -> anyhow::Result<()> {
             aivyx_config::EditFormat::Prompted => EditFormat::Prompted,
         },
     };
-    let system_prompt = build_system_prompt(&executor, edit_format);
 
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    // Snapshot every tool registered so far — this becomes a sub-agent's
+    // own tool list, which must never include `delegate_task` itself
+    // (recursion is structurally impossible this way, not merely
+    // policy-excluded). `delegate_task` is registered onto `registry`
+    // (the parent's) below, *after* this clone.
+    let sub_agent_registry = registry.clone();
+    // Verification config is threaded through so a sub-agent's own edits
+    // get verified before `delegate_task` returns, exactly like the
+    // parent's own edits would — mirrors the `agent.set_verification(...)`
+    // call below, resolved once here so both call sites agree without
+    // duplicating the allowed_commands-membership check.
+    let verification = settings
+        .verification
+        .command
+        .as_ref()
+        .filter(|command| command_specs.iter().any(|spec| &spec.name == *command))
+        .map(|command| (command.clone(), settings.verification.max_auto_verify_retries));
+    registry.register(Arc::new(aivyx_core::DelegateTaskTool::new(
+        aivyx_core::DelegateTaskConfig {
+            llm: Arc::clone(&llm),
+            gate: Arc::clone(&gate),
+            confiner: Arc::clone(&confiner),
+            checkpointer: checkpointer.clone(),
+            repo_map: repo_map.clone(),
+            events_tx: events_tx.clone(),
+            sub_agent_registry,
+            plan_mode: plan_mode.clone(),
+            autonomous_mode: autonomous_mode.clone(),
+            context_tokens: settings.backend.context_tokens,
+            edit_format,
+            verification: verification.clone(),
+            max_iterations: settings.sub_agent.max_iterations,
+        },
+    )));
+
+    let mut executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::clone(&confiner));
+    if let Some(cp) = &checkpointer {
+        executor.set_checkpointer(Arc::clone(cp));
+    }
+    let system_prompt = build_system_prompt(&executor, edit_format);
 
     // Best-effort probe of the *served* context window (llama-server
     // /props, Ollama /api/show) — a smaller-than-configured window means
@@ -325,11 +377,8 @@ async fn main() -> anyhow::Result<()> {
         events_tx,
     );
 
-    if settings.repo_map.enabled {
-        agent.set_repo_map(
-            Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
-            settings.repo_map.budget_tokens,
-        );
+    if let Some((map, budget)) = &repo_map {
+        agent.set_repo_map(Arc::clone(map), *budget);
     }
 
     // `/council` needs ≥2 members and a chairman; anything less and the
@@ -362,16 +411,14 @@ async fn main() -> anyhow::Result<()> {
     // itself uses) — warn loudly rather than silently doing nothing if it
     // doesn't, since a typo here would otherwise look like the feature is
     // enabled but never actually verify anything.
-    if let Some(command) = &settings.verification.command {
-        if command_specs.iter().any(|spec| &spec.name == command) {
-            agent.set_verification(command.clone(), settings.verification.max_auto_verify_retries);
-        } else {
-            tracing::warn!(
-                command = %command,
-                "verification.command does not match any [[permissions.allowed_commands]] \
-                 entry name — enforced verification is disabled until this is fixed"
-            );
-        }
+    if let Some((command, max_retries)) = &verification {
+        agent.set_verification(command.clone(), *max_retries);
+    } else if let Some(command) = &settings.verification.command {
+        tracing::warn!(
+            command = %command,
+            "verification.command does not match any [[permissions.allowed_commands]] \
+             entry name — enforced verification is disabled until this is fixed"
+        );
     }
 
     // Persistence is always on (it's what makes `--resume` possible after a
