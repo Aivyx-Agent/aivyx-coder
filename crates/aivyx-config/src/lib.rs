@@ -37,6 +37,7 @@ pub struct Settings {
     pub git: GitSettings,
     pub repo_map: RepoMapSettings,
     pub council: CouncilSettings,
+    pub architect: ArchitectSettings,
     pub verification: VerificationSettings,
     pub autonomous: AutonomousSettings,
     pub sub_agent: SubAgentSettings,
@@ -154,6 +155,41 @@ pub struct CouncilMember {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// Architect/editor model-pairing (`/architect <task>`, ROADMAP.md Phase 9):
+/// a single, separately configured model produces a prose implementation
+/// plan, which is then handed directly to the primary/editor model's own
+/// turn loop. Off until configured: an empty `base_url` or `model` means
+/// `/architect` explains how to enable itself instead of running — no
+/// separate enable flag, matching `VerificationSettings`'s convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchitectSettings {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    /// Token budget for the conversation-tail digest the architect sees
+    /// alongside the task — separate from `council.tail_budget_tokens`
+    /// since the two features are configured and toggled independently.
+    pub tail_budget_tokens: u32,
+}
+
+impl Default for ArchitectSettings {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            tail_budget_tokens: 3072,
+        }
+    }
+}
+
+impl ArchitectSettings {
+    pub fn configured(&self) -> bool {
+        !self.base_url.is_empty() && !self.model.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +680,47 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(no_chairman).unwrap();
         assert!(!settings.council.configured());
+    }
+
+    #[test]
+    fn architect_settings_default_is_unconfigured() {
+        let settings = Settings::default();
+        assert!(!settings.architect.configured());
+        assert_eq!(settings.architect.base_url, "");
+        assert_eq!(settings.architect.model, "");
+        assert_eq!(settings.architect.tail_budget_tokens, 3072);
+    }
+
+    #[test]
+    fn architect_block_parses_and_reports_configured() {
+        let raw = r#"
+            [architect]
+            base_url = "http://localhost:11434/v1"
+            model = "qwen3.6:27b"
+            tail_budget_tokens = 2048
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(settings.architect.configured());
+        assert_eq!(settings.architect.base_url, "http://localhost:11434/v1");
+        assert_eq!(settings.architect.model, "qwen3.6:27b");
+        assert_eq!(settings.architect.tail_budget_tokens, 2048);
+    }
+
+    #[test]
+    fn architect_needs_both_base_url_and_model_to_be_configured() {
+        let only_model = r#"
+            [architect]
+            model = "qwen3.6:27b"
+        "#;
+        let settings: Settings = toml::from_str(only_model).unwrap();
+        assert!(!settings.architect.configured());
+
+        let only_base_url = r#"
+            [architect]
+            base_url = "http://localhost:11434/v1"
+        "#;
+        let settings: Settings = toml::from_str(only_base_url).unwrap();
+        assert!(!settings.architect.configured());
     }
 
     #[test]
