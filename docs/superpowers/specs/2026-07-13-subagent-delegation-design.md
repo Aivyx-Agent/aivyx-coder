@@ -161,14 +161,27 @@ all, not parent-conversation leakage the way a history digest would be.
 
 ### Live visibility
 
-Matches `/council`'s `CouncilNote` precedent: as the sub-agent runs, its
-tool calls, tool results, and streaming text render into the transcript in
-real time via the shared `events_tx`, styled/labeled distinctly from the
-parent's own activity (a new `ChatLine` variant, analogous to
-`ChatLine::Council`). This means a confirmation modal triggered by the
-sub-agent's own `write_file`/`run_command` call has visible lead-up
-explaining what's being attempted and why, rather than appearing with no
-context.
+**Revised during plan-writing:** `/council`'s `CouncilNote` precedent
+doesn't transfer directly — council emits its own coarse-grained notes
+itself, at stage boundaries, and never has to forward a *separate* nested
+agent's full token-by-token event stream. A sub-agent is a genuine nested
+`Agent` with its own internal turn loop, so its `ToolCallDetected`/
+`ToolResult`/`TextDelta` events need to reach the transcript without being
+indistinguishable from the parent's own (which sharing one `events_tx`
+literally would produce, since both would emit the exact same
+`AgentEvent` variants). Resolution: the sub-agent gets its own
+`mpsc::unbounded_channel()`; `DelegateTaskTool::execute()` spawns a
+background task for the duration of the delegated call that drains the
+sub-agent's receiver and forwards each event, wrapped in a new
+`AgentEvent::SubAgentActivity(Box<AgentEvent>)` variant, onto the parent's
+real `events_tx` (baked into `DelegateTaskTool` at construction). The TUI
+unwraps this variant and renders the inner event through a
+visually-distinguished path (a new `ChatLine` variant, analogous to
+`ChatLine::Council`) instead of the normal one. This gives true live,
+token-by-token streaming with proper visual distinction — a confirmation
+modal triggered by the sub-agent's own `write_file`/`run_command` call has
+visible lead-up explaining what's being attempted and why, rather than
+appearing with no context.
 
 ### Stopping conditions
 
@@ -226,6 +239,7 @@ Mirrors the `/council`/`/wiki` precedent:
 | Trigger | A tool the model calls mid-turn, not a human-triggered slash command |
 | Tool scope | Full tool access, same trust boundary as the parent — not a read-only-only restriction |
 | Visibility | Streams live into the transcript, visually distinguished, not hidden until the final result |
+| Streaming mechanism | A spawned forwarding task drains the sub-agent's own `AgentEvent` channel and re-emits each event wrapped in `AgentEvent::SubAgentActivity(Box<AgentEvent>)` onto the parent's channel, for true token-by-token live streaming with visual distinction (revised during plan-writing after `/council`'s simpler same-channel precedent turned out not to apply to a genuinely nested `Agent`) |
 | Recursion | Capped at one level — a sub-agent's tool list excludes `delegate_task` |
 | Budget | New dedicated `[sub_agent] max_iterations` config, smaller default than the parent's per-turn cap |
 | Cap exhaustion | Best-effort partial result with a clear cutoff notice, never an error |
