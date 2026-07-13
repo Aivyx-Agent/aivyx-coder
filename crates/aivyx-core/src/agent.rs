@@ -48,6 +48,14 @@ pub enum AgentEvent {
     /// or ranking, the chairman's synthesis, or a failure note) — the whole
     /// deliberation streams through these; see `council::convene`.
     CouncilNote(String),
+    /// One event produced by a `delegate_task` sub-agent's own turn loop,
+    /// forwarded verbatim from its private `AgentEvent` channel so it can
+    /// render in the transcript distinguished from the parent's own
+    /// activity — see `crate::delegate::DelegateTaskTool`. `Box`ed since
+    /// `AgentEvent` itself isn't `Copy` and this variant would otherwise
+    /// make every `AgentEvent` at least as large as its own biggest
+    /// variant recursively.
+    SubAgentActivity(Box<AgentEvent>),
 }
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from

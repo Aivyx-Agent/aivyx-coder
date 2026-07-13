@@ -83,6 +83,12 @@ enum ChatLine {
     /// both the assistant and error notices, since a council's members are
     /// not "aivyx" and their notes are not failures.
     Council(String),
+    /// One rendered line of a `delegate_task` sub-agent's own activity
+    /// (its text, tool calls, tool results) — visually distinct from both
+    /// the parent's own transcript and `Council`'s deliberation, since a
+    /// sub-agent's mutations still trigger real confirmation modals and
+    /// need visible lead-up explaining what's being attempted and why.
+    SubAgent(String),
 }
 
 /// Configures an unattended `--auto` session (ROADMAP.md Phase 11c). `tasks`
@@ -357,6 +363,9 @@ impl App {
             AgentEvent::CouncilNote(text) => {
                 self.transcript.push(ChatLine::Council(text));
             }
+            AgentEvent::SubAgentActivity(inner) => {
+                self.transcript.push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
+            }
         }
     }
 
@@ -521,6 +530,26 @@ fn tool_output_text(output: &ToolOutput) -> String {
         ToolOutput::Ok(s) => s.clone(),
         ToolOutput::Error(s) => format!("error: {s}"),
         ToolOutput::Denied(s) => format!("denied: {s}"),
+    }
+}
+
+/// Renders one nested `AgentEvent` from a `delegate_task` sub-agent as a
+/// single line of text for `ChatLine::SubAgent` — deliberately reuses the
+/// same shape the parent's own top-level events render as (tool
+/// name/args, tool output text, plain text deltas) so a sub-agent's
+/// activity reads the same way the parent's own would, just prefixed
+/// distinctly by `chat_line_to_lines`.
+fn sub_agent_event_text(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::TextDelta(text) => text.clone(),
+        AgentEvent::ToolCallDetected(call) => format!("{}({})", call.name, call.arguments),
+        AgentEvent::ToolResult(result) => tool_output_text(&result.output),
+        AgentEvent::Error(text) | AgentEvent::TurnPaused(text) => text.clone(),
+        AgentEvent::TurnComplete
+        | AgentEvent::ContextUsage { .. }
+        | AgentEvent::TasksUpdated(_)
+        | AgentEvent::CouncilNote(_)
+        | AgentEvent::SubAgentActivity(_) => String::new(),
     }
 }
 
@@ -694,6 +723,12 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ChatLine::Council(text) => {
             prefixed_lines(text, "council> ", Style::default().fg(Color::Magenta))
         }
+        ChatLine::SubAgent(text) => {
+            if text.is_empty() {
+                return Vec::new();
+            }
+            prefixed_lines(text, "  sub-agent> ", Style::default().fg(Color::LightYellow))
+        }
     }
 }
 
@@ -747,6 +782,41 @@ mod tests {
             text: text.to_string(),
             status,
         }
+    }
+
+    fn tool_call(id: &str, name: &str) -> aivyx_types::ToolCall {
+        aivyx_types::ToolCall {
+            id: aivyx_types::ToolCallId(id.to_string()),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            source: aivyx_types::ToolCallSource::Native,
+        }
+    }
+
+    #[test]
+    fn sub_agent_text_delta_renders_as_a_distinguished_chat_line() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::SubAgentActivity(Box::new(
+            AgentEvent::TextDelta("exploring the auth module".to_string()),
+        )));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::SubAgent(text)) if text == "exploring the auth module"
+        ));
+    }
+
+    #[test]
+    fn sub_agent_tool_call_is_prefixed_and_still_distinguished() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::SubAgentActivity(Box::new(
+            AgentEvent::ToolCallDetected(tool_call("c1", "read_file")),
+        )));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::SubAgent(text)) if text.contains("read_file")
+        ));
     }
 
     #[test]
