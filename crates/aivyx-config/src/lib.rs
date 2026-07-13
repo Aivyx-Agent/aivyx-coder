@@ -39,6 +39,7 @@ pub struct Settings {
     pub council: CouncilSettings,
     pub verification: VerificationSettings,
     pub autonomous: AutonomousSettings,
+    pub sub_agent: SubAgentSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -87,6 +88,22 @@ impl Default for AutonomousSettings {
             max_iterations: 20,
             max_duration_secs: 3600,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubAgentSettings {
+    /// A delegated task's own tool-call budget — deliberately separate
+    /// from, and smaller than, `[permissions] max_tool_iterations_per_turn`:
+    /// a delegated task is meant to be a scoped, bounded piece of work, not
+    /// a full session.
+    pub max_iterations: u32,
+}
+
+impl Default for SubAgentSettings {
+    fn default() -> Self {
+        Self { max_iterations: 10 }
     }
 }
 
@@ -627,6 +644,22 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(no_chairman).unwrap();
         assert!(!settings.council.configured());
+    }
+
+    #[test]
+    fn sub_agent_settings_default_max_iterations_is_ten() {
+        let settings = SubAgentSettings::default();
+        assert_eq!(settings.max_iterations, 10);
+    }
+
+    #[test]
+    fn sub_agent_settings_parses_from_toml() {
+        let toml = r#"
+            [sub_agent]
+            max_iterations = 5
+        "#;
+        let settings: Settings = toml::from_str(toml).unwrap();
+        assert_eq!(settings.sub_agent.max_iterations, 5);
     }
 
     #[test]
