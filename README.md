@@ -136,8 +136,11 @@ uncommitted changes); `/wiki <page>` forces one page regardless of
 staleness. Every page write still goes through the standard confirmation
 modal. The repo map lists existing pages (path + one-line summary) as
 pointers so the model can `read_file` the relevant one on demand, at no new
-token-budget cost. See ROADMAP.md's Phase 11b entry for the full design
-rationale.
+token-budget cost. Each page is its own turn, so if `[verification]
+command` is configured it auto-runs once per regenerated page (not once per
+`/wiki` invocation) — expect a slow verification command to dominate a
+first-run, full-skeleton regeneration. See ROADMAP.md's Phase 11b entry for
+the full design rationale.
 
 Build/test the workspace:
 
