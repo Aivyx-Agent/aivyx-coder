@@ -21,7 +21,7 @@ serde_json = "1.0.150"
 similar = "3.1.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-tokio = { version = "1.52.3", features = ["process", "fs", "rt", "macros", "io-util", "time"] }
+tokio = { version = "1.52.3", features = ["process", "fs", "rt", "macros", "io-util", "time", "sync"] }
 tokio-util = "0.7.18"
 
 [dev-dependencies]
