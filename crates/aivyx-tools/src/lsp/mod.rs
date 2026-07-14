@@ -13,7 +13,7 @@ use crate::ToolError;
 use transport::Connection;
 
 struct Started {
-    connection: Connection,
+    connection: Arc<Connection>,
     child: Option<tokio::process::Child>,
     opened_uris: HashSet<String>,
     next_doc_version: i32,
@@ -65,7 +65,7 @@ impl LspClient {
         writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
     ) {
         *self.state.lock().await = Some(Started {
-            connection: Connection::new(reader, writer),
+            connection: Arc::new(Connection::new(reader, writer)),
             child: None,
             opened_uris: HashSet::new(),
             next_doc_version: 1,
@@ -116,7 +116,7 @@ impl LspClient {
         initialize(&connection, cwd).await?;
 
         *guard = Some(Started {
-            connection,
+            connection: Arc::new(connection),
             child: Some(child),
             opened_uris: HashSet::new(),
             next_doc_version: 1,
@@ -184,9 +184,20 @@ impl LspClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, ToolError> {
-        let guard = self.state.lock().await;
-        let started = guard.as_ref().expect("ensure_started just succeeded");
-        tokio::time::timeout(self.timeout, started.connection.request(method, params))
+        // Clone the `Arc<Connection>` under a short-lived lock and drop the
+        // guard before awaiting the round trip — `Connection` has its own
+        // internal synchronization (a writer `Mutex`, an `Arc<Mutex<HashMap>>`
+        // of pending requests) and is safe to call concurrently, so holding
+        // `self.state`'s lock for the whole in-flight request would
+        // needlessly serialize concurrent `go_to_definition`/`find_references`
+        // calls against each other and block `ensure_started`'s liveness
+        // check while a slow query is outstanding.
+        let connection = {
+            let guard = self.state.lock().await;
+            let started = guard.as_ref().expect("ensure_started just succeeded");
+            started.connection.clone()
+        };
+        tokio::time::timeout(self.timeout, connection.request(method, params))
             .await
             .map_err(|_| {
                 ToolError::ExecutionFailed(format!(
@@ -614,5 +625,153 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn find_references_formats_multiple_locations_as_one_line_each_in_order() {
+        // `parse_locations`'s `Value::Array` branch has no other coverage —
+        // every other test in this file responds with either `null` or a
+        // single `Location` object, but `find_references` hits the array
+        // shape constantly in practice (multiple reference sites).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn fib(n: u64) -> u64 { n }\nfn call_fib() { fib(1); }\nfn call_fib_again() { fib(2); }\n",
+        )
+        .unwrap();
+        let uri = format!("file://{}", dir.path().join("lib.rs").display());
+
+        let client = LspClient::new(Duration::from_secs(5));
+        let (client_reader, server_writer) = tokio::io::duplex(8192);
+        let (server_reader, client_writer) = tokio::io::duplex(8192);
+        client.wire_for_test(client_reader, client_writer).await;
+
+        let server = tokio::spawn(async move {
+            fake_server_respond_once(
+                tokio::io::BufReader::new(server_reader),
+                server_writer,
+                "textDocument/references",
+                serde_json::json!([
+                    {
+                        "uri": uri,
+                        "range": {"start": {"line": 1, "character": 16}, "end": {"line": 1, "character": 19}},
+                    },
+                    {
+                        "uri": uri,
+                        "range": {"start": {"line": 2, "character": 22}, "end": {"line": 2, "character": 25}},
+                    },
+                ]),
+            )
+            .await;
+        });
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let result = client
+            .find_references(dir.path(), &confiner, "lib.rs", 1, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            "lib.rs:2:fn call_fib() { fib(1); }\nlib.rs:3:fn call_fib_again() { fib(2); }"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_document_sends_did_change_not_did_open_on_the_second_query() {
+        // Only the *first*-query-sends-`didOpen` path had coverage before
+        // this test — querying the same URI a second time in one session
+        // must send `didChange`, not `didOpen` again.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn fib(n: u64) -> u64 { n }\n").unwrap();
+
+        let client = LspClient::new(Duration::from_secs(5));
+        let (client_reader, server_writer) = tokio::io::duplex(8192);
+        let (server_reader, client_writer) = tokio::io::duplex(8192);
+        client.wire_for_test(client_reader, client_writer).await;
+
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_reader);
+            let mut writer = server_writer;
+
+            let first_sync = transport::read_one_message(&mut reader).await.unwrap().unwrap();
+            assert_eq!(first_sync["method"], "textDocument/didOpen");
+            assert!(first_sync.get("id").is_none());
+            let _ = fake_server_respond_once(
+                &mut reader,
+                &mut writer,
+                "textDocument/definition",
+                serde_json::Value::Null,
+            )
+            .await;
+
+            let second_sync = transport::read_one_message(&mut reader).await.unwrap().unwrap();
+            assert_eq!(second_sync["method"], "textDocument/didChange");
+            assert!(second_sync.get("id").is_none());
+            let _ = fake_server_respond_once(
+                &mut reader,
+                &mut writer,
+                "textDocument/definition",
+                serde_json::Value::Null,
+            )
+            .await;
+        });
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        client
+            .go_to_definition(dir.path(), &confiner, "lib.rs", 1, 4)
+            .await
+            .unwrap();
+        client
+            .go_to_definition(dir.path(), &confiner, "lib.rs", 1, 4)
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_times_out_and_returns_a_clear_error_when_the_server_never_responds() {
+        // Proves `request()`'s `tokio::time::timeout` wrapping actually
+        // fires — a fake server that reads the request but never answers
+        // must cause a bounded `Err`, not a hang.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "fn fib(n: u64) -> u64 { n }\n").unwrap();
+
+        let client = LspClient::new(Duration::from_millis(100));
+        let (client_reader, server_writer) = tokio::io::duplex(8192);
+        let (server_reader, client_writer) = tokio::io::duplex(8192);
+        client.wire_for_test(client_reader, client_writer).await;
+
+        let server = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(server_reader);
+            let _ = transport::read_one_message(&mut reader).await; // didOpen
+            let _ = transport::read_one_message(&mut reader).await; // definition request
+            let _server_writer = server_writer; // keep the pipe open; never respond
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let started = std::time::Instant::now();
+        let err = client
+            .go_to_definition(dir.path(), &confiner, "lib.rs", 1, 4)
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        let ToolError::ExecutionFailed(msg) = err else {
+            panic!("expected ExecutionFailed")
+        };
+        assert!(
+            msg.contains("did not respond within"),
+            "expected a timeout-specific message, got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "request() should have timed out quickly (timeout was 100ms), took {elapsed:?} instead"
+        );
+
+        server.abort();
     }
 }
