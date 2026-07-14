@@ -756,6 +756,88 @@ persisted session history with the injected `"[Architect plan"` message
 immediately followed by the editor's own `read_file`/`edit_file` round-trip
 — confirming the whole request completed as one continuous turn.
 
+**LSP integration built and live-verified (2026-07-15).** Followed a full
+design pass (`docs/superpowers/specs/2026-07-14-lsp-integration-design.md`)
+before implementation, mirroring every prior Phase 9/10/11/12 item. Shipped:
+`go_to_definition` and `find_references`, two read-only tools backed by a
+lazily-spawned `rust-analyzer` subprocess — the first genuinely new
+capability *shape* in this project (every prior process-executing tool is
+one-shot spawn→drain→exit; this is a long-lived, stateful JSON-RPC session).
+A new `aivyx-tools/src/lsp/` module (not a new crate — mirrors
+`GitCheckpointer`'s precedent of a substantial stateful component living
+directly in `aivyx-tools`) holds a transport layer generic over any
+`AsyncRead`/`AsyncWrite` pair (a real child's stdio in production, an
+in-memory `tokio::io::duplex()` in tests) and `LspClient`, which is
+constructor-baked into both tools (`Arc<LspClient>`) rather than threaded
+through `ToolExecutionContext`/`ToolExecutor` — unlike `GitCheckpointer`,
+nothing else in the crate needs it, so it doesn't belong on the
+cross-cutting dispatch path. `rust-analyzer` is spawned through the same
+`ExecutionConfiner` every other process-executing tool already uses, lazily
+on first call, reused for the session, and transparently respawned once if
+it dies. Since this project has no persistent open-editor-buffer concept,
+every query re-syncs the target file fresh from disk (`didOpen`/`didChange`)
+immediately before asking, so edits made via `write_file`/`edit_file`
+between two LSP calls are always reflected. No `lsp-types` dependency —
+hand-rolled response types only, matching this workspace's existing
+hand-rolled-over-heavy-dependency convention (the same reasoning behind the
+frontmatter parser having no YAML dependency).
+
+Four real issues were found and fixed during implementation and review, one
+of them only surfaced by live testing against a genuine `rust-analyzer`:
+task reviews caught a missing regression test for "a healthy session is
+reused without respawning" (an explicit plan constraint with zero coverage,
+closed with a mutation-tested regression test — the re-reviewer confirmed by
+hand that inverting the liveness check would make the new test fail), a real
+concurrency bottleneck (`LspClient::request` held the client's state mutex
+across the *entire* in-flight JSON-RPC round trip, serializing both tools
+sharing one client — fixed by wrapping `Connection` in an `Arc` so only a
+cheap clone happens under the lock), and a live symlink/`deny_paths` bypass
+(both tools resolved paths via raw `cwd.join()` instead of the crate's
+`path_resolve::resolve()`, which `ConfirmationGate`'s deny-list depends on
+for symlink safety — the re-reviewer verified the closed gap with an actual
+symlink-escape test plus a before/after control reproducing the original
+bug). The fourth was found only once a real `rust-analyzer` binary was
+available for Task 6's live verification (none of this crate's own
+hand-rolled test doubles had ever exercised it): `read_loop`'s response
+correlation matched on JSON-RPC `"id"` presence alone, but rust-analyzer
+sends its own server-initiated requests (`window/workDoneProgress/create`
+and similar) on an independent id counter that collides with the client's
+own — a server request could silently masquerade as the response to a real
+pending query, resolving it with a bogus `Null`. Root-caused by directly
+tracing the wire protocol with a hand-rolled probe script before fixing;
+closed by requiring the absence of `"method"` and the presence of
+`"result"`/`"error"` before a message may resolve a pending sender. The same
+live pass also found that `ensure_started` never actually waited for
+`rust-analyzer`'s initial workspace load to finish — only for the
+`initialize` handshake, which returns long before indexing completes — so a
+query issued immediately after a fresh spawn silently returned empty results
+(confirmed directly: identical query, `[]` immediately after spawn, correct
+result 10s later). This directly contradicted `[lsp] timeout_secs`'s own doc
+comment, already written to promise "cold indexing can be slow" tolerance
+the implementation didn't yet provide; closed by tracking `$/progress`
+begin/end notifications and having a fresh spawn wait (debounced, since
+rust-analyzer's startup emits several back-to-back progress cycles, and
+bounded by the same `timeout_secs` budget) until the server goes quiet.
+
+21 new tests (276 total, up from 255): JSON-RPC framing/correlation against
+an in-memory duplex (no process), confiner-invocation and missing-binary
+error paths via a deliberately-nonexistent program name (not the real
+`rust-analyzer`, so every unit test stays deterministic regardless of
+what's on the machine running it), bidirectional 1-indexed↔0-indexed
+position conversion, array/single/null response-shape parsing,
+`didOpen`-vs-`didChange` branching, request timeout-firing, and both tools'
+`Tool` trait contracts. Plus a real-`rust-analyzer` Cargo integration test
+(self-skips when the binary isn't on `PATH` rather than failing) and one
+live E2E through the real binary: no local install of `rust-analyzer` or
+`rustup` was available, so the standalone release binary was downloaded
+directly for this verification pass. Both the integration test and the
+live E2E initially failed against the real binary — surfacing the two
+protocol bugs above — then passed cleanly once fixed: the live run showed
+`go_to_definition` resolving a real call site to its real definition
+through the actual TUI, with zero confirmation modals (matching the
+`ActionKind::Read` auto-allow every other read-only tool already gets) and
+correct 1-indexed input/output end to end.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class

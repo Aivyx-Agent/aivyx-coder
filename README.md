@@ -171,6 +171,21 @@ set under `[architect]` in `config.toml`; an unconfigured or bare
 ends the turn without ever invoking the editor — a failed plan never
 silently falls back to running the raw task unplanned.
 
+**LSP integration** (`go_to_definition`, `find_references`): two read-only
+tools giving exact symbol resolution the repo map's static, ranked symbol
+list can't provide — which exact definition a call site resolves to when
+several candidates share a name, and every reference site across the whole
+workspace. Backed by a `rust-analyzer` subprocess, spawned lazily on first
+use and reused for the rest of the session, confined by the same
+Landlock/seccomp `ExecutionConfiner` every other process-executing tool
+already gets. `path`/`line`/`column` arguments are 1-indexed, matching
+`grep`'s existing `path:line_number:text` convention; output mirrors it too
+(`path:line:text`, one line per result). Both tools are always registered —
+a missing `rust-analyzer` on `PATH` surfaces as a clear error on first call
+rather than a silent startup probe. Bounded by `[lsp] timeout_secs`
+(default 60s — cold `rust-analyzer` indexing on a larger workspace can be
+slow). Rust-only for now; no hover, workspace symbol search, or rename.
+
 Build/test the workspace:
 
 ```
