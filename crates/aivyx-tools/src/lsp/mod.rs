@@ -136,7 +136,7 @@ impl LspClient {
         column: u32,
     ) -> Result<String, ToolError> {
         self.ensure_started(cwd, confiner).await?;
-        let abs_path = cwd.join(path);
+        let abs_path = crate::path_resolve::resolve(cwd, path);
         let uri = path_to_uri(&abs_path);
         self.sync_document(&uri, &abs_path).await?;
 
@@ -162,7 +162,7 @@ impl LspClient {
         column: u32,
     ) -> Result<String, ToolError> {
         self.ensure_started(cwd, confiner).await?;
-        let abs_path = cwd.join(path);
+        let abs_path = crate::path_resolve::resolve(cwd, path);
         let uri = path_to_uri(&abs_path);
         self.sync_document(&uri, &abs_path).await?;
 

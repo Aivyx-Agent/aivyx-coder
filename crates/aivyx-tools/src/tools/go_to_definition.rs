@@ -66,7 +66,7 @@ impl Tool for GoToDefinitionTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::Read,
-            target: PermissionTarget::Path(cwd.join(&args.path)),
+            target: PermissionTarget::Path(crate::path_resolve::resolve(cwd, &args.path)),
             arguments_preview: json!({ "path": args.path, "line": args.line, "column": args.column }),
             preview: None,
         })
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(request.action, ActionKind::Read);
         assert_eq!(
             request.target,
-            PermissionTarget::Path(dir.path().join("src/lib.rs"))
+            PermissionTarget::Path(dir.path().canonicalize().unwrap().join("src/lib.rs"))
         );
     }
 
