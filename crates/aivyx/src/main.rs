@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aivyx_config::Settings;
-use aivyx_core::{Agent, AgentConfig, Council, CouncilSeat, EditFormat, session};
+use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilSeat, EditFormat, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
@@ -402,6 +402,23 @@ async fn main() -> anyhow::Result<()> {
             members: settings.council.members.iter().map(seat).collect(),
             chairman: seat(chairman),
             tail_budget_tokens: settings.council.tail_budget_tokens,
+        });
+    }
+
+    // `/architect` needs base_url + model; anything less and the command
+    // explains itself instead (the agent handles the None case).
+    if settings.architect.configured() {
+        agent.set_architect(Architect {
+            seat: ArchitectSeat {
+                model: settings.architect.model.clone(),
+                backend: Arc::new(OpenAiCompatBackend::with_idle_timeout(
+                    settings.architect.base_url.clone(),
+                    settings.architect.model.clone(),
+                    settings.architect.api_key.clone(),
+                    COUNCIL_IDLE_TIMEOUT,
+                )),
+            },
+            tail_budget_tokens: settings.architect.tail_budget_tokens,
         });
     }
 
