@@ -156,6 +156,21 @@ best-effort partial result rather than failing outright. Delegation is
 capped at one level — a sub-agent's own tool list never includes
 `delegate_task`.
 
+**Architect/editor model-pairing** (`/architect <task>`): a separately
+configured, typically stronger model produces a prose implementation plan
+for the stated task, which is then handed directly to the primary
+("editor") model's own turn loop — one continuous action, no re-prompt
+needed. Unlike `/council`, there's exactly one architect seat and no
+deliberation/ranking; unlike `delegate_task`, the architect never calls
+tools itself, and its output feeds the *same* session's next turn rather
+than spawning an isolated agent. Off until both `base_url` and `model` are
+set under `[architect]` in `config.toml`; an unconfigured or bare
+`/architect` explains itself instead of running. The plan streams live
+(prefixed `architect>`, cyan, visually distinct from `council>` and
+`sub-agent>`), and any planning failure (backend error, an empty response)
+ends the turn without ever invoking the editor — a failed plan never
+silently falls back to running the raw task unplanned.
+
 Build/test the workspace:
 
 ```

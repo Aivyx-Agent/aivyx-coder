@@ -709,6 +709,53 @@ model itself reported "the available tools only support reading files,
 not creating them," confirming graceful degradation rather than a
 silent per-call denial.
 
+**Architect/editor model-pairing built and live-verified (2026-07-14).**
+Followed a full design pass
+(`docs/superpowers/specs/2026-07-14-architect-editor-pairing-design.md`)
+before implementation, mirroring 11a/11b/11c and sub-agent delegation.
+Shipped: `/architect <task>`, a slash command dispatched in `Agent::run_turn`
+alongside `/council` and `/wiki`, via a new `crate::architect` module
+mirroring `crate::council`'s shape (`ArchitectSeat`/`Architect` vs.
+`CouncilSeat`/`Council` — the tail-budget field lives on the wrapper, not the
+seat, exactly as `Council` already does, since a bare seat carries no notion
+of how much conversation context it should see). Unlike `/council`, there's
+exactly one seat and no deliberation/ranking; unlike `delegate_task`, the
+architect never calls tools and its output feeds the *same* session's next
+turn rather than spawning an isolated agent. The core mechanism needed no new
+plumbing: `run_architect_turn` makes one no-tools planning call, then calls
+`self.run_turn_inner(formatted_plan, cwd, cancellation).await` directly —
+`run_turn_inner` is completely unmodified, since it already pushes whatever
+string it's given as a `Role::User` message and runs the normal iteration
+loop. That one call *is* the hand-off: the editor model sees the plan exactly
+as if it were the user's next message and starts calling tools immediately,
+in the same turn, with zero re-prompting.
+
+One real bug was found and fixed during implementation, not design: the
+plan's own reference code for `architect::plan` went straight from emitting
+a "planning…" note into the backend call, omitting the early
+`cancellation.is_cancelled()` check `council::convene` already does before
+each of its own stages. A pre-cancelled token could race `collect_text`'s
+internal `tokio::select!` against an already-ready mock stream in tests,
+producing genuine ~20% flakiness — reproduced in isolation (6/30 failures
+without the fix, independently re-confirmed by the task reviewer) before
+being fixed with the same one-line pre-check `convene` already uses.
+
+12 new tests (255 total, up from 243): config parsing/`configured()` logic,
+`parse_command` recognition, unconfigured/bare-invocation/backend-failure/
+empty-response turn behavior, a plan-mode regression proving the editor's
+own tool-list filtering still applies after a hand-off, the cancellation
+race fix above, and TUI rendering for the new `architect>`-prefixed
+(cyan) chat line. One live E2E through the real binary (only one local
+backend was actually running at test time — `Qwen3.5-9B-GGUF` via a
+Lemonade-managed llama-server — so both `[backend]` and `[architect]`
+pointed at the same seat; the mechanism under test doesn't require distinct
+models, only distinct configuration): `/architect` against a scratch repo
+produced a live `architect>`-prefixed plan, a real `edit_file` confirmation
+modal with the correct diff, an actual on-disk edit after approval, and a
+persisted session history with the injected `"[Architect plan"` message
+immediately followed by the editor's own `read_file`/`edit_file` round-trip
+— confirming the whole request completed as one continuous turn.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
