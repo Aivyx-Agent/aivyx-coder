@@ -114,6 +114,18 @@ impl LspClient {
         let connection = Connection::new(stdout, stdin);
 
         initialize(&connection, cwd).await?;
+        // rust-analyzer answers requests immediately even while its
+        // initial workspace load/index is still running, silently
+        // returning empty results rather than blocking — found via live
+        // testing: a query issued right after `initialize` returned no
+        // results, the identical query 10s later returned the correct
+        // one. `wait_until_idle` gives real workspace-load latency a
+        // chance to finish before this session is handed out for queries,
+        // bounded by the same budget `[lsp] timeout_secs` already exists
+        // to accommodate ("cold indexing can be slow"). Best-effort only:
+        // it returns once the budget is exhausted regardless of whether
+        // the server ever signals readiness.
+        connection.wait_until_idle(self.timeout).await;
 
         *guard = Some(Started {
             connection: Arc::new(connection),

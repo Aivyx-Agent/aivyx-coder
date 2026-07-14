@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -20,6 +21,19 @@ pub(crate) struct Connection {
     pending: PendingMap,
     next_id: AtomicI64,
     reader_task: tokio::task::JoinHandle<()>,
+    /// Net count of open `$/progress` tokens (incremented on `kind:
+    /// "begin"`, decremented on `kind: "end"`) — rust-analyzer answers
+    /// requests immediately even while its initial workspace load/index is
+    /// still in flight, silently returning empty results until it's
+    /// actually ready. This is the readiness signal `ensure_started` waits
+    /// on after a fresh spawn, closing the gap between what `[lsp]
+    /// timeout_secs`'s doc comments always claimed ("cold indexing can be
+    /// slow") and what the implementation actually waited for (previously:
+    /// nothing — only the `initialize` handshake, which returns long
+    /// before indexing finishes). Found via live testing against a real
+    /// rust-analyzer: an immediate post-spawn query returned `[]`, the
+    /// identical query 10s later returned the correct result.
+    open_progress_tokens: Arc<AtomicI64>,
 }
 
 impl Connection {
@@ -29,12 +43,15 @@ impl Connection {
     ) -> Self {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_for_task = pending.clone();
-        let reader_task = tokio::spawn(read_loop(reader, pending_for_task));
+        let open_progress_tokens = Arc::new(AtomicI64::new(0));
+        let progress_for_task = open_progress_tokens.clone();
+        let reader_task = tokio::spawn(read_loop(reader, pending_for_task, progress_for_task));
         Self {
             writer: Mutex::new(Box::new(writer)),
             pending,
             next_id: AtomicI64::new(1),
             reader_task,
+            open_progress_tokens,
         }
     }
 
@@ -44,6 +61,42 @@ impl Connection {
     /// whether to respawn.
     pub(crate) fn is_dead(&self) -> bool {
         self.reader_task.is_finished()
+    }
+
+    /// Blocks until no `$/progress` token has been open for a short
+    /// debounce window (rust-analyzer's startup emits several back-to-back
+    /// begin/end cycles — e.g. "Fetching", "Building CrateGraph", "Roots
+    /// Scanned", "Indexing", "cargo check" — with the counter briefly
+    /// touching zero *between* phases, not just once at the very end; the
+    /// debounce avoids mistaking that gap for real completion), or until
+    /// `timeout` elapses, whichever comes first. A server that never emits
+    /// any progress notification at all (small workspace, or a
+    /// non-rust-analyzer LSP server in principle) is indistinguishable
+    /// from "not yet started" by the counter alone, so this always returns
+    /// once `timeout` elapses regardless — callers must treat this as a
+    /// best-effort wait, not a guarantee.
+    pub(crate) async fn wait_until_idle(&self, timeout: Duration) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        const DEBOUNCE: Duration = Duration::from_millis(400);
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut idle_since: Option<tokio::time::Instant> = None;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            if self.open_progress_tokens.load(Ordering::Relaxed) <= 0 {
+                let since = *idle_since.get_or_insert(now);
+                if now.duration_since(since) >= DEBOUNCE {
+                    return;
+                }
+            } else {
+                idle_since = None;
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now))).await;
+        }
     }
 
     pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value, ToolError> {
@@ -103,21 +156,60 @@ async fn write_framed(
     writer.flush().await
 }
 
-async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap) {
+async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap, progress: Arc<AtomicI64>) {
     let mut reader = BufReader::new(reader);
     loop {
         match read_one_message(&mut reader).await {
             Ok(Some(value)) => {
-                if let Some(id) = value.get("id").and_then(Value::as_i64)
+                if value.get("method").and_then(Value::as_str) == Some("$/progress")
+                    && let Some(kind) = value
+                        .get("params")
+                        .and_then(|p| p.get("value"))
+                        .and_then(|v| v.get("kind"))
+                        .and_then(Value::as_str)
+                {
+                    match kind {
+                        "begin" => {
+                            progress.fetch_add(1, Ordering::Relaxed);
+                        }
+                        "end" => {
+                            progress.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        _ => {} // "report" carries no open/close signal
+                    }
+                }
+                // Only a genuine *response* to one of our own requests may
+                // resolve a pending sender. JSON-RPC's "id" field is not
+                // exclusive to responses — a server-initiated request (e.g.
+                // rust-analyzer's own `window/workDoneProgress/create`,
+                // sent unprompted throughout startup) also carries an "id",
+                // and critically runs its own independent id counter that
+                // collides with ours (both commonly start at 0/1/2...).
+                // Matching on "id" presence alone lets a server request
+                // masquerade as the response to one of our own requests,
+                // silently resolving it with a bogus `Null` payload instead
+                // of the real result — found via live testing against a
+                // real rust-analyzer; no hand-rolled test double in this
+                // crate's unit tests ever sent a server-initiated request,
+                // so this was invisible to every test that existed before
+                // this fix. A real response never carries "method"; a
+                // server request or notification always does.
+                let is_response = value.get("method").is_none()
+                    && (value.get("result").is_some() || value.get("error").is_some());
+                if is_response
+                    && let Some(id) = value.get("id").and_then(Value::as_i64)
                     && let Some(tx) = pending.lock().await.remove(&id)
                 {
                     let payload = value.get("result").cloned().unwrap_or(Value::Null);
                     let _ = tx.send(payload);
                 }
-                // Notifications from the server (no "id") are dropped —
-                // this project only issues requests it awaits; no
-                // server-initiated notification matters for
-                // go_to_definition/find_references.
+                // Anything else — a server-initiated request (has "id" AND
+                // "method") or a server notification (has "method", no
+                // "id") — is intentionally left unanswered: this project
+                // only ever issues requests it awaits, and rust-analyzer
+                // tolerates an unanswered `window/workDoneProgress/create`
+                // or similar capability-negotiation request without it
+                // affecting go_to_definition/find_references correctness.
             }
             Ok(None) => break, // EOF: child exited or pipe closed
             Err(_) => break,   // malformed framing: treat as dead, matching EOF
@@ -162,7 +254,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt as _;
 
     /// Writes one framed JSON-RPC message directly to a raw writer — the
     /// same wire format `Connection` itself produces, used here to drive
