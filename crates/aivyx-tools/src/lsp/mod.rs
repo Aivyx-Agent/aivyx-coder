@@ -243,4 +243,30 @@ mod tests {
              connection, got: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn ensure_started_reuses_an_already_healthy_session_without_respawning() {
+        // Wire a *live* session (both duplex halves stay open) pointed at a
+        // program that can never exist. If either call to `ensure_started`
+        // incorrectly decided the session was dead and tried to respawn, it
+        // would immediately fail trying to spawn the nonexistent binary —
+        // so two `Ok(())`s prove the healthy session was reused both times,
+        // not respawned.
+        let client =
+            LspClient::with_program("definitely-not-a-real-binary-xyz", Duration::from_secs(5));
+        let (client_reader, _server_writer) = tokio::io::duplex(4096);
+        let (_server_reader, client_writer) = tokio::io::duplex(4096);
+        client.wire_for_test(client_reader, client_writer).await;
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+
+        client
+            .ensure_started(Path::new("."), &confiner)
+            .await
+            .expect("first call should reuse the already-healthy wired session");
+        client
+            .ensure_started(Path::new("."), &confiner)
+            .await
+            .expect("second call should also reuse the already-healthy wired session");
+    }
 }
