@@ -1,11 +1,17 @@
 //! Exercises the real `rust-analyzer` binary end-to-end — spawn, confiner
 //! reuse (via `NoopConfiner`, since this test doesn't need real
 //! Landlock/seccomp confinement to prove the LSP protocol round-trip
-//! works), initialize handshake, a real go-to-definition and
-//! find-references query, and respawn-after-crash. Skipped entirely (not
-//! failed) when `rust-analyzer` isn't on `PATH`, since this project's dev
-//! and CI environments aren't guaranteed to have it installed — every
-//! other assertion in this crate's test suite works without it.
+//! works), initialize handshake, and a real go-to-definition and
+//! find-references query (including the indexing-readiness wait —
+//! against a real server, not a mock, so this is the only test that
+//! actually proves a query issued right after spawn returns correct
+//! results rather than a hollow success). Respawn-after-crash is not
+//! covered by this test; it has its own unit-level coverage in
+//! `lsp::tests::ensure_started_respawns_when_the_existing_connection_is_dead`.
+//! Skipped entirely (not failed) when `rust-analyzer` isn't on `PATH`,
+//! since this project's dev and CI environments aren't guaranteed to have
+//! it installed — every other assertion in this crate's test suite works
+//! without it.
 
 use std::process::Command as StdCommand;
 use std::sync::Arc;

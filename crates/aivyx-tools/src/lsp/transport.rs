@@ -71,10 +71,16 @@ impl Connection {
     /// debounce avoids mistaking that gap for real completion), or until
     /// `timeout` elapses, whichever comes first. A server that never emits
     /// any progress notification at all (small workspace, or a
-    /// non-rust-analyzer LSP server in principle) is indistinguishable
-    /// from "not yet started" by the counter alone, so this always returns
-    /// once `timeout` elapses regardless — callers must treat this as a
-    /// best-effort wait, not a guarantee.
+    /// non-rust-analyzer LSP server in principle) starts with the counter
+    /// already at zero, so this returns after just one `DEBOUNCE` window
+    /// (~400ms) rather than waiting the full `timeout` — only a server
+    /// that opens a token and never closes it (`begin` with no matching
+    /// `end`) blocks for the entire `timeout`. Either way this is a
+    /// best-effort wait, not a guarantee: a `begin` that arrives more than
+    /// `DEBOUNCE` after the previous phase's `end` (a slow phase transition
+    /// on a large/loaded workspace) can still let this return before the
+    /// server is genuinely ready, yielding an empty-but-safe result rather
+    /// than a wrong one.
     pub(crate) async fn wait_until_idle(&self, timeout: Duration) {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
         const DEBOUNCE: Duration = Duration::from_millis(400);

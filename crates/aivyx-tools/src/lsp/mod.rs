@@ -124,7 +124,16 @@ impl LspClient {
         // bounded by the same budget `[lsp] timeout_secs` already exists
         // to accommodate ("cold indexing can be slow"). Best-effort only:
         // it returns once the budget is exhausted regardless of whether
-        // the server ever signals readiness.
+        // the server ever signals readiness. `self.state`'s lock is
+        // deliberately still held across this wait (it was already held
+        // across `initialize` above) — spawning only happens once per
+        // session, so serializing a concurrent caller behind the *entire*
+        // first-spawn-to-ready sequence is the correct trade-off: it
+        // guarantees whoever gets the lock next sees an already-ready
+        // session, rather than needing its own readiness wait too. This is
+        // unrelated to `request()`'s per-query lock, which only clones the
+        // `Arc<Connection>` before releasing the lock — that fix targets
+        // steady-state query concurrency, not first-spawn setup.
         connection.wait_until_idle(self.timeout).await;
 
         *guard = Some(Started {
