@@ -7,9 +7,9 @@ use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilS
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
-    CommandSpec, EditFileTool, GitCheckpointer, GitCommitTool, GitReadTool, GlobTool, GrepTool,
-    ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry,
-    WriteFileTool,
+    CommandSpec, EditFileTool, FindReferencesTool, GitCheckpointer, GitCommitTool, GitReadTool,
+    GlobTool, GoToDefinitionTool, GrepTool, LspClient, ReadFileTool, RunCommandTool, RunShellTool,
+    SetTasksTool, ToolExecutor, ToolRegistry, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -288,6 +288,10 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
+
+    let lsp_client = Arc::new(LspClient::new(Duration::from_secs(settings.lsp.timeout_secs)));
+    registry.register(Arc::new(GoToDefinitionTool::new(Arc::clone(&lsp_client))));
+    registry.register(Arc::new(FindReferencesTool::new(Arc::clone(&lsp_client))));
 
     // Only registered when configured — an always-erroring tool offered to
     // the model would just be confusing noise for a project that hasn't

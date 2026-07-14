@@ -41,6 +41,7 @@ pub struct Settings {
     pub verification: VerificationSettings,
     pub autonomous: AutonomousSettings,
     pub sub_agent: SubAgentSettings,
+    pub lsp: LspSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -105,6 +106,22 @@ pub struct SubAgentSettings {
 impl Default for SubAgentSettings {
     fn default() -> Self {
         Self { max_iterations: 10 }
+    }
+}
+
+/// LSP integration (`go_to_definition`/`find_references`, ROADMAP.md
+/// Phase 9): bounds each JSON-RPC request to the lazily-spawned
+/// `rust-analyzer` subprocess. Generous default — cold indexing on the
+/// first call in a large workspace can take tens of seconds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspSettings {
+    pub timeout_secs: u64,
+}
+
+impl Default for LspSettings {
+    fn default() -> Self {
+        Self { timeout_secs: 60 }
     }
 }
 
@@ -721,6 +738,22 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(only_base_url).unwrap();
         assert!(!settings.architect.configured());
+    }
+
+    #[test]
+    fn lsp_settings_default_timeout_is_sixty_seconds() {
+        let settings = Settings::default();
+        assert_eq!(settings.lsp.timeout_secs, 60);
+    }
+
+    #[test]
+    fn lsp_block_parses_a_custom_timeout() {
+        let raw = r#"
+            [lsp]
+            timeout_secs = 120
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.lsp.timeout_secs, 120);
     }
 
     #[test]
