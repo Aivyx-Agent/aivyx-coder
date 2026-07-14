@@ -24,10 +24,11 @@ mod tools;
 pub mod wiki;
 
 pub use checkpoint::GitCheckpointer;
+pub use lsp::LspClient;
 pub use process::CommandSpec;
 pub use tools::{
-    EditFileTool, GitCommitTool, GitReadTool, GlobTool, GrepTool, ReadFileTool, RunCommandTool,
-    RunShellTool, SetTasksTool, WriteFileTool,
+    EditFileTool, FindReferencesTool, GitCommitTool, GitReadTool, GlobTool, GoToDefinitionTool,
+    GrepTool, ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool, WriteFileTool,
 };
 
 #[derive(Debug, Error)]

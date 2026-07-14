@@ -1,7 +1,9 @@
 mod edit_file;
+mod find_references;
 mod git_commit;
 mod git_read;
 mod glob;
+mod go_to_definition;
 mod grep;
 mod read_file;
 mod run_command;
@@ -10,9 +12,11 @@ mod set_tasks;
 mod write_file;
 
 pub use edit_file::EditFileTool;
+pub use find_references::FindReferencesTool;
 pub use git_commit::GitCommitTool;
 pub use git_read::GitReadTool;
 pub use glob::GlobTool;
+pub use go_to_definition::GoToDefinitionTool;
 pub use grep::GrepTool;
 pub use read_file::ReadFileTool;
 pub use run_command::RunCommandTool;

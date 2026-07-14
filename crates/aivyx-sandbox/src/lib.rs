@@ -48,7 +48,7 @@ pub enum ActionKind {
     Internal,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionTarget {
     Path(PathBuf),
     Command { program: String, args: Vec<String> },
