@@ -221,6 +221,13 @@ pub enum AgentError {
     ResponseTooLarge,
 }
 
+/// Where to find the user-global `AGENTS.md` (if resolvable) and the
+/// per-file token budget both the global and project files share.
+struct AgentsFileConfig {
+    global_path: Option<PathBuf>,
+    budget_tokens: u32,
+}
+
 pub struct Agent {
     llm: std::sync::Arc<dyn LlmBackend>,
     executor: ToolExecutor,
@@ -262,10 +269,17 @@ pub struct Agent {
     /// once per turn (cheap after the first pass — only changed files
     /// re-parse) into `repo_map_text`.
     repo_map: Option<(Arc<RepoMap>, u32)>,
+    /// `AGENTS.md` support when configured (`set_agents_file`); `None`
+    /// disables the feature entirely (both files).
+    agents_file_config: Option<AgentsFileConfig>,
     /// The rendered slice appended to the system prompt; also counted by
     /// the context estimator — a ~1k-token block compaction can't see would
     /// silently eat the window's headroom.
     repo_map_text: Option<String>,
+    /// Combined, labeled rendering of the project's and/or user's
+    /// `AGENTS.md` — re-rendered once per turn by `refresh_agents_files`,
+    /// mirroring `repo_map_text`'s own per-turn cadence.
+    agents_files_text: Option<String>,
     edit_format: EditFormat,
     /// Monotonic id source for tool calls synthesized from SEARCH/REPLACE
     /// blocks — they need ids that can't collide with the backend's.
@@ -335,7 +349,9 @@ impl Agent {
             autonomous_mode,
             last_turn_paused: false,
             repo_map: None,
+            agents_file_config: None,
             repo_map_text: None,
+            agents_files_text: None,
             edit_format: config.edit_format,
             synthetic_seq: 0,
             council: None,
@@ -395,6 +411,18 @@ impl Agent {
         self.repo_map = Some((map, budget_tokens));
     }
 
+    /// Enables `AGENTS.md` support: `global_path` is the resolved
+    /// user-global location (`None` if `Settings::agents_file_path()`
+    /// couldn't resolve one), applied identically per turn alongside the
+    /// project-level `<cwd>/AGENTS.md`. `budget_tokens` applies to each
+    /// file independently.
+    pub fn set_agents_file(&mut self, global_path: Option<PathBuf>, budget_tokens: u32) {
+        self.agents_file_config = Some(AgentsFileConfig {
+            global_path,
+            budget_tokens,
+        });
+    }
+
     /// Re-renders the map off the async runtime. Best-effort: a failure
     /// just means this turn goes without a map.
     async fn refresh_repo_map(&mut self) {
@@ -408,6 +436,69 @@ impl Agent {
             Err(err) => {
                 tracing::warn!(error = %err, "repo map rendering panicked; continuing without it");
                 None
+            }
+        };
+    }
+
+    /// Re-reads both `AGENTS.md` files off the async runtime. Best-effort:
+    /// any read error for either file (missing, permission denied, not
+    /// valid UTF-8) just means that source contributes nothing — this
+    /// never fails the turn. Called once per turn (not once per LLM
+    /// round-trip), mirroring `refresh_repo_map`'s cadence exactly.
+    async fn refresh_agents_files(&mut self, cwd: &Path) {
+        let Some(config) = &self.agents_file_config else {
+            return;
+        };
+        let budget_chars = (config.budget_tokens as f64 * self.chars_per_token) as usize;
+        let global_path = config.global_path.clone();
+        let project_path = cwd.join("AGENTS.md");
+        let budget_tokens = config.budget_tokens;
+
+        let mut sections: Vec<String> = Vec::new();
+        let mut over_budget_labels: Vec<&str> = Vec::new();
+
+        if let Some(path) = &global_path
+            && let Ok(content) = tokio::fs::read_to_string(path).await
+        {
+            let content = content.trim();
+            if !content.is_empty() {
+                if content.chars().count() > budget_chars {
+                    over_budget_labels.push("user-level AGENTS.md");
+                }
+                sections.push(format!(
+                    "User preferences ({}):\n{content}",
+                    path.display()
+                ));
+            }
+        }
+
+        if let Ok(content) = tokio::fs::read_to_string(&project_path).await {
+            let content = content.trim();
+            if !content.is_empty() {
+                if content.chars().count() > budget_chars {
+                    over_budget_labels.push("project AGENTS.md");
+                }
+                sections.push(format!("Project instructions (AGENTS.md):\n{content}"));
+            }
+        }
+
+        for label in &over_budget_labels {
+            self.notify(format!(
+                "{label} exceeds the configured [agents_file] budget_tokens ({budget_tokens} \
+                 tokens) — trim it or raise the budget; the full content was still included."
+            ));
+        }
+
+        self.agents_files_text = match sections.len() {
+            0 => None,
+            1 => Some(sections.remove(0)),
+            _ => {
+                let project = sections.remove(1);
+                let global = sections.remove(0);
+                Some(format!(
+                    "{global}\n\n(Project instructions take precedence over user preferences \
+                     if they conflict.)\n\n{project}"
+                ))
             }
         };
     }
@@ -466,6 +557,10 @@ impl Agent {
             system.push_str("\n\n");
             system.push_str(AUTONOMOUS_PROMPT);
         }
+        if let Some(text) = &self.agents_files_text {
+            system.push_str("\n\n");
+            system.push_str(text);
+        }
         if let Some(map) = &self.repo_map_text {
             system.push_str("\n\n");
             system.push_str(map);
@@ -483,6 +578,7 @@ impl Agent {
     fn prompt_chars(&self) -> usize {
         message_chars(&self.system_prompt, &self.history)
             + self.repo_map_text.as_ref().map_or(0, |m| m.chars().count())
+            + self.agents_files_text.as_ref().map_or(0, |m| m.chars().count())
     }
 
     /// Rough token estimate for the current prompt, using the
@@ -919,6 +1015,7 @@ impl Agent {
         // changes materially, and re-walking on every tool round-trip would
         // add latency exactly where slow local models already hurt.
         self.refresh_repo_map().await;
+        self.refresh_agents_files(cwd).await;
 
         for iteration in 1..=self.max_tool_iterations {
             if cancellation.is_cancelled() {
@@ -2051,6 +2148,311 @@ mod tests {
         // The estimator must see the map's weight, or compaction would run
         // blind to a block that's present in every request.
         assert!(agent.prompt_chars() > chars_without_map + 50);
+    }
+
+    fn agents_file_notes(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error(text) if text.contains("AGENTS.md") => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn project_only_agents_md_is_injected_with_no_precedence_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "Use tabs, not spaces, in this project.",
+        )
+        .unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("Project instructions (AGENTS.md):"));
+        assert!(system.contains("Use tabs, not spaces, in this project."));
+        assert!(!system.contains("User preferences"));
+        assert!(!system.contains("take precedence"));
+    }
+
+    #[tokio::test]
+    async fn global_only_agents_md_is_injected_with_no_precedence_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_path = global_dir.path().join("AGENTS.md");
+        std::fs::write(&global_path, "Always write terse commit messages.").unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(Some(global_path), 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("User preferences ("));
+        assert!(system.contains("Always write terse commit messages."));
+        assert!(!system.contains("Project instructions (AGENTS.md):"));
+        assert!(!system.contains("take precedence"));
+    }
+
+    #[tokio::test]
+    async fn neither_file_present_injects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_path = global_dir.path().join("AGENTS.md");
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(Some(global_path), 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(!system.contains("AGENTS.md"));
+        assert!(!system.contains("User preferences"));
+    }
+
+    #[tokio::test]
+    async fn both_files_present_orders_global_first_with_precedence_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "PROJECT_MARKER_TEXT").unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_path = global_dir.path().join("AGENTS.md");
+        std::fs::write(&global_path, "GLOBAL_MARKER_TEXT").unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(Some(global_path), 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("User preferences ("));
+        assert!(system.contains("Project instructions (AGENTS.md):"));
+        assert!(system.contains("take precedence"));
+        let global_index = system.find("GLOBAL_MARKER_TEXT").unwrap();
+        let project_index = system.find("PROJECT_MARKER_TEXT").unwrap();
+        assert!(
+            global_index < project_index,
+            "global content must appear before project content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_over_budget_is_included_in_full_and_triggers_one_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~1024 chars of 'x' — comfortably over an intentionally tiny
+        // 5-token budget (5 tokens * DEFAULT_CHARS_PER_TOKEN(4.0) = 20 chars).
+        let long_content = "x".repeat(1024);
+        std::fs::write(dir.path().join("AGENTS.md"), &long_content).unwrap();
+
+        let (mut agent, mut rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 5);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(
+            system.contains(&long_content),
+            "the full over-budget content must still be included"
+        );
+
+        let events = drain(&mut rx);
+        let notes = agents_file_notes(&events);
+        assert_eq!(notes.len(), 1, "expected exactly one over-budget notice");
+        assert!(notes[0].contains("project AGENTS.md"));
+    }
+
+    #[tokio::test]
+    async fn a_file_within_budget_triggers_no_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "short").unwrap();
+
+        let (mut agent, mut rx, _mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(agents_file_notes(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn editing_the_file_between_turns_changes_the_next_turns_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "FIRST_VERSION").unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![
+                vec![StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                }],
+                vec![StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                }],
+            ],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 1024);
+
+        agent
+            .run_turn("first".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "SECOND_VERSION").unwrap();
+        agent
+            .run_turn("second".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        assert!(received[0].messages[0].text_content().contains("FIRST_VERSION"));
+        assert!(received[1].messages[0].text_content().contains("SECOND_VERSION"));
+        assert!(!received[1].messages[0].text_content().contains("FIRST_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn agents_files_text_is_counted_by_the_size_estimator() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "a very distinctive block of project guidance text that is not tiny",
+        )
+        .unwrap();
+
+        let (mut agent, _rx, _mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 1024);
+        let chars_without_file = agent.prompt_chars();
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(agent.prompt_chars() > chars_without_file + 30);
+    }
+
+    #[tokio::test]
+    async fn never_calling_set_agents_file_injects_nothing_even_if_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "should never appear").unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        // Deliberately not calling agent.set_agents_file(...) — mirrors
+        // main.rs only calling it when settings.agents_file.enabled.
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        assert!(
+            !received[0]
+                .messages[0]
+                .text_content()
+                .contains("should never appear")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_project_path_degrades_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory named AGENTS.md instead of a file — read_to_string
+        // fails with a real I/O error (IsADirectory).
+        std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(None, 1024);
+
+        agent
+            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        assert!(!received[0].messages[0].text_content().contains("AGENTS.md:"));
     }
 
     #[tokio::test]
