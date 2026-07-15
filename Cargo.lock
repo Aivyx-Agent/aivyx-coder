@@ -128,6 +128,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "libc",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",

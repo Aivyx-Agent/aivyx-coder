@@ -21,6 +21,7 @@ mod lsp;
 mod path_resolve;
 mod process;
 mod tools;
+pub mod web;
 pub mod wiki;
 
 pub use checkpoint::GitCheckpointer;

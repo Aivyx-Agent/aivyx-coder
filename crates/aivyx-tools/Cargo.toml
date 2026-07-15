@@ -15,13 +15,14 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.27"
 libc = "0.2.186"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 similar = "3.1.1"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-tokio = { version = "1.52.3", features = ["process", "fs", "rt", "macros", "io-util", "time", "sync"] }
+tokio = { version = "1.52.3", features = ["process", "fs", "rt", "macros", "io-util", "time", "sync", "net"] }
 tokio-util = "0.7.18"
 
 [dev-dependencies]
