@@ -200,6 +200,18 @@ independently). A file over its budget is still included in full — never
 truncated, since hand-written prose has no safe cut point — but triggers a
 one-time notice naming which file and how to fix it.
 
+`AGENTS.md` content is injected directly into the system prompt — the
+trusted position, unlike tool results (which the system prompt explicitly
+tells the model to treat as untrusted data). This is deliberate: it's the
+whole point of the feature, and it's standard behavior for every comparable
+tool. It means a project's `AGENTS.md` is followed from the very first turn,
+on by default, before the user has necessarily reviewed it — e.g. right
+after cloning an unfamiliar repo. The actual security boundary stays the
+sandbox and `ConfirmationGate`, not prompt trust: no `AGENTS.md` content can
+skip a permission tier or bypass the approval gate on a mutating action, so
+review the file the same way you'd review any other project instructions
+before trusting them, not as a sandboxed-away concern.
+
 Build/test the workspace:
 
 ```
