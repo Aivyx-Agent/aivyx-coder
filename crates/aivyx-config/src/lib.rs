@@ -42,6 +42,7 @@ pub struct Settings {
     pub autonomous: AutonomousSettings,
     pub sub_agent: SubAgentSettings,
     pub lsp: LspSettings,
+    pub agents_file: AgentsFileSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -122,6 +123,31 @@ pub struct LspSettings {
 impl Default for LspSettings {
     fn default() -> Self {
         Self { timeout_secs: 60 }
+    }
+}
+
+/// Project-level (and user-global) instructions (`AGENTS.md`, ROADMAP.md
+/// Phase 9): auto-loaded into every turn's system prompt, refreshed live so
+/// an edit mid-session applies on the next turn without a restart. Off
+/// entirely disables both the project (`<cwd>/AGENTS.md`) and user-global
+/// (`<config_dir>/AGENTS.md`) files — there is no separate flag per file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsFileSettings {
+    pub enabled: bool,
+    /// Applied per file independently, not as a combined pool. A file over
+    /// budget is still included in full — this is hand-written prose with
+    /// no natural truncation point, unlike the repo map — but triggers a
+    /// notice so the user knows to trim it or raise this value.
+    pub budget_tokens: u32,
+}
+
+impl Default for AgentsFileSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            budget_tokens: 1024,
+        }
     }
 }
 
@@ -471,6 +497,13 @@ impl Settings {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
+    /// Resolves the user-global `AGENTS.md` location: the same config
+    /// directory `config.toml` lives in.
+    pub fn agents_file_path() -> Result<PathBuf, ConfigError> {
+        let dirs = ProjectDirs::from("", "", "aivyx-coder").ok_or(ConfigError::NoConfigDir)?;
+        Ok(dirs.config_dir().join("AGENTS.md"))
+    }
+
     /// Loads settings from the XDG config file, writing it out with
     /// defaults on first run so the user has a real file to edit rather
     /// than an invisible set of built-in defaults.
@@ -754,6 +787,25 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.lsp.timeout_secs, 120);
+    }
+
+    #[test]
+    fn agents_file_settings_default_is_enabled_with_a_1024_token_budget() {
+        let settings = Settings::default();
+        assert!(settings.agents_file.enabled);
+        assert_eq!(settings.agents_file.budget_tokens, 1024);
+    }
+
+    #[test]
+    fn agents_file_block_parses_custom_values() {
+        let raw = r#"
+            [agents_file]
+            enabled = false
+            budget_tokens = 2048
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(!settings.agents_file.enabled);
+        assert_eq!(settings.agents_file.budget_tokens, 2048);
     }
 
     #[test]
