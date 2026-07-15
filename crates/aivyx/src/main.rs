@@ -9,7 +9,7 @@ use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
     CommandSpec, EditFileTool, FindReferencesTool, GitCheckpointer, GitCommitTool, GitReadTool,
     GlobTool, GoToDefinitionTool, GrepTool, LspClient, ReadFileTool, RunCommandTool, RunShellTool,
-    SetTasksTool, ToolExecutor, ToolRegistry, WriteFileTool,
+    SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -298,6 +298,23 @@ async fn main() -> anyhow::Result<()> {
     // opted into any commands.
     if !command_specs.is_empty() {
         registry.register(Arc::new(RunCommandTool::new(command_specs.clone())));
+    }
+
+    // Both tools are only registered when explicitly enabled — network
+    // access being off is always a deliberate choice, unlike (for
+    // example) a missing rust-analyzer binary, which is an environmental
+    // accident LSP's own tools handle by always registering and failing
+    // clearly on first call instead.
+    if settings.web.enabled {
+        registry.register(Arc::new(WebFetchTool::new(
+            settings.web.fetch_timeout_secs,
+            settings.web.allow_private_targets,
+        )));
+        registry.register(Arc::new(WebSearchTool::new(
+            settings.web.search_base_url.clone(),
+            settings.web.max_search_results,
+            settings.web.fetch_timeout_secs,
+        )));
     }
 
     let edit_format = match cli.edit_format.as_deref() {
