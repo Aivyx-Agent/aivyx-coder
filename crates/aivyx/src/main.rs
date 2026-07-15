@@ -385,6 +385,13 @@ async fn main() -> anyhow::Result<()> {
         agent.set_repo_map(Arc::clone(map), *budget);
     }
 
+    // Absence of either file is not an error — the feature is off only
+    // when the user explicitly disables it via [agents_file] enabled.
+    if settings.agents_file.enabled {
+        let global_path = aivyx_config::Settings::agents_file_path().ok();
+        agent.set_agents_file(global_path, settings.agents_file.budget_tokens);
+    }
+
     // `/council` needs ≥2 members and a chairman; anything less and the
     // command explains itself instead (the agent handles the None case).
     if settings.council.configured() {
