@@ -16,7 +16,7 @@ grep-searcher = "0.1.16"
 html2text = "0.6"
 ignore = "0.4.27"
 libc = "0.2.186"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "stream", "rustls"] }
 schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

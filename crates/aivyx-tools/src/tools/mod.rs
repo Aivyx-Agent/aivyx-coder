@@ -10,6 +10,7 @@ mod run_command;
 mod run_shell;
 mod set_tasks;
 mod web_fetch;
+mod web_search;
 mod write_file;
 
 pub use edit_file::EditFileTool;
@@ -24,4 +25,5 @@ pub use run_command::RunCommandTool;
 pub use run_shell::RunShellTool;
 pub use set_tasks::SetTasksTool;
 pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
