@@ -186,6 +186,20 @@ rather than a silent startup probe. Bounded by `[lsp] timeout_secs`
 (default 60s — cold `rust-analyzer` indexing on a larger workspace can be
 slow). Rust-only for now; no hover, workspace symbol search, or rename.
 
+**`AGENTS.md` project instructions**: an optional `<cwd>/AGENTS.md`
+(project-level) and/or `<config_dir>/AGENTS.md` (user-global, sibling to
+`config.toml`) — conventions, architecture notes, "don't touch X," build/test
+commands, style preferences, stated once instead of re-derived every
+session. Both are refreshed every turn, not read once at startup, so an
+edit mid-session applies on the very next turn with no restart needed. When
+both are present, user-global content renders first, then a one-line note,
+then project content — project instructions take precedence over user
+preferences if they conflict. Governed by `[agents_file]` (`enabled`,
+default `true`; `budget_tokens`, default `1024`, applied per file
+independently). A file over its budget is still included in full — never
+truncated, since hand-written prose has no safe cut point — but triggers a
+one-time notice naming which file and how to fix it.
+
 Build/test the workspace:
 
 ```

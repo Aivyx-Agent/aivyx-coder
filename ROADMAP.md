@@ -838,6 +838,57 @@ through the actual TUI, with zero confirmation modals (matching the
 `ActionKind::Read` auto-allow every other read-only tool already gets) and
 correct 1-indexed input/output end to end.
 
+**`AGENTS.md` project instructions built and live-verified (2026-07-15).**
+Followed a full design pass
+(`docs/superpowers/specs/2026-07-15-agents-md-design.md`) before
+implementation, mirroring every prior Phase 9 item. Surfaced by a
+tool/capability audit of the shipped tool set against comparable agents
+(Claude Code's `CLAUDE.md`, Cursor's `.cursorrules`, Aider's config
+conventions, the emerging cross-tool `AGENTS.md` standard) and prioritized
+above the remaining audit items — it improves every session rather than one
+workflow, unlike a specific tool or workflow gap. Shipped: an optional
+`<cwd>/AGENTS.md` (project) and `<config_dir>/AGENTS.md` (user-global,
+sibling to `config.toml`), both refreshed every turn via a new
+`Agent::refresh_agents_files`, reusing `refresh_repo_map`'s exact per-turn
+(not per-round-trip) cadence and its `Option<...>`-gated
+constructor-injection shape (`Agent::set_agents_file`). Merge order is
+global-then-project with a one-line precedence note when both are present,
+each file budgeted independently (`[agents_file] budget_tokens`, default
+1024) — a deliberate divergence from the repo map's truncate-by-rank
+behavior: a file over budget is still included in full (hand-written prose
+has no safe cut point to truncate at) but triggers a one-time notice via
+the existing `Agent::notify`/`AgentEvent::Error` channel, reusing that
+established non-fatal-notice convention rather than adding a new event
+variant.
+
+12 new tests (288 total, up from 276): all four file-presence combinations
+(neither/global-only/project-only/both) and their labeling/ordering, the
+precedence-note appearing only when both files are present, over-budget
+(full content still included, exactly one notice) and within-budget (no
+notice) behavior, a dynamic-refresh test proving an edit between two turns
+changes the very next turn's prompt (not just at startup), the size
+estimator correctly counting the new content, the feature stays fully
+inert when never wired in (mirrors how `main.rs`'s own `[agents_file]
+enabled` gate works, since `Agent` itself carries no separate runtime
+disable flag), and graceful degradation on a real I/O error (a directory
+literally named `AGENTS.md` in place of a file). Task reviews independently
+hand-traced two easy-to-get-backwards details and confirmed both correct:
+the per-turn refresh call landed in `run_turn_inner`'s own call site, not
+`run_architect_turn`'s separate, pre-existing `refresh_repo_map()` call
+(the two functions each have one); and the both-files-present merge
+correctly extracts project and global content in the right order despite
+`Vec::remove`'s index-shifting behavior (`remove(1)` before `remove(0)`).
+One live E2E through the real binary, in two turns of the same session:
+turn one, with an `AGENTS.md` instructing the model to end every response
+with a specific marker line, produced a response ending with exactly that
+marker (verified via the persisted session JSON, not raw screen text, per
+this project's own established grading method); `AGENTS.md` was then
+edited mid-session to remove the rule, and turn two's response — while
+still accurately recalling the old rule from ordinary conversation memory
+while describing the repo's contents — no longer produced the marker,
+directly confirming the refresh is live per-turn rather than loaded once at
+session start.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
