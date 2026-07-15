@@ -91,8 +91,20 @@ impl Tool for WebFetchTool {
             resolve_and_check(&url).await?;
         }
 
+        // Redirects must not be auto-followed: `resolve_and_check` only
+        // validated the *initial* URL above, and reqwest's default client
+        // follows up to 10 redirects with no re-check — a public URL that
+        // 302s to e.g. http://169.254.169.254/ or http://127.0.0.1/ would
+        // sail through untouched, defeating the entire SSRF pre-flight
+        // check for a tool with no human confirmation gate. Instead, a 3xx
+        // response is surfaced as an error naming the redirect target so
+        // the caller can issue a fresh top-level `web_fetch` call for it —
+        // which naturally re-runs `resolve_and_check` against that exact
+        // URL, keeping "every URL ever connected to has gone through
+        // resolve_and_check exactly once" trivially true.
         let client = reqwest::Client::builder()
             .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| {
                 ToolError::ExecutionFailed(format!("failed to build HTTP client: {err}"))
@@ -104,6 +116,19 @@ impl Tool for WebFetchTool {
                 .send()
                 .await
                 .map_err(|err| ToolError::ExecutionFailed(format!("request failed: {err}")))?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<no Location header>");
+                return Err(ToolError::ExecutionFailed(format!(
+                    "request to {} redirected ({}) to {location} — call web_fetch again with \
+                     that URL if you want to follow it",
+                    response.url(),
+                    response.status()
+                )));
+            }
             if !response.status().is_success() {
                 return Err(ToolError::ExecutionFailed(format!(
                     "request failed with status {}",
@@ -243,6 +268,32 @@ mod tests {
             panic!("expected ExecutionFailed")
         };
         assert!(msg.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_to_follow_a_redirect_and_names_the_target() {
+        // resolve_and_check only validates the *initial* URL; if the
+        // client auto-followed redirects, a public-looking URL that 302s
+        // to a private/local target would bypass the SSRF check entirely.
+        // Assert the redirect is surfaced as an error naming the target
+        // instead of being silently followed.
+        let target = "http://169.254.169.254/latest/meta-data/";
+        let response = format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n");
+        let addr = spawn_mock_http_server(Box::leak(response.into_boxed_str())).await;
+
+        let tool = WebFetchTool::new(5, true);
+        let args = json!({ "url": format!("http://{addr}/") });
+        let err = tool
+            .execute(args, &ctx(tokio_util::sync::CancellationToken::new()))
+            .await
+            .unwrap_err();
+        let ToolError::ExecutionFailed(msg) = err else {
+            panic!("expected ExecutionFailed")
+        };
+        assert!(
+            msg.contains(target),
+            "expected error to name the redirect target {target:?}, got: {msg}"
+        );
     }
 
     #[test]

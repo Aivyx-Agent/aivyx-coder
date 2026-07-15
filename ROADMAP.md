@@ -929,7 +929,7 @@ hand-rolled `tokio::net::TcpListener`-based single-shot HTTP double
 (`crate::web::test_support::spawn_mock_http_server`), never a real network
 call, deliberately without adding an HTTP-mocking crate dependency
 (mirroring LSP integration's own fake-JSON-RPC-server precedent for test
-doubles over real network calls). 28 new tests (316 total, up from 288):
+doubles over real network calls). 35 new tests (323 total, up from 288):
 SSRF range boundaries for every blocked range plus a real-DNS-resolution
 case, HTML-to-text conversion, char-boundary-safe head-truncation at the
 50KB cap, SearXNG JSON response parsing (multiple/zero/malformed results),

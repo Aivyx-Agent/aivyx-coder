@@ -7,11 +7,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ToolError;
 
-/// True if `ip` is loopback, private, or link-local — the ranges a
-/// same-host or same-LAN service could be reachable on, which a
+/// True if `ip` is loopback, private, link-local, or unspecified — the
+/// ranges a same-host or same-LAN service could be reachable on, which a
 /// network-reaching tool with no per-call confirmation must not be able
 /// to reach unless the user explicitly opts in
-/// (`[web] allow_private_targets = true`).
+/// (`[web] allow_private_targets = true`). Unspecified (`0.0.0.0` /
+/// `::`) is included because on Linux `connect()` to it actually reaches
+/// localhost — a loopback-equivalent bypass of the loopback check if left
+/// unblocked.
 ///
 /// IPv4 uses `std`'s long-stable `Ipv4Addr` predicates directly. IPv6 uses
 /// hand-rolled bitmask checks for the unique-local (`fc00::/7`) and
@@ -19,8 +22,8 @@ use crate::ToolError;
 /// `Ipv6Addr::is_unique_local`/`is_unicast_link_local`, whose standard
 /// library stability has moved around across Rust versions — the bitmask
 /// checks are correct regardless of what's stable in the toolchain this
-/// crate happens to build with. `Ipv6Addr::is_loopback` (`::1`) is
-/// long-stable and used directly.
+/// crate happens to build with. `Ipv6Addr::is_loopback` (`::1`) and
+/// `is_unspecified` (`::`) are long-stable and used directly.
 pub(crate) fn is_private_or_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_ipv4_private_or_local(v4),
@@ -29,7 +32,7 @@ pub(crate) fn is_private_or_local(ip: IpAddr) -> bool {
 }
 
 fn is_ipv4_private_or_local(v4: Ipv4Addr) -> bool {
-    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
 }
 
 fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
@@ -40,7 +43,7 @@ fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return is_ipv4_private_or_local(v4);
     }
-    if v6.is_loopback() {
+    if v6.is_loopback() || v6.is_unspecified() {
         return true;
     }
     let segments = v6.segments();
@@ -144,6 +147,14 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_unspecified_is_blocked() {
+        // On Linux, connect() to 0.0.0.0 actually reaches localhost — a
+        // loopback-equivalent bypass of the loopback check if left
+        // unblocked.
+        assert!(is_private_or_local("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
     fn ipv6_loopback_is_blocked() {
         assert!(is_private_or_local("::1".parse().unwrap()));
     }
@@ -163,6 +174,13 @@ mod tests {
     fn ipv6_public_address_is_allowed() {
         // 2001:4860:4860::8888 is one of Google's public DNS IPv6 addresses.
         assert!(!is_private_or_local("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_unspecified_is_blocked() {
+        // Same reasoning as the IPv4 0.0.0.0 case: connect() to :: can
+        // reach localhost, so it must be blocked like the loopback address.
+        assert!(is_private_or_local("::".parse().unwrap()));
     }
 
     #[tokio::test]
