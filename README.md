@@ -212,6 +212,29 @@ skip a permission tier or bypass the approval gate on a mutating action, so
 review the file the same way you'd review any other project instructions
 before trusting them, not as a sandboxed-away concern.
 
+**`web_fetch`/`web_search`**: aivyx-coder is local-only in where LLM
+inference happens (Ollama/vLLM/llama.cpp), not in network isolation — the
+agent has full network access. `web_fetch(url)` fetches a URL and converts
+its HTML to readable text via `html2text`, head-truncated at 50KB.
+`web_search(query)` queries a configured SearXNG instance and returns
+ranked `title | url | content` results, one per line. Both use the same
+`ActionKind::Read` auto-allow tier as `read_file`/`grep` — no confirmation
+modal, a deliberate choice over the more conservative confirm-by-default
+alternative, on the reasoning that fetched/searched content is already
+covered by the standing untrusted-tool-output convention. `web_fetch`
+carries its own pre-flight SSRF check: before connecting, it resolves the
+target host and refuses loopback/private/link-local addresses (override
+with `[web] allow_private_targets = true`) — a best-effort mitigation with
+a known DNS-resolution TOCTOU gap, not the project's primary security
+boundary (that remains the sandbox/`ConfirmationGate`, same distinction as
+`AGENTS.md` above). `web_search` has no such check; it only ever talks to
+the one explicitly-configured, admin-trusted `search_base_url`. Governed by
+`[web]`: `enabled` (default `true`, gates registration of both tools),
+`search_base_url` (default unset — `web_search` self-explains how to
+configure it when called unconfigured, rather than being silently absent),
+`max_search_results` (default `10`), `fetch_timeout_secs` (default `30`),
+`allow_private_targets` (default `false`).
+
 Build/test the workspace:
 
 ```

@@ -889,6 +889,64 @@ while describing the repo's contents — no longer produced the marker,
 directly confirming the refresh is live per-turn rather than loaded once at
 session start.
 
+**`web_fetch`/`web_search` tools built and live-verified (2026-07-15).**
+Resolved the Medium-priority web-network values question the capability
+audit above raised as a real tradeoff rather than an oversight: "local-only"
+describes where LLM inference happens (Ollama/vLLM/llama.cpp), not network
+isolation — the agent gets full network access, and this phase ships the
+first two tools whose entire purpose is reaching it.
+`web_fetch(url)`/`web_search(query)` followed a full design pass
+(`docs/superpowers/specs/2026-07-15-web-tools-design.md`) before
+implementation. `web_search` queries a self-hosted or public SearXNG
+instance (chosen specifically for needing no API key or paid signup,
+matching this project's avoid-external-service-dependencies posture — no
+other search backend is in scope). Both tools use `ActionKind::Read`
+auto-allow, the same tier as `read_file`/`grep` — a real fork decided
+against the more conservative confirm-by-default alternative, on the
+reasoning that fetched/searched content is already covered by the standing
+untrusted-tool-output convention.
+
+Since neither tool sits behind a human confirmation gate, `web_fetch`
+carries its own SSRF pre-flight check shared via `resolve_and_check`:
+before connecting, it resolves the target host and refuses any
+loopback/private/link-local resolved address (`[web] allow_private_targets
+= true` overrides it). This has a documented, accepted DNS-resolution
+TOCTOU limitation — the check's own resolution and the actual HTTP client's
+subsequent resolution could theoretically diverge — consistent with this
+project's established stance that the sandbox/`ConfirmationGate` remains
+the primary security boundary, not this kind of best-effort mitigation.
+Task 2's review caught a genuine Critical bug before merge: IPv4-mapped
+IPv6 addresses (`::ffff:127.0.0.1` and similar, a well-known real SSRF
+bypass vector) skipped the check entirely, since the IPv6 range logic never
+unwrapped them via `to_ipv4_mapped()` — fixed, with the fix independently
+re-verified by the re-reviewer compiling and running a standalone program
+against all test vectors. `web_search` carries no equivalent check: it only
+ever talks to the one explicitly-configured, admin-trusted
+`search_base_url`.
+
+All HTTP-touching tests run against an in-process mock server — a
+hand-rolled `tokio::net::TcpListener`-based single-shot HTTP double
+(`crate::web::test_support::spawn_mock_http_server`), never a real network
+call, deliberately without adding an HTTP-mocking crate dependency
+(mirroring LSP integration's own fake-JSON-RPC-server precedent for test
+doubles over real network calls). 28 new tests (316 total, up from 288):
+SSRF range boundaries for every blocked range plus a real-DNS-resolution
+case, HTML-to-text conversion, char-boundary-safe head-truncation at the
+50KB cap, SearXNG JSON response parsing (multiple/zero/malformed results),
+`web_search`'s unconfigured-`search_base_url` explanation path, and both
+tools' absence from the registry when `[web] enabled = false`. Live E2E
+through the real binary (a `python-pyte`-driven PTY harness, needed for
+accurate VT100 screen rendering after a first hand-rolled ANSI-stripping
+attempt produced misleading garbled text) confirmed, via the persisted
+session JSON per this project's established grading method: a real
+`web_fetch` against `https://example.com` returning genuine page content
+with no confirmation modal; a real `web_search` against a self-hosted
+SearXNG instance (public instances all blocked or rate-limited their JSON
+API) returning real ranked results with no confirmation modal; and
+`web_fetch` against `http://127.0.0.1:1/` being cleanly refused by the SSRF
+check with the documented error message, confirming the check is wired
+through to the real binary end-to-end, not just covered at the unit level.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
