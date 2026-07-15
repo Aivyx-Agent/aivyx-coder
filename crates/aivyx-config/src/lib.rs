@@ -43,6 +43,7 @@ pub struct Settings {
     pub sub_agent: SubAgentSettings,
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
+    pub web: WebSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -147,6 +148,41 @@ impl Default for AgentsFileSettings {
         Self {
             enabled: true,
             budget_tokens: 1024,
+        }
+    }
+}
+
+/// The agent's first network-reaching tools (`web_fetch`/`web_search`,
+/// ROADMAP.md Phase 9): "local-only" describes where LLM inference
+/// happens, not whether the agent can reach the network — see the
+/// 2026-07-15 web-tools design doc for the full reasoning. Both tools are
+/// registered only when `enabled`; `web_search` additionally needs
+/// `search_base_url` set (a SearXNG instance) to actually function, and
+/// explains itself if called before that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSettings {
+    pub enabled: bool,
+    pub search_base_url: Option<String>,
+    /// Applied by `web_search`; results beyond this are dropped, not an
+    /// error.
+    pub max_search_results: u32,
+    /// Applied to both tools' HTTP client.
+    pub fetch_timeout_secs: u64,
+    /// When `false` (default), `web_fetch` refuses to connect to a
+    /// resolved loopback/private/link-local address. See
+    /// `aivyx_tools::web::is_private_or_local`.
+    pub allow_private_targets: bool,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            search_base_url: None,
+            max_search_results: 10,
+            fetch_timeout_secs: 30,
+            allow_private_targets: false,
         }
     }
 }
@@ -806,6 +842,47 @@ mod tests {
         let settings: Settings = toml::from_str(raw).unwrap();
         assert!(!settings.agents_file.enabled);
         assert_eq!(settings.agents_file.budget_tokens, 2048);
+    }
+
+    #[test]
+    fn web_settings_defaults_are_network_enabled_but_search_unconfigured() {
+        let settings = Settings::default();
+        assert!(settings.web.enabled);
+        assert_eq!(settings.web.search_base_url, None);
+        assert_eq!(settings.web.max_search_results, 10);
+        assert_eq!(settings.web.fetch_timeout_secs, 30);
+        assert!(!settings.web.allow_private_targets);
+    }
+
+    #[test]
+    fn web_block_parses_custom_values() {
+        let raw = r#"
+            [web]
+            enabled = true
+            search_base_url = "https://searx.example.org"
+            max_search_results = 5
+            fetch_timeout_secs = 15
+            allow_private_targets = true
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(settings.web.enabled);
+        assert_eq!(
+            settings.web.search_base_url,
+            Some("https://searx.example.org".to_string())
+        );
+        assert_eq!(settings.web.max_search_results, 5);
+        assert_eq!(settings.web.fetch_timeout_secs, 15);
+        assert!(settings.web.allow_private_targets);
+    }
+
+    #[test]
+    fn web_disabled_via_config() {
+        let raw = r#"
+            [web]
+            enabled = false
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(!settings.web.enabled);
     }
 
     #[test]
