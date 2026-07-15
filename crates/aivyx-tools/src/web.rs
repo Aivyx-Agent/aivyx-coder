@@ -33,6 +33,13 @@ fn is_ipv4_private_or_local(v4: Ipv4Addr) -> bool {
 }
 
 fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
+    // ::ffff:0:0/96 - IPv4-mapped addresses. A well-known SSRF-filter-bypass
+    // vector: ::ffff:x.y.z.w is equivalent to x.y.z.w on dual-stack systems,
+    // so it must be checked against the same rules as a plain IPv4 address
+    // rather than waved through because it's syntactically an IPv6 literal.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return is_ipv4_private_or_local(v4);
+    }
     if v6.is_loopback() {
         return true;
     }
@@ -179,6 +186,64 @@ mod tests {
         // rather than only a synthetic IP literal.
         let addr = test_support::spawn_mock_http_server("HTTP/1.1 200 OK\r\n\r\n").await;
         let url = reqwest::Url::parse(&format!("http://{addr}/")).unwrap();
+        let err = resolve_and_check(&url).await.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_are_checked_as_their_embedded_ipv4_address() {
+        // A well-known SSRF-filter-bypass vector: ::ffff:x.y.z.w is
+        // equivalent to x.y.z.w on dual-stack systems, so it must be
+        // checked against the same rules as a plain IPv4 address, not
+        // waved through because it's syntactically an IPv6 literal.
+        assert!(is_private_or_local("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_private_or_local("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(is_private_or_local("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(is_private_or_local("::ffff:169.254.1.1".parse().unwrap()));
+        // A public IPv4-mapped address must still be allowed.
+        assert!(!is_private_or_local("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_private_range_boundaries_are_respected() {
+        // 10.0.0.0/8
+        assert!(!is_private_or_local("9.255.255.255".parse().unwrap()));
+        assert!(is_private_or_local("10.0.0.0".parse().unwrap()));
+        assert!(is_private_or_local("10.255.255.255".parse().unwrap()));
+        assert!(!is_private_or_local("11.0.0.0".parse().unwrap()));
+        // 192.168.0.0/16
+        assert!(!is_private_or_local("192.167.255.255".parse().unwrap()));
+        assert!(is_private_or_local("192.168.0.0".parse().unwrap()));
+        assert!(is_private_or_local("192.168.255.255".parse().unwrap()));
+        assert!(!is_private_or_local("192.169.0.0".parse().unwrap()));
+        // 169.254.0.0/16
+        assert!(!is_private_or_local("169.253.255.255".parse().unwrap()));
+        assert!(is_private_or_local("169.254.0.0".parse().unwrap()));
+        assert!(is_private_or_local("169.254.255.255".parse().unwrap()));
+        assert!(!is_private_or_local("169.255.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_range_boundaries_are_respected() {
+        // fc00::/7
+        assert!(!is_private_or_local("fbff:ffff::1".parse().unwrap()));
+        assert!(is_private_or_local("fc00::".parse().unwrap()));
+        assert!(is_private_or_local("fdff:ffff::1".parse().unwrap()));
+        assert!(!is_private_or_local("fe00::1".parse().unwrap()));
+        // fe80::/10
+        assert!(!is_private_or_local("fe7f:ffff::1".parse().unwrap()));
+        assert!(is_private_or_local("fe80::1".parse().unwrap()));
+        assert!(!is_private_or_local("fec0::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_check_refuses_localhost_via_real_dns_resolution() {
+        // Unlike the existing tests (which pass IP literals — parsed
+        // directly, never touching the OS resolver), "localhost" forces
+        // tokio::net::lookup_host to actually resolve a hostname, proving
+        // the resolution code path itself works, not just IP-literal
+        // handling.
+        let url = reqwest::Url::parse("http://localhost:9/").unwrap();
         let err = resolve_and_check(&url).await.unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
     }
