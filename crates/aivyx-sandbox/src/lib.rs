@@ -46,6 +46,16 @@ pub enum ActionKind {
     /// honestly describe itself this way, and so audit logs don't record an
     /// internal state change as a "Read" of anything.
     Internal,
+    /// A tool call dispatched to an external MCP (Model Context Protocol)
+    /// server — arbitrary, user-configured third-party code whose actual
+    /// behavior this project can't verify, regardless of anything the
+    /// server itself claims (e.g. MCP's optional, advisory `readOnlyHint`
+    /// annotation). Always confirm-gated, uniformly: there is no case where
+    /// this is treated as auto-allowed, unlike every other `ActionKind`.
+    /// Kept distinct from `Write`/`Execute` so audit logs and the
+    /// confirmation modal can honestly say "this is an MCP call," not
+    /// mislabel it as a filesystem write or local command execution.
+    McpTool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

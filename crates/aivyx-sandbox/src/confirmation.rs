@@ -873,6 +873,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tool_actions_are_confirm_gated_not_auto_allowed() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+        );
+
+        let request = PermissionRequest {
+            tool_name: "mcp__filesystem__search_docs".to_string(),
+            action: ActionKind::McpTool,
+            target: PermissionTarget::Other("search_docs (server: filesystem)".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+
+        let decision = gate.check(&request).await;
+        assert_eq!(decision, PermissionDecision::Allow);
+        // The point of this test: unlike Read/Internal, the prompter was
+        // actually invoked — this call did NOT short-circuit to auto-allow.
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn deny_paths_still_wins_over_autonomous_mode() {
         let prompter = Arc::new(FakePrompter {
             response: UserResponse::Allow,

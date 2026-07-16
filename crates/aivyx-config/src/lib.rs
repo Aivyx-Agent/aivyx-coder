@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,7 @@ pub struct Settings {
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
     pub web: WebSettings,
+    pub mcp: McpSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -185,6 +187,54 @@ impl Default for WebSettings {
             allow_private_targets: false,
         }
     }
+}
+
+/// One configured MCP (Model Context Protocol) server: spawned as a child
+/// process, speaking JSON-RPC 2.0 over its stdin/stdout (stdio transport
+/// only — see `docs/superpowers/specs/2026-07-16-mcp-support-design.md`'s
+/// non-goals for remote/HTTP transport).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Used verbatim in the registered `mcp__<name>__<tool>` tool name and
+    /// in the resources/prompts meta-tools' `server` filter argument.
+    pub name: String,
+    /// The executable to spawn.
+    pub command: String,
+    pub args: Vec<String>,
+    /// Additional environment variables for the spawned process (e.g. API
+    /// keys the server itself needs), merged over the agent's own
+    /// environment.
+    pub env: HashMap<String, String>,
+    /// Bounds this server's spawn + `initialize` handshake + discovery
+    /// (`tools/list`/`resources/list`/`prompts/list`) sequence at startup.
+    /// A server that doesn't finish within this budget is skipped for the
+    /// session with a warning, rather than blocking startup indefinitely.
+    pub timeout_secs: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// Wraps `servers` purely so `config.toml` can use `[[mcp.servers]]` array-
+/// of-tables syntax rather than a flat `[[mcp_servers]]` at the top level.
+/// No top-level `[mcp] enabled` flag: an empty `servers` list is already a
+/// complete no-op (no servers to connect to, nothing to register), unlike
+/// `[web] enabled`, which had to gate two tools that are otherwise always
+/// statically present regardless of configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    pub servers: Vec<McpServerConfig>,
 }
 
 /// Council mode (`/council <question>`): the configured members each answer
@@ -899,6 +949,47 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(toml).unwrap();
         assert_eq!(settings.sub_agent.max_iterations, 5);
+    }
+
+    #[test]
+    fn mcp_server_config_defaults() {
+        let config = McpServerConfig::default();
+        assert_eq!(config.name, "");
+        assert_eq!(config.command, "");
+        assert!(config.args.is_empty());
+        assert!(config.env.is_empty());
+        assert_eq!(config.timeout_secs, 30);
+    }
+
+    #[test]
+    fn settings_defaults_to_no_mcp_servers() {
+        let settings = Settings::default();
+        assert!(settings.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_servers_array_parses_from_toml() {
+        let toml_str = r#"
+            [[mcp.servers]]
+            name = "filesystem"
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+            timeout_secs = 15
+
+            [mcp.servers.env]
+            API_KEY = "secret"
+        "#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(settings.mcp.servers.len(), 1);
+        let server = &settings.mcp.servers[0];
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        );
+        assert_eq!(server.timeout_secs, 15);
+        assert_eq!(server.env.get("API_KEY"), Some(&"secret".to_string()));
     }
 
     #[test]
