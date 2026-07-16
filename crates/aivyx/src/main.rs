@@ -7,11 +7,11 @@ use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilS
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
-    CommandSpec, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitCheckpointer,
-    GitCommitTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
-    ListMcpResourcesTool, LspClient, McpClient, McpToolAdapter, ReadFileTool, ReadMcpResourceTool,
-    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    CommandSpec, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool,
+    GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
+    GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
+    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RunCommandTool, RunShellTool, SetTasksTool,
+    ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -290,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
+    registry.register(Arc::new(GitBranchTool::new()));
+    registry.register(Arc::new(GitPushTool::new()));
+    registry.register(Arc::new(GitPrTool::new()));
 
     let lsp_client = Arc::new(LspClient::new(Duration::from_secs(settings.lsp.timeout_secs)));
     registry.register(Arc::new(GoToDefinitionTool::new(Arc::clone(&lsp_client))));
