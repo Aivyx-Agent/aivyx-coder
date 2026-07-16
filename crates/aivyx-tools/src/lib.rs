@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 mod checkpoint;
 mod diff;
 mod lsp;
+mod mcp;
 mod path_resolve;
 mod process;
 mod tools;
