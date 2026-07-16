@@ -947,6 +947,83 @@ API) returning real ranked results with no confirmation modal; and
 check with the documented error message, confirming the check is wired
 through to the real binary end-to-end, not just covered at the unit level.
 
+**MCP client support built and live-verified (2026-07-16).** The queued
+next major phase after `web_fetch`/`web_search`, resolving the tool audit's
+original "no plug-in integration surface" gap: instead of one bespoke tool
+per third-party integration, aivyx-coder can now connect to arbitrary
+user-configured MCP servers over stdio, covering all three MCP primitives
+(tools, resources, prompts) in one phase rather than a tools-first, defer-
+the-rest split. Followed a full design pass
+(`docs/superpowers/specs/2026-07-16-mcp-support-design.md`) before
+implementation, mirroring every prior Phase 9 item.
+
+The core trust decision, and a genuine fork decided the conservative way
+(the opposite of `web_fetch`/`web_search`'s auto-allow): every discovered
+MCP tool call declares a new `ActionKind::McpTool`, always confirm-gated,
+regardless of anything the server itself claims about its own behavior
+(including MCP's optional, advisory `readOnlyHint`/`destructiveHint`
+annotations, deliberately not trusted). Unlike this project's own
+hand-written tools, an MCP tool's actual behavior is arbitrary third-party
+code that can't be verified, so it can't be allowed to honestly describe
+itself as safe the way `Read`/`Internal` actions can. Resources and
+prompts, by contrast, are protocol-guaranteed read-only regardless of which
+server provides them, so they surface through four fixed meta-tools
+(`list_mcp_resources`/`read_mcp_resource`/`list_mcp_prompts`/`get_mcp_prompt`)
+at the `Read` tier instead — one meta-tool per primitive rather than one
+tool per discovered item, since a server's resource/prompt list can be
+unbounded and would otherwise churn the tool registry every time it
+changes.
+
+Every configured `[[mcp.servers]]` entry connects concurrently at startup
+(via `tokio::task::JoinSet`), each bounded by its own `timeout_secs` — this
+eager-at-startup design is forced by `ToolRegistry` being a fixed list built
+once before the model can be offered anything, unlike the LSP client's own
+lazy-spawn-on-first-use pattern, since MCP's server set is arbitrary and
+user-configured rather than one well-known always-present tool. A server
+that fails or times out is skipped with a warning (both logged and
+surfaced into the TUI) rather than blocking startup or any other server's
+tools. A dead connection respawns on next use, re-running only the
+`initialize` handshake — not full rediscovery, which only ever runs once,
+at startup, to populate the static registry. The MCP stdio transport is
+hand-rolled (newline-delimited JSON-RPC 2.0 framing, no new dependency),
+deliberately mirroring the LSP client's own `Connection` shape (pending-map
+request/response correlation, background read-loop task, `is_dead()`
+liveness, `Drop`-based cleanup) with only the wire framing genuinely
+different from LSP's `Content-Length` header block.
+
+29 new tests (352 total, up from 323): `ActionKind::McpTool`'s confirm-gate
+fall-through (proven via the prompter actually being invoked, not just the
+decision equalling `Allow`), the MCP transport's request/response
+correlation and liveness detection, `McpClient`'s spawn/handshake/discovery/
+respawn lifecycle (including a real "not found" spawn-failure path and a
+reused-not-respawned healthy-session path, mirroring the LSP client's own
+test shape), content-block/resource/prompt rendering (text concatenation,
+non-text placeholder strings, `isError` passthrough), the `McpToolAdapter`'s
+naming/schema-passthrough/permission-tier/error-mapping, and all four
+meta-tools' aggregation/filter/empty-result/unknown-server paths — plus the
+critical cross-task polarity check: `McpToolAdapter` correctly does NOT
+override `mutates_outside_session()` (the trait default applies, hiding MCP
+tools in Plan Mode), while the four meta-tools correctly DO override it to
+`false` (keeping them available in Plan Mode) — the opposite polarity in
+each case, both verified correct by the task reviews.
+
+One live E2E through the real binary (a `python-pyte`-driven PTY harness),
+confirmed via the persisted session JSON per this project's established
+grading method: a real MCP tool call (`mcp__mini__echo`, via a small
+purpose-built stdio test server — the official `@modelcontextprotocol/
+server-everything` reference package was reachable and worked standalone,
+but repeatedly timed out when spawned through this project's own
+Landlock-confined `ExecutionConfiner`, since its default-deny sandbox policy
+has no read access to `npx`'s cache directory; a real, if narrower, finding
+about this sandbox's interaction with `npx`-based MCP servers, left as a
+noted limitation rather than a defect in this phase's own code) showing the
+confirmation modal and succeeding on approval; a real `list_mcp_resources`
+call with no confirmation modal, returning genuine resource data; and,
+observed directly during the environment investigation above, the
+skip-with-warning path firing for real against a genuinely slow server —
+the session stayed usable and the warning surfaced live in the TUI rather
+than the process hanging or crashing.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class

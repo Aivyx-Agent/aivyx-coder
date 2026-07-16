@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::ToolError;
 use transport::McpConnection;
 
-pub use protocol::{PromptArgumentInfo, PromptInfo, ResourceInfo, ToolInfo};
+pub use protocol::ToolInfo;
 
 struct Started {
     connection: Arc<McpConnection>,

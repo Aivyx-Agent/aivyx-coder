@@ -235,6 +235,29 @@ configure it when called unconfigured, rather than being silently absent),
 `max_search_results` (default `10`), `fetch_timeout_secs` (default `30`),
 `allow_private_targets` (default `false`).
 
+**MCP (Model Context Protocol) client support**: aivyx-coder can connect to
+arbitrary user-configured MCP servers over stdio, covering all three MCP
+primitives — tools, resources, and prompts. Each configured
+`[[mcp.servers]]` entry is spawned and discovered concurrently at startup
+(bounded by that server's own `timeout_secs`); a server that fails or times
+out is skipped with a warning rather than blocking the rest of startup or
+any other server. Every discovered tool is registered under
+`mcp__<server>__<tool>` and always requires confirmation via a dedicated
+`ActionKind::McpTool` — unlike `web_fetch`/`web_search`'s auto-allow, an MCP
+tool's actual behavior is arbitrary third-party code this project can't
+verify, so it's never auto-allowed regardless of anything the server itself
+claims about being read-only. Resources and prompts, by contrast, are
+protocol-guaranteed read-only, so they surface through four fixed,
+auto-allowed (`ActionKind::Read`) meta-tools instead of one tool per
+discovered item: `list_mcp_resources`/`read_mcp_resource` and
+`list_mcp_prompts`/`get_mcp_prompt`, each aggregating across every connected
+server or filterable to one by name. A connection that dies mid-session is
+respawned on its next use, re-running only the `initialize` handshake (not
+full rediscovery, which only ever runs once at startup). Configured via
+`[[mcp.servers]]`: `name`, `command`, `args` (default empty), `env` (default
+empty), `timeout_secs` (default `30`) — no separate `[mcp] enabled` flag,
+since an empty server list is already a complete no-op.
+
 Build/test the workspace:
 
 ```
