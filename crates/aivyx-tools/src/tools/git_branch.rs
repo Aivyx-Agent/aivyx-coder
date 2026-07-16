@@ -92,6 +92,17 @@ impl Tool for GitBranchTool {
                 "branch name must not be empty".to_string(),
             ));
         }
+        let dash_prefixed = match args.mode {
+            GitBranchMode::Switch => Some(&args.name),
+            GitBranchMode::Create => args.base.as_ref(),
+        };
+        if dash_prefixed.is_some_and(|value| value.starts_with('-')) {
+            return Err(ToolError::InvalidArguments(
+                "branch name/base ref must not start with '-' — this could be misinterpreted \
+                    as a command-line flag"
+                    .to_string(),
+            ));
+        }
         let argv = Self::build_argv(&args);
         let current = current_branch(cwd).unwrap_or_else(|| "(unknown)".to_string());
         let preview = match args.mode {
@@ -260,5 +271,35 @@ mod tests {
             Path::new("."),
         );
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn switch_name_starting_with_dash_is_rejected() {
+        let tool = GitBranchTool::new();
+        let result = tool.permission_request(&json!({ "mode": "switch", "name": "-f" }), Path::new("."));
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn create_base_starting_with_dash_is_rejected() {
+        let tool = GitBranchTool::new();
+        let result = tool.permission_request(
+            &json!({ "mode": "create", "name": "feature-x", "base": "-f" }),
+            Path::new("."),
+        );
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn create_with_normal_name_and_no_base_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+
+        let tool = GitBranchTool::new();
+        let result = tool.permission_request(
+            &json!({ "mode": "create", "name": "feature-x" }),
+            dir.path(),
+        );
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 }
