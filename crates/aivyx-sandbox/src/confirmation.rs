@@ -26,6 +26,14 @@ const AUTONOMOUS_OUTSIDE_CWD_DENIAL: &str =
     "target is outside the autonomous session's worktree boundary — file edits in \
      autonomous mode are confined to the working directory the session was launched in.";
 
+/// Told to the model when an MCP tool call reaches autonomous mode. There is
+/// no way to pre-approve an MCP tool the way `[[permissions.allowed_commands]]`
+/// pre-approves a shell command, and autonomous mode has no human to prompt —
+/// so denial is the only safe behavior, consistent with `ActionKind::McpTool`
+/// being "always confirm-gated, uniformly" (see its doc comment in `lib.rs`).
+const AUTONOMOUS_MCP_TOOL_DENIAL: &str =
+    "MCP tools require interactive confirmation and cannot run in autonomous mode";
+
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
 /// must not silently bless every future write anywhere.
@@ -171,6 +179,20 @@ impl PermissionGate for ConfirmationGate {
         // below because the cwd-boundary check applies to Write/Delete
         // targets that the cache path doesn't otherwise examine.
         if self.autonomous_mode.active() {
+            // Gate on the action, not the target: every MCP tool call
+            // currently uses `PermissionTarget::Other`, but this check must
+            // not depend on that implementation detail staying true. There
+            // is no pre-approval tier for MCP tools, so denial is
+            // unconditional here, unlike the Command branch below.
+            if request.action == ActionKind::McpTool {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "permission denied: MCP tool call in autonomous mode"
+                );
+                return PermissionDecision::Deny(Some(AUTONOMOUS_MCP_TOOL_DENIAL.to_string()));
+            }
             if self.is_outside_autonomous_worktree(request, &self.cwd) {
                 tracing::warn!(
                     tool = %request.tool_name,
@@ -900,6 +922,49 @@ mod tests {
         // The point of this test: unlike Read/Internal, the prompter was
         // actually invoked — this call did NOT short-circuit to auto-allow.
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_mcp_tool_calls_unconditionally() {
+        // Regression test for the final-review finding: in autonomous mode,
+        // every MCP tool call must be denied outright — there is no
+        // pre-approval tier for MCP tools (unlike Command), and autonomous
+        // mode never prompts a human. The FakePrompter is configured to
+        // Allow to prove the denial isn't accidentally coming from the
+        // prompter path (autonomous mode must never reach it at all).
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+        );
+
+        let request = PermissionRequest {
+            tool_name: "mcp__filesystem__search_docs".to_string(),
+            action: ActionKind::McpTool,
+            target: PermissionTarget::Other("search_docs (server: filesystem)".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        };
+
+        let decision = gate.check(&request).await;
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected an MCP-tool denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("autonomous"), "reason: {reason}");
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never prompt, even for MCP tool calls"
+        );
     }
 
     #[tokio::test]

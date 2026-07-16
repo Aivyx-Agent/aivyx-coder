@@ -256,7 +256,11 @@ respawned on its next use, re-running only the `initialize` handshake (not
 full rediscovery, which only ever runs once at startup). Configured via
 `[[mcp.servers]]`: `name`, `command`, `args` (default empty), `env` (default
 empty), `timeout_secs` (default `30`) — no separate `[mcp] enabled` flag,
-since an empty server list is already a complete no-op.
+since an empty server list is already a complete no-op. `npx`-based servers
+may need cache-directory read access added to `[sandbox] extra_read_paths`
+(or an absolute path to an already-installed server binary used instead) to
+avoid startup timeouts under the sandbox, since its default-deny policy has
+no read access to `npx`'s cache directory by default.
 
 Build/test the workspace:
 

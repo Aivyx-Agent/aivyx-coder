@@ -352,6 +352,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_started_respawns_when_the_existing_connection_is_dead() {
+        // Regression test for the final-review finding: nothing previously
+        // proved that a *previously working* session, once its connection
+        // died, actually gets a fresh spawn (and fresh `initialize`
+        // handshake) on the next `ensure_started` call rather than the dead
+        // state being silently reused. Mirrors
+        // `lsp::tests::ensure_started_respawns_when_the_existing_connection_is_dead`:
+        // wire a session whose connection is already dead, then call
+        // `ensure_started` again — the resulting "not found" error (naming
+        // the same program every retry would use) proves a fresh spawn was
+        // genuinely attempted, not skipped. A respawn only ever redoes
+        // `initialize`, never `tools/list`/`resources/list`/`prompts/list`
+        // (see `ensure_started`'s doc comment) — a failed spawn never even
+        // reaches `initialize`, so there is nothing further to observe here.
+        let client = McpClient::new(
+            "test-server".to_string(),
+            "definitely-not-a-real-binary-xyz".to_string(),
+            vec![],
+            vec![],
+        );
+        let (client_reader, server_writer) = tokio::io::duplex(4096);
+        let (_server_reader, client_writer) = tokio::io::duplex(4096);
+        client.wire_for_test(client_reader, client_writer).await;
+        drop(server_writer); // closes the write half -> reader sees EOF -> is_dead() becomes true
+
+        for _ in 0..50 {
+            let guard = client.state.lock().await;
+            if guard.as_ref().unwrap().connection.is_dead() {
+                break;
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(aivyx_sandbox::NoopConfiner);
+        let err = client
+            .ensure_started(Path::new("."), &confiner)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("definitely-not-a-real-binary-xyz"),
+            "expected a fresh spawn attempt (and its failure) after detecting the dead \
+             connection, got: {message}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_tools_parses_tools_from_a_scripted_response() {
         let client = wired_client(|method| {
             assert_eq!(method, "tools/list");

@@ -70,7 +70,26 @@ impl McpConnection {
         }
 
         match rx.await {
-            Ok(value) => Ok(value),
+            // `value` is the full raw JSON-RPC response envelope (see
+            // `read_loop`), not just its `result` field — so an
+            // error-shaped response can be told apart from a genuine
+            // (possibly empty/null) success result instead of both
+            // collapsing to `Value::Null`.
+            Ok(value) => match value.get("error") {
+                Some(error) => {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<no message>");
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let described = match code {
+                        Some(code) => format!("MCP server returned an error (code {code}): {message}"),
+                        None => format!("MCP server returned an error: {message}"),
+                    };
+                    Err(ToolError::ExecutionFailed(described))
+                }
+                None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+            },
             Err(_) => Err(ToolError::ExecutionFailed(
                 "MCP server closed the connection before responding".to_string(),
             )),
@@ -126,8 +145,11 @@ async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap) {
                     && let Some(id) = value.get("id").and_then(Value::as_i64)
                     && let Some(tx) = pending.lock().await.remove(&id)
                 {
-                    let payload = value.get("result").cloned().unwrap_or(Value::Null);
-                    let _ = tx.send(payload);
+                    // Send the whole raw envelope (not just `result`) so
+                    // `request()` can distinguish a genuine `"error"`
+                    // response from a successful-but-empty `"result"` —
+                    // both used to collapse to `Value::Null` here.
+                    let _ = tx.send(value);
                 }
             }
             Ok(None) => break, // EOF: child exited or pipe closed
@@ -191,6 +213,44 @@ mod tests {
 
         let result = request_fut.await.unwrap();
         assert_eq!(result, serde_json::json!({"tools": []}));
+        drain_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_resolves_to_an_error_when_the_response_has_an_error_field() {
+        // Regression test for the final-review finding: a JSON-RPC error
+        // response used to be silently discarded and resolved as
+        // `Ok(Value::Null)`, indistinguishable from a genuine empty
+        // success. It must now surface as an `Err` carrying the server's
+        // error message.
+        let (client_reader, mut server_writer) = tokio::io::duplex(4096);
+        let (server_reader, client_writer) = tokio::io::duplex(4096);
+        let connection = McpConnection::new(client_reader, client_writer);
+
+        let drain_task = tokio::spawn(async move {
+            let mut server_reader = server_reader;
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut server_reader, &mut buf).await;
+        });
+
+        let request_fut = connection.request("tools/call", serde_json::json!({}));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        write_raw_line(
+            &mut server_writer,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32601, "message": "Method not found"}
+            }),
+        )
+        .await;
+
+        let err = request_fut.await.expect_err("expected an Err, got Ok");
+        let message = err.to_string();
+        assert!(
+            message.contains("Method not found"),
+            "error text missing the server's message: {message}"
+        );
         drain_task.await.unwrap();
     }
 

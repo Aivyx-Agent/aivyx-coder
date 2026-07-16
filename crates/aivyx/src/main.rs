@@ -349,8 +349,20 @@ async fn main() -> anyhow::Result<()> {
 
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     while let Some(joined) = mcp_discovery.join_next().await {
-        let (server_name, client, outcome) =
-            joined.expect("MCP discovery task panicked");
+        // A `JoinError` here means the discovery task itself panicked —
+        // treated the same as a connect/discover failure or timeout below:
+        // log it and keep going. One broken server (even one whose
+        // discovery code panics) must never crash the whole session.
+        let (server_name, client, outcome) = match joined {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("an MCP server discovery task panicked — skipping");
+                let _ = events_tx.send(aivyx_core::AgentEvent::Error(
+                    "an MCP server discovery task panicked — skipping".to_string(),
+                ));
+                continue;
+            }
+        };
         match outcome {
             Ok(Ok(tools)) => {
                 for tool_info in tools {
