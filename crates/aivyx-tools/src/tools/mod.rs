@@ -1,5 +1,6 @@
 mod edit_file;
 mod find_references;
+mod git_branch;
 mod git_commit;
 mod git_read;
 mod glob;
@@ -17,6 +18,7 @@ mod write_file;
 
 pub use edit_file::EditFileTool;
 pub use find_references::FindReferencesTool;
+pub use git_branch::GitBranchTool;
 pub use git_commit::GitCommitTool;
 pub use git_read::GitReadTool;
 pub use glob::GlobTool;
