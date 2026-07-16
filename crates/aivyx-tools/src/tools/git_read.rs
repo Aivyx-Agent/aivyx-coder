@@ -21,7 +21,7 @@ const DEFAULT_LOG_COUNT: u32 = 10;
 
 #[derive(Deserialize, JsonSchema)]
 struct GitReadArgs {
-    /// What to inspect: "status" (working tree status), "diff" (changes), or "log" (recent commits).
+    /// What to inspect: "status" (working tree status), "diff" (changes), "log" (recent commits), or "branches" (local branches with upstream tracking info).
     mode: GitReadMode,
     /// diff only: limit the diff to this file or directory (absolute or relative to the working directory).
     #[serde(default)]
@@ -40,6 +40,7 @@ enum GitReadMode {
     Status,
     Diff,
     Log,
+    Branches,
 }
 
 /// Read-only git inspection (status / diff / log). A single tool rather
@@ -97,6 +98,7 @@ impl GitReadTool {
                     count.to_string(),
                 ]
             }
+            GitReadMode::Branches => vec!["branch".into(), "-vv".into()],
         }
     }
 }
@@ -117,7 +119,8 @@ impl Tool for GitReadTool {
             description: "Inspect the git repository in the working directory (read-only): \
                 mode \"status\" shows branch and changed files, mode \"diff\" shows unstaged \
                 changes (set staged=true for staged ones, path to limit to one file/directory), \
-                mode \"log\" shows recent commits (count, default 10)."
+                mode \"log\" shows recent commits (count, default 10), mode \"branches\" shows \
+                local branches with upstream tracking info."
                 .to_string(),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(GitReadArgs)),
         }
@@ -234,6 +237,19 @@ mod tests {
         let tool = GitReadTool::new(vec![]);
         let text = run_tool(&tool, dir.path(), json!({ "mode": "log", "count": 5 })).await;
         assert!(text.contains("initial"));
+    }
+
+    #[tokio::test]
+    async fn branches_mode_lists_local_branches_with_the_current_one_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        git(dir.path(), &["checkout", "-b", "feature-x"]).await;
+
+        let tool = GitReadTool::new(vec![]);
+        let text = run_tool(&tool, dir.path(), json!({ "mode": "branches" })).await;
+
+        assert!(text.contains("feature-x"));
+        assert!(text.contains("main"));
     }
 
     #[tokio::test]
