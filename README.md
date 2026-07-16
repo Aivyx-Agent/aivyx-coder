@@ -269,12 +269,17 @@ purpose-built branch/push/PR-creation tools instead of leaving them to
 — rather than introducing a new tier: these are structured invocations of
 the same trusted `git`/`gh` CLIs `git_commit` already shells out to, not
 arbitrary or unverifiable code. `git_branch(mode, name, base?)` creates (and
-switches to) a new branch or switches to an existing one; both `name` and
-`base` are rejected if they start with `-` (a real, live-git-reproduced
-vulnerability found during review: a dash-prefixed value in these argv
-positions gets parsed by git as a flag rather than a value — e.g. a branch
-name of `-f` would silently force-discard uncommitted changes instead of
-erroring). `git_push(remote?)` always pushes with `-u` (a no-op once
+switches to) a new branch or switches to an existing one; `name` (when
+switching) and `base` (when creating, if given) are rejected if they start
+with `-` (a real, live-git-reproduced vulnerability found during review: a
+dash-prefixed value in these two bare-positional argv slots gets parsed by
+git as a flag rather than a value — e.g. a branch name of `-f` when
+switching would silently force-discard uncommitted changes instead of
+erroring "branch not found." Note `create`'s own new-branch `name` — the
+value right after `-b` — is a different, genuinely safe position: git
+unconditionally consumes it positionally and rejects a dash-prefixed
+branch name outright, so it isn't guarded). `git_push(remote?)` always
+pushes with `-u` (a no-op once
 upstream tracking exists) and carries the same leading-dash rejection on
 `remote` for the same reason; it has **no `--force`/`--force-with-lease`
 support at all**, not even as an internal, unexposed flag. `git_pr(title,
