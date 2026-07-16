@@ -30,10 +30,10 @@ pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use process::CommandSpec;
 pub use tools::{
-    EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool, GitCommitTool, GitReadTool, GlobTool,
-    GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter,
-    ReadFileTool, ReadMcpResourceTool, RunCommandTool, RunShellTool, SetTasksTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool, GitCommitTool, GitPushTool,
+    GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool,
+    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RunCommandTool, RunShellTool, SetTasksTool,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 
 #[derive(Debug, Error)]
