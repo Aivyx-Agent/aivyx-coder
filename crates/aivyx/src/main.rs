@@ -7,9 +7,11 @@ use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilS
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
-    CommandSpec, EditFileTool, FindReferencesTool, GitCheckpointer, GitCommitTool, GitReadTool,
-    GlobTool, GoToDefinitionTool, GrepTool, LspClient, ReadFileTool, RunCommandTool, RunShellTool,
-    SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
+    CommandSpec, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitCheckpointer,
+    GitCommitTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
+    ListMcpResourcesTool, LspClient, McpClient, McpToolAdapter, ReadFileTool, ReadMcpResourceTool,
+    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -315,6 +317,80 @@ async fn main() -> anyhow::Result<()> {
             settings.web.max_search_results,
             settings.web.fetch_timeout_secs,
         )));
+    }
+
+    // Every configured server connects concurrently, each bounded by its
+    // own `timeout_secs` — a slow or broken server can't hang startup or
+    // delay every other server's tools from becoming available. A server
+    // that fails or times out is skipped with a one-time warning (both a
+    // log line and a surfaced AgentEvent::Error, matching how a
+    // context-window mismatch is reported above) rather than aborting the
+    // whole session.
+    let mut mcp_discovery = tokio::task::JoinSet::new();
+    for server in settings.mcp.servers.clone() {
+        let confiner = Arc::clone(&confiner);
+        let cwd = cwd.clone();
+        mcp_discovery.spawn(async move {
+            let client = Arc::new(McpClient::new(
+                server.name.clone(),
+                server.command.clone(),
+                server.args.clone(),
+                server.env.clone().into_iter().collect(),
+            ));
+            let timeout = Duration::from_secs(server.timeout_secs);
+            let outcome = tokio::time::timeout(timeout, async {
+                client.ensure_started(&cwd, &confiner).await?;
+                client.list_tools().await
+            })
+            .await;
+            (server.name, client, outcome)
+        });
+    }
+
+    let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
+    while let Some(joined) = mcp_discovery.join_next().await {
+        let (server_name, client, outcome) =
+            joined.expect("MCP discovery task panicked");
+        match outcome {
+            Ok(Ok(tools)) => {
+                for tool_info in tools {
+                    registry.register(Arc::new(McpToolAdapter::new(
+                        Arc::clone(&client),
+                        &server_name,
+                        tool_info,
+                    )));
+                }
+                mcp_clients.push(client);
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    server = %server_name,
+                    error = %err,
+                    "MCP server failed to connect/discover tools — skipping for this session"
+                );
+                let _ = events_tx.send(aivyx_core::AgentEvent::Error(format!(
+                    "MCP server \"{server_name}\" failed to connect: {err} — its tools are \
+                     unavailable this session"
+                )));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    server = %server_name,
+                    "MCP server startup timed out — skipping for this session"
+                );
+                let _ = events_tx.send(aivyx_core::AgentEvent::Error(format!(
+                    "MCP server \"{server_name}\" timed out during startup — its tools are \
+                     unavailable this session"
+                )));
+            }
+        }
+    }
+
+    if !mcp_clients.is_empty() {
+        registry.register(Arc::new(ListMcpResourcesTool::new(mcp_clients.clone())));
+        registry.register(Arc::new(ReadMcpResourceTool::new(mcp_clients.clone())));
+        registry.register(Arc::new(ListMcpPromptsTool::new(mcp_clients.clone())));
+        registry.register(Arc::new(GetMcpPromptTool::new(mcp_clients.clone())));
     }
 
     let edit_format = match cli.edit_format.as_deref() {
