@@ -262,6 +262,34 @@ may need cache-directory read access added to `[sandbox] extra_read_paths`
 avoid startup timeouts under the sandbox, since its default-deny policy has
 no read access to `npx`'s cache directory by default.
 
+**Branch/PR tooling**: `git_branch`, `git_push`, and `git_pr` give the model
+purpose-built branch/push/PR-creation tools instead of leaving them to
+`run_shell` alone. All three share `git_commit`'s exact permission tier —
+`ActionKind::Execute` with a `PermissionTarget::Command` target, confirm-gated
+— rather than introducing a new tier: these are structured invocations of
+the same trusted `git`/`gh` CLIs `git_commit` already shells out to, not
+arbitrary or unverifiable code. `git_branch(mode, name, base?)` creates (and
+switches to) a new branch or switches to an existing one; both `name` and
+`base` are rejected if they start with `-` (a real, live-git-reproduced
+vulnerability found during review: a dash-prefixed value in these argv
+positions gets parsed by git as a flag rather than a value — e.g. a branch
+name of `-f` would silently force-discard uncommitted changes instead of
+erroring). `git_push(remote?)` always pushes with `-u` (a no-op once
+upstream tracking exists) and carries the same leading-dash rejection on
+`remote` for the same reason; it has **no `--force`/`--force-with-lease`
+support at all**, not even as an internal, unexposed flag. `git_pr(title,
+body?, base?, draft?)` opens a pull request via the `gh` CLI, gated behind
+two deterministic preflight checks (never by parsing either tool's stderr
+text): the current branch must already have an upstream (checked via `git
+rev-parse`, directing the model to `git_push` first if missing) and `gh`
+must be installed and authenticated (checked via `gh auth status`,
+distinguishing "not installed" from "not authenticated" with different
+fixes). `git_pr` is always registered, no config flag — a missing or
+unauthenticated `gh` is an environmental accident, the same reasoning
+`go_to_definition`/`find_references` already apply to a missing
+`rust-analyzer`. Branch *listing* (read-only) is a fourth mode on the
+existing `git_read` tool instead of a new tool, staying auto-allowed.
+
 Build/test the workspace:
 
 ```

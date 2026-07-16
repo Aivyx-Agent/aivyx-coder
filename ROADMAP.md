@@ -1024,6 +1024,83 @@ skip-with-warning path firing for real against a genuinely slow server —
 the session stayed usable and the warning surfaced live in the TUI rather
 than the process hanging or crashing.
 
+**Branch/PR tooling built and live-verified (2026-07-16).** Closes out the
+lowest-priority remaining item from the original tool/capability audit
+("no dedicated branch/PR tools — already reachable via `run_shell`"),
+kept deliberately narrow to match that framing. `git_branch`/`git_push`/
+`git_pr` all reuse `git_commit`'s existing `ActionKind::Execute` +
+`PermissionTarget::Command` permission tier rather than introducing a new
+one — a real fork, decided the opposite way from MCP's genuinely novel
+arbitrary-third-party-code trust situation: these tools are structured
+invocations of the same trusted `git`/`gh` CLIs `git_commit` already
+shells out to, so the existing tier's reasoning already covers them.
+Branch *listing* stays read-only and auto-allowed as a new mode on the
+existing `git_read` tool, rather than a fourth mutating tool, mirroring
+why `git_read`/`git_commit` were already split (Plan Mode's tool filtering
+is static per-tool).
+
+A task review caught a real, live-git-reproduced Critical bug before
+merge: `git_branch`'s `name` (switch mode) and `base` (create mode) sat in
+bare positional argv slots with no protection against a leading dash — a
+branch name of `-f` produced `git checkout -f`, which git parses as the
+`--force` flag rather than a branch name, **silently discarding
+uncommitted changes** instead of erroring "branch not found." Fixed by
+rejecting any leading-`-` value in those two positions before the git
+process ever spawns (the `-b <name>` position — the new branch's own
+name — is genuinely unaffected, since `-b` unconditionally consumes the
+next token positionally; confirmed both ways against live git). The same
+class of bug was proactively fixed in `git_push`'s `remote` argument
+before its own review even ran, since it sits in the identical kind of
+slot (`git push -u <remote> <branch>`) — both fixes were independently
+reproduced against real git by their respective task reviewers, not just
+taken on faith. `git_pr`'s `title`/`body`/`base` needed no equivalent
+guard: they're each passed as an explicit `--flag value` pair, which
+`gh`'s Cobra-based argument parser (like most standard CLI parsers)
+consumes as-is regardless of what the value looks like — verified
+empirically against a real local `gh` binary, not just reasoned about.
+
+`git_push` never constructs a `--force`/`--force-with-lease` argv at all,
+deliberately excluded as a whole operation class rather than merely
+undocumented. `git_pr` gates on two deterministic preflight checks, each
+by exit status only, never by parsing either tool's stderr text for a
+specific phrase (a documented anti-pattern from earlier phases, since
+exact wording isn't a stable contract across versions): a `git
+rev-parse`-based upstream check (directing the model to `git_push` first
+if missing, rather than `git_pr` silently pushing on its own behalf) and a
+`gh auth status` check (distinguishing "not installed" from "not
+authenticated" with different fixes). `git_pr` is always registered, no
+config flag — the same "environmental accident, not a deliberate
+off-switch" reasoning already applied to a missing `rust-analyzer`.
+
+20 new tests (375 total, up from 355): the new `git_read` branches mode;
+`git_branch`'s create/switch/base-ref/preview/validation paths plus the
+dash-rejection fix; `git_push`'s first-push/subsequent-push/preview paths
+(against a real local **bare** repository used as the test remote — a
+genuine local git transport round-trip, no network) plus its own
+dash-rejection guard; and `git_pr`'s two preflight-failure paths, its
+success path, and its argv construction, all against a fake `gh`
+stand-in (`GitPrTool::with_gh_program`, mirroring the LSP client's
+`with_program` test-only constructor) — no real GitHub account or network
+access anywhere in the suite.
+
+Live E2E through the real binary covered `git_branch` and `git_push`
+only, not `git_pr` — an explicit non-goal from the design, since there's
+no safe, repeatable way to live-test a real `gh pr create` call against a
+real GitHub repository in this environment; `git_pr`'s verification is
+bounded by its fake-`gh` unit tests. Confirmed live, via a `python-pyte`
+PTY harness and the persisted session JSON per this project's established
+grading method: creating a branch via `git_branch` showed a real
+confirmation modal naming the exact `git checkout -b` argv and, on
+approval, genuinely created and checked out the branch (independently
+verified against the scratch repo's actual `git branch`/`git log`
+afterward); listing branches via `git_read`'s new mode showed no
+confirmation modal and returned real branch data; pushing via `git_push`
+against a real local **bare** repository (no network) showed a real
+confirmation modal and, on approval, genuinely landed the commit on the
+bare repo's `main` branch — independently verified afterward by reading
+the bare repo directly (`git --git-dir=<bare> log main`), not just trusting
+the tool's own reported output.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
