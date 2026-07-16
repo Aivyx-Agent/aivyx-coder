@@ -27,10 +27,11 @@ pub mod wiki;
 
 pub use checkpoint::GitCheckpointer;
 pub use lsp::LspClient;
+pub use mcp::{McpClient, ToolInfo};
 pub use process::CommandSpec;
 pub use tools::{
     EditFileTool, FindReferencesTool, GitCommitTool, GitReadTool, GlobTool, GoToDefinitionTool,
-    GrepTool, ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool, WebFetchTool,
+    GrepTool, McpToolAdapter, ReadFileTool, RunCommandTool, RunShellTool, SetTasksTool, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
 
