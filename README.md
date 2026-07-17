@@ -309,7 +309,11 @@ misparse in the first place. No bespoke recovery mechanism either — a
 deleted file is one `git checkout <checkpoint-ref> -- <path>` away from
 being restored via the existing automatic pre-mutation checkpoint every
 mutating tool already gets, live-verified end to end (delete, then
-restore) as part of this tool's own testing.
+restore) as part of this tool's own testing. That safety net inherits the
+checkpointer's own existing limits, not new ones this tool introduces: a
+gitignored file (staged via `git add -A`, which never picks up ignored
+paths) has no checkpoint to restore from, and a non-git working directory
+has no checkpointer active at all.
 
 Build/test the workspace:
 
