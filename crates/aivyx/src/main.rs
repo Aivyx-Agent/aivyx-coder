@@ -7,8 +7,8 @@ use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilS
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PlanMode};
 use aivyx_tools::{
-    CommandSpec, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool,
-    GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
+    CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
+    GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
     McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RunCommandTool, RunShellTool, SetTasksTool,
     ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
@@ -284,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    registry.register(Arc::new(DeleteFileTool));
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
     registry.register(Arc::new(RunShellTool));
