@@ -295,6 +295,22 @@ unauthenticated `gh` is an environmental accident, the same reasoning
 `rust-analyzer`. Branch *listing* (read-only) is a fourth mode on the
 existing `git_read` tool instead of a new tool, staying auto-allowed.
 
+**`delete_file(path)`**: `ActionKind::Delete`'s first real constructor —
+every prior tool declared `Read`/`Write`/`Execute`/`Internal`/`McpTool`,
+this closes out the original tool/capability audit's last remaining item.
+Confirm-gated, same tier as `write_file`/`edit_file`; the user sees the
+file's content in the preview (or a binary-file warning, reusing
+`write_file`'s exact wording) before approving. Single-file only — a
+directory target is refused with a clear error, `run_shell` remains the
+path for directory removal. Deletion itself is plain `tokio::fs::remove_file`,
+no subprocess spawned at all — a deliberate contrast with the branch/PR
+tooling phase's own argv-injection lesson above: there's no argv here to
+misparse in the first place. No bespoke recovery mechanism either — a
+deleted file is one `git checkout <checkpoint-ref> -- <path>` away from
+being restored via the existing automatic pre-mutation checkpoint every
+mutating tool already gets, live-verified end to end (delete, then
+restore) as part of this tool's own testing.
+
 Build/test the workspace:
 
 ```

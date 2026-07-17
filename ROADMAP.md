@@ -1101,6 +1101,66 @@ bare repo's `main` branch — independently verified afterward by reading
 the bare repo directly (`git --git-dir=<bare> log main`), not just trusting
 the tool's own reported output.
 
+**`delete_file` built and live-verified (2026-07-17).** Closes out the
+original tool/capability audit entirely — the last remaining tracked
+gap was `ActionKind::Delete` being defined in the permission-tier enum
+since this project's security model was first designed, but never having
+a real constructor: every prior mutating tool declared `Read`/`Write`/
+`Execute`/`Internal`/`McpTool`, and deletion was only ever reachable
+through `run_shell`'s generic confirm tier. `delete_file(path)` closes
+that gap directly, reusing `write_file`/`edit_file`'s existing
+`ActionKind`-adjacent confirm-gated shape (no new tier) and their exact
+preview pattern (file content, or a binary-file warning reusing
+`write_file`'s own wording verbatim).
+
+Two deliberate scope decisions, both a direct continuation of lessons
+from the immediately preceding phases rather than fresh ground: single-
+file only, no directory/recursive deletion (`run_shell` remains the path
+for that, matching this project's now-repeated "ship the narrow version
+first" pattern from `git_push`'s own force-push exclusion); and deletion
+implemented as a single `tokio::fs::remove_file` call with **no
+subprocess spawned at all**, a deliberate, explicit contrast with the
+branch/PR tooling phase's own argv-injection vulnerability
+(`git_branch`/`git_push`'s dash-prefixed bare-positional-argument bug,
+found and fixed one phase earlier) — there is no argv here to construct,
+so that entire bug class cannot exist by design, not merely by careful
+guarding. No `deny_paths` field on the tool either, matching `write_file`/
+`edit_file`: `ConfirmationGate`'s existing central check already blocks
+any `PermissionTarget::Path` under configured `deny_paths` uniformly,
+so a per-tool duplicate would be redundant.
+
+No new recovery or confirmation-richness mechanism was built for this
+either — deliberately deferring entirely to the existing automatic
+pre-mutation checkpoint every mutating tool already gets for free via
+`ToolExecutor::dispatch_inner`'s `mutates_outside_session()`-keyed hook,
+zero new plumbing required. This is the same "checkpoints are the safety
+net, not bespoke recovery machinery" decision this project has made
+repeatedly (enforced verification's own retry-exhaustion path relies on
+the identical mechanism) — but this is the first phase to specifically
+live-verify the delete-then-restore round trip end to end, since no
+earlier phase's live E2E happened to delete anything.
+
+6 new tests (381 total, up from 375): successful deletion (file genuinely
+gone afterward), the directory-refusal and nonexistent-path errors (both
+`ToolError::ExecutionFailed`, not `InvalidArguments` — the `path`
+argument itself is well-formed in both cases, the problem is a runtime
+precondition about what's on disk), the text-file preview, the binary-file
+warning preview, and the permission request's `ActionKind::Delete`/
+`PermissionTarget::Path` shape.
+
+Live E2E through the real binary (a `python-pyte`-driven PTY harness),
+confirmed via the persisted session JSON per this project's established
+grading method: a real `delete_file` call showed a genuine confirmation
+modal and, on approval, the target file was verifiably gone from disk
+afterward — plus the new ground this phase specifically set out to prove:
+locating the checkpoint `delete_file` automatically created
+(`git for-each-ref refs/aivyx/checkpoints/`, labeled `"aivyx checkpoint
+before delete_file"` by the existing generic checkpoint mechanism with no
+tool-specific wiring) and confirming `git checkout <that-ref> -- <path>`
+genuinely restored the file with its exact original content — the direct,
+concrete payoff of this phase's "no bespoke recovery machinery" decision,
+verified rather than assumed.
+
 ### Phase 10 — Serving layer: llama-server migration + constrained-decoding spike (scoped 2026-07-11)
 
 The Phase 2 A/B diagnosis promoted the serving layer to a first-class
