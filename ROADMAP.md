@@ -16,7 +16,7 @@ directional, not committed fact, until spot-checked.
 
 ## Where things stand today
 
-*(Updated 2026-07-17 — the phase sections below carry the full history
+*(Updated 2026-07-18 — the phase sections below carry the full history
 and evidence; this is the summary.)*
 
 **Shipped and live-verified** (Phases 1–8, 10 Parts A & B, 11a/11b/11c,
@@ -52,6 +52,16 @@ the entire growing conversation prefix on every turn after the first, a
 genuine (if not decision-gating) positive finding. Full details in the
 Phase 10 section below.
 
+**vLLM compat pass (2026-07-18)**: the last README-claimed provider
+(Ollama/vLLM/llama.cpp) is now live-verified. vLLM served the same
+Qwen3.5-9B-AWQ weights cleanly on the first attempt — no compat bugs,
+unlike SGLang's dtype crash — with correct native AWQ quantization and
+GDN/Mamba dtype auto-detection, and a working `--default-chat-template-kwargs`
+launch flag SGLang lacked. One live E2E task through the real binary
+came back clean (native tool calls, correct edit, no retries). No new
+config surface needed — `base_url` already generically targets any
+OpenAI-compatible endpoint. Full details in the Phase 10 section below.
+
 **Capability audit (2026-07-12) — fully closed.** A broader audit against
 the project's actual end-goal — a high-end vibe-coding agent with a path
 to full autonomy — found the security/checkpoint foundation doesn't need
@@ -61,11 +71,9 @@ in the agent loop itself (closed via Phase 12) plus five smaller gaps
 support, branch/PR tooling, `delete_file`). No tracked items remain from
 this audit.
 
-**In flight / next**: nothing pre-scoped remains in this ROADMAP. The one
-still-open, explicitly-deferred thread is a cheap vLLM compat pass (image
-pull + one E2E run) — vLLM is a README-claimed provider never
-live-tested, called out as a Part-B follow-on outside that spike's own
-scope. Anything beyond that needs fresh brainstorming.
+**In flight / next**: nothing pre-scoped remains in this ROADMAP. All
+previously-tracked threads (including the vLLM compat pass) are closed.
+Anything beyond that needs fresh brainstorming.
 
 ## What the research says a coding agent needs
 
@@ -1404,9 +1412,57 @@ way during this spike (no aivyx architecture changes, per the spike's own
 bound); this section is a documentation-only update recording the
 result.
 
-**Follow-on item, still open and out of this spike's scope:** a vLLM
-compat pass (official image + one map/git E2E) — the one README-claimed
-provider never live-tested.
+**vLLM compat pass, run and closed out (2026-07-18).** The one
+README-claimed provider (Ollama/vLLM/llama.cpp) never live-tested until
+now. Scope matched the roadmap's own framing: cheap, one session, official
+image, one E2E run, no aivyx-coder code changes expected or made.
+
+Reused the `QuantTrio/Qwen3.5-9B-AWQ` weights already on disk from the
+SGLang spike (Part B) — no new model download needed, since vLLM natively
+supports AWQ. Pulled the official `vllm/vllm-openai:latest` image
+(vLLM 0.25.1) and served with:
+```
+docker run -d --gpus all --ipc=host \
+  -v /home/julian/models/Qwen3.5-9B-AWQ:/model -p 8010:8000 \
+  vllm/vllm-openai:latest \
+  --model /model --served-model-name Qwen3.5-9B-AWQ \
+  --max-model-len 16384 --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --gpu-memory-utilization 0.85
+```
+
+Unlike the SGLang spike, **vLLM came up clean on the first attempt** —
+no compat bugs found. Two things that were sharp edges in SGLang were
+non-issues here: AWQ quantization was auto-detected from the model's own
+`config.json` (no explicit `--quantization` flag needed), and the
+Gated-DeltaNet/Mamba cache dtype matched the model's `float16` correctly
+out of the box (vLLM's `MambaConfig` handles this natively — no
+`SGLANG_MAMBA_CONV_DTYPE`-style env var workaround required). vLLM also
+has a real `--default-chat-template-kwargs` launch flag (SGLang's
+equivalent didn't exist despite general docs suggesting otherwise), so
+forcing `enable_thinking: false` needed no patched chat template this
+time.
+
+Verified via raw curl: a plain completion came back with no reasoning
+tokens and the correct answer; a tool-definition request produced a
+schema-valid `tool_calls` array via the `qwen3_coder` parser. Then ran one
+task (the same "discount" fixture from the A5/B2 grid: multiply
+`calculate_total`'s return by 0.9) through the real `aivyx-coder` release
+binary — PTY + `python-pyte` harness, graded via the persisted session
+JSON. Result: a clean `read_file` → `edit_file` sequence, both tool calls
+natively parsed (`"source": "Native"`), correct edit applied
+(`total * 0.9`), one confirmation, no malformed calls, no retries.
+
+**Verdict: vLLM is a genuinely working third provider for this project's
+target model**, with a real compat story (native AWQ + native GDN dtype
+handling, no adapter cost/hackery) that's better than SGLang's on this
+same model. No aivyx-coder config surface was added — `base_url` already
+generically points at any OpenAI-compatible endpoint, so vLLM needs zero
+new code, only a config change, exactly like SGLang would have. Environment
+fully restored afterward (container removed, `config.toml` back to
+llama-server, llama-server restarted with its original invocation, VRAM
+footprint confirmed matching pre-spike: 8267 MiB).
 
 ### Phase 11 — Candidate directions (scoped 2026-07-11, user-proposed)
 
