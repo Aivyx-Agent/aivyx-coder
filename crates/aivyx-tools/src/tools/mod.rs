@@ -1,3 +1,4 @@
+mod delete_file;
 mod edit_file;
 mod find_references;
 mod git_branch;
@@ -18,6 +19,7 @@ mod web_fetch;
 mod web_search;
 mod write_file;
 
+pub use delete_file::DeleteFileTool;
 pub use edit_file::EditFileTool;
 pub use find_references::FindReferencesTool;
 pub use git_branch::GitBranchTool;
