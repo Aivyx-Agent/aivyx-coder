@@ -16,47 +16,56 @@ directional, not committed fact, until spot-checked.
 
 ## Where things stand today
 
-*(Updated 2026-07-12 — the phase sections below carry the full history
+*(Updated 2026-07-17 — the phase sections below carry the full history
 and evidence; this is the summary.)*
 
-**Shipped and live-verified** (Phases 1–8, 10 Part A, 11a, 12): the full
-agent loop — streaming chat, native + prompted SEARCH/REPLACE edit formats
+**Shipped and live-verified** (Phases 1–8, 10 Parts A & B, 11a/11b/11c,
+12, and the full Phase 9 stretch-goal list): the full agent loop —
+streaming chat, native + prompted SEARCH/REPLACE edit formats
 (A/B-measured, native default), grep/glob search, `run_command`/`run_shell`
-behind real Landlock+seccomp confinement, git tools + automatic worktree
-checkpoint refs, tree-sitter repo map injection, session persistence/resume,
-context budget + compaction, plan mode (gate-enforced read-only), `/council`
-multi-model deliberation, a startup probe of the *served* context window,
+behind real Landlock+seccomp confinement, git tools (including
+`git_branch`/`git_push`/`git_pr`) + automatic worktree checkpoint refs,
+`delete_file` (`ActionKind::Delete`'s first constructor), tree-sitter repo
+map injection, an agent-maintained wiki (`/wiki`), session
+persistence/resume, context budget + compaction, plan mode (gate-enforced
+read-only), autonomous mode (`--auto`), `/council` multi-model
+deliberation, AGENTS.md project instructions, `web_fetch`/`web_search`,
+full MCP client support, a startup probe of the *served* context window,
 goal-bounded turn pausing instead of a hard iteration-cap failure, and
-enforced post-edit verification with automatic fix-and-retry. 177 workspace
-tests; every security-critical behavior also proven by live E2E against
-real serving.
+enforced post-edit verification with automatic fix-and-retry. 381
+workspace tests; every security-critical behavior also proven by live
+E2E against real serving.
 
-**Serving verdict (Phase 10)**: the serving configuration — not the
-model, not the edit format — was the dominant reliability variable.
+**Serving verdict (Phase 10 Part A)**: the serving configuration — not
+the model, not the edit format — was the dominant reliability variable.
 Correctly-configured llama-server (explicit 16k window, thinking
 disabled) took the same qwen3.5:9b from Ollama's best 7/9 to 9/9 at ~10×
-the speed on the edit benchmark. The daily driver runs llama-server via
-a systemd user unit; Ollama stays as the zero-setup default and serves
-the council's swap-per-request members.
+the speed on the edit benchmark. The daily driver runs llama-server;
+Ollama stays as the zero-setup default and serves the council's
+swap-per-request members.
 
-**Capability audit (2026-07-12)**: a broader audit against the project's
-actual end-goal — a high-end vibe-coding agent with a path to full
-autonomy — found the security/checkpoint foundation doesn't need a
-redesign for autonomy, only extension, but surfaced two structural gaps
-in the agent loop itself (a hard per-turn iteration cap instead of
-goal-bounded continuation, and an entirely emergent — never enforced —
-verification loop) plus five smaller gaps folded into Phase 9. Both
-structural gaps are now closed — see Phase 12 below.
+**Constrained-decoding verdict (Phase 10 Part B, 2026-07-17)**: SGLang's
+xgrammar-forced tool calls matched llama-server's already-clean 9/9,
+0-malformed-call baseline exactly — no material win, so no config
+surface was added. Radix caching was confirmed to automatically reuse
+the entire growing conversation prefix on every turn after the first, a
+genuine (if not decision-gating) positive finding. Full details in the
+Phase 10 section below.
 
-**In flight / next**: Phase 10 Part B — the SGLang constrained-decoding
-spike (xgrammar forcing schema-valid tool calls at generation time) —
-runs via the official docker image after the AUR package proved broken;
-AWQ weights are re-downloaded and shard-verified. A cheap vLLM compat
-pass (image pull + one E2E run) is queued separately, since vLLM is a
-README-claimed provider not yet live-tested. Then Phase 11b (agent wiki)
-design pass, Phase 11c (autonomous loop — its security-profile design
-pass is now unblocked by Phase 12's loop-mechanics work), and the
-remaining Phase 9 stretch items.
+**Capability audit (2026-07-12) — fully closed.** A broader audit against
+the project's actual end-goal — a high-end vibe-coding agent with a path
+to full autonomy — found the security/checkpoint foundation doesn't need
+a redesign for autonomy, only extension, but surfaced two structural gaps
+in the agent loop itself (closed via Phase 12) plus five smaller gaps
+(closed via Phase 9: AGENTS.md, `web_fetch`/`web_search`, MCP client
+support, branch/PR tooling, `delete_file`). No tracked items remain from
+this audit.
+
+**In flight / next**: nothing pre-scoped remains in this ROADMAP. The one
+still-open, explicitly-deferred thread is a cheap vLLM compat pass (image
+pull + one E2E run) — vLLM is a README-claimed provider never
+live-tested, called out as a Part-B follow-on outside that spike's own
+scope. Anything beyond that needs fresh brainstorming.
 
 ## What the research says a coding agent needs
 
@@ -1307,22 +1316,97 @@ release) has no `enable_thinking` template variable at all —
 `--chat-template-kwargs` is a no-op for that model family, not something
 to debug if it appears inert.
 
-**Part B status (2026-07-12): unblocked, environment rebuilt, spike
-pending.** The first attempt was aborted by machine-level data corruption
-(RAM path; memtest86+ later passed clean after the fix — full story in
-memory `project_jarvis_home_disk_corruption`), which corrupted the AWQ
-shards mid-load. Environment now: AWQ weights re-downloaded and
-shard-verified against upstream sha256s; serving migrated from the
-deleted source build to the packaged AUR `llama.cpp-cuda` (b9966 —
-build requires `GGML_CCACHE=OFF`, see README Serving); SGLang will run
-from the official `lmsysorg/sglang` docker image after the AUR package
-proved broken (host needs only repo-packaged `nvidia-container-toolkit`
-+ docker). Launch recipe from the first attempt carries over: thinking
-disabled via patched chat template, `--tool-call-parser qwen3_coder`
-(QuantTrio's template uses the qwen3-coder XML format), xgrammar
-backend. Follow-on item outside the spike's scope: a vLLM compat pass
-(official image + one map/git E2E) — the one README-claimed provider
-never live-tested.
+**Part B run and closed out (2026-07-17).** The prior attempt's
+environment (AWQ weights, AUR `llama.cpp-cuda`, SGLang via the official
+docker image) had gone stale since 2026-07-12 — the AWQ shards were no
+longer on disk and had to be re-downloaded fresh from
+`QuantTrio/Qwen3.5-9B-AWQ` (12.4GB; the first transfer attempt dropped
+mid-shard and needed a resumed re-run). The GPU's current daily-driver
+llama-server (running since 2026-07-12, serving the qwen3.5:9b GGUF
+quant) was stopped for the duration of the spike to free VRAM, and
+restored to its exact prior invocation afterward.
+
+Two real compatibility snags, both found and resolved before B0 could
+complete, worth recording for whoever runs this again:
+- SGLang (current `:latest` image) has **no `--chat-template-kwargs`
+  launch flag** — despite general SGLang docs suggesting one — so the
+  planned "thinking disabled via patched chat template" recipe had to
+  mean an actual patched template file, not a launch-time kwarg. Fixed by
+  copying QuantTrio's bundled `chat_template.jinja`, replacing its
+  `{%- if enable_thinking is defined and enable_thinking is false %}`
+  guard with an unconditional `{%- if true %}`, and passing the result via
+  `--chat-template`.
+- Qwen3.5's hybrid GDN (Gated DeltaNet / linear-attention) layers crash
+  on first inference under this AWQ quant with `RuntimeError: Index put
+  requires the source and destination dtypes match, got BFloat16 for the
+  destination and Half for the source` — a real, open, unmerged SGLang
+  bug ([sgl-project/sglang#30178](https://github.com/sgl-project/sglang/issues/30178):
+  `SGLANG_MAMBA_CONV_DTYPE` defaults to a hardcoded `"bfloat16"` instead
+  of following the model's own configured dtype). The linked fix
+  (sgl-project/sglang#30950) wasn't merged into the pulled image, so
+  the same effect was reproduced manually: `docker run -e
+  SGLANG_MAMBA_CONV_DTYPE=float16 ...` (matching the AWQ model's own
+  `config.json`-declared `"dtype": "float16"`) — this cleared the crash
+  and the server came up clean.
+
+**B0 (serve):** SGLang up and serving `/model` on port 30000; a raw
+`curl` sanity check confirmed both non-thinking behavior
+(`reasoning_tokens: 0`, clean direct answers, no leaked `<think>` tokens)
+and schema-valid native tool-call output (`qwen3_coder` parser correctly
+emitted `read_file({"path": "test.txt"})`-shaped calls) before aivyx-coder
+was ever pointed at it.
+
+**B1 (baseline compatibility):** one real task (the A5 benchmark's own
+"discount" task, below) through the actual `aivyx` binary — `read_file`
+then a correct single-shot `edit_file`, no malformed tool calls, no
+repair-loop retries, verified via the persisted session JSON and the
+resulting file content on disk.
+
+**B2 (the measurement): 9/9, 0 malformed tool calls, 0 repair-loop
+retries** — the exact same 3-tasks-×-3-reps grid A5 used against
+llama-server (discount / bounds-check / iterator-rewrite, judged from
+final file state), replayed live through the real binary against SGLang.
+One harness bug surfaced and was fixed mid-run: the PTY driver's
+"turn complete" heuristic (`"ready —"` in the status line) is not
+sufficient on its own — that text is shown even while an unsent message
+still sits in the input box — so 6 of the first 9 runs were killed
+prematurely before the model had even finished responding, misreported
+as failures. Fixed by also requiring the input placeholder text
+(confirming the box was genuinely cleared by a real submission) before
+starting the completion timer; all 6 re-ran cleanly to 9/9 once fixed.
+Since llama-server's own A5 result was already a clean 9/9 with no
+malformed calls on this exact grid, SGLang's constrained decoding had no
+regressed baseline to improve *on* — same ceiling, reached the same way.
+
+**B3 (radix-cache benefit): confirmed working exactly as hypothesized,**
+measured directly from SGLang's own per-request `#cached-token` telemetry
+(a more precise signal than wall-clock TTFT, which the harness's own
+typing/rendering overhead would have polluted) across a real two-turn
+conversation: turn 1's tool-call continuation left 5568 cached tokens;
+turn 2 — a genuinely new user message appended to the same growing
+history aivyx-coder resends in full every turn — reused all 5568 of them
+and only prefilled its own 255 new tokens. Zero re-computation of
+anything the server had already seen. A full head-to-head wall-clock
+number against llama-server's own `--cache-reuse` was not captured (out
+of the spike's one-session budget, and not decision-critical — B4's gate
+depends on B2, not B3), but the mechanism itself is real and automatic
+for aivyx-coder's exact request pattern with no client-side change
+needed.
+
+**B4 (decision gate): no config surface added.** The gate was "aivyx only
+grows config surface if B2 shows a material win" — it didn't, because
+there was no headroom left to win: llama-server's existing baseline was
+already a clean 9/9 with zero malformed calls, so constrained decoding
+had nothing left to fix on this grid. This is a real, evidence-based
+"no," not an inconclusive one — consistent with Phase 2's own "evidence
+before architecture" rule. `aivyx-coder` itself was not modified in any
+way during this spike (no aivyx architecture changes, per the spike's own
+bound); this section is a documentation-only update recording the
+result.
+
+**Follow-on item, still open and out of this spike's scope:** a vLLM
+compat pass (official image + one map/git E2E) — the one README-claimed
+provider never live-tested.
 
 ### Phase 11 — Candidate directions (scoped 2026-07-11, user-proposed)
 
