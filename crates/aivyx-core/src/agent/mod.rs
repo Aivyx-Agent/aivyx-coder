@@ -10,10 +10,12 @@ use aivyx_types::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolOutput, ToolResult,
 };
 use futures::StreamExt;
+use time::OffsetDateTime;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::edit_blocks::{self, BlockParse};
+use crate::editor_context;
 use crate::session::{self, SessionState, Task};
 
 #[cfg(test)]
@@ -21,7 +23,7 @@ mod tests;
 mod types;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
-use types::{AgentsFileConfig, VerificationConfig};
+use types::{AgentsFileConfig, EditorContextConfig, VerificationConfig};
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from
 /// a misbehaving backend that never stops streaming.
@@ -161,6 +163,9 @@ pub struct Agent {
     /// `AGENTS.md` support when configured (`set_agents_file`); `None`
     /// disables the feature entirely (both files).
     agents_file_config: Option<AgentsFileConfig>,
+    /// Editor-context support when configured (`set_editor_context`);
+    /// `None` disables the feature entirely.
+    editor_context_config: Option<EditorContextConfig>,
     /// The rendered slice appended to the system prompt; also counted by
     /// the context estimator — a ~1k-token block compaction can't see would
     /// silently eat the window's headroom.
@@ -169,6 +174,12 @@ pub struct Agent {
     /// `AGENTS.md` — re-rendered once per turn by `refresh_agents_files`,
     /// mirroring `repo_map_text`'s own per-turn cadence.
     agents_files_text: Option<String>,
+    /// One-line "currently open in editor" status, re-rendered once per
+    /// turn by `refresh_editor_context` — same per-turn cadence as
+    /// `agents_files_text`/`repo_map_text`. Metadata only, deliberately —
+    /// see the module doc on `editor_context` for why file content never
+    /// flows through this field.
+    editor_context_text: Option<String>,
     edit_format: EditFormat,
     /// Monotonic id source for tool calls synthesized from SEARCH/REPLACE
     /// blocks — they need ids that can't collide with the backend's.
@@ -239,8 +250,10 @@ impl Agent {
             last_turn_paused: false,
             repo_map: None,
             agents_file_config: None,
+            editor_context_config: None,
             repo_map_text: None,
             agents_files_text: None,
+            editor_context_text: None,
             edit_format: config.edit_format,
             synthetic_seq: 0,
             council: None,
@@ -309,6 +322,72 @@ impl Agent {
         self.agents_file_config = Some(AgentsFileConfig {
             global_path,
             budget_tokens,
+        });
+    }
+
+    /// Enables editor-context awareness: a per-project JSON file an editor
+    /// integration writes to (see the `editor_context` module), re-read
+    /// and surfaced as a one-line system-prompt addition every turn.
+    /// `deny_paths` is checked against the reported file path before it's
+    /// ever surfaced, same as every other path-reporting tool in this
+    /// project.
+    pub fn set_editor_context(&mut self, deny_paths: Vec<PathBuf>) {
+        self.editor_context_config = Some(EditorContextConfig { deny_paths });
+    }
+
+    /// Re-reads the editor-context file (if configured) and stores a
+    /// one-line "currently open in editor" status, or clears it to `None`
+    /// on any of: feature disabled, file missing/unreadable/malformed,
+    /// unrecognized `schema_version`, stale `updated_at` (>5 minutes old),
+    /// `workspace_root` not matching this session's own `cwd`, or the
+    /// reported file falling under a configured `deny_paths` entry. None
+    /// of these are user-facing notices — an editor integration not
+    /// running, or a stale leftover file, is a normal silent state, not a
+    /// misconfiguration (unlike `AGENTS.md`'s over-budget notice).
+    async fn refresh_editor_context(&mut self, cwd: &Path) {
+        self.editor_context_text = None;
+
+        let Some(config) = &self.editor_context_config else {
+            return;
+        };
+        let Some(path) = editor_context::editor_context_file_path(cwd) else {
+            return;
+        };
+        let Some(context) = editor_context::read_editor_context(&path).await else {
+            return;
+        };
+        if context.schema_version != editor_context::SCHEMA_VERSION {
+            return;
+        }
+        if OffsetDateTime::now_utc() - context.updated_at > time::Duration::minutes(5) {
+            return;
+        }
+
+        let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let canonical_root = context
+            .workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| context.workspace_root.clone());
+        if canonical_root != canonical_cwd {
+            return;
+        }
+
+        let resolved_file = context.workspace_root.join(&context.file);
+        if aivyx_sandbox::path_is_denied(&resolved_file, &config.deny_paths) {
+            return;
+        }
+
+        let file_display = context.file.display();
+        self.editor_context_text = Some(match &context.selection {
+            None => format!(
+                "Currently open in editor: {file_display}, cursor at line {}.",
+                context.cursor.line
+            ),
+            Some(sel) => format!(
+                "Currently open in editor: {file_display}, cursor at line {}, with lines \
+                 {}-{} selected.",
+                context.cursor.line, sel.start_line, sel.end_line
+            ),
         });
     }
 
@@ -451,6 +530,10 @@ impl Agent {
             system.push_str("\n\n");
             system.push_str(map);
         }
+        if let Some(text) = &self.editor_context_text {
+            system.push_str("\n\n");
+            system.push_str(text);
+        }
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::text(Role::System, system));
         messages.extend(self.history.iter().cloned());
@@ -466,6 +549,10 @@ impl Agent {
             + self.repo_map_text.as_ref().map_or(0, |m| m.chars().count())
             + self
                 .agents_files_text
+                .as_ref()
+                .map_or(0, |m| m.chars().count())
+            + self
+                .editor_context_text
                 .as_ref()
                 .map_or(0, |m| m.chars().count())
     }
@@ -910,6 +997,7 @@ impl Agent {
         // add latency exactly where slow local models already hurt.
         self.refresh_repo_map().await;
         self.refresh_agents_files(cwd).await;
+        self.refresh_editor_context(cwd).await;
 
         for iteration in 1..=self.max_tool_iterations {
             if cancellation.is_cancelled() {

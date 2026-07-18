@@ -122,3 +122,13 @@ pub(crate) struct AgentsFileConfig {
     pub(crate) global_path: Option<PathBuf>,
     pub(crate) budget_tokens: u32,
 }
+
+/// `deny_paths` needed to check a reported editor-context file path before
+/// surfacing it — see `Agent::refresh_editor_context`. No budget/enable
+/// fields here: unlike `AGENTS.md`, there's no token-budget concept for a
+/// one-line status string, and `Some`/`None` on the outer
+/// `editor_context_config` field is itself the enable/disable signal,
+/// mirroring `AgentsFileConfig`'s own pattern.
+pub(crate) struct EditorContextConfig {
+    pub(crate) deny_paths: Vec<PathBuf>,
+}

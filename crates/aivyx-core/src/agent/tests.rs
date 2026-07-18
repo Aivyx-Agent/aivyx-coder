@@ -974,6 +974,345 @@ async fn an_unreadable_project_path_degrades_gracefully() {
 }
 
 #[tokio::test]
+async fn editor_context_not_configured_injects_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("Currently open in editor"));
+}
+
+#[tokio::test]
+async fn editor_context_surfaces_a_valid_matching_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"src/foo.rs","cursor":{{"line":42,"column":8}},"updated_at":"{now}"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("Currently open in editor: src/foo.rs, cursor at line 42."));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_surfaces_selection_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"src/foo.rs","cursor":{{"line":42,"column":8}},"selection":{{"start_line":40,"end_line":45}},"updated_at":"{now}"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains(
+        "Currently open in editor: src/foo.rs, cursor at line 42, with lines 40-45 selected."
+    ));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_ignores_a_stale_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"src/foo.rs","cursor":{{"line":1,"column":1}},"updated_at":"2020-01-01T00:00:00Z"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("Currently open in editor"));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_ignores_a_workspace_root_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"src/foo.rs","cursor":{{"line":1,"column":1}},"updated_at":"{now}"}}"#,
+            other_dir.path().canonicalize().unwrap().display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("Currently open in editor"));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_ignores_a_wrong_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":99,"workspace_root":"{}","file":"src/foo.rs","cursor":{{"line":1,"column":1}},"updated_at":"{now}"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("Currently open in editor"));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_ignores_a_denied_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"secret/foo.rs","cursor":{{"line":1,"column":1}},"updated_at":"{now}"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![canonical_dir.join("secret")]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("Currently open in editor"));
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
+async fn editor_context_injection_never_contains_file_content() {
+    // Security regression guard for spec Decision 5: writes a real file
+    // with real "secret" content on disk, points a valid context file at
+    // it, runs a real turn, and confirms the actual content never reaches
+    // the system prompt sent to the backend — only the path/line/column
+    // metadata does. This exercises the real read-and-format path (not a
+    // hand-set field), so it would actually catch a future regression
+    // where someone "helpfully" adds the selected text to the injected
+    // string.
+    let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    std::fs::write(
+        canonical_dir.join("secret.rs"),
+        "fn leaked_super_secret_function() {}",
+    )
+    .unwrap();
+    let context_path = crate::editor_context::editor_context_file_path(&canonical_dir)
+        .expect("state dir should exist in tests");
+    tokio::fs::create_dir_all(context_path.parent().unwrap())
+        .await
+        .unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    tokio::fs::write(
+        &context_path,
+        format!(
+            r#"{{"schema_version":1,"workspace_root":"{}","file":"secret.rs","cursor":{{"line":1,"column":1}},"updated_at":"{now}"}}"#,
+            canonical_dir.display()
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_editor_context(vec![]);
+
+    agent
+        .run_turn("hi".to_string(), &canonical_dir, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("secret.rs"));
+    assert!(
+        !system.contains("leaked_super_secret_function"),
+        "must never inject raw file content into the system prompt"
+    );
+
+    tokio::fs::remove_file(&context_path).await.ok();
+}
+
+#[tokio::test]
 async fn usage_arriving_after_done_is_still_surfaced() {
     // The shape real OpenAI-compatible servers (incl. Ollama) produce
     // with `stream_options.include_usage`: the usage chunk trails the
