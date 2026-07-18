@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 use crate::edit_blocks::{self, BlockParse};
 use crate::session::{self, SessionState, Task};
 
-mod types;
 #[cfg(test)]
 mod tests;
+mod types;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
 use types::{AgentsFileConfig, VerificationConfig};
@@ -354,10 +354,7 @@ impl Agent {
                 if content.chars().count() > budget_chars {
                     over_budget_labels.push("user-level AGENTS.md");
                 }
-                sections.push(format!(
-                    "User preferences ({}):\n{content}",
-                    path.display()
-                ));
+                sections.push(format!("User preferences ({}):\n{content}", path.display()));
             }
         }
 
@@ -467,7 +464,10 @@ impl Agent {
     fn prompt_chars(&self) -> usize {
         message_chars(&self.system_prompt, &self.history)
             + self.repo_map_text.as_ref().map_or(0, |m| m.chars().count())
-            + self.agents_files_text.as_ref().map_or(0, |m| m.chars().count())
+            + self
+                .agents_files_text
+                .as_ref()
+                .map_or(0, |m| m.chars().count())
     }
 
     /// Rough token estimate for the current prompt, using the
@@ -571,7 +571,8 @@ impl Agent {
             .dispatch(call, cwd, cancellation.clone())
             .await;
         self.emit(AgentEvent::ToolResult(result.clone()));
-        let passed = matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+        let passed =
+            matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
         self.history.push(Message {
             role: Role::Tool,
             tool_call_id: Some(result.call_id.clone()),
@@ -701,8 +702,7 @@ impl Agent {
 
         self.refresh_repo_map().await;
         let architect = self.architect.as_ref().expect("checked above");
-        let budget_chars =
-            (architect.tail_budget_tokens as f64 * self.chars_per_token) as usize;
+        let budget_chars = (architect.tail_budget_tokens as f64 * self.chars_per_token) as usize;
         let digest = crate::council::tail_digest(&self.history, budget_chars);
 
         let mut context = String::new();
@@ -713,17 +713,15 @@ impl Agent {
         if let Some(digest) = &digest {
             context.push_str(digest);
         }
-        let context = if context.is_empty() { None } else { Some(context) };
+        let context = if context.is_empty() {
+            None
+        } else {
+            Some(context)
+        };
 
         let seat = &self.architect.as_ref().expect("checked above").seat;
-        let plan_text = crate::architect::plan(
-            seat,
-            subject,
-            context,
-            &self.events_tx,
-            &cancellation,
-        )
-        .await;
+        let plan_text =
+            crate::architect::plan(seat, subject, context, &self.events_tx, &cancellation).await;
 
         let Some(plan_text) = plan_text else {
             self.emit(AgentEvent::TurnComplete);
@@ -835,7 +833,9 @@ impl Agent {
             );
 
             self.last_turn_paused = false;
-            let mut result = self.run_turn_inner(instruction, cwd, cancellation.clone()).await;
+            let mut result = self
+                .run_turn_inner(instruction, cwd, cancellation.clone())
+                .await;
             let mut continuations_sent = 0u32;
             while result.is_ok() && self.last_turn_paused && !cancellation.is_cancelled() {
                 if continuations_sent >= MAX_WIKI_PAGE_CONTINUATIONS {
@@ -871,9 +871,14 @@ impl Agent {
                 continue;
             }
 
-            if let Err(err) =
-                aivyx_tools::wiki::stamp_page(&wiki_dir, cwd, &page.name, &page.covers, &cancellation)
-                    .await
+            if let Err(err) = aivyx_tools::wiki::stamp_page(
+                &wiki_dir,
+                cwd,
+                &page.name,
+                &page.covers,
+                &cancellation,
+            )
+            .await
             {
                 self.emit(AgentEvent::Error(format!(
                     "page `{}` did not save correctly ({err}) — it will be retried on the next \

@@ -1,1014 +1,292 @@
-    use super::*;
-    use std::collections::VecDeque;
-    use std::time::Duration;
+use super::*;
+use std::collections::VecDeque;
+use std::time::Duration;
 
-    use aivyx_llm::LlmError;
-    use aivyx_sandbox::{
-        ActionKind, AutonomousMode, ExecutionConfiner, NoopConfiner, PermissionDecision,
-        PermissionGate, PermissionRequest, PermissionTarget, PlanMode,
-    };
-    use aivyx_tools::{CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry};
-    use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
-    use futures::stream::BoxStream;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use aivyx_llm::LlmError;
+use aivyx_sandbox::{
+    ActionKind, AutonomousMode, ExecutionConfiner, NoopConfiner, PermissionDecision,
+    PermissionGate, PermissionRequest, PermissionTarget, PlanMode,
+};
+use aivyx_tools::{
+    CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry,
+};
+use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
+use futures::stream::BoxStream;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-    /// Scriptable `LlmBackend`: each `stream_chat` pops the next scripted
-    /// response (a whole `Vec<StreamEvent>`) and streams it, and records the
-    /// request it received so tests can assert on what history was actually
-    /// sent (used heavily once compaction lands). An exhausted queue streams
-    /// nothing — the loop then sees a response with no tool calls and ends.
-    struct MockBackend {
-        responses: Mutex<VecDeque<Vec<StreamEvent>>>,
-        received: Mutex<Vec<ChatRequest>>,
+/// Scriptable `LlmBackend`: each `stream_chat` pops the next scripted
+/// response (a whole `Vec<StreamEvent>`) and streams it, and records the
+/// request it received so tests can assert on what history was actually
+/// sent (used heavily once compaction lands). An exhausted queue streams
+/// nothing — the loop then sees a response with no tool calls and ends.
+struct MockBackend {
+    responses: Mutex<VecDeque<Vec<StreamEvent>>>,
+    received: Mutex<Vec<ChatRequest>>,
+}
+
+impl MockBackend {
+    fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+            received: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmBackend for MockBackend {
+    fn model_id(&self) -> &str {
+        "mock"
     }
 
-    impl MockBackend {
-        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
-            Self {
-                responses: Mutex::new(responses.into()),
-                received: Mutex::new(Vec::new()),
-            }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        self.received.lock().unwrap().push(request);
+        let events = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default();
+        Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
+    }
+}
+
+/// Gate that allows everything — the loop tests are about loop mechanics,
+/// not permission decisions (those have their own tests in aivyx-sandbox).
+struct AllowAllGate;
+
+#[async_trait::async_trait]
+impl PermissionGate for AllowAllGate {
+    async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+}
+
+/// A tool whose only effect is to cancel the run's cancellation token —
+/// lets a test deterministically trigger the mid-dispatch cancellation
+/// checkpoint (the token becomes cancelled *during* the dispatch loop, so
+/// any remaining calls in the same response must be recorded as skipped).
+struct CancelTool;
+
+#[async_trait::async_trait]
+impl Tool for CancelTool {
+    fn name(&self) -> &str {
+        "cancel_tool"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "cancel_tool".to_string(),
+            description: "test".to_string(),
+            parameters_schema: serde_json::json!({}),
         }
     }
 
-    #[async_trait::async_trait]
-    impl LlmBackend for MockBackend {
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-
-        async fn stream_chat(
-            &self,
-            request: ChatRequest,
-        ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
-            self.received.lock().unwrap().push(request);
-            let events = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default();
-            Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
-        }
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "cancel_tool".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Other("cancel".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+        })
     }
 
-    /// Gate that allows everything — the loop tests are about loop mechanics,
-    /// not permission decisions (those have their own tests in aivyx-sandbox).
-    struct AllowAllGate;
-
-    #[async_trait::async_trait]
-    impl PermissionGate for AllowAllGate {
-        async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
-            PermissionDecision::Allow
-        }
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        ctx.cancellation.cancel();
+        Ok(ToolOutput::Ok("cancelled the token".to_string()))
     }
+}
 
-    /// A tool whose only effect is to cancel the run's cancellation token —
-    /// lets a test deterministically trigger the mid-dispatch cancellation
-    /// checkpoint (the token becomes cancelled *during* the dispatch loop, so
-    /// any remaining calls in the same response must be recorded as skipped).
-    struct CancelTool;
-
-    #[async_trait::async_trait]
-    impl Tool for CancelTool {
-        fn name(&self) -> &str {
-            "cancel_tool"
-        }
-
-        fn definition(&self) -> ToolDefinition {
-            ToolDefinition {
-                name: "cancel_tool".to_string(),
-                description: "test".to_string(),
-                parameters_schema: serde_json::json!({}),
-            }
-        }
-
-        fn permission_request(
-            &self,
-            _arguments: &serde_json::Value,
-            _cwd: &Path,
-        ) -> Result<PermissionRequest, ToolError> {
-            Ok(PermissionRequest {
-                tool_name: "cancel_tool".to_string(),
-                action: ActionKind::Execute,
-                target: PermissionTarget::Other("cancel".to_string()),
-                arguments_preview: serde_json::json!({}),
-                preview: None,
-            })
-        }
-
-        async fn execute(
-            &self,
-            _arguments: serde_json::Value,
-            ctx: &ToolExecutionContext,
-        ) -> Result<ToolOutput, ToolError> {
-            ctx.cancellation.cancel();
-            Ok(ToolOutput::Ok("cancelled the token".to_string()))
-        }
+fn tool_call(id: &str, name: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.to_string()),
+        name: name.to_string(),
+        arguments: serde_json::json!({}),
+        source: ToolCallSource::Native,
     }
+}
 
-    fn tool_call(id: &str, name: &str) -> ToolCall {
-        ToolCall {
-            id: ToolCallId(id.to_string()),
-            name: name.to_string(),
-            arguments: serde_json::json!({}),
-            source: ToolCallSource::Native,
-        }
+fn user_msg(text: &str) -> Message {
+    Message::text(Role::User, text)
+}
+
+fn assistant_msg(text: &str) -> Message {
+    Message::text(Role::Assistant, text)
+}
+
+fn ok_tool_result_msg(id: &str, text: &str) -> Message {
+    Message {
+        role: Role::Tool,
+        tool_call_id: Some(ToolCallId(id.to_string())),
+        content: vec![ContentBlock::ToolResult(ToolResult {
+            call_id: ToolCallId(id.to_string()),
+            output: ToolOutput::Ok(text.to_string()),
+        })],
     }
+}
 
-    fn user_msg(text: &str) -> Message {
-        Message::text(Role::User, text)
-    }
+fn build_agent_with_config(
+    responses: Vec<Vec<StreamEvent>>,
+    registry: ToolRegistry,
+    config: AgentConfig,
+) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
+    let (tx, rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(responses));
+    let llm: std::sync::Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        config,
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    (agent, rx, mock)
+}
 
-    fn assistant_msg(text: &str) -> Message {
-        Message::text(Role::Assistant, text)
-    }
-
-    fn ok_tool_result_msg(id: &str, text: &str) -> Message {
-        Message {
-            role: Role::Tool,
-            tool_call_id: Some(ToolCallId(id.to_string())),
-            content: vec![ContentBlock::ToolResult(ToolResult {
-                call_id: ToolCallId(id.to_string()),
-                output: ToolOutput::Ok(text.to_string()),
-            })],
-        }
-    }
-
-    fn build_agent_with_config(
-        responses: Vec<Vec<StreamEvent>>,
-        registry: ToolRegistry,
-        config: AgentConfig,
-    ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
-        let (tx, rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(responses));
-        let llm: std::sync::Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            config,
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
-        (agent, rx, mock)
-    }
-
-    fn build_agent(
-        responses: Vec<Vec<StreamEvent>>,
-        registry: ToolRegistry,
-        max_iters: u32,
-    ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
-        build_agent_with_config(
-            responses,
-            registry,
-            AgentConfig {
-                max_tool_iterations: max_iters,
-                ..Default::default()
-            },
-        )
-    }
-
-    fn prompted_config() -> AgentConfig {
+fn build_agent(
+    responses: Vec<Vec<StreamEvent>>,
+    registry: ToolRegistry,
+    max_iters: u32,
+) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
+    build_agent_with_config(
+        responses,
+        registry,
         AgentConfig {
-            edit_format: EditFormat::Prompted,
+            max_tool_iterations: max_iters,
             ..Default::default()
-        }
-    }
+        },
+    )
+}
 
-    fn text_response(text: &str) -> Vec<StreamEvent> {
-        vec![
-            StreamEvent::TextDelta(text.to_string()),
+fn prompted_config() -> AgentConfig {
+    AgentConfig {
+        edit_format: EditFormat::Prompted,
+        ..Default::default()
+    }
+}
+
+fn text_response(text: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::TextDelta(text.to_string()),
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ]
+}
+
+fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        out.push(event);
+    }
+    out
+}
+
+fn count_tool_calls(history: &[Message]) -> usize {
+    history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::ToolCall(_)))
+        .count()
+}
+
+fn count_tool_results(history: &[Message]) -> usize {
+    history.iter().filter(|m| m.role == Role::Tool).count()
+}
+
+fn count_denied_containing(history: &[Message], needle: &str) -> usize {
+    history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolResult(ToolResult { output: ToolOutput::Denied(msg), .. })
+                    if msg.contains(needle)
+            )
+        })
+        .count()
+}
+
+#[test]
+fn notify_emits_an_error_event_with_the_given_message() {
+    // `notify` is the autonomous driver's only way to report why it
+    // stopped (goal achieved / budget exhausted / cancelled) — it must
+    // reach the same channel the TUI's render loop already drains into
+    // the transcript, via the existing `AgentEvent::Error` ->
+    // `ChatLine::Notice` mapping in `aivyx-tui`.
+    let (agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+
+    agent.notify("autonomous run stopped: goal achieved after 3 iteration(s)");
+
+    let events = drain(&mut rx);
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::Error(message)]
+            if message == "autonomous run stopped: goal achieved after 3 iteration(s)"
+    ));
+}
+
+#[tokio::test]
+async fn plain_text_response_completes_the_turn() {
+    let (mut agent, mut rx, _) = build_agent(
+        vec![vec![
+            StreamEvent::TextDelta("hi there".to_string()),
             StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
             },
-        ]
-    }
+        ]],
+        ToolRegistry::new(),
+        10,
+    );
 
-    fn drain(rx: &mut UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            out.push(event);
-        }
-        out
-    }
-
-    fn count_tool_calls(history: &[Message]) -> usize {
-        history
-            .iter()
-            .flat_map(|m| &m.content)
-            .filter(|b| matches!(b, ContentBlock::ToolCall(_)))
-            .count()
-    }
-
-    fn count_tool_results(history: &[Message]) -> usize {
-        history.iter().filter(|m| m.role == Role::Tool).count()
-    }
-
-    fn count_denied_containing(history: &[Message], needle: &str) -> usize {
-        history
-            .iter()
-            .flat_map(|m| &m.content)
-            .filter(|b| {
-                matches!(
-                    b,
-                    ContentBlock::ToolResult(ToolResult { output: ToolOutput::Denied(msg), .. })
-                        if msg.contains(needle)
-                )
-            })
-            .count()
-    }
-
-    #[test]
-    fn notify_emits_an_error_event_with_the_given_message() {
-        // `notify` is the autonomous driver's only way to report why it
-        // stopped (goal achieved / budget exhausted / cancelled) — it must
-        // reach the same channel the TUI's render loop already drains into
-        // the transcript, via the existing `AgentEvent::Error` ->
-        // `ChatLine::Notice` mapping in `aivyx-tui`.
-        let (agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-
-        agent.notify("autonomous run stopped: goal achieved after 3 iteration(s)");
-
-        let events = drain(&mut rx);
-        assert!(matches!(
-            events.as_slice(),
-            [AgentEvent::Error(message)]
-                if message == "autonomous run stopped: goal achieved after 3 iteration(s)"
-        ));
-    }
-
-    #[tokio::test]
-    async fn plain_text_response_completes_the_turn() {
-        let (mut agent, mut rx, _) = build_agent(
-            vec![vec![
-                StreamEvent::TextDelta("hi there".to_string()),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                },
-            ]],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn(
-                "hello".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(agent.history.len(), 2);
-        assert_eq!(agent.history[0].role, Role::User);
-        assert_eq!(agent.history[1].role, Role::Assistant);
-        assert_eq!(agent.history[1].text_content(), "hi there");
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::TurnComplete))
-        );
-    }
-
-    #[tokio::test]
-    async fn tool_call_then_final_answer_produces_balanced_history() {
-        // The tool is unregistered, so dispatch returns a NotFound error
-        // result — enough to exercise the full assistant-toolcall -> dispatch
-        // -> tool-result -> next-iteration mechanic and its balance invariant.
-        let (mut agent, _rx, _) = build_agent(
-            vec![
-                vec![
-                    StreamEvent::ToolCallComplete(tool_call("c1", "read_file")),
-                    StreamEvent::Done {
-                        finish_reason: FinishReason::ToolCalls,
-                    },
-                ],
-                vec![
-                    StreamEvent::TextDelta("done".to_string()),
-                    StreamEvent::Done {
-                        finish_reason: FinishReason::Stop,
-                    },
-                ],
-            ],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(count_tool_calls(&agent.history), 1);
-        assert_eq!(count_tool_results(&agent.history), 1);
-        assert_eq!(agent.history.last().unwrap().text_content(), "done");
-    }
-
-    #[tokio::test]
-    async fn too_many_tool_calls_in_one_response_are_capped_but_all_recorded() {
-        let mut first: Vec<StreamEvent> = (0..25)
-            .map(|i| StreamEvent::ToolCallComplete(tool_call(&format!("c{i}"), "read_file")))
-            .collect();
-        first.push(StreamEvent::Done {
-            finish_reason: FinishReason::ToolCalls,
-        });
-        let (mut agent, _rx, _) = build_agent(
-            vec![
-                first,
-                vec![StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                }],
-            ],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        // Every call still gets a matching result (invariant preserved)...
-        assert_eq!(count_tool_results(&agent.history), 25);
-        // ...but only the first MAX_TOOL_CALLS_PER_RESPONSE actually ran; the
-        // remaining 5 are recorded as skipped.
-        assert_eq!(
-            count_denied_containing(&agent.history, "too many tool calls"),
-            25 - MAX_TOOL_CALLS_PER_RESPONSE
-        );
-    }
-
-    #[tokio::test]
-    async fn truncated_response_surfaces_an_error_event() {
-        let (mut agent, mut rx, _) = build_agent(
-            vec![vec![
-                StreamEvent::TextDelta("partial".to_string()),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::Length,
-                },
-            ]],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Error(msg) if msg.contains("truncated")))
-        );
-    }
-
-    #[tokio::test]
-    async fn usage_is_surfaced_as_a_context_usage_event() {
-        let (mut agent, mut rx, _) = build_agent(
-            vec![vec![
-                StreamEvent::Usage {
-                    prompt_tokens: 1234,
-                    completion_tokens: 56,
-                },
-                StreamEvent::TextDelta("ok".to_string()),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                },
-            ]],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(drain(&mut rx).iter().any(|e| matches!(
-            e,
-            AgentEvent::ContextUsage {
-                used: 1234,
-                limit: 8192
-            }
-        )));
-    }
-
-    #[tokio::test]
-    async fn plan_mode_filters_tools_and_annotates_the_system_prompt_per_request() {
-        // Two turns against the same agent: one with plan mode on, one after
-        // toggling it off — the request the backend actually receives must
-        // flip both the tool list and the system-prompt note, proving the
-        // flag is consulted per-request rather than latched at construction.
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-
-        let (tx, _rx) = unbounded_channel();
-        let stop = || {
-            vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]
-        };
-        let mock = Arc::new(MockBackend::new(vec![stop(), stop()]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let plan_mode = PlanMode::new();
-        plan_mode.set_active(true);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 10,
-                ..Default::default()
-            },
-            Arc::default(),
-            plan_mode.clone(),
-            AutonomousMode::new(),
-            tx,
-        );
-
-        agent
-            .run_turn("plan".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-        plan_mode.set_active(false);
-        agent
-            .run_turn("act".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let plan_tools: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
-        let act_tools: Vec<&str> = received[1].tools.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(plan_tools, vec!["read_file"]);
-        assert_eq!(act_tools, vec!["read_file", "write_file"]);
-
-        let plan_system = received[0].messages[0].text_content();
-        let act_system = received[1].messages[0].text_content();
-        assert!(plan_system.contains("PLAN MODE"));
-        assert!(!act_system.contains("PLAN MODE"));
-    }
-
-    #[tokio::test]
-    async fn prompted_blocks_apply_through_the_normal_tool_path() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("target.rs"),
-            "fn old_name() {}\nfn other() {}\n",
+    agent
+        .run_turn(
+            "hello".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
         )
-        .unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::EditFileTool));
-
-        let block = "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn renamed() {}\n>>>>>>> REPLACE";
-        let (mut agent, _rx, mock) = build_agent_with_config(
-            vec![text_response(block), text_response("done")],
-            registry,
-            prompted_config(),
-        );
-
-        agent
-            .run_turn(
-                "rename it".to_string(),
-                dir.path(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join("target.rs")).unwrap();
-        assert!(
-            content.contains("fn renamed()"),
-            "edit not applied: {content}"
-        );
-        assert!(content.contains("fn other()"));
-        // The synthesized call is in history, marked TextFallback, balanced
-        // by its result — and the loop continued for a second round-trip.
-        assert_eq!(count_tool_calls(&agent.history), 1);
-        assert_eq!(count_tool_results(&agent.history), 1);
-        let synthetic = agent
-            .history
-            .iter()
-            .flat_map(|m| &m.content)
-            .find_map(|b| match b {
-                ContentBlock::ToolCall(c) => Some(c),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(synthetic.source, ToolCallSource::TextFallback);
-        assert_eq!(mock.received.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn empty_search_block_creates_a_new_file_via_write_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-
-        let block = "fresh.txt\n<<<<<<< SEARCH\n=======\nhello world\n>>>>>>> REPLACE";
-        let (mut agent, _rx, _) = build_agent_with_config(
-            vec![text_response(block), text_response("done")],
-            registry,
-            prompted_config(),
-        );
-
-        agent
-            .run_turn(
-                "create it".to_string(),
-                dir.path(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(),
-            "hello world\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn malformed_block_feeds_an_error_back_and_the_turn_continues() {
-        let broken = "target.rs\n<<<<<<< SEARCH\nfn a() {}\n=======\nfn b() {}\n"; // no terminator
-        let (mut agent, _rx, mock) = build_agent_with_config(
-            vec![text_response(broken), text_response("understood")],
-            ToolRegistry::new(),
-            prompted_config(),
-        );
-
-        agent
-            .run_turn("edit".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            count_denied_containing(&agent.history, "malformed SEARCH/REPLACE"),
-            1
-        );
-        // The feedback drove a second round-trip instead of ending the turn.
-        assert_eq!(mock.received.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn native_mode_never_parses_block_syntax_out_of_text() {
-        // A model quoting the format in conversation (or a file containing
-        // markers being discussed) must not trigger edits in native mode.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("target.rs"), "fn old_name() {}\n").unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::EditFileTool));
-
-        let block = "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn changed() {}\n>>>>>>> REPLACE";
-        let (mut agent, _rx, mock) =
-            build_agent_with_config(vec![text_response(block)], registry, AgentConfig::default());
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(count_tool_calls(&agent.history), 0);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("target.rs")).unwrap(),
-            "fn old_name() {}\n"
-        );
-        assert_eq!(mock.received.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn prompted_mode_hides_edit_tools_and_teaches_the_block_format() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        registry.register(Arc::new(aivyx_tools::EditFileTool));
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-
-        let (mut agent, _rx, mock) =
-            build_agent_with_config(vec![text_response("hello")], registry, prompted_config());
-
-        agent
-            .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(tool_names, vec!["read_file"]);
-        assert!(
-            received[0].messages[0]
-                .text_content()
-                .contains("SEARCH/REPLACE")
-        );
-    }
-
-    #[tokio::test]
-    async fn repo_map_is_rendered_into_the_system_prompt_and_counted_by_the_estimator() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("widget.rs"),
-            "pub fn extremely_distinctive_symbol() {}\n",
-        )
+        .await
         .unwrap();
 
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_repo_map(
-            Arc::new(aivyx_repomap::RepoMap::new(
-                dir.path().to_path_buf(),
-                vec![],
-            )),
-            1000,
-        );
-        let chars_without_map = agent.prompt_chars();
-
-        agent
-            .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(system.contains("Repository map"));
-        assert!(system.contains("extremely_distinctive_symbol"));
-        // The estimator must see the map's weight, or compaction would run
-        // blind to a block that's present in every request.
-        assert!(agent.prompt_chars() > chars_without_map + 50);
-    }
-
-    fn agents_file_notes(events: &[AgentEvent]) -> Vec<&str> {
-        events
+    assert_eq!(agent.history.len(), 2);
+    assert_eq!(agent.history[0].role, Role::User);
+    assert_eq!(agent.history[1].role, Role::Assistant);
+    assert_eq!(agent.history[1].text_content(), "hi there");
+    assert!(
+        drain(&mut rx)
             .iter()
-            .filter_map(|e| match e {
-                AgentEvent::Error(text) if text.contains("AGENTS.md") => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
+            .any(|e| matches!(e, AgentEvent::TurnComplete))
+    );
+}
 
-    #[tokio::test]
-    async fn project_only_agents_md_is_injected_with_no_precedence_note() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("AGENTS.md"),
-            "Use tabs, not spaces, in this project.",
-        )
-        .unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(system.contains("Project instructions (AGENTS.md):"));
-        assert!(system.contains("Use tabs, not spaces, in this project."));
-        assert!(!system.contains("User preferences"));
-        assert!(!system.contains("take precedence"));
-    }
-
-    #[tokio::test]
-    async fn global_only_agents_md_is_injected_with_no_precedence_note() {
-        let dir = tempfile::tempdir().unwrap();
-        let global_dir = tempfile::tempdir().unwrap();
-        let global_path = global_dir.path().join("AGENTS.md");
-        std::fs::write(&global_path, "Always write terse commit messages.").unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(Some(global_path), 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(system.contains("User preferences ("));
-        assert!(system.contains("Always write terse commit messages."));
-        assert!(!system.contains("Project instructions (AGENTS.md):"));
-        assert!(!system.contains("take precedence"));
-    }
-
-    #[tokio::test]
-    async fn neither_file_present_injects_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let global_dir = tempfile::tempdir().unwrap();
-        let global_path = global_dir.path().join("AGENTS.md");
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(Some(global_path), 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(!system.contains("AGENTS.md"));
-        assert!(!system.contains("User preferences"));
-    }
-
-    #[tokio::test]
-    async fn both_files_present_orders_global_first_with_precedence_note() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "PROJECT_MARKER_TEXT").unwrap();
-        let global_dir = tempfile::tempdir().unwrap();
-        let global_path = global_dir.path().join("AGENTS.md");
-        std::fs::write(&global_path, "GLOBAL_MARKER_TEXT").unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(Some(global_path), 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(system.contains("User preferences ("));
-        assert!(system.contains("Project instructions (AGENTS.md):"));
-        assert!(system.contains("take precedence"));
-        let global_index = system.find("GLOBAL_MARKER_TEXT").unwrap();
-        let project_index = system.find("PROJECT_MARKER_TEXT").unwrap();
-        assert!(
-            global_index < project_index,
-            "global content must appear before project content"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_file_over_budget_is_included_in_full_and_triggers_one_notice() {
-        let dir = tempfile::tempdir().unwrap();
-        // ~1024 chars of 'x' — comfortably over an intentionally tiny
-        // 5-token budget (5 tokens * DEFAULT_CHARS_PER_TOKEN(4.0) = 20 chars).
-        let long_content = "x".repeat(1024);
-        std::fs::write(dir.path().join("AGENTS.md"), &long_content).unwrap();
-
-        let (mut agent, mut rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 5);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(
-            system.contains(&long_content),
-            "the full over-budget content must still be included"
-        );
-
-        let events = drain(&mut rx);
-        let notes = agents_file_notes(&events);
-        assert_eq!(notes.len(), 1, "expected exactly one over-budget notice");
-        assert!(notes[0].contains("project AGENTS.md"));
-    }
-
-    #[tokio::test]
-    async fn a_file_within_budget_triggers_no_notice() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "short").unwrap();
-
-        let (mut agent, mut rx, _mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(agents_file_notes(&events).is_empty());
-    }
-
-    #[tokio::test]
-    async fn editing_the_file_between_turns_changes_the_next_turns_prompt() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "FIRST_VERSION").unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
+#[tokio::test]
+async fn tool_call_then_final_answer_produces_balanced_history() {
+    // The tool is unregistered, so dispatch returns a NotFound error
+    // result — enough to exercise the full assistant-toolcall -> dispatch
+    // -> tool-result -> next-iteration mechanic and its balance invariant.
+    let (mut agent, _rx, _) = build_agent(
+        vec![
             vec![
-                vec![StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                }],
-                vec![StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                }],
-            ],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 1024);
-
-        agent
-            .run_turn("first".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "SECOND_VERSION").unwrap();
-        agent
-            .run_turn("second".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        assert!(received[0].messages[0].text_content().contains("FIRST_VERSION"));
-        assert!(received[1].messages[0].text_content().contains("SECOND_VERSION"));
-        assert!(!received[1].messages[0].text_content().contains("FIRST_VERSION"));
-    }
-
-    #[tokio::test]
-    async fn agents_files_text_is_counted_by_the_size_estimator() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("AGENTS.md"),
-            "a very distinctive block of project guidance text that is not tiny",
-        )
-        .unwrap();
-
-        let (mut agent, _rx, _mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 1024);
-        let chars_without_file = agent.prompt_chars();
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(agent.prompt_chars() > chars_without_file + 30);
-    }
-
-    #[tokio::test]
-    async fn never_calling_set_agents_file_injects_nothing_even_if_files_exist() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "should never appear").unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        // Deliberately not calling agent.set_agents_file(...) — mirrors
-        // main.rs only calling it when settings.agents_file.enabled.
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        assert!(
-            !received[0]
-                .messages[0]
-                .text_content()
-                .contains("should never appear")
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_project_path_degrades_gracefully() {
-        let dir = tempfile::tempdir().unwrap();
-        // A directory named AGENTS.md instead of a file — read_to_string
-        // fails with a real I/O error (IsADirectory).
-        std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
-
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        agent.set_agents_file(None, 1024);
-
-        agent
-            .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        assert!(!received[0].messages[0].text_content().contains("AGENTS.md:"));
-    }
-
-    #[tokio::test]
-    async fn usage_arriving_after_done_is_still_surfaced() {
-        // The shape real OpenAI-compatible servers (incl. Ollama) produce
-        // with `stream_options.include_usage`: the usage chunk trails the
-        // finish_reason chunk. Regression test for the loop breaking on
-        // `Done` and losing the token counts — caught live, not by the
-        // original tests, which all put Usage before Done.
-        let (mut agent, mut rx, _) = build_agent(
-            vec![vec![
-                StreamEvent::TextDelta("ok".to_string()),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::Stop,
-                },
-                StreamEvent::Usage {
-                    prompt_tokens: 777,
-                    completion_tokens: 5,
-                },
-            ]],
-            ToolRegistry::new(),
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ContextUsage { used: 777, .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_set_tasks_call_surfaces_tasks_updated_and_persists_the_session() {
-        // The real `set_tasks` tool, wired the same way `main.rs` wires it:
-        // one shared handle given to both the tool and the agent — this test
-        // covers the whole loop (dispatch mutates the list, the agent
-        // notices, emits, and persists it with the turn).
-        let tasks: Arc<Mutex<Vec<Task>>> = Arc::default();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::SetTasksTool::new(Arc::clone(&tasks))));
-
-        let (tx, mut rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![
-            vec![
-                StreamEvent::ToolCallComplete(ToolCall {
-                    id: ToolCallId("c1".to_string()),
-                    name: "set_tasks".to_string(),
-                    arguments: serde_json::json!({ "tasks": [
-                        { "text": "step one", "status": "in_progress" },
-                    ]}),
-                    source: ToolCallSource::Native,
-                }),
+                StreamEvent::ToolCallComplete(tool_call("c1", "read_file")),
                 StreamEvent::Done {
                     finish_reason: FinishReason::ToolCalls,
                 },
@@ -1019,1532 +297,2349 @@
                     finish_reason: FinishReason::Stop,
                 },
             ],
-        ]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 10,
-                ..Default::default()
-            },
-            Arc::clone(&tasks),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
+        ],
+        ToolRegistry::new(),
+        10,
+    );
 
-        let dir = tempfile::tempdir().unwrap();
-        let session_path = dir.path().join("session.json");
-        agent.set_session_path(session_path.clone());
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
+    assert_eq!(count_tool_calls(&agent.history), 1);
+    assert_eq!(count_tool_results(&agent.history), 1);
+    assert_eq!(agent.history.last().unwrap().text_content(), "done");
+}
 
-        assert!(drain(&mut rx).iter().any(|e| matches!(
-            e,
-            AgentEvent::TasksUpdated(list) if list.len() == 1 && list[0].text == "step one"
-        )));
+#[tokio::test]
+async fn too_many_tool_calls_in_one_response_are_capped_but_all_recorded() {
+    let mut first: Vec<StreamEvent> = (0..25)
+        .map(|i| StreamEvent::ToolCallComplete(tool_call(&format!("c{i}"), "read_file")))
+        .collect();
+    first.push(StreamEvent::Done {
+        finish_reason: FinishReason::ToolCalls,
+    });
+    let (mut agent, _rx, _) = build_agent(
+        vec![
+            first,
+            vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }],
+        ],
+        ToolRegistry::new(),
+        10,
+    );
 
-        let saved = crate::session::load(&session_path).expect("session should have been saved");
-        assert_eq!(saved.tasks.len(), 1);
-        assert_eq!(
-            saved.tasks[0].status,
-            crate::session::TaskStatus::InProgress
-        );
-        // user, assistant (tool call), tool result, final assistant text.
-        assert_eq!(saved.history.len(), 4);
-    }
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn max_tool_iterations_pauses_the_turn_without_losing_history() {
-        // Both responses request a tool and never give a final answer, so the
-        // loop must stop at the iteration cap — as a pause (ROADMAP.md Phase
-        // 12 Part A), not an error: the turn itself must still return `Ok`.
-        let looping = || {
-            vec![
-                StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::ToolCalls,
-                },
-            ]
-        };
-        let (mut agent, mut rx, _) = build_agent(vec![looping(), looping()], ToolRegistry::new(), 2);
+    // Every call still gets a matching result (invariant preserved)...
+    assert_eq!(count_tool_results(&agent.history), 25);
+    // ...but only the first MAX_TOOL_CALLS_PER_RESPONSE actually ran; the
+    // remaining 5 are recorded as skipped.
+    assert_eq!(
+        count_denied_containing(&agent.history, "too many tool calls"),
+        25 - MAX_TOOL_CALLS_PER_RESPONSE
+    );
+}
 
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::TurnPaused(msg) if msg.contains("2-round-trip"))),
-            "expected a TurnPaused event, got {events:?}"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
-            "a paused turn must not also claim completion"
-        );
-        assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
-            "hitting the cap mid-work is a pause, not an error"
-        );
-        // Every dispatched tool call up to the cap still has a matching
-        // result — nothing lost by pausing instead of failing.
-        assert_eq!(count_tool_calls(&agent.history), 2);
-        assert_eq!(count_tool_results(&agent.history), 2);
-    }
-
-    #[tokio::test]
-    async fn a_paused_turn_resumes_cleanly_from_a_follow_up_message() {
-        // After pausing on the cap, the agent's history/session already hold
-        // everything dispatched so far; a plain follow-up `run_turn` call
-        // (exactly what an interactive user would send next) must continue
-        // the same conversation rather than starting over or erroring.
-        let looping = vec![
-            StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+#[tokio::test]
+async fn truncated_response_surfaces_an_error_event() {
+    let (mut agent, mut rx, _) = build_agent(
+        vec![vec![
+            StreamEvent::TextDelta("partial".to_string()),
             StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
+                finish_reason: FinishReason::Length,
             },
-        ];
-        let (mut agent, mut rx, mock) =
-            build_agent(vec![looping, text_response("done")], ToolRegistry::new(), 1);
+        ]],
+        ToolRegistry::new(),
+        10,
+    );
 
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::TurnPaused(_)))
-        );
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        agent
-            .run_turn(
-                "continue".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(msg) if msg.contains("truncated")))
+    );
+}
 
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::TurnComplete))
-        );
-        assert_eq!(agent.history.last().unwrap().text_content(), "done");
-        // Both round-trips actually reached the backend — resuming is a
-        // real continuation, not a silently-dropped no-op.
-        assert_eq!(mock.received.lock().unwrap().len(), 2);
-    }
-
-    // ----- autonomous mode (Phase 11c) -----
-
-    fn build_autonomous_agent(
-        responses: Vec<Vec<StreamEvent>>,
-        registry: ToolRegistry,
-    ) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>, AutonomousMode) {
-        let (tx, rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(responses));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let autonomous_mode = AutonomousMode::new();
-        autonomous_mode.set_active(true);
-        let agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 10,
-                ..Default::default()
+#[tokio::test]
+async fn usage_is_surfaced_as_a_context_usage_event() {
+    let (mut agent, mut rx, _) = build_agent(
+        vec![vec![
+            StreamEvent::Usage {
+                prompt_tokens: 1234,
+                completion_tokens: 56,
             },
-            Arc::default(),
-            PlanMode::new(),
-            autonomous_mode.clone(),
-            tx,
-        );
-        (agent, rx, mock, autonomous_mode)
-    }
-
-    #[tokio::test]
-    async fn last_turn_paused_reflects_the_most_recent_turn_outcome() {
-        // build_autonomous_agent's max_tool_iterations (10) is too high to
-        // pause on a single tool call, so this test builds its own agent
-        // directly with max_tool_iterations: 1 instead of using that helper.
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        let (tx, _rx2) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![vec![
-            StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+            StreamEvent::TextDelta("ok".to_string()),
             StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
+                finish_reason: FinishReason::Stop,
             },
-        ]]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 1,
-                ..Default::default()
-            },
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
+        ]],
+        ToolRegistry::new(),
+        10,
+    );
 
-        assert!(!agent.last_turn_paused(), "false before any turn has run");
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(agent.last_turn_paused(), "the 1-iteration cap must have paused this turn");
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        agent
-            .run_turn(
-                "continue".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        // Second call exhausts the mock queue -> a Stop response with no
-        // tool calls -> TurnComplete, not another pause.
-        assert!(!agent.last_turn_paused(), "a normal completion must clear the flag");
-    }
-
-    #[tokio::test]
-    async fn autonomous_mode_hides_run_shell_and_git_commit() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        registry.register(Arc::new(aivyx_tools::RunShellTool));
-        registry.register(Arc::new(aivyx_tools::GitCommitTool::new(vec![])));
-        registry.register(Arc::new(aivyx_tools::GitReadTool::new(vec![])));
-
-        let (mut agent, _rx, mock, _) =
-            build_autonomous_agent(vec![text_response("hi")], registry);
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
-        assert!(tool_names.contains(&"read_file"));
-        assert!(tool_names.contains(&"git_read"));
-        assert!(!tool_names.contains(&"run_shell"), "run_shell must be hidden");
-        assert!(!tool_names.contains(&"git_commit"), "git_commit must be hidden");
-    }
-
-    #[tokio::test]
-    async fn autonomous_mode_appends_the_autonomous_prompt_note() {
-        let (mut agent, _rx, mock, _) =
-            build_autonomous_agent(vec![text_response("hi")], ToolRegistry::new());
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let received = mock.received.lock().unwrap();
-        let system = received[0].messages[0].text_content();
-        assert!(system.contains("unattended"), "system prompt: {system}");
-    }
-
-    async fn init_git_repo(dir: &Path) {
-        for argv in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.name", "test"],
-            vec!["config", "user.email", "test@test.invalid"],
-        ] {
-            tokio::process::Command::new("git")
-                .args(&argv)
-                .current_dir(dir)
-                .output()
-                .await
-                .unwrap();
+    assert!(drain(&mut rx).iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextUsage {
+            used: 1234,
+            limit: 8192
         }
-        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
-        tokio::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        tokio::process::Command::new("git")
-            .args(["commit", "-q", "-m", "initial"])
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-    }
+    )));
+}
 
-    #[tokio::test]
-    async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
-        let dir = tempfile::tempdir().unwrap();
-        // Real git repo, matching the checkpoint tests' own fixture style —
-        // the discard path exercises real GitCheckpointer plumbing, not a
-        // mock, since that's exactly the piece this test must prove works.
-        init_git_repo(dir.path()).await;
+#[tokio::test]
+async fn plan_mode_filters_tools_and_annotates_the_system_prompt_per_request() {
+    // Two turns against the same agent: one with plan mode on, one after
+    // toggling it off — the request the backend actually receives must
+    // flip both the tool list and the system-prompt note, proving the
+    // flag is consulted per-request rather than latched at construction.
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
 
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-        registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
-            name: "verify".to_string(),
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), "exit 1".to_string()], // always fails
-            timeout: Duration::from_secs(5),
-        }])));
+    let (tx, _rx) = unbounded_channel();
+    let stop = || {
+        vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]
+    };
+    let mock = Arc::new(MockBackend::new(vec![stop(), stop()]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let plan_mode = PlanMode::new();
+    plan_mode.set_active(true);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        plan_mode.clone(),
+        AutonomousMode::new(),
+        tx,
+    );
 
-        let write_call = vec![
-            StreamEvent::ToolCallComplete(ToolCall {
-                id: ToolCallId("c1".to_string()),
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({ "path": "new.txt", "content": "hi\n" }),
-                source: ToolCallSource::Native,
-            }),
+    agent
+        .run_turn("plan".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    plan_mode.set_active(false);
+    agent
+        .run_turn("act".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let plan_tools: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+    let act_tools: Vec<&str> = received[1].tools.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(plan_tools, vec!["read_file"]);
+    assert_eq!(act_tools, vec!["read_file", "write_file"]);
+
+    let plan_system = received[0].messages[0].text_content();
+    let act_system = received[1].messages[0].text_content();
+    assert!(plan_system.contains("PLAN MODE"));
+    assert!(!act_system.contains("PLAN MODE"));
+}
+
+#[tokio::test]
+async fn prompted_blocks_apply_through_the_normal_tool_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("target.rs"),
+        "fn old_name() {}\nfn other() {}\n",
+    )
+    .unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+    let block =
+        "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn renamed() {}\n>>>>>>> REPLACE";
+    let (mut agent, _rx, mock) = build_agent_with_config(
+        vec![text_response(block), text_response("done")],
+        registry,
+        prompted_config(),
+    );
+
+    agent
+        .run_turn(
+            "rename it".to_string(),
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let content = std::fs::read_to_string(dir.path().join("target.rs")).unwrap();
+    assert!(
+        content.contains("fn renamed()"),
+        "edit not applied: {content}"
+    );
+    assert!(content.contains("fn other()"));
+    // The synthesized call is in history, marked TextFallback, balanced
+    // by its result — and the loop continued for a second round-trip.
+    assert_eq!(count_tool_calls(&agent.history), 1);
+    assert_eq!(count_tool_results(&agent.history), 1);
+    let synthetic = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolCall(c) => Some(c),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(synthetic.source, ToolCallSource::TextFallback);
+    assert_eq!(mock.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn empty_search_block_creates_a_new_file_via_write_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let block = "fresh.txt\n<<<<<<< SEARCH\n=======\nhello world\n>>>>>>> REPLACE";
+    let (mut agent, _rx, _) = build_agent_with_config(
+        vec![text_response(block), text_response("done")],
+        registry,
+        prompted_config(),
+    );
+
+    agent
+        .run_turn(
+            "create it".to_string(),
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(),
+        "hello world\n"
+    );
+}
+
+#[tokio::test]
+async fn malformed_block_feeds_an_error_back_and_the_turn_continues() {
+    let broken = "target.rs\n<<<<<<< SEARCH\nfn a() {}\n=======\nfn b() {}\n"; // no terminator
+    let (mut agent, _rx, mock) = build_agent_with_config(
+        vec![text_response(broken), text_response("understood")],
+        ToolRegistry::new(),
+        prompted_config(),
+    );
+
+    agent
+        .run_turn("edit".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        count_denied_containing(&agent.history, "malformed SEARCH/REPLACE"),
+        1
+    );
+    // The feedback drove a second round-trip instead of ending the turn.
+    assert_eq!(mock.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn native_mode_never_parses_block_syntax_out_of_text() {
+    // A model quoting the format in conversation (or a file containing
+    // markers being discussed) must not trigger edits in native mode.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("target.rs"), "fn old_name() {}\n").unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+    let block =
+        "target.rs\n<<<<<<< SEARCH\nfn old_name() {}\n=======\nfn changed() {}\n>>>>>>> REPLACE";
+    let (mut agent, _rx, mock) =
+        build_agent_with_config(vec![text_response(block)], registry, AgentConfig::default());
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(count_tool_calls(&agent.history), 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("target.rs")).unwrap(),
+        "fn old_name() {}\n"
+    );
+    assert_eq!(mock.received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn prompted_mode_hides_edit_tools_and_teaches_the_block_format() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let (mut agent, _rx, mock) =
+        build_agent_with_config(vec![text_response("hello")], registry, prompted_config());
+
+    agent
+        .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(tool_names, vec!["read_file"]);
+    assert!(
+        received[0].messages[0]
+            .text_content()
+            .contains("SEARCH/REPLACE")
+    );
+}
+
+#[tokio::test]
+async fn repo_map_is_rendered_into_the_system_prompt_and_counted_by_the_estimator() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("widget.rs"),
+        "pub fn extremely_distinctive_symbol() {}\n",
+    )
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_repo_map(
+        Arc::new(aivyx_repomap::RepoMap::new(
+            dir.path().to_path_buf(),
+            vec![],
+        )),
+        1000,
+    );
+    let chars_without_map = agent.prompt_chars();
+
+    agent
+        .run_turn("hi".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("Repository map"));
+    assert!(system.contains("extremely_distinctive_symbol"));
+    // The estimator must see the map's weight, or compaction would run
+    // blind to a block that's present in every request.
+    assert!(agent.prompt_chars() > chars_without_map + 50);
+}
+
+fn agents_file_notes(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Error(text) if text.contains("AGENTS.md") => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn project_only_agents_md_is_injected_with_no_precedence_note() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "Use tabs, not spaces, in this project.",
+    )
+    .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("Project instructions (AGENTS.md):"));
+    assert!(system.contains("Use tabs, not spaces, in this project."));
+    assert!(!system.contains("User preferences"));
+    assert!(!system.contains("take precedence"));
+}
+
+#[tokio::test]
+async fn global_only_agents_md_is_injected_with_no_precedence_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_path = global_dir.path().join("AGENTS.md");
+    std::fs::write(&global_path, "Always write terse commit messages.").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(Some(global_path), 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("User preferences ("));
+    assert!(system.contains("Always write terse commit messages."));
+    assert!(!system.contains("Project instructions (AGENTS.md):"));
+    assert!(!system.contains("take precedence"));
+}
+
+#[tokio::test]
+async fn neither_file_present_injects_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_path = global_dir.path().join("AGENTS.md");
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(Some(global_path), 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("AGENTS.md"));
+    assert!(!system.contains("User preferences"));
+}
+
+#[tokio::test]
+async fn both_files_present_orders_global_first_with_precedence_note() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "PROJECT_MARKER_TEXT").unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_path = global_dir.path().join("AGENTS.md");
+    std::fs::write(&global_path, "GLOBAL_MARKER_TEXT").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(Some(global_path), 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("User preferences ("));
+    assert!(system.contains("Project instructions (AGENTS.md):"));
+    assert!(system.contains("take precedence"));
+    let global_index = system.find("GLOBAL_MARKER_TEXT").unwrap();
+    let project_index = system.find("PROJECT_MARKER_TEXT").unwrap();
+    assert!(
+        global_index < project_index,
+        "global content must appear before project content"
+    );
+}
+
+#[tokio::test]
+async fn a_file_over_budget_is_included_in_full_and_triggers_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    // ~1024 chars of 'x' — comfortably over an intentionally tiny
+    // 5-token budget (5 tokens * DEFAULT_CHARS_PER_TOKEN(4.0) = 20 chars).
+    let long_content = "x".repeat(1024);
+    std::fs::write(dir.path().join("AGENTS.md"), &long_content).unwrap();
+
+    let (mut agent, mut rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 5);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(
+        system.contains(&long_content),
+        "the full over-budget content must still be included"
+    );
+
+    let events = drain(&mut rx);
+    let notes = agents_file_notes(&events);
+    assert_eq!(notes.len(), 1, "expected exactly one over-budget notice");
+    assert!(notes[0].contains("project AGENTS.md"));
+}
+
+#[tokio::test]
+async fn a_file_within_budget_triggers_no_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "short").unwrap();
+
+    let (mut agent, mut rx, _mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(agents_file_notes(&events).is_empty());
+}
+
+#[tokio::test]
+async fn editing_the_file_between_turns_changes_the_next_turns_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "FIRST_VERSION").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![
+            vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }],
+            vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }],
+        ],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 1024);
+
+    agent
+        .run_turn("first".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "SECOND_VERSION").unwrap();
+    agent
+        .run_turn("second".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    assert!(
+        received[0].messages[0]
+            .text_content()
+            .contains("FIRST_VERSION")
+    );
+    assert!(
+        received[1].messages[0]
+            .text_content()
+            .contains("SECOND_VERSION")
+    );
+    assert!(
+        !received[1].messages[0]
+            .text_content()
+            .contains("FIRST_VERSION")
+    );
+}
+
+#[tokio::test]
+async fn agents_files_text_is_counted_by_the_size_estimator() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "a very distinctive block of project guidance text that is not tiny",
+    )
+    .unwrap();
+
+    let (mut agent, _rx, _mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 1024);
+    let chars_without_file = agent.prompt_chars();
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(agent.prompt_chars() > chars_without_file + 30);
+}
+
+#[tokio::test]
+async fn never_calling_set_agents_file_injects_nothing_even_if_files_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "should never appear").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    // Deliberately not calling agent.set_agents_file(...) — mirrors
+    // main.rs only calling it when settings.agents_file.enabled.
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    assert!(
+        !received[0].messages[0]
+            .text_content()
+            .contains("should never appear")
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_project_path_degrades_gracefully() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory named AGENTS.md instead of a file — read_to_string
+    // fails with a real I/O error (IsADirectory).
+    std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(None, 1024);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    assert!(
+        !received[0].messages[0]
+            .text_content()
+            .contains("AGENTS.md:")
+    );
+}
+
+#[tokio::test]
+async fn usage_arriving_after_done_is_still_surfaced() {
+    // The shape real OpenAI-compatible servers (incl. Ollama) produce
+    // with `stream_options.include_usage`: the usage chunk trails the
+    // finish_reason chunk. Regression test for the loop breaking on
+    // `Done` and losing the token counts — caught live, not by the
+    // original tests, which all put Usage before Done.
+    let (mut agent, mut rx, _) = build_agent(
+        vec![vec![
+            StreamEvent::TextDelta("ok".to_string()),
             StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
+                finish_reason: FinishReason::Stop,
             },
-        ];
-        let (tx, _rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![
-            write_call,
-            text_response("done"),
-            text_response("still trying"),
-        ]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let mut executor = ToolExecutor::new(registry, gate, confiner);
-        executor.set_checkpointer(Arc::new(
-            aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
-                .await
-                .unwrap(),
-        ));
-        let autonomous_mode = AutonomousMode::new();
-        autonomous_mode.set_active(true);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 10,
-                ..Default::default()
+            StreamEvent::Usage {
+                prompt_tokens: 777,
+                completion_tokens: 5,
             },
-            Arc::default(),
-            PlanMode::new(),
-            autonomous_mode,
-            tx,
-        );
-        agent.set_verification("verify".to_string(), 1);
+        ]],
+        ToolRegistry::new(),
+        10,
+    );
 
-        agent
-            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        assert!(
-            !dir.path().join("new.txt").exists(),
-            "the file created by the discarded experiment must be gone after rewind"
-        );
-    }
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextUsage { used: 777, .. }))
+    );
+}
 
-    // ----- /wiki (Phase 11b) -----
+#[tokio::test]
+async fn a_set_tasks_call_surfaces_tasks_updated_and_persists_the_session() {
+    // The real `set_tasks` tool, wired the same way `main.rs` wires it:
+    // one shared handle given to both the tool and the agent — this test
+    // covers the whole loop (dispatch mutates the list, the agent
+    // notices, emits, and persists it with the turn).
+    let tasks: Arc<Mutex<Vec<Task>>> = Arc::default();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::SetTasksTool::new(Arc::clone(&tasks))));
 
-    fn stale(name: &str, covers: &[&str]) -> aivyx_tools::wiki::StalePage {
-        aivyx_tools::wiki::StalePage {
-            name: name.to_string(),
-            covers: covers.iter().map(|s| s.to_string()).collect(),
-            reason: aivyx_tools::wiki::StaleReason::Missing,
-        }
-    }
-
-    fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
+    let (tx, mut rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![
         vec![
             StreamEvent::ToolCallComplete(ToolCall {
-                id: ToolCallId(id.to_string()),
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({ "path": path, "content": content }),
+                id: ToolCallId("c1".to_string()),
+                name: "set_tasks".to_string(),
+                arguments: serde_json::json!({ "tasks": [
+                    { "text": "step one", "status": "in_progress" },
+                ]}),
                 source: ToolCallSource::Native,
             }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![
+            StreamEvent::TextDelta("done".to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ],
+    ]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::clone(&tasks),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.json");
+    agent.set_session_path(session_path.clone());
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(drain(&mut rx).iter().any(|e| matches!(
+        e,
+        AgentEvent::TasksUpdated(list) if list.len() == 1 && list[0].text == "step one"
+    )));
+
+    let saved = crate::session::load(&session_path).expect("session should have been saved");
+    assert_eq!(saved.tasks.len(), 1);
+    assert_eq!(
+        saved.tasks[0].status,
+        crate::session::TaskStatus::InProgress
+    );
+    // user, assistant (tool call), tool result, final assistant text.
+    assert_eq!(saved.history.len(), 4);
+}
+
+#[tokio::test]
+async fn max_tool_iterations_pauses_the_turn_without_losing_history() {
+    // Both responses request a tool and never give a final answer, so the
+    // loop must stop at the iteration cap — as a pause (ROADMAP.md Phase
+    // 12 Part A), not an error: the turn itself must still return `Ok`.
+    let looping = || {
+        vec![
+            StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
             StreamEvent::Done {
                 finish_reason: FinishReason::ToolCalls,
             },
         ]
-    }
+    };
+    let (mut agent, mut rx, _) = build_agent(vec![looping(), looping()], ToolRegistry::new(), 2);
 
-    #[tokio::test]
-    async fn wiki_batch_regenerates_missing_pages_and_stamps_frontmatter() {
-        // Uses `run_wiki_turn_for_pages` directly (an explicit page list)
-        // rather than the full `run_wiki_turn` → `page_specs`/`stale_pages`
-        // chain — that chain is already covered by Task 2's aivyx-tools
-        // tests and by the dispatch-specific tests below; this test's job
-        // is purely "given a page needs regenerating, is the orchestration
-        // (one turn, then stamp) correct."
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnPaused(msg) if msg.contains("2-round-trip"))),
+        "expected a TurnPaused event, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
+        "a paused turn must not also claim completion"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+        "hitting the cap mid-work is a pause, not an error"
+    );
+    // Every dispatched tool call up to the cap still has a matching
+    // result — nothing lost by pausing instead of failing.
+    assert_eq!(count_tool_calls(&agent.history), 2);
+    assert_eq!(count_tool_results(&agent.history), 2);
+}
 
-        let (tx, _rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![
-            write_call(
-                "c1",
-                "docs/wiki/aivyx-core.md",
-                "---\nsummary: \"Turn loop.\"\n---\n# aivyx-core\nBody.\n",
-            ),
-            text_response("done"), // no more tool calls: the page's turn ends
-        ]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig { max_tool_iterations: 10, ..Default::default() },
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
+#[tokio::test]
+async fn a_paused_turn_resumes_cleanly_from_a_follow_up_message() {
+    // After pausing on the cap, the agent's history/session already hold
+    // everything dispatched so far; a plain follow-up `run_turn` call
+    // (exactly what an interactive user would send next) must continue
+    // the same conversation rather than starting over or erroring.
+    let looping = vec![
+        StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, mut rx, mock) =
+        build_agent(vec![looping, text_response("done")], ToolRegistry::new(), 1);
 
-        agent
-            .run_wiki_turn_for_pages(
-                vec![stale("aivyx-core", &["crates/aivyx-core"])],
-                dir.path(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnPaused(_)))
+    );
 
-        let written = std::fs::read_to_string(dir.path().join("docs/wiki/aivyx-core.md")).unwrap();
-        let (fm, body) = aivyx_tools::wiki::parse_frontmatter(&written);
-        assert!(fm.generated_at_commit.is_some(), "frontmatter must be stamped");
-        assert_eq!(fm.covers, vec!["crates/aivyx-core"]);
-        assert_eq!(fm.summary.as_deref(), Some("Turn loop."));
-        assert_eq!(body, "# aivyx-core\nBody.\n");
-    }
+    agent
+        .run_turn(
+            "continue".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing() {
-        // No `crates/` directory at all in this tempdir, so
-        // `crate::wiki::page_specs` (Task 3) discovers exactly one page:
-        // `architecture-overview` (matches
-        // `page_specs_handles_a_missing_crates_directory_gracefully`'s
-        // behavior) — stamping *that* page at the real current HEAD is what
-        // makes `stale_pages` report nothing stale.
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
-        let wiki_dir = dir.path().join("docs/wiki");
-        std::fs::create_dir_all(&wiki_dir).unwrap();
-        let head = tokio::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir.path())
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnComplete))
+    );
+    assert_eq!(agent.history.last().unwrap().text_content(), "done");
+    // Both round-trips actually reached the backend — resuming is a
+    // real continuation, not a silently-dropped no-op.
+    assert_eq!(mock.received.lock().unwrap().len(), 2);
+}
+
+// ----- autonomous mode (Phase 11c) -----
+
+fn build_autonomous_agent(
+    responses: Vec<Vec<StreamEvent>>,
+    registry: ToolRegistry,
+) -> (
+    Agent,
+    UnboundedReceiver<AgentEvent>,
+    Arc<MockBackend>,
+    AutonomousMode,
+) {
+    let (tx, rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(responses));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    let agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode.clone(),
+        tx,
+    );
+    (agent, rx, mock, autonomous_mode)
+}
+
+#[tokio::test]
+async fn last_turn_paused_reflects_the_most_recent_turn_outcome() {
+    // build_autonomous_agent's max_tool_iterations (10) is too high to
+    // pause on a single tool call, so this test builds its own agent
+    // directly with max_tool_iterations: 1 instead of using that helper.
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    let (tx, _rx2) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![vec![
+        StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ]]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 1,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    assert!(!agent.last_turn_paused(), "false before any turn has run");
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        agent.last_turn_paused(),
+        "the 1-iteration cap must have paused this turn"
+    );
+
+    agent
+        .run_turn(
+            "continue".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Second call exhausts the mock queue -> a Stop response with no
+    // tool calls -> TurnComplete, not another pause.
+    assert!(
+        !agent.last_turn_paused(),
+        "a normal completion must clear the flag"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_mode_hides_run_shell_and_git_commit() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::RunShellTool));
+    registry.register(Arc::new(aivyx_tools::GitCommitTool::new(vec![])));
+    registry.register(Arc::new(aivyx_tools::GitReadTool::new(vec![])));
+
+    let (mut agent, _rx, mock, _) = build_autonomous_agent(vec![text_response("hi")], registry);
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let tool_names: Vec<&str> = received[0].tools.iter().map(|d| d.name.as_str()).collect();
+    assert!(tool_names.contains(&"read_file"));
+    assert!(tool_names.contains(&"git_read"));
+    assert!(
+        !tool_names.contains(&"run_shell"),
+        "run_shell must be hidden"
+    );
+    assert!(
+        !tool_names.contains(&"git_commit"),
+        "git_commit must be hidden"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_mode_appends_the_autonomous_prompt_note() {
+    let (mut agent, _rx, mock, _) =
+        build_autonomous_agent(vec![text_response("hi")], ToolRegistry::new());
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(system.contains("unattended"), "system prompt: {system}");
+}
+
+async fn init_git_repo(dir: &Path) {
+    for argv in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.name", "test"],
+        vec!["config", "user.email", "test@test.invalid"],
+    ] {
+        tokio::process::Command::new("git")
+            .args(&argv)
+            .current_dir(dir)
             .output()
             .await
             .unwrap();
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        // `covers` is deliberately omitted here: `stale_pages` only reads
-        // `generated_at_commit` back from a page's own frontmatter — the
-        // covered paths it diffs against come from `spec.covers`
-        // (`crate::wiki::ARCHITECTURE_OVERVIEW_COVERS` for this page), not
-        // from the file on disk. Since `generated_at_commit` here equals
-        // the repo's current HEAD with no commits made since, `git diff
-        // --name-only <head> HEAD -- <anything>` is trivially empty
-        // regardless of whether those covered paths exist in this minimal
-        // fixture repo.
-        std::fs::write(
-            wiki_dir.join("architecture-overview.md"),
-            format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
-        )
+    }
+    std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+    tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(dir)
+        .output()
+        .await
+        .unwrap();
+    tokio::process::Command::new("git")
+        .args(["commit", "-q", "-m", "initial"])
+        .current_dir(dir)
+        .output()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    // Real git repo, matching the checkpoint tests' own fixture style —
+    // the discard path exercises real GitCheckpointer plumbing, not a
+    // mock, since that's exactly the piece this test must prove works.
+    init_git_repo(dir.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "exit 1".to_string()], // always fails
+        timeout: Duration::from_secs(5),
+    }])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "new.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (tx, _rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![
+        write_call,
+        text_response("done"),
+        text_response("still trying"),
+    ]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let mut executor = ToolExecutor::new(registry, gate, confiner);
+    executor.set_checkpointer(Arc::new(
+        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap(),
+    ));
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode,
+        tx,
+    );
+    agent.set_verification("verify".to_string(), 1);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
         .unwrap();
 
-        let registry = ToolRegistry::new(); // no write_file registered: none must be called
-        let (tx, mut rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![]));
-        let llm: Arc<dyn LlmBackend> = mock;
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig::default(),
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
+    assert!(
+        !dir.path().join("new.txt").exists(),
+        "the file created by the discarded experiment must be gone after rewind"
+    );
+}
 
-        agent
-            .run_wiki_turn(crate::wiki::WikiCommand::Batch, dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
+// ----- /wiki (Phase 11b) -----
 
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("up to date"))));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+fn stale(name: &str, covers: &[&str]) -> aivyx_tools::wiki::StalePage {
+    aivyx_tools::wiki::StalePage {
+        name: name.to_string(),
+        covers: covers.iter().map(|s| s.to_string()).collect(),
+        reason: aivyx_tools::wiki::StaleReason::Missing,
     }
+}
 
-    #[tokio::test]
-    async fn wiki_forced_invocation_with_unknown_page_name_rejects_with_no_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
+fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId(id.to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": content }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ]
+}
 
-        let registry = ToolRegistry::new();
-        let (tx, mut rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig::default(),
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
+#[tokio::test]
+async fn wiki_batch_regenerates_missing_pages_and_stamps_frontmatter() {
+    // Uses `run_wiki_turn_for_pages` directly (an explicit page list)
+    // rather than the full `run_wiki_turn` → `page_specs`/`stale_pages`
+    // chain — that chain is already covered by Task 2's aivyx-tools
+    // tests and by the dispatch-specific tests below; this test's job
+    // is purely "given a page needs regenerating, is the orchestration
+    // (one turn, then stamp) correct."
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
 
-        agent
-            .run_wiki_turn(
-                crate::wiki::WikiCommand::Forced("not-a-real-page".to_string()),
-                dir.path(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
 
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("unknown wiki page"))));
-        assert_eq!(mock.received.lock().unwrap().len(), 0, "no turn should have been sent to the backend");
+    let (tx, _rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![
+        write_call(
+            "c1",
+            "docs/wiki/aivyx-core.md",
+            "---\nsummary: \"Turn loop.\"\n---\n# aivyx-core\nBody.\n",
+        ),
+        text_response("done"), // no more tool calls: the page's turn ends
+    ]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_wiki_turn_for_pages(
+            vec![stale("aivyx-core", &["crates/aivyx-core"])],
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let written = std::fs::read_to_string(dir.path().join("docs/wiki/aivyx-core.md")).unwrap();
+    let (fm, body) = aivyx_tools::wiki::parse_frontmatter(&written);
+    assert!(
+        fm.generated_at_commit.is_some(),
+        "frontmatter must be stamped"
+    );
+    assert_eq!(fm.covers, vec!["crates/aivyx-core"]);
+    assert_eq!(fm.summary.as_deref(), Some("Turn loop."));
+    assert_eq!(body, "# aivyx-core\nBody.\n");
+}
+
+#[tokio::test]
+async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing() {
+    // No `crates/` directory at all in this tempdir, so
+    // `crate::wiki::page_specs` (Task 3) discovers exactly one page:
+    // `architecture-overview` (matches
+    // `page_specs_handles_a_missing_crates_directory_gracefully`'s
+    // behavior) — stamping *that* page at the real current HEAD is what
+    // makes `stale_pages` report nothing stale.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let wiki_dir = dir.path().join("docs/wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+    let head = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    // `covers` is deliberately omitted here: `stale_pages` only reads
+    // `generated_at_commit` back from a page's own frontmatter — the
+    // covered paths it diffs against come from `spec.covers`
+    // (`crate::wiki::ARCHITECTURE_OVERVIEW_COVERS` for this page), not
+    // from the file on disk. Since `generated_at_commit` here equals
+    // the repo's current HEAD with no commits made since, `git diff
+    // --name-only <head> HEAD -- <anything>` is trivially empty
+    // regardless of whether those covered paths exist in this minimal
+    // fixture repo.
+    std::fs::write(
+        wiki_dir.join("architecture-overview.md"),
+        format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
+    )
+    .unwrap();
+
+    let registry = ToolRegistry::new(); // no write_file registered: none must be called
+    let (tx, mut rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![]));
+    let llm: Arc<dyn LlmBackend> = mock;
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_wiki_turn(
+            crate::wiki::WikiCommand::Batch,
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("up to date")))
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+}
+
+#[tokio::test]
+async fn wiki_forced_invocation_with_unknown_page_name_rejects_with_no_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let registry = ToolRegistry::new();
+    let (tx, mut rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_wiki_turn(
+            crate::wiki::WikiCommand::Forced("not-a-real-page".to_string()),
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("unknown wiki page")))
+    );
+    assert_eq!(
+        mock.received.lock().unwrap().len(),
+        0,
+        "no turn should have been sent to the backend"
+    );
+}
+
+#[tokio::test]
+async fn wiki_continues_to_the_next_page_after_one_page_writes_nothing() {
+    // `run_wiki_turn_for_pages` takes an explicit page list, so there's
+    // no dependency on `page_specs`' filesystem-driven crate discovery
+    // here — no `crates/` subdirectories need to exist.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let (tx, _rx) = unbounded_channel();
+    // Page "alpha" (processed first, in list order) never calls
+    // write_file — just prose, so its turn ends after one request.
+    // Page "beta" does call write_file, which forces a *second* request
+    // for that turn (the model needs a follow-up round-trip after a
+    // tool call to produce the "nothing more to do" response that ends
+    // the turn) — three requests total, not two.
+    let mock = Arc::new(MockBackend::new(vec![
+        text_response("I looked around but decided not to write anything."),
+        write_call(
+            "c1",
+            "docs/wiki/beta.md",
+            "---\nsummary: \"Beta.\"\n---\nBeta body.\n",
+        ),
+        text_response("done"),
+    ]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    let pages = vec![
+        stale("alpha", &["crates/alpha"]),
+        stale("beta", &["crates/beta"]),
+    ];
+    agent
+        .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("docs/wiki/alpha.md").exists(),
+        "a page the model never wrote must not appear on disk"
+    );
+    assert!(
+        dir.path().join("docs/wiki/beta.md").exists(),
+        "the next page must still be attempted after a prior page wrote nothing"
+    );
+    assert_eq!(
+        mock.received.lock().unwrap().len(),
+        3,
+        "both pages must have been attempted (1 request for alpha, 2 for beta)"
+    );
+}
+
+#[tokio::test]
+async fn wiki_page_that_keeps_pausing_is_abandoned_after_the_continuation_cap() {
+    // `max_tool_iterations: 1` means any response containing a tool call
+    // exhausts the cap on its very first iteration, so `run_turn_inner`
+    // pauses (`AgentEvent::TurnPaused`) every single time — the model
+    // never reaches a natural "no more tool calls" completion for the
+    // "stuck" page. Without the cap under test, `run_wiki_turn_for_pages`
+    // would send "continue" forever; with it, the page is abandoned
+    // after `MAX_WIKI_PAGE_CONTINUATIONS` continuations (1 initial
+    // request + `MAX_WIKI_PAGE_CONTINUATIONS` continues) and the batch
+    // moves on to the next page.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let (tx, mut rx) = unbounded_channel();
+    let mut responses = Vec::new();
+    for i in 0..(MAX_WIKI_PAGE_CONTINUATIONS + 1) {
+        // Always a tool call, never a plain final answer, so "stuck"
+        // never naturally completes — every one of these iterations
+        // must pause under `max_tool_iterations: 1`.
+        responses.push(write_call(
+            &format!("stuck-{i}"),
+            "docs/wiki/stuck.md",
+            "---\nsummary: \"Stuck.\"\n---\nBody.\n",
+        ));
     }
+    // "beta" completes on its very first request with no tool calls,
+    // proving the batch moved on past "stuck" rather than looping on it
+    // forever or aborting the whole batch.
+    responses.push(text_response("done"));
 
-    #[tokio::test]
-    async fn wiki_continues_to_the_next_page_after_one_page_writes_nothing() {
-        // `run_wiki_turn_for_pages` takes an explicit page list, so there's
-        // no dependency on `page_specs`' filesystem-driven crate discovery
-        // here — no `crates/` subdirectories need to exist.
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
+    let mock = Arc::new(MockBackend::new(responses));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 1,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
 
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let pages = vec![
+        stale("stuck", &["crates/stuck"]),
+        stale("beta", &["crates/beta"]),
+    ];
+    agent
+        .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
 
-        let (tx, _rx) = unbounded_channel();
-        // Page "alpha" (processed first, in list order) never calls
-        // write_file — just prose, so its turn ends after one request.
-        // Page "beta" does call write_file, which forces a *second* request
-        // for that turn (the model needs a follow-up round-trip after a
-        // tool call to produce the "nothing more to do" response that ends
-        // the turn) — three requests total, not two.
-        let mock = Arc::new(MockBackend::new(vec![
-            text_response("I looked around but decided not to write anything."),
-            write_call("c1", "docs/wiki/beta.md", "---\nsummary: \"Beta.\"\n---\nBeta body.\n"),
-            text_response("done"),
-        ]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig { max_tool_iterations: 10, ..Default::default() },
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
-
-        let pages = vec![stale("alpha", &["crates/alpha"]), stale("beta", &["crates/beta"])];
-        agent
-            .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(
-            !dir.path().join("docs/wiki/alpha.md").exists(),
-            "a page the model never wrote must not appear on disk"
-        );
-        assert!(
-            dir.path().join("docs/wiki/beta.md").exists(),
-            "the next page must still be attempted after a prior page wrote nothing"
-        );
-        assert_eq!(
-            mock.received.lock().unwrap().len(),
-            3,
-            "both pages must have been attempted (1 request for alpha, 2 for beta)"
-        );
-    }
-
-    #[tokio::test]
-    async fn wiki_page_that_keeps_pausing_is_abandoned_after_the_continuation_cap() {
-        // `max_tool_iterations: 1` means any response containing a tool call
-        // exhausts the cap on its very first iteration, so `run_turn_inner`
-        // pauses (`AgentEvent::TurnPaused`) every single time — the model
-        // never reaches a natural "no more tool calls" completion for the
-        // "stuck" page. Without the cap under test, `run_wiki_turn_for_pages`
-        // would send "continue" forever; with it, the page is abandoned
-        // after `MAX_WIKI_PAGE_CONTINUATIONS` continuations (1 initial
-        // request + `MAX_WIKI_PAGE_CONTINUATIONS` continues) and the batch
-        // moves on to the next page.
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
-
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-
-        let (tx, mut rx) = unbounded_channel();
-        let mut responses = Vec::new();
-        for i in 0..(MAX_WIKI_PAGE_CONTINUATIONS + 1) {
-            // Always a tool call, never a plain final answer, so "stuck"
-            // never naturally completes — every one of these iterations
-            // must pause under `max_tool_iterations: 1`.
-            responses.push(write_call(
-                &format!("stuck-{i}"),
-                "docs/wiki/stuck.md",
-                "---\nsummary: \"Stuck.\"\n---\nBody.\n",
-            ));
-        }
-        // "beta" completes on its very first request with no tool calls,
-        // proving the batch moved on past "stuck" rather than looping on it
-        // forever or aborting the whole batch.
-        responses.push(text_response("done"));
-
-        let mock = Arc::new(MockBackend::new(responses));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig { max_tool_iterations: 1, ..Default::default() },
-            Arc::default(),
-            PlanMode::new(),
-            AutonomousMode::new(),
-            tx,
-        );
-
-        let pages = vec![stale("stuck", &["crates/stuck"]), stale("beta", &["crates/beta"])];
-        agent
-            .run_wiki_turn_for_pages(pages, dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        // Bounds the request count: proves the cap actually stopped the
-        // "continue" loop (1 initial + MAX_WIKI_PAGE_CONTINUATIONS continues
-        // for "stuck") rather than the test merely happening to terminate,
-        // and that exactly one further request (for "beta") followed —
-        // i.e. the stuck page didn't swallow the rest of the batch.
-        assert_eq!(
-            mock.received.lock().unwrap().len() as u32,
-            MAX_WIKI_PAGE_CONTINUATIONS + 2,
-            "expected MAX_WIKI_PAGE_CONTINUATIONS + 1 requests for the stuck page plus 1 for \
+    // Bounds the request count: proves the cap actually stopped the
+    // "continue" loop (1 initial + MAX_WIKI_PAGE_CONTINUATIONS continues
+    // for "stuck") rather than the test merely happening to terminate,
+    // and that exactly one further request (for "beta") followed —
+    // i.e. the stuck page didn't swallow the rest of the batch.
+    assert_eq!(
+        mock.received.lock().unwrap().len() as u32,
+        MAX_WIKI_PAGE_CONTINUATIONS + 2,
+        "expected MAX_WIKI_PAGE_CONTINUATIONS + 1 requests for the stuck page plus 1 for \
              beta, not more"
-        );
+    );
 
-        let events = drain(&mut rx);
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                AgentEvent::Error(m)
-                    if m.contains("stuck") && m.contains("leaving it stale")
-            )),
-            "expected a notice naming the abandoned page, got {events:?}"
-        );
-        assert!(
-            events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
-            "the batch must still finish after abandoning one page"
-        );
-    }
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error(m)
+                if m.contains("stuck") && m.contains("leaving it stale")
+        )),
+        "expected a notice naming the abandoned page, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)),
+        "the batch must still finish after abandoning one page"
+    );
+}
 
-    #[tokio::test]
-    async fn run_turn_dispatches_wiki_commands_before_normal_turn_processing() {
-        // Reuses the "nothing stale" fixture from
-        // `wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing`
-        // so this test can also assert zero LLM calls happened. What's
-        // distinct here: routing through the public `Agent::run_turn` entry
-        // point (every real caller's entry point), not `run_wiki_turn`
-        // directly — confirming the interception wiring added to
-        // `run_turn`'s own dispatch `match` in this task actually fires.
-        let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path()).await;
-        let wiki_dir = dir.path().join("docs/wiki");
-        std::fs::create_dir_all(&wiki_dir).unwrap();
-        let head = tokio::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .await
-            .unwrap();
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        std::fs::write(
-            wiki_dir.join("architecture-overview.md"),
-            format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
-        )
+#[tokio::test]
+async fn run_turn_dispatches_wiki_commands_before_normal_turn_processing() {
+    // Reuses the "nothing stale" fixture from
+    // `wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing`
+    // so this test can also assert zero LLM calls happened. What's
+    // distinct here: routing through the public `Agent::run_turn` entry
+    // point (every real caller's entry point), not `run_wiki_turn`
+    // directly — confirming the interception wiring added to
+    // `run_turn`'s own dispatch `match` in this task actually fires.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let wiki_dir = dir.path().join("docs/wiki");
+    std::fs::create_dir_all(&wiki_dir).unwrap();
+    let head = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .await
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    std::fs::write(
+        wiki_dir.join("architecture-overview.md"),
+        format!("---\ngenerated_at_commit: {head}\n---\nbody\n"),
+    )
+    .unwrap();
+
+    let registry = ToolRegistry::new();
+    let (mut agent, mut rx, mock) = build_agent(vec![], registry, 10);
+
+    agent
+        .run_turn("/wiki".to_string(), dir.path(), CancellationToken::new())
+        .await
         .unwrap();
 
-        let registry = ToolRegistry::new();
-        let (mut agent, mut rx, mock) = build_agent(vec![], registry, 10);
-
-        agent
-            .run_turn("/wiki".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            mock.received.lock().unwrap().len(),
-            0,
-            "with nothing stale, /wiki must short-circuit before any LLM call"
-        );
-        // `agent.history` is empty in this scenario (no turn ever ran), so
-        // this is a vacuous-but-real regression guard: it would fail the
-        // moment a future change pushed the raw command into history before
-        // the staleness check.
-        assert!(
-            !agent.history.iter().any(|m| m.text_content().contains("/wiki")),
-            "the raw /wiki command text must never enter LLM history"
-        );
-        let _ = drain(&mut rx);
-    }
-
-    // ----- enforced verification (Phase 12 Part B) -----
-
-    fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
-        CommandSpec {
-            name: name.to_string(),
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), if exit_ok { "exit 0" } else { "exit 1" }.to_string()],
-            timeout: Duration::from_secs(5),
-        }
-    }
-
-    fn auto_verify_calls(history: &[Message]) -> usize {
-        history
+    assert_eq!(
+        mock.received.lock().unwrap().len(),
+        0,
+        "with nothing stale, /wiki must short-circuit before any LLM call"
+    );
+    // `agent.history` is empty in this scenario (no turn ever ran), so
+    // this is a vacuous-but-real regression guard: it would fail the
+    // moment a future change pushed the raw command into history before
+    // the staleness check.
+    assert!(
+        !agent
+            .history
             .iter()
-            .flat_map(|m| &m.content)
-            .filter(|b| {
-                matches!(
-                    b,
-                    ContentBlock::ToolCall(c) if c.source == ToolCallSource::AutoVerification
-                )
-            })
-            .count()
+            .any(|m| m.text_content().contains("/wiki")),
+        "the raw /wiki command text must never enter LLM history"
+    );
+    let _ = drain(&mut rx);
+}
+
+// ----- enforced verification (Phase 12 Part B) -----
+
+fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
+    CommandSpec {
+        name: name.to_string(),
+        program: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            if exit_ok { "exit 0" } else { "exit 1" }.to_string(),
+        ],
+        timeout: Duration::from_secs(5),
     }
+}
 
-    #[tokio::test]
-    async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
-            "verify", true,
-        )])));
-
-        let write_call = vec![
-            StreamEvent::ToolCallComplete(ToolCall {
-                id: ToolCallId("c1".to_string()),
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
-                source: ToolCallSource::Native,
-            }),
-            StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
-            },
-        ];
-        let (mut agent, mut rx, mock) = build_agent(
-            vec![write_call, text_response("done")],
-            registry,
-            10,
-        );
-        agent.set_verification("verify".to_string(), 3);
-
-        agent
-            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
-            "a passing verification must not surface a failure notice"
-        );
-        assert_eq!(
-            auto_verify_calls(&agent.history),
-            1,
-            "exactly one auto-verification call expected"
-        );
-        assert!(!agent.unverified_edits);
-        assert_eq!(agent.verify_retries, 0);
-        // Verification passing must not cost the model another round-trip
-        // beyond the two real ones (the edit, then the model's own
-        // no-more-tool-calls response) — it's dispatched directly, not
-        // through another `stream_chat` call.
-        assert_eq!(mock.received.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
-        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
-            "verify", false,
-        )])));
-
-        let write_call = vec![
-            StreamEvent::ToolCallComplete(ToolCall {
-                id: ToolCallId("c1".to_string()),
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
-                source: ToolCallSource::Native,
-            }),
-            StreamEvent::Done {
-                finish_reason: FinishReason::ToolCalls,
-            },
-        ];
-        // One response ends the model's tool calls, then one more scripted
-        // no-op response per retry (the loop re-enters the model after
-        // each failed verification so it can react).
-        let (mut agent, mut rx, _) = build_agent(
-            vec![
-                write_call,
-                text_response("done"),
-                text_response("trying again"),
-                text_response("still trying"),
-            ],
-            registry,
-            10,
-        );
-        agent.set_verification("verify".to_string(), 2);
-
-        agent
-            .run_turn("go".to_string(), dir.path(), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(
-            events.iter().any(
-                |e| matches!(e, AgentEvent::Error(msg) if msg.contains("still failing after 2 attempt"))
-            ),
-            "expected the exhausted-retries notice, got {events:?}"
-        );
-        assert_eq!(
-            auto_verify_calls(&agent.history),
-            2,
-            "exactly max_auto_verify_retries auto-verification attempts expected"
-        );
-        // The retry budget resets so the feature isn't silently disabled
-        // for the rest of the session, but the edits remain genuinely
-        // unverified — the very next attempt to end a turn must re-check.
-        assert_eq!(agent.verify_retries, 0);
-        assert!(agent.unverified_edits);
-    }
-
-    #[tokio::test]
-    async fn verification_never_fires_when_nothing_was_edited() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
-            "verify", true,
-        )])));
-        let (mut agent, _rx, _) = build_agent(vec![text_response("hi there")], registry, 10);
-        agent.set_verification("verify".to_string(), 3);
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(auto_verify_calls(&agent.history), 0);
-        assert!(!agent.unverified_edits);
-    }
-
-    #[tokio::test]
-    async fn a_precancelled_turn_is_a_noop_with_only_the_user_message() {
-        let (mut agent, _rx, mock) = build_agent(
-            vec![vec![StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-            }]],
-            ToolRegistry::new(),
-            10,
-        );
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), cancellation)
-            .await
-            .unwrap();
-
-        // The user message is recorded, but no request is ever sent and no
-        // assistant/tool messages are appended.
-        assert_eq!(agent.history.len(), 1);
-        assert_eq!(agent.history[0].role, Role::User);
-        assert!(mock.received.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancellation_mid_dispatch_records_remaining_calls_as_skipped() {
-        // Two calls to a tool that cancels the run token on its first
-        // execution: call 1 runs (and cancels), call 2 must then be recorded
-        // as cancelled rather than dispatched — and both still get results.
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(CancelTool));
-        let (mut agent, _rx, _) = build_agent(
-            vec![vec![
-                StreamEvent::ToolCallComplete(tool_call("c1", "cancel_tool")),
-                StreamEvent::ToolCallComplete(tool_call("c2", "cancel_tool")),
-                StreamEvent::Done {
-                    finish_reason: FinishReason::ToolCalls,
-                },
-            ]],
-            registry,
-            10,
-        );
-
-        agent
-            .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(count_tool_results(&agent.history), 2);
-        assert_eq!(
-            count_denied_containing(&agent.history, "cancelled before"),
-            1
-        );
-    }
-
-    #[test]
-    fn drop_oldest_group_removes_the_first_turn_and_keeps_the_rest() {
-        let mut history = vec![
-            user_msg("u1"),
-            assistant_msg("a1"),
-            ok_tool_result_msg("c1", "r1"),
-            user_msg("u2"),
-            assistant_msg("a2"),
-        ];
-        assert!(drop_oldest_group(&mut history));
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].role, Role::User);
-        assert_eq!(history[0].text_content(), "u2");
-    }
-
-    #[test]
-    fn drop_oldest_group_keeps_the_only_group() {
-        let mut history = vec![user_msg("u1"), assistant_msg("a1")];
-        assert!(!drop_oldest_group(&mut history));
-        assert_eq!(history.len(), 2);
-    }
-
-    #[test]
-    fn elide_shrinks_only_oversized_ok_results() {
-        let big = "x".repeat(10_000);
-        let mut history = vec![
-            ok_tool_result_msg("c1", &big),
-            ok_tool_result_msg("c2", "small"),
-        ];
-        elide_oversized_tool_results(&mut history, 100);
-
-        let ContentBlock::ToolResult(r1) = &history[0].content[0] else {
-            panic!("expected a tool result")
-        };
-        let ToolOutput::Ok(s1) = &r1.output else {
-            panic!("expected Ok")
-        };
-        assert!(s1.chars().count() < 10_000);
-        assert!(s1.contains("elided"));
-
-        let ContentBlock::ToolResult(r2) = &history[1].content[0] else {
-            panic!("expected a tool result")
-        };
-        let ToolOutput::Ok(s2) = &r2.output else {
-            panic!("expected Ok")
-        };
-        assert_eq!(s2, "small");
-    }
-
-    #[test]
-    fn compaction_drops_oldest_turns_and_surfaces_a_notice() {
-        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-        // Small window so a handful of padded turns overflows it. With the
-        // default 4 chars/token: high-water 80 tok = 320 chars, low 60 = 240.
-        agent.context_limit = 100;
-        for i in 0..5 {
-            agent
-                .history
-                .push(user_msg(&format!("u{i} {}", "x".repeat(150))));
-            agent
-                .history
-                .push(assistant_msg(&format!("a{i} {}", "y".repeat(150))));
-        }
-        let before = agent.history.len();
-
-        agent.compact_if_needed();
-
-        assert!(agent.history.len() < before, "history should have shrunk");
-        assert!(agent.history_truncated);
-        // The most recent turn is always preserved.
-        assert!(
-            agent
-                .history
-                .last()
-                .unwrap()
-                .text_content()
-                .starts_with("a4")
-        );
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("truncated")))
-        );
-    }
-
-    #[test]
-    fn no_compaction_when_well_under_the_window() {
-        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-        agent.context_limit = 100_000;
-        agent.history.push(user_msg("hello"));
-        agent.history.push(assistant_msg("hi"));
-
-        agent.compact_if_needed();
-
-        assert_eq!(agent.history.len(), 2);
-        assert!(!agent.history_truncated);
-        assert!(drain(&mut rx).is_empty());
-    }
-
-    // ----- council mode (Phase 11a) -----
-
-    fn council_seat(
-        model: &str,
-        responses: Vec<Vec<StreamEvent>>,
-    ) -> (crate::council::CouncilSeat, Arc<MockBackend>) {
-        let mock = Arc::new(MockBackend::new(responses));
-        (
-            crate::council::CouncilSeat {
-                model: model.to_string(),
-                backend: mock.clone(),
-            },
-            mock,
-        )
-    }
-
-    fn council_notes(events: &[AgentEvent]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::CouncilNote(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    // Long enough to clear MIN_ANSWER_CHARS in council.rs.
-    const ANSWER_A: &str = "Use tabs: accessibility tooling respects tab width settings.";
-    const ANSWER_B: &str = "Use spaces: rendering is identical everywhere, zero ambiguity.";
-    const RANKING: &str = "1. Advisor A — more concrete\n2. Advisor B — weaker rationale";
-    const SYNTHESIS: &str = "Recommendation: adopt spaces, matching the dominant ecosystem.";
-
-    #[tokio::test]
-    async fn council_command_without_configuration_notes_and_ends_the_turn() {
-        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-
-        agent
-            .run_turn(
-                "/council tabs or spaces?".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
+fn auto_verify_calls(history: &[Message]) -> usize {
+    history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| {
+            matches!(
+                b,
+                ContentBlock::ToolCall(c) if c.source == ToolCallSource::AutoVerification
             )
-            .await
-            .unwrap();
+        })
+        .count()
+}
 
-        let events = drain(&mut rx);
-        assert!(
-            council_notes(&events)
-                .iter()
-                .any(|n| n.contains("no council is configured"))
-        );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(agent.history.is_empty(), "command must not enter history");
-        assert!(
-            main_mock.received.lock().unwrap().is_empty(),
-            "no LLM request may be made without a council"
-        );
-    }
+#[tokio::test]
+async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
 
-    // ----- architect/editor pairing (Phase 9) -----
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, mut rx, mock) =
+        build_agent(vec![write_call, text_response("done")], registry, 10);
+    agent.set_verification("verify".to_string(), 3);
 
-    fn architect_seat(
-        model: &str,
-        responses: Vec<Vec<StreamEvent>>,
-    ) -> (crate::architect::ArchitectSeat, Arc<MockBackend>) {
-        let mock = Arc::new(MockBackend::new(responses));
-        (
-            crate::architect::ArchitectSeat {
-                model: model.to_string(),
-                backend: mock.clone(),
-            },
-            mock,
-        )
-    }
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
 
-    fn architect_notes(events: &[AgentEvent]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::ArchitectNote(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+        "a passing verification must not surface a failure notice"
+    );
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        1,
+        "exactly one auto-verification call expected"
+    );
+    assert!(!agent.unverified_edits);
+    assert_eq!(agent.verify_retries, 0);
+    // Verification passing must not cost the model another round-trip
+    // beyond the two real ones (the edit, then the model's own
+    // no-more-tool-calls response) — it's dispatched directly, not
+    // through another `stream_chat` call.
+    assert_eq!(mock.received.lock().unwrap().len(), 2);
+}
 
-    // Long enough to clear MIN_ANSWER_CHARS in council.rs.
-    const PLAN_TEXT: &str = "1. Add a TokenV2 struct in auth/token.rs. 2. Update verify() to accept it.";
+#[tokio::test]
+async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
 
-    #[tokio::test]
-    async fn architect_command_without_configuration_notes_and_ends_the_turn() {
-        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-
-        agent
-            .run_turn(
-                "/architect refactor auth".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(
-            architect_notes(&events)
-                .iter()
-                .any(|n| n.contains("no architect is configured"))
-        );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(agent.history.is_empty(), "command must not enter history");
-        assert!(
-            main_mock.received.lock().unwrap().is_empty(),
-            "no LLM request may be made without an architect"
-        );
-    }
-
-    #[tokio::test]
-    async fn bare_architect_command_notes_usage_and_ends_the_turn() {
-        let (mut agent, mut rx, _main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-        let (seat, _) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
-        agent.set_architect(crate::architect::Architect {
-            seat,
-            tail_budget_tokens: 3072,
-        });
-
-        agent
-            .run_turn("/architect".to_string(), Path::new("."), CancellationToken::new())
-            .await
-            .unwrap();
-
-        let events = drain(&mut rx);
-        assert!(architect_notes(&events).iter().any(|n| n.contains("usage:")));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(agent.history.is_empty());
-    }
-
-    #[tokio::test]
-    async fn architect_plan_hands_off_to_the_editor_in_the_same_turn() {
-        // The editor's mock backend replies with one tool call (read_file)
-        // then a plain stop, so the test can prove the hand-off actually
-        // reached the tool-dispatch loop, not just that text was injected.
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        let editor_responses = vec![
-            vec![StreamEvent::ToolCallComplete(tool_call("c1", "read_file"))],
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    // One response ends the model's tool calls, then one more scripted
+    // no-op response per retry (the loop re-enters the model after
+    // each failed verification so it can react).
+    let (mut agent, mut rx, _) = build_agent(
+        vec![
+            write_call,
             text_response("done"),
-        ];
-        let (mut agent, mut rx, editor_mock) = build_agent(editor_responses, registry, 10);
-        let (seat, architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
-        agent.set_architect(crate::architect::Architect {
-            seat,
-            tail_budget_tokens: 3072,
-        });
+            text_response("trying again"),
+            text_response("still trying"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
 
-        agent
-            .run_turn(
-                "/architect refactor the auth module".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
 
-        assert_eq!(
-            architect_mock.received.lock().unwrap().len(),
-            1,
-            "the architect backend must be called exactly once"
-        );
-        assert_eq!(
-            editor_mock.received.lock().unwrap().len(),
-            2,
-            "the editor backend must run its normal iteration loop after the hand-off"
-        );
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(msg) if msg.contains("still failing after 2 attempt"))
+        ),
+        "expected the exhausted-retries notice, got {events:?}"
+    );
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        2,
+        "exactly max_auto_verify_retries auto-verification attempts expected"
+    );
+    // The retry budget resets so the feature isn't silently disabled
+    // for the rest of the session, but the edits remain genuinely
+    // unverified — the very next attempt to end a turn must re-check.
+    assert_eq!(agent.verify_retries, 0);
+    assert!(agent.unverified_edits);
+}
 
-        // History carries the injected plan message and the editor's own
-        // tool-call round-trip, in that order — proving the hand-off is one
-        // continuous turn, not two disjoint actions.
-        let plan_index = agent
-            .history
-            .iter()
-            .position(|m| {
-                m.content.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.contains("[Architect plan")))
-            })
-            .expect("plan message must be in history");
-        assert!(
-            agent.history[plan_index]
-                .content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(PLAN_TEXT))),
-            "injected message must contain the architect's plan text"
-        );
-        assert_eq!(count_tool_calls(&agent.history[plan_index..]), 1);
+#[tokio::test]
+async fn verification_never_fires_when_nothing_was_edited() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
+    let (mut agent, _rx, _) = build_agent(vec![text_response("hi there")], registry, 10);
+    agent.set_verification("verify".to_string(), 3);
 
-        let events = drain(&mut rx);
-        assert!(
-            architect_notes(&events).iter().any(|n| n.contains(PLAN_TEXT)),
-            "the plan must stream live as an ArchitectNote"
-        );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCallDetected(_))));
-    }
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn architect_backend_failure_ends_the_turn_without_invoking_the_editor() {
-        let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-        let (seat, architect_mock) = architect_seat("model-architect", vec![]);
-        agent.set_architect(crate::architect::Architect {
-            seat,
-            tail_budget_tokens: 3072,
-        });
+    assert_eq!(auto_verify_calls(&agent.history), 0);
+    assert!(!agent.unverified_edits);
+}
 
-        agent
-            .run_turn(
-                "/architect refactor auth".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+#[tokio::test]
+async fn a_precancelled_turn_is_a_noop_with_only_the_user_message() {
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
 
-        let events = drain(&mut rx);
-        assert!(
-            architect_notes(&events)
-                .iter()
-                .any(|n| n.contains("no usable plan")),
-            "an empty response (below MIN_ANSWER_CHARS) must be treated as a failure"
-        );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-        assert!(agent.history.is_empty());
-        assert_eq!(architect_mock.received.lock().unwrap().len(), 1);
-        assert!(
-            editor_mock.received.lock().unwrap().is_empty(),
-            "the editor must never be invoked after a failed plan"
-        );
-    }
+    agent
+        .run_turn("go".to_string(), Path::new("."), cancellation)
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn architect_plan_mode_regression_editor_only_gets_read_only_tools() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Arc::new(aivyx_tools::ReadFileTool));
-        registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    // The user message is recorded, but no request is ever sent and no
+    // assistant/tool messages are appended.
+    assert_eq!(agent.history.len(), 1);
+    assert_eq!(agent.history[0].role, Role::User);
+    assert!(mock.received.lock().unwrap().is_empty());
+}
 
-        let (tx, mut rx) = unbounded_channel();
-        let mock = Arc::new(MockBackend::new(vec![text_response("noted")]));
-        let llm: Arc<dyn LlmBackend> = mock.clone();
-        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
-        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
-        let executor = ToolExecutor::new(registry, gate, confiner);
-        let plan_mode = PlanMode::new();
-        plan_mode.set_active(true);
-        let mut agent = Agent::new(
-            llm,
-            executor,
-            "system",
-            AgentConfig {
-                max_tool_iterations: 10,
-                ..Default::default()
+#[tokio::test]
+async fn cancellation_mid_dispatch_records_remaining_calls_as_skipped() {
+    // Two calls to a tool that cancels the run token on its first
+    // execution: call 1 runs (and cancels), call 2 must then be recorded
+    // as cancelled rather than dispatched — and both still get results.
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CancelTool));
+    let (mut agent, _rx, _) = build_agent(
+        vec![vec![
+            StreamEvent::ToolCallComplete(tool_call("c1", "cancel_tool")),
+            StreamEvent::ToolCallComplete(tool_call("c2", "cancel_tool")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
             },
-            Arc::default(),
-            plan_mode,
-            AutonomousMode::new(),
-            tx,
-        );
-        let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
-        agent.set_architect(crate::architect::Architect {
-            seat,
-            tail_budget_tokens: 3072,
-        });
+        ]],
+        registry,
+        10,
+    );
 
-        agent
-            .run_turn(
-                "/architect refactor auth".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
 
-        let received = mock.received.lock().unwrap();
-        let tool_names: Vec<&str> = received[0].tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(tool_names.contains(&"read_file"));
-        assert!(
-            !tool_names.contains(&"write_file"),
-            "plan mode must still filter the editor's own tool list after an architect hand-off"
-        );
-        drop(rx.try_recv()); // drain isn't needed for this assertion; silence unused warning
-    }
+    assert_eq!(count_tool_results(&agent.history), 2);
+    assert_eq!(
+        count_denied_containing(&agent.history, "cancelled before"),
+        1
+    );
+}
 
-    #[tokio::test]
-    async fn architect_planning_cancellation_ends_the_turn_without_invoking_the_editor() {
-        let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-        let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
-        agent.set_architect(crate::architect::Architect {
-            seat,
-            tail_budget_tokens: 3072,
-        });
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
+#[test]
+fn drop_oldest_group_removes_the_first_turn_and_keeps_the_rest() {
+    let mut history = vec![
+        user_msg("u1"),
+        assistant_msg("a1"),
+        ok_tool_result_msg("c1", "r1"),
+        user_msg("u2"),
+        assistant_msg("a2"),
+    ];
+    assert!(drop_oldest_group(&mut history));
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].role, Role::User);
+    assert_eq!(history[0].text_content(), "u2");
+}
 
-        agent
-            .run_turn(
-                "/architect refactor auth".to_string(),
-                Path::new("."),
-                cancellation,
-            )
-            .await
-            .unwrap();
+#[test]
+fn drop_oldest_group_keeps_the_only_group() {
+    let mut history = vec![user_msg("u1"), assistant_msg("a1")];
+    assert!(!drop_oldest_group(&mut history));
+    assert_eq!(history.len(), 2);
+}
 
-        let events = drain(&mut rx);
-        assert!(
-            architect_notes(&events)
-                .iter()
-                .any(|n| n.contains("cancelled")),
-            "a pre-cancelled token must abort planning with an explanatory note"
-        );
-        assert!(agent.history.is_empty());
-        assert!(editor_mock.received.lock().unwrap().is_empty());
-    }
+#[test]
+fn elide_shrinks_only_oversized_ok_results() {
+    let big = "x".repeat(10_000);
+    let mut history = vec![
+        ok_tool_result_msg("c1", &big),
+        ok_tool_result_msg("c2", "small"),
+    ];
+    elide_oversized_tool_results(&mut history, 100);
 
-    #[tokio::test]
-    async fn council_runs_the_protocol_and_pushes_only_the_synthesis() {
-        let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
-        // Each member answers (stage 1), then ranks (stage 2).
-        let (seat_a, mock_a) = council_seat(
-            "model-a",
-            vec![text_response(ANSWER_A), text_response(RANKING)],
-        );
-        let (seat_b, _) = council_seat(
-            "model-b",
-            vec![text_response(ANSWER_B), text_response(RANKING)],
-        );
-        let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
-        agent.set_council(crate::council::Council {
-            members: vec![seat_a, seat_b],
-            chairman: chair,
-            tail_budget_tokens: 3072,
-        });
+    let ContentBlock::ToolResult(r1) = &history[0].content[0] else {
+        panic!("expected a tool result")
+    };
+    let ToolOutput::Ok(s1) = &r1.output else {
+        panic!("expected Ok")
+    };
+    assert!(s1.chars().count() < 10_000);
+    assert!(s1.contains("elided"));
 
-        agent
-            .run_turn(
-                "/council tabs or spaces?".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+    let ContentBlock::ToolResult(r2) = &history[1].content[0] else {
+        panic!("expected a tool result")
+    };
+    let ToolOutput::Ok(s2) = &r2.output else {
+        panic!("expected Ok")
+    };
+    assert_eq!(s2, "small");
+}
 
-        // Only the chairman's synthesis enters history, as a marked
-        // user-role message; the raw command text never does.
-        assert_eq!(agent.history.len(), 1);
-        let entry = &agent.history[0];
-        assert_eq!(entry.role, Role::User);
-        let text = entry.text_content();
-        assert!(text.contains("[Council synthesis"));
-        assert!(text.contains(SYNTHESIS));
-        assert!(text.contains("model-chair"));
-        assert!(!text.contains("/council"));
-
-        // The whole deliberation streamed as notes.
-        let events = drain(&mut rx);
-        let notes = council_notes(&events);
-        assert!(notes.iter().any(|n| n.contains(ANSWER_A)));
-        assert!(notes.iter().any(|n| n.contains(ANSWER_B)));
-        assert!(notes.iter().any(|n| n.contains(RANKING)));
-        assert!(notes.iter().any(|n| n.contains(SYNTHESIS)));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-
-        // Members were asked twice (answer, rank), toollessly, with the
-        // advisor prompt; the agent's own backend was never touched.
-        let member_requests = mock_a.received.lock().unwrap();
-        assert_eq!(member_requests.len(), 2);
-        assert!(member_requests.iter().all(|r| r.tools.is_empty()));
-        assert!(member_requests[0].messages[0].text_content().contains("advisor"));
-        assert!(
-            member_requests[0].messages[1]
-                .text_content()
-                .contains("tabs or spaces?")
-        );
-        assert_eq!(chair_mock.received.lock().unwrap().len(), 1);
-        assert!(main_mock.received.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn council_below_quorum_leaves_no_history_entry() {
-        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-        // One usable answer, one empty (e.g. an all-thinking response).
-        let (seat_a, _) = council_seat("model-a", vec![text_response(ANSWER_A)]);
-        let (seat_b, _) = council_seat("model-b", vec![text_response("")]);
-        let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
-        agent.set_council(crate::council::Council {
-            members: vec![seat_a, seat_b],
-            chairman: chair,
-            tail_budget_tokens: 3072,
-        });
-
-        agent
-            .run_turn(
-                "/council anything".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(agent.history.is_empty());
-        assert!(
-            chair_mock.received.lock().unwrap().is_empty(),
-            "an aborted council must not consult the chairman"
-        );
-        let events = drain(&mut rx);
-        assert!(
-            council_notes(&events)
-                .iter()
-                .any(|n| n.contains("quorum"))
-        );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
-    }
-
-    #[tokio::test]
-    async fn council_chairman_failure_leaves_no_history_entry() {
-        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-        let (seat_a, _) = council_seat(
-            "model-a",
-            vec![text_response(ANSWER_A), text_response(RANKING)],
-        );
-        let (seat_b, _) = council_seat(
-            "model-b",
-            vec![text_response(ANSWER_B), text_response(RANKING)],
-        );
-        let (chair, _) = council_seat("model-chair", vec![text_response("")]);
-        agent.set_council(crate::council::Council {
-            members: vec![seat_a, seat_b],
-            chairman: chair,
-            tail_budget_tokens: 3072,
-        });
-
-        agent
-            .run_turn(
-                "/council anything".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            agent.history.is_empty(),
-            "nothing unsynthesized may enter history"
-        );
-        let events = drain(&mut rx);
-        assert!(
-            council_notes(&events)
-                .iter()
-                .any(|n| n.contains("no usable synthesis"))
-        );
-    }
-
-    #[tokio::test]
-    async fn bare_council_reviews_the_last_assistant_message_with_a_digest() {
-        let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
-        agent.history.push(user_msg("should we rewrite the parser?"));
+#[test]
+fn compaction_drops_oldest_turns_and_surfaces_a_notice() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    // Small window so a handful of padded turns overflows it. With the
+    // default 4 chars/token: high-water 80 tok = 320 chars, low 60 = 240.
+    agent.context_limit = 100;
+    for i in 0..5 {
         agent
             .history
-            .push(assistant_msg("Plan: rewrite the parser with a PEG grammar."));
-        let (seat_a, mock_a) = council_seat(
-            "model-a",
-            vec![text_response(ANSWER_A), text_response(RANKING)],
-        );
-        let (seat_b, _) = council_seat(
-            "model-b",
-            vec![text_response(ANSWER_B), text_response(RANKING)],
-        );
-        let (chair, _) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
-        agent.set_council(crate::council::Council {
-            members: vec![seat_a, seat_b],
-            chairman: chair,
-            tail_budget_tokens: 3072,
-        });
-
+            .push(user_msg(&format!("u{i} {}", "x".repeat(150))));
         agent
-            .run_turn(
-                "/council".to_string(),
-                Path::new("."),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let requests = mock_a.received.lock().unwrap();
-        let prompt = requests[0].messages[1].text_content();
-        assert!(
-            prompt.contains("PEG grammar"),
-            "bare /council must put the last assistant message before the council"
-        );
-        assert!(
-            prompt.contains("should we rewrite the parser?"),
-            "the conversation tail digest should accompany the question"
-        );
-        drop(requests);
-
-        // Synthesis landed on top of the existing history.
-        assert_eq!(agent.history.len(), 3);
-        drain(&mut rx);
+            .history
+            .push(assistant_msg(&format!("a{i} {}", "y".repeat(150))));
     }
+    let before = agent.history.len();
+
+    agent.compact_if_needed();
+
+    assert!(agent.history.len() < before, "history should have shrunk");
+    assert!(agent.history_truncated);
+    // The most recent turn is always preserved.
+    assert!(
+        agent
+            .history
+            .last()
+            .unwrap()
+            .text_content()
+            .starts_with("a4")
+    );
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("truncated")))
+    );
+}
+
+#[test]
+fn no_compaction_when_well_under_the_window() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.context_limit = 100_000;
+    agent.history.push(user_msg("hello"));
+    agent.history.push(assistant_msg("hi"));
+
+    agent.compact_if_needed();
+
+    assert_eq!(agent.history.len(), 2);
+    assert!(!agent.history_truncated);
+    assert!(drain(&mut rx).is_empty());
+}
+
+// ----- council mode (Phase 11a) -----
+
+fn council_seat(
+    model: &str,
+    responses: Vec<Vec<StreamEvent>>,
+) -> (crate::council::CouncilSeat, Arc<MockBackend>) {
+    let mock = Arc::new(MockBackend::new(responses));
+    (
+        crate::council::CouncilSeat {
+            model: model.to_string(),
+            backend: mock.clone(),
+        },
+        mock,
+    )
+}
+
+fn council_notes(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::CouncilNote(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+// Long enough to clear MIN_ANSWER_CHARS in council.rs.
+const ANSWER_A: &str = "Use tabs: accessibility tooling respects tab width settings.";
+const ANSWER_B: &str = "Use spaces: rendering is identical everywhere, zero ambiguity.";
+const RANKING: &str = "1. Advisor A — more concrete\n2. Advisor B — weaker rationale";
+const SYNTHESIS: &str = "Recommendation: adopt spaces, matching the dominant ecosystem.";
+
+#[tokio::test]
+async fn council_command_without_configuration_notes_and_ends_the_turn() {
+    let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+
+    agent
+        .run_turn(
+            "/council tabs or spaces?".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        council_notes(&events)
+            .iter()
+            .any(|n| n.contains("no council is configured"))
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(agent.history.is_empty(), "command must not enter history");
+    assert!(
+        main_mock.received.lock().unwrap().is_empty(),
+        "no LLM request may be made without a council"
+    );
+}
+
+// ----- architect/editor pairing (Phase 9) -----
+
+fn architect_seat(
+    model: &str,
+    responses: Vec<Vec<StreamEvent>>,
+) -> (crate::architect::ArchitectSeat, Arc<MockBackend>) {
+    let mock = Arc::new(MockBackend::new(responses));
+    (
+        crate::architect::ArchitectSeat {
+            model: model.to_string(),
+            backend: mock.clone(),
+        },
+        mock,
+    )
+}
+
+fn architect_notes(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ArchitectNote(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+// Long enough to clear MIN_ANSWER_CHARS in council.rs.
+const PLAN_TEXT: &str =
+    "1. Add a TokenV2 struct in auth/token.rs. 2. Update verify() to accept it.";
+
+#[tokio::test]
+async fn architect_command_without_configuration_notes_and_ends_the_turn() {
+    let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+
+    agent
+        .run_turn(
+            "/architect refactor auth".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        architect_notes(&events)
+            .iter()
+            .any(|n| n.contains("no architect is configured"))
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(agent.history.is_empty(), "command must not enter history");
+    assert!(
+        main_mock.received.lock().unwrap().is_empty(),
+        "no LLM request may be made without an architect"
+    );
+}
+
+#[tokio::test]
+async fn bare_architect_command_notes_usage_and_ends_the_turn() {
+    let (mut agent, mut rx, _main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let (seat, _) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+    agent.set_architect(crate::architect::Architect {
+        seat,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/architect".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        architect_notes(&events)
+            .iter()
+            .any(|n| n.contains("usage:"))
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(agent.history.is_empty());
+}
+
+#[tokio::test]
+async fn architect_plan_hands_off_to_the_editor_in_the_same_turn() {
+    // The editor's mock backend replies with one tool call (read_file)
+    // then a plain stop, so the test can prove the hand-off actually
+    // reached the tool-dispatch loop, not just that text was injected.
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    let editor_responses = vec![
+        vec![StreamEvent::ToolCallComplete(tool_call("c1", "read_file"))],
+        text_response("done"),
+    ];
+    let (mut agent, mut rx, editor_mock) = build_agent(editor_responses, registry, 10);
+    let (seat, architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+    agent.set_architect(crate::architect::Architect {
+        seat,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/architect refactor the auth module".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        architect_mock.received.lock().unwrap().len(),
+        1,
+        "the architect backend must be called exactly once"
+    );
+    assert_eq!(
+        editor_mock.received.lock().unwrap().len(),
+        2,
+        "the editor backend must run its normal iteration loop after the hand-off"
+    );
+
+    // History carries the injected plan message and the editor's own
+    // tool-call round-trip, in that order — proving the hand-off is one
+    // continuous turn, not two disjoint actions.
+    let plan_index = agent
+        .history
+        .iter()
+        .position(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("[Architect plan")))
+        })
+        .expect("plan message must be in history");
+    assert!(
+        agent.history[plan_index]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains(PLAN_TEXT))),
+        "injected message must contain the architect's plan text"
+    );
+    assert_eq!(count_tool_calls(&agent.history[plan_index..]), 1);
+
+    let events = drain(&mut rx);
+    assert!(
+        architect_notes(&events)
+            .iter()
+            .any(|n| n.contains(PLAN_TEXT)),
+        "the plan must stream live as an ArchitectNote"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallDetected(_)))
+    );
+}
+
+#[tokio::test]
+async fn architect_backend_failure_ends_the_turn_without_invoking_the_editor() {
+    let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let (seat, architect_mock) = architect_seat("model-architect", vec![]);
+    agent.set_architect(crate::architect::Architect {
+        seat,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/architect refactor auth".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        architect_notes(&events)
+            .iter()
+            .any(|n| n.contains("no usable plan")),
+        "an empty response (below MIN_ANSWER_CHARS) must be treated as a failure"
+    );
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert!(agent.history.is_empty());
+    assert_eq!(architect_mock.received.lock().unwrap().len(), 1);
+    assert!(
+        editor_mock.received.lock().unwrap().is_empty(),
+        "the editor must never be invoked after a failed plan"
+    );
+}
+
+#[tokio::test]
+async fn architect_plan_mode_regression_editor_only_gets_read_only_tools() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let (tx, mut rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![text_response("noted")]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let plan_mode = PlanMode::new();
+    plan_mode.set_active(true);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        plan_mode,
+        AutonomousMode::new(),
+        tx,
+    );
+    let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+    agent.set_architect(crate::architect::Architect {
+        seat,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/architect refactor auth".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let tool_names: Vec<&str> = received[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(tool_names.contains(&"read_file"));
+    assert!(
+        !tool_names.contains(&"write_file"),
+        "plan mode must still filter the editor's own tool list after an architect hand-off"
+    );
+    drop(rx.try_recv()); // drain isn't needed for this assertion; silence unused warning
+}
+
+#[tokio::test]
+async fn architect_planning_cancellation_ends_the_turn_without_invoking_the_editor() {
+    let (mut agent, mut rx, editor_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let (seat, _architect_mock) = architect_seat("model-architect", vec![text_response(PLAN_TEXT)]);
+    agent.set_architect(crate::architect::Architect {
+        seat,
+        tail_budget_tokens: 3072,
+    });
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    agent
+        .run_turn(
+            "/architect refactor auth".to_string(),
+            Path::new("."),
+            cancellation,
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        architect_notes(&events)
+            .iter()
+            .any(|n| n.contains("cancelled")),
+        "a pre-cancelled token must abort planning with an explanatory note"
+    );
+    assert!(agent.history.is_empty());
+    assert!(editor_mock.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn council_runs_the_protocol_and_pushes_only_the_synthesis() {
+    let (mut agent, mut rx, main_mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    // Each member answers (stage 1), then ranks (stage 2).
+    let (seat_a, mock_a) = council_seat(
+        "model-a",
+        vec![text_response(ANSWER_A), text_response(RANKING)],
+    );
+    let (seat_b, _) = council_seat(
+        "model-b",
+        vec![text_response(ANSWER_B), text_response(RANKING)],
+    );
+    let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+    agent.set_council(crate::council::Council {
+        members: vec![seat_a, seat_b],
+        chairman: chair,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/council tabs or spaces?".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Only the chairman's synthesis enters history, as a marked
+    // user-role message; the raw command text never does.
+    assert_eq!(agent.history.len(), 1);
+    let entry = &agent.history[0];
+    assert_eq!(entry.role, Role::User);
+    let text = entry.text_content();
+    assert!(text.contains("[Council synthesis"));
+    assert!(text.contains(SYNTHESIS));
+    assert!(text.contains("model-chair"));
+    assert!(!text.contains("/council"));
+
+    // The whole deliberation streamed as notes.
+    let events = drain(&mut rx);
+    let notes = council_notes(&events);
+    assert!(notes.iter().any(|n| n.contains(ANSWER_A)));
+    assert!(notes.iter().any(|n| n.contains(ANSWER_B)));
+    assert!(notes.iter().any(|n| n.contains(RANKING)));
+    assert!(notes.iter().any(|n| n.contains(SYNTHESIS)));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+
+    // Members were asked twice (answer, rank), toollessly, with the
+    // advisor prompt; the agent's own backend was never touched.
+    let member_requests = mock_a.received.lock().unwrap();
+    assert_eq!(member_requests.len(), 2);
+    assert!(member_requests.iter().all(|r| r.tools.is_empty()));
+    assert!(
+        member_requests[0].messages[0]
+            .text_content()
+            .contains("advisor")
+    );
+    assert!(
+        member_requests[0].messages[1]
+            .text_content()
+            .contains("tabs or spaces?")
+    );
+    assert_eq!(chair_mock.received.lock().unwrap().len(), 1);
+    assert!(main_mock.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn council_below_quorum_leaves_no_history_entry() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    // One usable answer, one empty (e.g. an all-thinking response).
+    let (seat_a, _) = council_seat("model-a", vec![text_response(ANSWER_A)]);
+    let (seat_b, _) = council_seat("model-b", vec![text_response("")]);
+    let (chair, chair_mock) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+    agent.set_council(crate::council::Council {
+        members: vec![seat_a, seat_b],
+        chairman: chair,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/council anything".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(agent.history.is_empty());
+    assert!(
+        chair_mock.received.lock().unwrap().is_empty(),
+        "an aborted council must not consult the chairman"
+    );
+    let events = drain(&mut rx);
+    assert!(council_notes(&events).iter().any(|n| n.contains("quorum")));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+}
+
+#[tokio::test]
+async fn council_chairman_failure_leaves_no_history_entry() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    let (seat_a, _) = council_seat(
+        "model-a",
+        vec![text_response(ANSWER_A), text_response(RANKING)],
+    );
+    let (seat_b, _) = council_seat(
+        "model-b",
+        vec![text_response(ANSWER_B), text_response(RANKING)],
+    );
+    let (chair, _) = council_seat("model-chair", vec![text_response("")]);
+    agent.set_council(crate::council::Council {
+        members: vec![seat_a, seat_b],
+        chairman: chair,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/council anything".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        agent.history.is_empty(),
+        "nothing unsynthesized may enter history"
+    );
+    let events = drain(&mut rx);
+    assert!(
+        council_notes(&events)
+            .iter()
+            .any(|n| n.contains("no usable synthesis"))
+    );
+}
+
+#[tokio::test]
+async fn bare_council_reviews_the_last_assistant_message_with_a_digest() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent
+        .history
+        .push(user_msg("should we rewrite the parser?"));
+    agent.history.push(assistant_msg(
+        "Plan: rewrite the parser with a PEG grammar.",
+    ));
+    let (seat_a, mock_a) = council_seat(
+        "model-a",
+        vec![text_response(ANSWER_A), text_response(RANKING)],
+    );
+    let (seat_b, _) = council_seat(
+        "model-b",
+        vec![text_response(ANSWER_B), text_response(RANKING)],
+    );
+    let (chair, _) = council_seat("model-chair", vec![text_response(SYNTHESIS)]);
+    agent.set_council(crate::council::Council {
+        members: vec![seat_a, seat_b],
+        chairman: chair,
+        tail_budget_tokens: 3072,
+    });
+
+    agent
+        .run_turn(
+            "/council".to_string(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = mock_a.received.lock().unwrap();
+    let prompt = requests[0].messages[1].text_content();
+    assert!(
+        prompt.contains("PEG grammar"),
+        "bare /council must put the last assistant message before the council"
+    );
+    assert!(
+        prompt.contains("should we rewrite the parser?"),
+        "the conversation tail digest should accompany the question"
+    );
+    drop(requests);
+
+    // Synthesis landed on top of the existing history.
+    assert_eq!(agent.history.len(), 3);
+    drain(&mut rx);
+}
