@@ -226,6 +226,43 @@ skip a permission tier or bypass the approval gate on a mutating action, so
 review the file the same way you'd review any other project instructions
 before trusting them, not as a sandboxed-away concern.
 
+**Editor context**: an optional per-project JSON file
+(`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
+canonicalized-`cwd` hash as session files) that any editor integration can
+write to, reporting the currently open file, cursor position, and
+selection. Re-read every turn and surfaced as a one-line addition to the
+system prompt ("Currently open in editor: src/foo.rs, cursor at line
+42.") — metadata only, never file content; the model calls `read_file`
+itself for actual code, exactly as it already does everywhere else. A
+file that's missing, malformed, reports an unrecognized `schema_version`,
+is more than 5 minutes stale, whose `workspace_root` doesn't match this
+session's own directory, or whose reported path falls under a configured
+`deny_paths` entry is silently ignored — none of these are user-facing
+errors. No editor plugin ships with aivyx-coder; this is the file-format
+contract such a plugin (for any editor) would write to. Governed by
+`[editor_context]`: `enabled` (default `true` — a no-op until some
+integration actually writes the file).
+
+The JSON schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "workspace_root": "/abs/path/to/project",
+  "file": "src/foo.rs",
+  "cursor": { "line": 42, "column": 8 },
+  "selection": { "start_line": 40, "end_line": 45 },
+  "updated_at": "2026-07-18T12:00:00Z"
+}
+```
+
+`workspace_root` is absolute and must canonicalize to aivyx-coder's own
+`cwd`. `file` is relative to `workspace_root`. `cursor` is required,
+1-indexed. `selection` is optional — omit the key entirely (not `null`)
+when there's no active selection; 1-indexed, inclusive line range, no
+column granularity in this version. `updated_at` is an RFC 3339
+timestamp.
+
 **`web_fetch`/`web_search`**: aivyx-coder is local-only in where LLM
 inference happens (Ollama/vLLM/llama.cpp), not in network isolation — the
 agent has full network access. `web_fetch(url)` fetches a URL and converts
@@ -681,6 +718,9 @@ checkpoints = true   # snapshot the worktree before every mutating tool call
 [repo_map]
 enabled = true       # append a ranked symbol map to the system prompt
 budget_tokens = 1024 # rough token budget the map may consume per request
+
+[editor_context]
+enabled = true  # a no-op until some editor integration writes the context file
 
 # Enforced verification (docs/HISTORY.md Phase 12 Part B): after file edits,
 # before a turn is allowed to end, auto-run this named allowed_commands
