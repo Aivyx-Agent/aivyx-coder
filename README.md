@@ -272,8 +272,9 @@ for a write/edit/delete, or the command text for a shell/MCP action) to
 `~/.local/state/aivyx-coder/editor-approval/<hash>-request.json`, then
 waits on either the terminal's own Allow/Deny/Always-Allow prompt or a
 matching `~/.local/state/aivyx-coder/editor-approval/<hash>-response.json`
-file — whichever answers first wins; the other is dropped. Both files are
-created 0600 and deleted the instant the decision resolves, whichever
+file — whichever answers first wins; the other is dropped. The request file
+is created 0600; the response file's permissions are determined by the editor
+plugin. Both files are deleted the instant the decision resolves, whichever
 surface answered. No editor integration ships in this repo for any
 specific editor — this is a schema contract (see below) an editor plugin
 implements against, exactly like editor context. Governed by
@@ -286,22 +287,23 @@ Request file schema:
 {
   "schema_version": 1,
   "request_id": "6a6e...-uuid",
+  "target": "/home/user/project/src/foo.rs",
   "action_kind": "write",
-  "target": "src/foo.rs",
   "old_content": "fn foo() {}\n",
   "new_content": "fn foo() -> i32 { 42 }\n"
 }
 ```
 
-`action_kind` is one of `write`, `delete`, `execute`, `mcp_tool`, each
-with different content fields: `write` carries `old_content`/`new_content`
-(old empty for a brand-new file); `delete` carries `old_content` plus
-`will_delete: true` (no `new_content` key at all); `execute` carries
-`command`/`args`; `mcp_tool` carries a `description` string. A `write` or
-`delete` request whose underlying file can't be read as text (a binary
-file) never generates a request file at all — the terminal remains the
-sole surface for that one decision, same as when no editor integration is
-running.
+`target` is always an absolute, resolved path (contrast this with editor
+context's `file` field, which is relative to `workspace_root`). `action_kind`
+is one of `write`, `delete`, `execute`, `mcp_tool`, each with different content
+fields: `write` carries `old_content`/`new_content` (old empty for a brand-new
+file); `delete` carries `old_content` plus `will_delete: true` (no
+`new_content` key at all); `execute` carries `command`/`args`; `mcp_tool`
+carries a `description` string. A `write` or `delete` request whose underlying
+file can't be read as text (a binary file) never generates a request file at
+all — the terminal remains the sole surface for that one decision, same as when
+no editor integration is running.
 
 Response file schema (written by the editor integration):
 
@@ -778,7 +780,7 @@ budget_tokens = 1024 # rough token budget the map may consume per request
 enabled = true  # a no-op until some editor integration writes the context file
 
 [editor_approval]
-enabled = true
+enabled = true  # a no-op until an external editor plugin writes a response file
 
 # Enforced verification (docs/HISTORY.md Phase 12 Part B): after file edits,
 # before a turn is allowed to end, auto-run this named allowed_commands
