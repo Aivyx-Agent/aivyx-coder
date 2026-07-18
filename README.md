@@ -9,7 +9,7 @@ cannot quietly do damage.
 
 This is a from-scratch Rust project built reliability-first: the security
 boundary was designed before the tools that need it, and hardened through
-repeated full-codebase audits (see `ROADMAP.md` for the phase history).
+repeated full-codebase audits (see `docs/HISTORY.md` for the phase history).
 
 ## Building and running
 
@@ -43,8 +43,8 @@ instead — multiline code survives plain text better than JSON string
 escaping on small models. Parsed blocks are applied through the *same*
 tools, so the permission modal, diff preview, plan-mode denial, deny_paths,
 and checkpoints all behave identically in both formats; malformed blocks
-get corrective feedback the model can retry from. See ROADMAP.md Phase 2
-for the A/B measurements behind the default.
+get corrective feedback the model can retry from. See `docs/HISTORY.md`'s
+Phase 2 for the A/B measurements behind the default.
 
 **Repository map**: on each turn a token-budgeted map of the repo's
 top-ranked files and symbol signatures (tree-sitter extraction, PageRank
@@ -123,8 +123,8 @@ max_iterations = 20      # total "continue" round-trips for the whole run
 max_duration_secs = 3600 # wall-clock ceiling for the whole run
 ```
 
-Mutually exclusive with `--plan` and `--resume`. See ROADMAP.md's Phase 11c
-entry for the full trust-profile rationale and design forks.
+Mutually exclusive with `--plan` and `--resume`. See `docs/HISTORY.md`'s
+Phase 11c entry for the full trust-profile rationale and design forks.
 
 **Agent-maintained wiki** (`/wiki`, `/wiki <page>`): generates and keeps
 `docs/wiki/*.md` up to date — one page per workspace crate plus
@@ -139,8 +139,8 @@ pointers so the model can `read_file` the relevant one on demand, at no new
 token-budget cost. Each page is its own turn, so if `[verification]
 command` is configured it auto-runs once per regenerated page (not once per
 `/wiki` invocation) — expect a slow verification command to dominate a
-first-run, full-skeleton regeneration. See ROADMAP.md's Phase 11b entry for
-the full design rationale.
+first-run, full-skeleton regeneration. See `docs/HISTORY.md`'s Phase 11b
+entry for the full design rationale.
 
 **Sub-agent delegation** (`delegate_task`): a tool the model can call
 mid-turn to hand a bounded task to a fresh, isolated agent — full tool
@@ -434,8 +434,8 @@ wraps llama.cpp (plus other backends) with model pull/load management and
 a distro package (CachyOS/Arch: `lemonade-server`, binary `lemonade` +
 `lemond` service) — its CUDA backend ships prebuilt binaries per compute
 capability, sidestepping the `GGML_CCACHE` build gotcha above entirely.
-Two things verified live (ROADMAP.md Phase 10) before pointing aivyx at
-it:
+Two things verified live (`docs/HISTORY.md` Phase 10) before pointing aivyx
+at it:
 
 - **Target the underlying llama-server port, not Lemonade's gateway
   port.** Lemonade spawns a real `llama-server` process per loaded model
@@ -482,6 +482,18 @@ a Lemonade-managed `qwen3.5:9b`.
 | `set_tasks` | replace the agent's own task list (shown in the TUI) | none (internal state only) |
 | `git_read` | git status / diff / log (read-only, fixed argv shapes) | none (auto-allowed) |
 | `git_commit` | stage + commit, with your identity/hooks/config | prompt, with a change-summary preview |
+| `delete_file` | delete a file | prompt (then cacheable) |
+| `git_branch` | create or switch git branches | prompt (then cacheable) |
+| `git_push` | push the current branch to a remote | prompt (then cacheable) |
+| `git_pr` | open a pull request via `gh` | prompt (then cacheable) |
+| `web_fetch` | fetch a URL and convert to readable text | none (auto-allowed) |
+| `web_search` | query a configured SearXNG instance | none (auto-allowed) |
+| `go_to_definition` | resolve a symbol to its definition (via `rust-analyzer`) | none (auto-allowed) |
+| `find_references` | find every reference to a symbol across the workspace | none (auto-allowed) |
+| `delegate_task` | hand a bounded task to a fresh sub-agent | none (internal state only) |
+| `list_mcp_resources` / `read_mcp_resource` | list/read resources from connected MCP servers | none (auto-allowed) |
+| `list_mcp_prompts` / `get_mcp_prompt` | list/get prompts from connected MCP servers | none (auto-allowed) |
+| `mcp__<server>__<tool>` | dynamically discovered tool from a connected MCP server | prompt (then cacheable) |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command
@@ -656,7 +668,7 @@ checkpoints = true   # snapshot the worktree before every mutating tool call
 enabled = true       # append a ranked symbol map to the system prompt
 budget_tokens = 1024 # rough token budget the map may consume per request
 
-# Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
+# Enforced verification (docs/HISTORY.md Phase 12 Part B): after file edits,
 # before a turn is allowed to end, auto-run this named allowed_commands
 # entry via run_command and let the model react to the result — fix and
 # retry on failure, or actually end the turn on success. Off by default;
@@ -721,5 +733,5 @@ Deliberately not (yet) addressed — documented rather than hidden:
   but `log` shows committed history as-is — anything already committed is
   considered yours to see.
 
-See `ROADMAP.md` for what's planned next (repo map, git integration, richer
-agentic UX) and the project's own audit history.
+See `ROADMAP.md` for current status and `docs/HISTORY.md` for the full
+phase-by-phase history and audit trail.
