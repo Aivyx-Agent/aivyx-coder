@@ -16,3 +16,8 @@ aivyx-repomap = { path = "crates/aivyx-repomap" }
 aivyx-core = { path = "crates/aivyx-core" }
 aivyx-config = { path = "crates/aivyx-config" }
 aivyx-tui = { path = "crates/aivyx-tui" }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
