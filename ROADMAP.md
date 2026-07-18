@@ -61,6 +61,32 @@ in the agent loop itself (closed via Phase 12) plus five smaller gaps
 support, branch/PR tooling, `delete_file`). No tracked items remain from
 this audit.
 
-**In flight / next**: nothing pre-scoped remains. All previously-tracked
-threads (including the vLLM compat pass) are closed. See `docs/HISTORY.md`
-for the full phase-by-phase narrative behind every item above.
+**Editor/IDE context integration — shipped.** The agent now polls a
+local, editor-agnostic JSON descriptor file for the user's currently
+open file, cursor position, and selection, and injects a one-line
+metadata note into the system prompt every turn (e.g. "Currently open
+in editor: {file}, cursor at line {line}."). Deliberately metadata-only
+— the model never receives raw file/selection content this way, only a
+path and line/column numbers; it still has to call `read_file` itself
+for actual code, so the project's existing invariant (file content only
+enters the conversation via an explicit, visible tool call) holds. No
+editor-specific plugin code ships here — just the schema contract and
+the agent-side read/inject path, gated by a new `[editor_context]`
+config flag (default on). Live-E2E verified through the real release
+binary. The project's own security review of this phase caught and
+fixed a real gap before merge: the injected file-path string wasn't
+sanitized before being interpolated into the trusted system prompt,
+which could have let a crafted descriptor forge fake instructions via
+embedded control characters — fixed by sanitizing the displayed copy
+while leaving the real path untouched for the security-relevant
+`deny_paths` check.
+
+**In flight / next**: nothing pre-scoped remains. This was a freeform
+addition beyond the original capability audit, not pulled from a
+backlog. Likely next directions — none yet scoped — include a
+"context out" follow-on (surfacing the agent's diffs in the user's
+editor instead of just the terminal) and public-release polish (the
+repo is live and private on GitHub with a working release-build
+pipeline, but no `v0.1.0` tag has been cut and visibility hasn't been
+flipped to public). See `docs/HISTORY.md` for the full phase-by-phase
+narrative behind every item above.
