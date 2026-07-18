@@ -208,7 +208,7 @@ pub fn default_confiner(
 /// Shared by `ConfirmationGate::is_denied` and (behind `sandbox-backend`)
 /// `LandlockConfiner`'s path-grant construction — both need the same
 /// "is this path under a denied path" check.
-pub(crate) fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
+pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     deny_paths.iter().any(|denied| path.starts_with(denied))
 }
 

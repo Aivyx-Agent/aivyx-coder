@@ -501,6 +501,12 @@ async fn main() -> anyhow::Result<()> {
         agent.set_agents_file(global_path, settings.agents_file.budget_tokens);
     }
 
+    // Absence of a context file is not an error — the feature is off only
+    // when the user explicitly disables it via [editor_context] enabled.
+    if settings.editor_context.enabled {
+        agent.set_editor_context(deny_paths.clone());
+    }
+
     // `/council` needs ≥2 members and a chairman; anything less and the
     // command explains itself instead (the agent handles the None case).
     if settings.council.configured() {

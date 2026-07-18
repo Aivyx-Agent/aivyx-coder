@@ -44,6 +44,7 @@ pub struct Settings {
     pub sub_agent: SubAgentSettings,
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
+    pub editor_context: EditorContextSettings,
     pub web: WebSettings,
     pub mcp: McpSettings,
 }
@@ -151,6 +152,22 @@ impl Default for AgentsFileSettings {
             enabled: true,
             budget_tokens: 1024,
         }
+    }
+}
+
+/// Live editor context (open file, cursor, selection) — see
+/// `aivyx_core::editor_context` and the "Editor context" README section
+/// for the JSON file contract. No budget concept (a one-line status, not
+/// prose) — just an enable flag, matching `repo_map`'s own shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorContextSettings {
+    pub enabled: bool,
+}
+
+impl Default for EditorContextSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -892,6 +909,22 @@ mod tests {
         let settings: Settings = toml::from_str(raw).unwrap();
         assert!(!settings.agents_file.enabled);
         assert_eq!(settings.agents_file.budget_tokens, 2048);
+    }
+
+    #[test]
+    fn editor_context_settings_default_is_enabled() {
+        let settings = Settings::default();
+        assert!(settings.editor_context.enabled);
+    }
+
+    #[test]
+    fn editor_context_block_parses_custom_values() {
+        let raw = r#"
+            [editor_context]
+            enabled = false
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert!(!settings.editor_context.enabled);
     }
 
     #[test]
