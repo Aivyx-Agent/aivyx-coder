@@ -3,6 +3,7 @@ pub mod architect;
 pub mod council;
 pub mod delegate;
 pub mod edit_blocks;
+pub mod editor_context;
 pub mod session;
 pub mod wiki;
 
