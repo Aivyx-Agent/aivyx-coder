@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::{
     ActionKind, AutonomousMode, PermissionDecision, PermissionGate, PermissionPrompter,
-    PermissionRequest, PermissionTarget, PlanMode, UserResponse, path_is_denied,
+    PermissionRequest, PermissionTarget, PlanMode, UserResponse, editor_approval, path_is_denied,
 };
 
 /// Told to the model on a plan-mode denial. This is a backstop message: in
@@ -84,6 +84,7 @@ pub struct ConfirmationGate {
     autonomous_mode: AutonomousMode,
     cwd: PathBuf,
     always_allow: Mutex<HashSet<PermissionKey>>,
+    editor_approval_enabled: bool,
 }
 
 impl ConfirmationGate {
@@ -96,6 +97,11 @@ impl ConfirmationGate {
     /// ever runs entries from this same list, and `run_shell` treats an
     /// exact match against it as pre-approved before falling back to the
     /// normal confirm-then-cache flow for anything else.
+    ///
+    /// `editor_approval_enabled` gates the editor-side answer race in
+    /// `check` below (`docs/superpowers/specs/
+    /// 2026-07-19-editor-approval-integration-design.md`) — when `false`,
+    /// `check` behaves exactly as it did before this feature existed.
     pub fn new(
         prompter: Arc<dyn PermissionPrompter>,
         deny_paths: Vec<PathBuf>,
@@ -103,6 +109,7 @@ impl ConfirmationGate {
         plan_mode: PlanMode,
         autonomous_mode: AutonomousMode,
         cwd: PathBuf,
+        editor_approval_enabled: bool,
     ) -> Self {
         let always_allow = pre_approved_commands
             .into_iter()
@@ -115,6 +122,7 @@ impl ConfirmationGate {
             autonomous_mode,
             cwd,
             always_allow: Mutex::new(always_allow),
+            editor_approval_enabled,
         }
     }
 
@@ -138,6 +146,47 @@ impl ConfirmationGate {
             return false;
         };
         !path.starts_with(cwd)
+    }
+
+    /// Races the terminal's own prompt against a possible editor-side
+    /// answer to the same pending request. When editor-approval is
+    /// disabled, or there's no structured content to offer the editor for
+    /// this particular request (e.g. a binary-file diff gap), falls back
+    /// to the terminal path unchanged — exactly as `check` behaved before
+    /// this feature existed.
+    async fn resolve_via_prompter_or_editor(&self, request: &PermissionRequest) -> UserResponse {
+        if !self.editor_approval_enabled {
+            return self.prompter.prompt(request).await;
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let Some(pending) = editor_approval::build_pending_request(request, request_id.clone())
+        else {
+            return self.prompter.prompt(request).await;
+        };
+        let (Some(req_path), Some(resp_path)) = (
+            editor_approval::request_path(&self.cwd),
+            editor_approval::response_path(&self.cwd),
+        ) else {
+            return self.prompter.prompt(request).await;
+        };
+
+        if editor_approval::write_pending_request(&req_path, &pending)
+            .await
+            .is_err()
+        {
+            return self.prompter.prompt(request).await;
+        }
+
+        let response: UserResponse = tokio::select! {
+            response = self.prompter.prompt(request) => response,
+            response = editor_approval::poll_for_response(&resp_path, &request_id) => response,
+        };
+
+        let _ = tokio::fs::remove_file(&req_path).await;
+        let _ = tokio::fs::remove_file(&resp_path).await;
+
+        response
     }
 }
 
@@ -255,7 +304,7 @@ impl PermissionGate for ConfirmationGate {
             return PermissionDecision::AllowAlways;
         }
 
-        let decision = match self.prompter.prompt(request).await {
+        let decision = match self.resolve_via_prompter_or_editor(request).await {
             UserResponse::Allow => PermissionDecision::Allow,
             UserResponse::AllowAlways => {
                 self.always_allow.lock().unwrap().insert(key);
@@ -333,6 +382,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -356,6 +406,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -379,6 +430,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -408,6 +460,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let first = gate.check(&write_request("/home/user/project/a.rs")).await;
@@ -445,6 +498,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -472,6 +526,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let test_request = PermissionRequest {
@@ -522,6 +577,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -573,6 +629,7 @@ mod tests {
             plan_mode.clone(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         // Cache a write approval while still in Act mode.
@@ -624,6 +681,7 @@ mod tests {
             plan_mode,
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let read = gate.check(&read_request("/home/user/project/a.rs")).await;
@@ -659,6 +717,7 @@ mod tests {
             plan_mode,
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate.check(&write_request("/home/user/.ssh/config")).await;
@@ -682,6 +741,7 @@ mod tests {
             plan_mode.clone(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         gate.check(&write_request("/home/user/project/a.rs")).await;
@@ -716,6 +776,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         gate.check(&write_request("/home/user/project/a.rs")).await;
@@ -739,6 +800,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -768,6 +830,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -802,6 +865,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let approved = PermissionRequest {
@@ -855,6 +919,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -892,6 +957,7 @@ mod tests {
             plan_mode,
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -916,6 +982,7 @@ mod tests {
             PlanMode::new(),
             AutonomousMode::new(),
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -955,6 +1022,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let request = PermissionRequest {
@@ -993,6 +1061,7 @@ mod tests {
             PlanMode::new(),
             autonomous_mode,
             PathBuf::from("/home/user/project"),
+            false,
         );
 
         let decision = gate
@@ -1002,5 +1071,245 @@ mod tests {
             panic!("expected a deny_paths denial, got {decision:?}");
         };
         assert!(reason.contains("deny_paths"));
+    }
+
+    /// A prompter that never resolves — used to prove the editor-response
+    /// branch of the race can win deterministically, without any timing
+    /// dependency on how fast a "normal" prompter would answer.
+    struct NeverPrompter;
+
+    #[async_trait]
+    impl PermissionPrompter for NeverPrompter {
+        async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+            std::future::pending::<()>().await;
+            unreachable!("NeverPrompter must never resolve")
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_response_wins_when_terminal_never_answers() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let gate = ConfirmationGate::new(
+            Arc::new(NeverPrompter),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd_dir.path().to_path_buf(),
+            true,
+        );
+
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(cwd_dir.path().join("a.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: Some(crate::DiffContent {
+                old_content: "old\n".to_string(),
+                new_content: "new\n".to_string(),
+            }),
+        };
+
+        // Poll the request file until it appears, extract the request_id
+        // the gate generated, then answer it — mirroring what a real
+        // editor plugin would do.
+        let req_path = editor_approval::request_path(cwd_dir.path()).unwrap();
+        let resp_path = editor_approval::response_path(cwd_dir.path()).unwrap();
+        let answer_task = tokio::spawn(async move {
+            let request_id = loop {
+                if let Ok(content) = tokio::fs::read_to_string(&req_path).await {
+                    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    break value["request_id"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            let response_json = format!(
+                r#"{{ "schema_version": 1, "request_id": "{request_id}", "decision": "allow" }}"#
+            );
+            tokio::fs::write(&resp_path, response_json).await.unwrap();
+        });
+
+        let decision = gate.check(&request).await;
+        answer_task.await.unwrap();
+
+        assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn terminal_still_answers_when_editor_approval_is_disabled() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd_dir.path().to_path_buf(),
+            false,
+        );
+
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(cwd_dir.path().join("a.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: Some(crate::DiffContent {
+                old_content: "old\n".to_string(),
+                new_content: "new\n".to_string(),
+            }),
+        };
+
+        let decision = gate.check(&request).await;
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // No pending-request file should ever have been written.
+        let req_path = editor_approval::request_path(cwd_dir.path()).unwrap();
+        assert!(!req_path.exists());
+    }
+
+    #[tokio::test]
+    async fn no_structured_diff_falls_back_to_the_terminal_even_when_enabled() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd_dir.path().to_path_buf(),
+            true,
+        );
+
+        // A Write action with diff: None (the binary-file gap) has no
+        // pending content to offer the editor at all.
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(cwd_dir.path().join("a.bin")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        let decision = gate.check(&request).await;
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn always_allow_from_the_editor_populates_the_same_cache() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let gate = ConfirmationGate::new(
+            Arc::new(NeverPrompter),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd_dir.path().to_path_buf(),
+            true,
+        );
+
+        let target_path = cwd_dir.path().join("a.rs");
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(target_path.clone()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: Some(crate::DiffContent {
+                old_content: "old\n".to_string(),
+                new_content: "new\n".to_string(),
+            }),
+        };
+
+        let req_path = editor_approval::request_path(cwd_dir.path()).unwrap();
+        let resp_path = editor_approval::response_path(cwd_dir.path()).unwrap();
+        let answer_task = tokio::spawn(async move {
+            let request_id = loop {
+                if let Ok(content) = tokio::fs::read_to_string(&req_path).await {
+                    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    break value["request_id"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            let response_json = format!(
+                r#"{{ "schema_version": 1, "request_id": "{request_id}", "decision": "always_allow" }}"#
+            );
+            tokio::fs::write(&resp_path, response_json).await.unwrap();
+        });
+
+        let decision = gate.check(&request).await;
+        answer_task.await.unwrap();
+        assert_eq!(decision, PermissionDecision::AllowAlways);
+
+        // Second identical request must now hit the Always-Allow cache
+        // without writing a new pending-request file at all.
+        let decision2 = gate.check(&request).await;
+        assert_eq!(decision2, PermissionDecision::AllowAlways);
+        assert!(
+            !editor_approval::request_path(cwd_dir.path()).unwrap().exists(),
+            "cached Always-Allow must short-circuit before ever reaching the editor race"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_files_are_deleted_after_resolution() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let gate = ConfirmationGate::new(
+            Arc::new(NeverPrompter),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd_dir.path().to_path_buf(),
+            true,
+        );
+
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(cwd_dir.path().join("a.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: Some(crate::DiffContent {
+                old_content: "old\n".to_string(),
+                new_content: "new\n".to_string(),
+            }),
+        };
+
+        let req_path = editor_approval::request_path(cwd_dir.path()).unwrap();
+        let resp_path = editor_approval::response_path(cwd_dir.path()).unwrap();
+        let resp_path_for_task = resp_path.clone();
+        let req_path_for_task = req_path.clone();
+        let answer_task = tokio::spawn(async move {
+            let request_id = loop {
+                if let Ok(content) = tokio::fs::read_to_string(&req_path_for_task).await {
+                    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    break value["request_id"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            let response_json = format!(
+                r#"{{ "schema_version": 1, "request_id": "{request_id}", "decision": "deny" }}"#
+            );
+            tokio::fs::write(&resp_path_for_task, response_json).await.unwrap();
+        });
+
+        gate.check(&request).await;
+        answer_task.await.unwrap();
+
+        assert!(!req_path.exists(), "request file must be deleted after resolution");
+        assert!(!resp_path.exists(), "response file must be deleted after resolution");
     }
 }

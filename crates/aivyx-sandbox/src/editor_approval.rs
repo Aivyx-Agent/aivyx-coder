@@ -9,11 +9,6 @@
 //! the only consumer, lives here — `aivyx-sandbox` has no dependency on
 //! `aivyx-core`, so the module can't live on the other side of that edge.
 
-// This module's `pub(crate)` items have no caller yet outside of its own
-// tests: `ConfirmationGate` is the intended consumer, wired up in a
-// follow-on task. Remove this allow once that wiring lands.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
