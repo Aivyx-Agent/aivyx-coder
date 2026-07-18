@@ -2,6 +2,16 @@
 set -euo pipefail
 
 TARGET="x86_64-unknown-linux-musl"
+
+# tree-sitter-rust (pulled in transitively via aivyx-repomap) bundles C source
+# files that must be compiled for the musl target. cc-rs (its build script's
+# C compiler discovery crate) looks for a triple-prefixed binary
+# (x86_64-linux-musl-gcc) that doesn't exist on Arch or Debian-family
+# systems; those instead provide a plain `musl-gcc` (from the `musl` /
+# `musl-tools` package). Point cc-rs at it directly via the CC_<target> env
+# var convention so this works portably, not just on one machine.
+export CC_x86_64_unknown_linux_musl=musl-gcc
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -17,6 +27,14 @@ if ! cargo build --release --target "${TARGET}" -p aivyx 2>&1 | tee "${BUILD_LOG
     echo "ERROR: the ${TARGET} Rust target is not installed."
     echo "On Arch/CachyOS: pacman -S rust-musl"
     echo "On rustup-managed toolchains: rustup target add ${TARGET}"
+    echo ""
+    echo "Note: this is separate from needing a musl C cross-compiler."
+    echo "This project also requires one because tree-sitter-rust bundles C"
+    echo "source that must be compiled for ${TARGET}. If the build fails"
+    echo "with a C-compiler-related error even after installing the Rust"
+    echo "target above, install musl-gcc:"
+    echo "  On Arch/CachyOS: pacman -S musl"
+    echo "  On Debian/Ubuntu: apt install musl-tools"
     exit 1
   fi
   echo ""
