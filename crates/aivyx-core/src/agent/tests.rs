@@ -1030,8 +1030,10 @@ async fn editor_context_surfaces_a_valid_matching_file() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(system.contains("Currently open in editor: src/foo.rs, cursor at line 42."));
 
     tokio::fs::remove_file(&context_path).await.ok();
@@ -1073,8 +1075,10 @@ async fn editor_context_surfaces_selection_when_present() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(system.contains(
         "Currently open in editor: src/foo.rs, cursor at line 42, with lines 40-45 selected."
     ));
@@ -1115,8 +1119,10 @@ async fn editor_context_ignores_a_stale_file() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(!system.contains("Currently open in editor"));
 
     tokio::fs::remove_file(&context_path).await.ok();
@@ -1159,8 +1165,10 @@ async fn editor_context_ignores_a_workspace_root_mismatch() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(!system.contains("Currently open in editor"));
 
     tokio::fs::remove_file(&context_path).await.ok();
@@ -1202,8 +1210,10 @@ async fn editor_context_ignores_a_wrong_schema_version() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(!system.contains("Currently open in editor"));
 
     tokio::fs::remove_file(&context_path).await.ok();
@@ -1245,8 +1255,10 @@ async fn editor_context_ignores_a_denied_path() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(!system.contains("Currently open in editor"));
 
     tokio::fs::remove_file(&context_path).await.ok();
@@ -1301,8 +1313,10 @@ async fn editor_context_injection_never_contains_file_content() {
         .await
         .unwrap();
 
-    let received = mock.received.lock().unwrap();
-    let system = received[0].messages[0].text_content();
+    let system = {
+        let received = mock.received.lock().unwrap();
+        received[0].messages[0].text_content()
+    };
     assert!(system.contains("secret.rs"));
     assert!(
         !system.contains("leaked_super_secret_function"),
