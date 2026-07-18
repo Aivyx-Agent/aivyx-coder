@@ -157,8 +157,9 @@ impl Default for AgentsFileSettings {
 
 /// Live editor context (open file, cursor, selection) — see
 /// `aivyx_core::editor_context` and the "Editor context" README section
-/// for the JSON file contract. No budget concept (a one-line status, not
-/// prose) — just an enable flag, matching `repo_map`'s own shape.
+/// for the JSON file contract. No budget concept, unlike `repo_map` and
+/// `agents_file` (a one-line status has no natural truncation point to
+/// budget against) — just an enable flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorContextSettings {
