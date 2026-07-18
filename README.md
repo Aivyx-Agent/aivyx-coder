@@ -17,6 +17,19 @@ repeated full-codebase audits (see `docs/HISTORY.md` for the phase history).
 cargo run -p aivyx
 ```
 
+For a release build (Linux x86_64 only, static musl binary, matching
+where the real Landlock+seccomp sandbox actually works):
+
+```
+scripts/build-release.sh
+```
+
+Produces `dist/aivyx-coder-v<version>-x86_64-linux-musl.tar.gz` plus a
+`.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are also
+built and published automatically via GitHub Actions once this
+repository is pushed to GitHub — check the repository's Releases page
+for pre-built downloads at that point.
+
 Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
 pointing at Ollama (`http://localhost:11434/v1`); edit it to taste.
