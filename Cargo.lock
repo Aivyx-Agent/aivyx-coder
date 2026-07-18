@@ -22,7 +22,6 @@ dependencies = [
  "aivyx-sandbox",
  "aivyx-tools",
  "aivyx-tui",
- "aivyx-types",
  "anyhow",
  "clap",
  "shell-escape",
@@ -79,9 +78,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "tokio-stream",
- "tracing",
 ]
 
 [[package]]
@@ -91,7 +88,6 @@ dependencies = [
  "ignore",
  "streaming-iterator",
  "tempfile",
- "tracing",
  "tree-sitter",
  "tree-sitter-rust",
 ]
@@ -100,17 +96,13 @@ dependencies = [
 name = "aivyx-sandbox"
 version = "0.1.0"
 dependencies = [
- "aivyx-types",
  "async-trait",
  "landlock",
  "libc",
  "seccompiler",
- "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -123,7 +115,6 @@ dependencies = [
  "async-trait",
  "futures",
  "globset",
- "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "html2text",
