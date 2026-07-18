@@ -124,7 +124,8 @@ max_duration_secs = 3600 # wall-clock ceiling for the whole run
 ```
 
 Mutually exclusive with `--plan` and `--resume`. See `docs/HISTORY.md`'s
-Phase 11c entry for the full trust-profile rationale and design forks.
+Phase 11 section (the "11c" subsection) for the full trust-profile
+rationale and design forks.
 
 **Agent-maintained wiki** (`/wiki`, `/wiki <page>`): generates and keeps
 `docs/wiki/*.md` up to date — one page per workspace crate plus
@@ -139,8 +140,8 @@ pointers so the model can `read_file` the relevant one on demand, at no new
 token-budget cost. Each page is its own turn, so if `[verification]
 command` is configured it auto-runs once per regenerated page (not once per
 `/wiki` invocation) — expect a slow verification command to dominate a
-first-run, full-skeleton regeneration. See `docs/HISTORY.md`'s Phase 11b
-entry for the full design rationale.
+first-run, full-skeleton regeneration. See `docs/HISTORY.md`'s Phase 11
+section (the "11b" subsection) for the full design rationale.
 
 **Sub-agent delegation** (`delegate_task`): a tool the model can call
 mid-turn to hand a bounded task to a fresh, isolated agent — full tool
