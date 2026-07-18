@@ -27,12 +27,13 @@ if ! cargo build --release --target "${TARGET}" -p aivyx 2>&1 | tee "${BUILD_LOG
     echo "ERROR: the ${TARGET} Rust target is not installed."
     echo "On Arch/CachyOS: pacman -S rust-musl"
     echo "On rustup-managed toolchains: rustup target add ${TARGET}"
+    exit 1
+  fi
+  if grep -q "failed to find tool" "${BUILD_LOG}"; then
     echo ""
-    echo "Note: this is separate from needing a musl C cross-compiler."
-    echo "This project also requires one because tree-sitter-rust bundles C"
-    echo "source that must be compiled for ${TARGET}. If the build fails"
-    echo "with a C-compiler-related error even after installing the Rust"
-    echo "target above, install musl-gcc:"
+    echo "ERROR: musl C cross-compiler not found."
+    echo "This project requires one because tree-sitter-rust bundles C"
+    echo "source that must be compiled for ${TARGET}. Install musl-gcc:"
     echo "  On Arch/CachyOS: pacman -S musl"
     echo "  On Debian/Ubuntu: apt install musl-tools"
     exit 1
