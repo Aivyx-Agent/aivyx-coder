@@ -359,7 +359,7 @@ impl Agent {
         if context.schema_version != editor_context::SCHEMA_VERSION {
             return;
         }
-        if OffsetDateTime::now_utc() - context.updated_at > time::Duration::minutes(5) {
+        if (OffsetDateTime::now_utc() - context.updated_at).abs() > time::Duration::minutes(5) {
             return;
         }
 
@@ -377,7 +377,7 @@ impl Agent {
             return;
         }
 
-        let file_display = context.file.display();
+        let file_display = sanitize_for_display(&context.file.display().to_string());
         self.editor_context_text = Some(match &context.selection {
             None => format!(
                 "Currently open in editor: {file_display}, cursor at line {}.",
@@ -1467,6 +1467,37 @@ fn elide(text: &str, cap: usize) -> String {
         "{head}\n[... {} characters elided to fit the context window ...]\n{tail}",
         chars.len() - 2 * half
     )
+}
+
+/// Bound on the displayed length of the editor-context `file` value injected
+/// into the trusted system prompt — this is a display string, not a real
+/// path used for I/O, so an arbitrarily long value is just truncated rather
+/// than rejected outright.
+const EDITOR_CONTEXT_FILE_DISPLAY_MAX_CHARS: usize = 512;
+
+/// Strips ASCII control characters (below 0x20, plus 0x7F/DEL — this
+/// includes `\n`, `\r`, and tab) from `file` before it is interpolated into
+/// the injected editor-context note, and clamps its length. `file` is a
+/// free-form string from a JSON descriptor an attacker may influence; the
+/// note it feeds is dropped verbatim into the *trusted* system prompt, so a
+/// crafted value containing newlines could otherwise forge additional
+/// "instructions" at that trust level. This only affects what is displayed —
+/// `context.file` itself (used to resolve the real path for the
+/// `deny_paths` check) is left untouched.
+fn sanitize_for_display(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect();
+    if cleaned.chars().count() <= EDITOR_CONTEXT_FILE_DISPLAY_MAX_CHARS {
+        cleaned
+    } else {
+        let truncated: String = cleaned
+            .chars()
+            .take(EDITOR_CONTEXT_FILE_DISPLAY_MAX_CHARS)
+            .collect();
+        format!("{truncated}...")
+    }
 }
 
 /// Parses `run_command`'s formatted output (see

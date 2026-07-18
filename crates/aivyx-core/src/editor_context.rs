@@ -12,11 +12,9 @@ use time::OffsetDateTime;
 /// Bumped if the on-disk shape changes incompatibly. A file reporting any
 /// other value is treated as absent (not a best-effort parse) — this is a
 /// machine-to-machine contract, not a human-edited config file.
-#[allow(dead_code)]
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct EditorContext {
     pub(crate) schema_version: u32,
     pub(crate) workspace_root: PathBuf,
@@ -28,14 +26,16 @@ pub(crate) struct EditorContext {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct Cursor {
     pub(crate) line: u32,
+    // Retained for schema completeness — column is parsed but not
+    // currently surfaced anywhere (only `line` appears in the injected
+    // system-prompt note).
+    #[allow(dead_code)]
     pub(crate) column: u32,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct Selection {
     pub(crate) start_line: u32,
     pub(crate) end_line: u32,
@@ -50,7 +50,6 @@ pub(crate) struct Selection {
 /// resumed-by-eye the way a session file might be inspected).
 ///
 /// `None` when no home/state directory can be determined at all.
-#[allow(dead_code)]
 pub(crate) fn editor_context_file_path(cwd: &Path) -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
     let state_dir = dirs
@@ -86,7 +85,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// `workspace_root` — that's `Agent::refresh_editor_context`'s job (it
 /// needs `cwd` and `deny_paths`, which this module deliberately doesn't
 /// know about, to do those checks).
-#[allow(dead_code)]
 pub(crate) async fn read_editor_context(path: &Path) -> Option<EditorContext> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&content).ok()

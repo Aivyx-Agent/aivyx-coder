@@ -258,9 +258,9 @@ The JSON schema (`schema_version: 1`):
 
 `workspace_root` is absolute and must canonicalize to aivyx-coder's own
 `cwd`. `file` is relative to `workspace_root`. `cursor` is required,
-1-indexed. `selection` is optional — omit the key entirely (not `null`)
-when there's no active selection; 1-indexed, inclusive line range, no
-column granularity in this version. `updated_at` is an RFC 3339
+1-indexed. `selection` is optional — omit the `selection` field (or set it
+to `null`) when there's no active selection; 1-indexed, inclusive line
+range, no column granularity in this version. `updated_at` is an RFC 3339
 timestamp.
 
 **`web_fetch`/`web_search`**: aivyx-coder is local-only in where LLM
