@@ -248,6 +248,18 @@ pub async fn run(
                     app.pending_permission = Some(modal);
                 }
             }
+            _ = async {
+                match app.pending_permission.as_mut() {
+                    Some(modal) => modal.reply_tx.closed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // The other side of the gate's race (an editor-approval
+                // response) already answered this decision — the modal is
+                // stale and must not wait for a keypress to clear. Do NOT
+                // send a reply here: the decision was already made.
+                app.pending_permission = None;
+            }
         }
     }
 
@@ -310,6 +322,16 @@ impl App {
         if let Some(modal) = self.pending_permission.take() {
             let _ = modal.reply_tx.send(response);
         }
+    }
+
+    /// True if the pending modal's reply channel is already closed —
+    /// meaning the other side of `ConfirmationGate`'s race (an
+    /// editor-approval response) already answered this decision, and the
+    /// modal is stale.
+    fn pending_permission_is_stale(&self) -> bool {
+        self.pending_permission
+            .as_ref()
+            .is_some_and(|modal| modal.reply_tx.is_closed())
     }
 
     fn take_input(&mut self) -> String {
@@ -484,7 +506,14 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
 
-        if let Some(modal) = &self.pending_permission {
+        // Belt-and-braces alongside the stale-modal `select!` branch in
+        // `run`: that branch only clears `pending_permission` on its own
+        // wakeup, so a redraw that lands in the same tick the editor
+        // answered (before the branch has run) must not repaint a modal
+        // whose decision is already resolved.
+        if !self.pending_permission_is_stale()
+            && let Some(modal) = &self.pending_permission
+        {
             render_permission_modal(frame, &modal.request);
         }
     }
@@ -765,6 +794,8 @@ fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivyx_sandbox::ActionKind;
+    use tokio::sync::oneshot;
 
     #[test]
     fn command_target_with_embedded_newline_splits_into_visible_lines() {
@@ -1013,5 +1044,51 @@ mod tests {
         let message = goal_achieved_notice(4);
         assert!(message.contains("goal achieved"));
         assert!(message.contains('4'));
+    }
+
+    fn modal_request() -> (crate::permission::ModalRequest, oneshot::Receiver<UserResponse>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/tmp/example.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        (
+            crate::permission::ModalRequest { request, reply_tx },
+            reply_rx,
+        )
+    }
+
+    #[test]
+    fn pending_permission_is_stale_false_when_nothing_pending() {
+        let app = App::new(None, PlanMode::new());
+        assert!(!app.pending_permission_is_stale());
+    }
+
+    #[test]
+    fn pending_permission_is_stale_false_while_receiver_alive() {
+        let mut app = App::new(None, PlanMode::new());
+        let (modal, reply_rx) = modal_request();
+        app.pending_permission = Some(modal);
+
+        assert!(!app.pending_permission_is_stale());
+        drop(reply_rx); // keep the receiver alive through the assertion above
+    }
+
+    #[test]
+    fn pending_permission_is_stale_true_once_editor_answers_and_drops_receiver() {
+        let mut app = App::new(None, PlanMode::new());
+        let (modal, reply_rx) = modal_request();
+        app.pending_permission = Some(modal);
+
+        // Simulate the editor-approval race winning: the other side of
+        // ConfirmationGate's select! already got its answer and dropped its
+        // receiver, closing this modal's reply channel.
+        drop(reply_rx);
+
+        assert!(app.pending_permission_is_stale());
     }
 }

@@ -294,8 +294,11 @@ Request file schema:
 }
 ```
 
-`target` is always an absolute, resolved path (contrast this with editor
-context's `file` field, which is relative to `workspace_root`). `action_kind`
+`target` is an absolute, resolved path for `write`/`delete` (contrast this
+with editor context's `file` field, which is relative to `workspace_root`);
+for `execute` it's the command string (e.g. `"cargo test"`), and for
+`mcp_tool` a description string (e.g. `"search (server: filesystem)"`) —
+neither of those is a path. `action_kind`
 is one of `write`, `delete`, `execute`, `mcp_tool`, each with different content
 fields: `write` carries `old_content`/`new_content` (old empty for a brand-new
 file); `delete` carries `old_content` plus `will_delete: true` (no
