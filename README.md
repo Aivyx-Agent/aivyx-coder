@@ -263,6 +263,61 @@ to `null`) when there's no active selection; 1-indexed, inclusive line
 range, no column granularity in this version. `updated_at` is an RFC 3339
 timestamp.
 
+**Editor approval**: a follow-on to editor context — lets the user's
+editor answer a pending permission decision (a file write/edit/delete, a
+shell command, or an MCP tool call) instead of requiring a terminal
+keypress. When enabled and a pending decision is raised, aivyx-coder
+writes a request file describing it (the real before/after file content
+for a write/edit/delete, or the command text for a shell/MCP action) to
+`~/.local/state/aivyx-coder/editor-approval/<hash>-request.json`, then
+waits on either the terminal's own Allow/Deny/Always-Allow prompt or a
+matching `~/.local/state/aivyx-coder/editor-approval/<hash>-response.json`
+file — whichever answers first wins; the other is dropped. Both files are
+created 0600 and deleted the instant the decision resolves, whichever
+surface answered. No editor integration ships in this repo for any
+specific editor — this is a schema contract (see below) an editor plugin
+implements against, exactly like editor context. Governed by
+`[editor_approval]`: `enabled` (default `true` — inert without an
+external process actually writing a response file).
+
+Request file schema:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "6a6e...-uuid",
+  "action_kind": "write",
+  "target": "src/foo.rs",
+  "old_content": "fn foo() {}\n",
+  "new_content": "fn foo() -> i32 { 42 }\n"
+}
+```
+
+`action_kind` is one of `write`, `delete`, `execute`, `mcp_tool`, each
+with different content fields: `write` carries `old_content`/`new_content`
+(old empty for a brand-new file); `delete` carries `old_content` plus
+`will_delete: true` (no `new_content` key at all); `execute` carries
+`command`/`args`; `mcp_tool` carries a `description` string. A `write` or
+`delete` request whose underlying file can't be read as text (a binary
+file) never generates a request file at all — the terminal remains the
+sole surface for that one decision, same as when no editor integration is
+running.
+
+Response file schema (written by the editor integration):
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "6a6e...-uuid",
+  "decision": "allow"
+}
+```
+
+`decision` is one of `allow`, `deny`, `always_allow` — `always_allow`
+feeds the exact same Always-Allow cache a terminal Always-Allow does,
+keyed on the same exact target. A response whose `request_id` doesn't
+match the currently pending request is ignored.
+
 **`web_fetch`/`web_search`**: aivyx-coder is local-only in where LLM
 inference happens (Ollama/vLLM/llama.cpp), not in network isolation — the
 agent has full network access. `web_fetch(url)` fetches a URL and converts
@@ -721,6 +776,9 @@ budget_tokens = 1024 # rough token budget the map may consume per request
 
 [editor_context]
 enabled = true  # a no-op until some editor integration writes the context file
+
+[editor_approval]
+enabled = true
 
 # Enforced verification (docs/HISTORY.md Phase 12 Part B): after file edits,
 # before a turn is allowed to end, auto-run this named allowed_commands
