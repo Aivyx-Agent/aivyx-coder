@@ -107,6 +107,7 @@ impl Tool for SetTasksTool {
             target: PermissionTarget::Other("session task list".to_string()),
             arguments_preview: json!({ "tasks": args.tasks.len() }),
             preview: None,
+            diff: None,
         })
     }
 

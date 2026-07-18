@@ -94,6 +94,7 @@ impl Tool for RunCommandTool {
             // `Command: {program} {args}` from `target` above.
             arguments_preview: json!({ "name": spec.name }),
             preview: None,
+            diff: None,
         })
     }
 

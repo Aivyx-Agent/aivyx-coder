@@ -51,6 +51,7 @@ impl Tool for ReadFileTool {
             target: PermissionTarget::Path(resolved),
             arguments_preview: json!({ "path": args.path }),
             preview: None,
+            diff: None,
         })
     }
 

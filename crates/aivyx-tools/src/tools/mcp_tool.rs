@@ -69,6 +69,7 @@ impl Tool for McpToolAdapter {
             )),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 

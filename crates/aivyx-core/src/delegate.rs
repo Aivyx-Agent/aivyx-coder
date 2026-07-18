@@ -140,6 +140,7 @@ impl Tool for DelegateTaskTool {
             target: PermissionTarget::Other("delegate_task".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         })
     }
 

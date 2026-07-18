@@ -85,6 +85,7 @@ impl Tool for WebSearchTool {
             target: PermissionTarget::Other(args.query.clone()),
             arguments_preview: json!({ "query": args.query }),
             preview: None,
+            diff: None,
         })
     }
 

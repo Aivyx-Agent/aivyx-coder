@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, DiffContent, PermissionRequest, PermissionTarget};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -142,6 +142,10 @@ impl Tool for EditFileTool {
             &old_content,
             &new_content,
         ));
+        let diff = Some(DiffContent {
+            old_content: old_content.clone(),
+            new_content: new_content.clone(),
+        });
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
@@ -149,6 +153,7 @@ impl Tool for EditFileTool {
             target: PermissionTarget::Path(resolved),
             arguments_preview: json!({ "path": args.path, "replace_all": args.replace_all }),
             preview,
+            diff,
         })
     }
 
@@ -248,5 +253,22 @@ mod tests {
     fn empty_old_string_is_rejected() {
         let err = apply_edit("anything", "", "x", false).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn diff_carries_the_real_before_and_after_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+        let args = serde_json::json!({
+            "path": "a.rs",
+            "old_string": "fn foo() {}",
+            "new_string": "fn foo() -> i32 { 42 }",
+        });
+
+        let request = EditFileTool.permission_request(&args, dir.path()).unwrap();
+
+        let diff = request.diff.expect("expected diff content");
+        assert_eq!(diff.old_content, "fn foo() {}\n");
+        assert_eq!(diff.new_content, "fn foo() -> i32 { 42 }\n");
     }
 }

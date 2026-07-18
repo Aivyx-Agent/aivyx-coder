@@ -93,6 +93,7 @@ impl Tool for GitPushTool {
             },
             arguments_preview: arguments.clone(),
             preview: Some(build_preview(cwd, &remote, &current)),
+            diff: None,
         })
     }
 

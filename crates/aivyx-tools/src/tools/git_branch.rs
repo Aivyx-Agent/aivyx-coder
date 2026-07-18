@@ -123,6 +123,7 @@ impl Tool for GitBranchTool {
             },
             arguments_preview: arguments.clone(),
             preview: Some(preview),
+            diff: None,
         })
     }
 

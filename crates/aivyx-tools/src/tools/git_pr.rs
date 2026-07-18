@@ -129,6 +129,7 @@ impl Tool for GitPrTool {
             },
             arguments_preview: arguments.clone(),
             preview: Some(format!("Opens a pull request titled \"{}\"", args.title)),
+            diff: None,
         })
     }
 

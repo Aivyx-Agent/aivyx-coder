@@ -83,6 +83,7 @@ impl Tool for GrepTool {
             target: PermissionTarget::Path(root),
             arguments_preview: json!({ "pattern": args.pattern, "path": args.path }),
             preview: None,
+            diff: None,
         })
     }
 

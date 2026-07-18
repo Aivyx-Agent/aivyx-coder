@@ -96,6 +96,7 @@ impl Tool for CancelTool {
             target: PermissionTarget::Other("cancel".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         })
     }
 

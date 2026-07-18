@@ -121,6 +121,7 @@ impl Tool for GitCommitTool {
             },
             arguments_preview: arguments.clone(),
             preview: Some(build_preview(cwd, &self.pathspecs(&resolved, cwd))),
+            diff: None,
         })
     }
 

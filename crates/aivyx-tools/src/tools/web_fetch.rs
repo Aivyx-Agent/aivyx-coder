@@ -74,6 +74,7 @@ impl Tool for WebFetchTool {
             target: PermissionTarget::Other(args.url.clone()),
             arguments_preview: json!({ "url": args.url }),
             preview: None,
+            diff: None,
         })
     }
 

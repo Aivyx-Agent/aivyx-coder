@@ -69,6 +69,7 @@ impl Tool for ListMcpResourcesTool {
             target: PermissionTarget::Other("mcp resources".to_string()),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 
@@ -163,6 +164,7 @@ impl Tool for ReadMcpResourceTool {
             target: PermissionTarget::Other("mcp resource".to_string()),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 
@@ -226,6 +228,7 @@ impl Tool for ListMcpPromptsTool {
             target: PermissionTarget::Other("mcp prompts".to_string()),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 
@@ -324,6 +327,7 @@ impl Tool for GetMcpPromptTool {
             target: PermissionTarget::Other("mcp prompt".to_string()),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 

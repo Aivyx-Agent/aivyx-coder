@@ -32,6 +32,21 @@ pub struct PermissionRequest {
     /// file write/edit). Computed by the tool, since only it has the old
     /// and new content — this crate and the UI treat it as an opaque string.
     pub preview: Option<String>,
+    /// Structured before/after content for a file write/edit/delete, for
+    /// consumers (e.g. an editor-approval integration) that want to render
+    /// their own native diff view rather than a preformatted text blob.
+    /// `None` when there's no meaningful structured content (a non-file
+    /// action, or a file whose content can't be read as text — see
+    /// `write_file`'s/`delete_file`'s own binary-file fallback).
+    pub diff: Option<DiffContent>,
+}
+
+/// Structured before/after text for a file write/edit/delete.
+/// `old_content` is empty for a brand-new file (nothing existed before).
+#[derive(Debug, Clone)]
+pub struct DiffContent {
+    pub old_content: String,
+    pub new_content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

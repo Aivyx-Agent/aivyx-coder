@@ -69,6 +69,7 @@ impl Tool for GoToDefinitionTool {
             target: PermissionTarget::Path(crate::path_resolve::resolve(cwd, &args.path)),
             arguments_preview: json!({ "path": args.path, "line": args.line, "column": args.column }),
             preview: None,
+            diff: None,
         })
     }
 

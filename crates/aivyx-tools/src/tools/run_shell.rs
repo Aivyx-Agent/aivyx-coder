@@ -70,6 +70,7 @@ impl Tool for RunShellTool {
             },
             arguments_preview: json!({}),
             preview: None,
+            diff: None,
         })
     }
 

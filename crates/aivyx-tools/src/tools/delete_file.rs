@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, DiffContent, PermissionRequest, PermissionTarget};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -62,13 +62,19 @@ impl Tool for DeleteFileTool {
             )));
         }
 
-        let preview = match std::fs::read_to_string(&resolved) {
-            Ok(content) => Some(content),
-            Err(_) => Some(format!(
-                "WARNING: {} could not be read as text (binary file?). This will delete it \
-                 entirely.",
-                resolved.display()
-            )),
+        let (preview, diff) = match std::fs::read_to_string(&resolved) {
+            Ok(content) => (
+                Some(content.clone()),
+                Some(DiffContent { old_content: content, new_content: String::new() }),
+            ),
+            Err(_) => (
+                Some(format!(
+                    "WARNING: {} could not be read as text (binary file?). This will delete it \
+                     entirely.",
+                    resolved.display()
+                )),
+                None,
+            ),
         };
 
         Ok(PermissionRequest {
@@ -77,6 +83,7 @@ impl Tool for DeleteFileTool {
             target: PermissionTarget::Path(resolved),
             arguments_preview: json!({ "path": args.path }),
             preview,
+            diff,
         })
     }
 
@@ -193,5 +200,33 @@ mod tests {
             panic!("expected ExecutionFailed, got {result:?}");
         };
         assert!(message.contains("directory"), "message: {message}");
+    }
+
+    #[test]
+    fn diff_carries_old_content_with_empty_new_content() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.txt"), "important notes\n").unwrap();
+
+        let tool = DeleteFileTool;
+        let request = tool
+            .permission_request(&json!({ "path": "readme.txt" }), dir.path())
+            .unwrap();
+
+        let diff = request.diff.expect("expected diff content for a text file");
+        assert_eq!(diff.old_content, "important notes\n");
+        assert_eq!(diff.new_content, "");
+    }
+
+    #[test]
+    fn binary_file_has_no_structured_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin"), [0xFF, 0xFE, 0x00, 0xD8, 0x00]).unwrap();
+
+        let tool = DeleteFileTool;
+        let request = tool
+            .permission_request(&json!({ "path": "data.bin" }), dir.path())
+            .unwrap();
+
+        assert!(request.diff.is_none(), "a binary file has no text diff content");
     }
 }

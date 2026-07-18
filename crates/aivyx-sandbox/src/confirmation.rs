@@ -309,6 +309,7 @@ mod tests {
             target: PermissionTarget::Path(PathBuf::from(path)),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         }
     }
 
@@ -386,6 +387,7 @@ mod tests {
             target: PermissionTarget::Other("session task list".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
 
         let decision = gate.check(&request).await;
@@ -481,6 +483,7 @@ mod tests {
             },
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         let build_request = PermissionRequest {
             target: PermissionTarget::Command {
@@ -530,6 +533,7 @@ mod tests {
             },
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
 
         let decision = gate.check(&request).await;
@@ -596,6 +600,7 @@ mod tests {
             },
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         assert!(matches!(
             gate.check(&pre_approved).await,
@@ -630,6 +635,7 @@ mod tests {
             target: PermissionTarget::Other("session task list".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         assert_eq!(gate.check(&internal).await, PermissionDecision::Allow);
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
@@ -770,6 +776,7 @@ mod tests {
             target: PermissionTarget::Path(PathBuf::from("/etc/passwd")),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         let decision = gate.check(&request).await;
 
@@ -806,6 +813,7 @@ mod tests {
             },
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         assert_eq!(gate.check(&approved).await, PermissionDecision::AllowAlways);
 
@@ -858,6 +866,7 @@ mod tests {
             },
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
         assert!(matches!(gate.check(&request).await, PermissionDecision::Deny(_)));
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
@@ -915,6 +924,7 @@ mod tests {
             target: PermissionTarget::Other("search_docs (server: filesystem)".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
 
         let decision = gate.check(&request).await;
@@ -953,6 +963,7 @@ mod tests {
             target: PermissionTarget::Other("search_docs (server: filesystem)".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
+            diff: None,
         };
 
         let decision = gate.check(&request).await;

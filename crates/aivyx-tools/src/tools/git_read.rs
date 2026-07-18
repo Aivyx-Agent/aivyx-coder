@@ -146,6 +146,7 @@ impl Tool for GitReadTool {
             target: PermissionTarget::Path(target),
             arguments_preview: arguments.clone(),
             preview: None,
+            diff: None,
         })
     }
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, DiffContent, PermissionRequest, PermissionTarget};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -46,25 +46,28 @@ impl Tool for WriteFileTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let resolved = resolve(cwd, &args.path);
 
-        let preview = match std::fs::read_to_string(&resolved) {
-            Ok(old) => Some(unified_diff(
-                &resolved.display().to_string(),
-                &old,
-                &args.content,
-            )),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(unified_diff(
-                &resolved.display().to_string(),
-                "",
-                &args.content,
-            )),
+        let (preview, diff) = match std::fs::read_to_string(&resolved) {
+            Ok(old) => (
+                Some(unified_diff(&resolved.display().to_string(), &old, &args.content)),
+                Some(DiffContent { old_content: old, new_content: args.content.clone() }),
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (
+                Some(unified_diff(&resolved.display().to_string(), "", &args.content)),
+                Some(DiffContent { old_content: String::new(), new_content: args.content.clone() }),
+            ),
             // Fails open on the gate decision (the user can still approve
             // or deny) but must NOT look identical to the new-file case —
             // an existing binary/non-UTF8 file is about to be destroyed.
-            Err(_) => Some(format!(
-                "WARNING: {} already exists but could not be read as text (binary file?). \
-                 This write will overwrite it entirely.",
-                resolved.display()
-            )),
+            // No structured diff either: there's no text content to hand a
+            // diff viewer.
+            Err(_) => (
+                Some(format!(
+                    "WARNING: {} already exists but could not be read as text (binary file?). \
+                     This write will overwrite it entirely.",
+                    resolved.display()
+                )),
+                None,
+            ),
         };
 
         Ok(PermissionRequest {
@@ -73,6 +76,7 @@ impl Tool for WriteFileTool {
             target: PermissionTarget::Path(resolved),
             arguments_preview: json!({ "path": args.path }),
             preview,
+            diff,
         })
     }
 
@@ -127,5 +131,29 @@ mod tests {
             .expect("expected a warning preview, not None");
         assert!(preview.contains("WARNING"));
         assert!(preview.contains("binary"));
+    }
+
+    #[test]
+    fn new_file_diff_has_empty_old_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "path": "new.txt", "content": "hello\n" });
+
+        let request = WriteFileTool.permission_request(&args, dir.path()).unwrap();
+
+        let diff = request.diff.expect("expected diff content for a new file");
+        assert_eq!(diff.old_content, "");
+        assert_eq!(diff.new_content, "hello\n");
+    }
+
+    #[test]
+    fn existing_binary_file_has_no_structured_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.bin");
+        std::fs::write(&target, [0xFF, 0xFE, 0x00, 0xD8, 0x00]).unwrap();
+        let args = serde_json::json!({ "path": "existing.bin", "content": "hello\n" });
+
+        let request = WriteFileTool.permission_request(&args, dir.path()).unwrap();
+
+        assert!(request.diff.is_none(), "a binary file has no text diff content");
     }
 }
