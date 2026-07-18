@@ -17,6 +17,7 @@ use async_trait::async_trait;
 #[cfg(feature = "sandbox-backend")]
 mod confiner;
 mod confirmation;
+mod editor_approval;
 #[cfg(feature = "sandbox-backend")]
 pub use confiner::LandlockConfiner;
 pub use confirmation::ConfirmationGate;
