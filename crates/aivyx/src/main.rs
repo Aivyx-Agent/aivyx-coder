@@ -239,10 +239,7 @@ async fn main() -> anyhow::Result<()> {
         plan_mode.clone(),
         autonomous_mode.clone(),
         cwd.clone(),
-        // Editor-approval racing is wired from config in a follow-on task;
-        // `false` here keeps `check` behaving exactly as it did before the
-        // feature existed until that wiring lands.
-        false,
+        settings.editor_approval.enabled,
     ));
     let confiner = aivyx_sandbox::default_confiner(
         &cwd,

@@ -45,6 +45,7 @@ pub struct Settings {
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
     pub editor_context: EditorContextSettings,
+    pub editor_approval: EditorApprovalSettings,
     pub web: WebSettings,
     pub mcp: McpSettings,
 }
@@ -167,6 +168,27 @@ pub struct EditorContextSettings {
 }
 
 impl Default for EditorContextSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Gates whether `ConfirmationGate` will race a pending permission
+/// decision against a possible editor-side answer (see
+/// `docs/superpowers/specs/2026-07-19-editor-approval-integration-design.md`).
+/// Unlike `EditorContextSettings`, there is no `deny_paths` concept here —
+/// `deny_paths` is already enforced upstream of `ConfirmationGate` ever
+/// reaching the interactive-prompt tier for a denied target at all.
+/// Defaults to `true`, same as `editor_context`: the feature is inert
+/// without an active external process writing a response file, so
+/// `enabled` alone grants no new capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorApprovalSettings {
+    pub enabled: bool,
+}
+
+impl Default for EditorApprovalSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -916,6 +938,11 @@ mod tests {
     fn editor_context_settings_default_is_enabled() {
         let settings = Settings::default();
         assert!(settings.editor_context.enabled);
+    }
+
+    #[test]
+    fn editor_approval_settings_default_is_enabled() {
+        assert!(EditorApprovalSettings::default().enabled);
     }
 
     #[test]
