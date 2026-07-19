@@ -1970,3 +1970,212 @@ infrastructure). Phase 5 is gated behind Phase 1-4 partly because it's the
 biggest single chunk of new complexity (real sandboxing) and partly because
 shell-exec is exactly where the `Command`-target permission gaps matter —
 better to have the simpler tools' patterns settled first.
+
+### Editor/IDE context integration — ✅ done
+
+The first entirely new feature phase after the GitHub push (2026-07-18).
+The agent now polls a local, editor-agnostic JSON descriptor file
+(`~/.local/state/aivyx-coder/editor-context/<fnv1a-hash>.json`, the same
+keying scheme as session files) describing what file/line/selection is
+open in the user's editor and, if present, schema-valid, fresh (under 5
+minutes), and `workspace_root`-matched, injects a one-line metadata note
+into the system prompt every turn (e.g. "Currently open in editor: {file},
+cursor at line {line}."). Deliberately editor-agnostic — no plugin code
+for any specific editor ships — and metadata-only: the model never
+receives raw file/selection content this way, only a path and
+line/column numbers, so it still has to call `read_file` itself for
+actual code. This preserves the project's existing invariant that file
+content only enters the conversation via an explicit, visible tool call.
+Gated by a new `[editor_context] enabled` config flag (default on).
+Live-E2E verified through the real release binary: the model correctly
+answered a cursor/file question with zero tool calls, proving the
+injected note alone (not a `read_file` call) informed the answer.
+
+**Real security finding from this phase's whole-branch review**: the first
+implementation interpolated the editor-context JSON's `file` string
+verbatim into the system prompt with no sanitization — a crafted value
+containing embedded newlines/control characters could have forged fake
+instructions at trusted-prompt trust level (the numeric cursor/selection
+fields were always safe; only the free-form path string was the gap).
+Fixed by sanitizing only the *displayed* copy of the string (strip ASCII
+control chars + C1 controls, clamp length to 512 chars) while leaving the
+real, unsanitized path untouched for the actual `deny_paths` security
+check — sanitizing the security-relevant copy would have weakened that
+check for no reason. General lesson: any new data source formatted into
+the system/trusted prompt — even one that's supposedly "just metadata" —
+needs the same string-sanitization scrutiny as tool output, because the
+trust boundary is about prompt position, not about whether the data looks
+like harmless structured fields.
+
+### Editor approval integration — ✅ done
+
+The "context out" follow-on to editor/IDE context integration (2026-07-19).
+The user's editor can now answer a pending `ConfirmationGate` permission
+decision (write/edit/delete/execute/MCP-tool) as a fully equal-trust second
+surface, racing the terminal's own Allow/Deny/Always-Allow prompt via
+`tokio::select!` — first decision wins, the other is dropped. Transport:
+two polled JSON files (request + response) under
+`~/.local/state/aivyx-coder/editor-approval/`, the same FNV-1a-of-cwd
+keying scheme as `editor_context`/sessions. `[editor_approval] enabled`
+defaults to `true` — a deliberate, reasoned exception to this project's
+usual conservative-security-default posture, since the feature is
+genuinely inert without an active external process writing a response
+file, unlike a feature that's live the moment it's flipped on.
+
+**Real architectural correction found during plan-writing**: the original
+spec placed the new schema/path-keying module in
+`crates/aivyx-core/src/editor_approval.rs`, mirroring the sibling
+`editor_context.rs`. This was wrong — `aivyx-sandbox` (where
+`ConfirmationGate`, the only consumer, lives) has zero dependency on
+`aivyx-core`, so that placement would have created a dependency cycle.
+Caught by directly checking both crates' `Cargo.toml` files before writing
+the plan. The module ended up in
+`crates/aivyx-sandbox/src/editor_approval.rs` instead; `aivyx-core` never
+touches this feature's logic at all, unlike `editor_context`.
+
+**Real, previously-unanticipated finding surfaced only by the live E2E
+task, not by any unit test or code review of the touched crates**: when
+the editor wins the race, nothing told the TUI's render loop (a crate none
+of the plan's tasks originally touched) to dismiss its own now-stale
+"Permission required" modal, since the modal was only ever cleared via a
+keypress. Fixed with an actively-woken `tokio::select!` branch using
+`oneshot::Sender::closed()` (fires the instant the other race branch's
+receiver drops) plus a belt-and-braces render guard for the one-frame
+window before that branch fires. General lesson: a live E2E through the
+real UI can surface integration gaps that no amount of unit-testing the
+changed crates in isolation would catch, because the gap can live in a
+crate the plan never scoped as "touched."
+
+`ConfirmationGate::check`'s race logic got the most scrutiny of any single
+task in this phase: independently re-verified twice (task review and
+whole-branch review) that the pre-existing security tier order
+(deny_paths → Read/Internal auto-allow → plan-mode deny → autonomous-mode
+resolution → Always-Allow cache → interactive prompt) was completely
+untouched, and that autonomous mode is structurally unreachable from the
+new race logic.
+
+### Capability-gap-closing chapter — ✅ done
+
+Following a direct audit of whether aivyx-coder can actually write real
+code/scripts/small applications (2026-07-19) — the answer was no: no
+genuine from-scratch multi-file build had ever been tested, only narrow
+edit-existing-file benchmarks and single-tool-call E2Es. The audit
+surfaced 4 concrete, previously-undocumented gaps, sequenced by the user
+as separate sub-projects, each following this project's full
+spec → plan → subagent-driven-development → finishing-a-development-branch
+cycle. Motivating context for the whole chapter: once all 4 closed, the
+user planned to deploy the agent to a real bare-metal test rig (previously
+used for the sibling Aivyx-Agent project) as a genuine "give it a
+playground" trial.
+
+**Gap 1 — multi-file edit atomicity.** Closed the "N independent
+`edit_file` calls, no transactional guarantee" gap the audit itself had
+called the biggest reliability multiplier for any real cross-file change.
+When a model response contains multiple mutating tool calls and a later
+one fails, every earlier successful call in that same response now
+automatically rolls back to the checkpoint from before the batch started —
+reusing 100% pre-existing checkpoint/restore infrastructure, zero new
+dependencies, entirely scoped to `crates/aivyx-core/src/agent/mod.rs`'s
+turn loop. The rollback notice is folded directly into the failing call's
+own error text, a deliberate correction to the original spec's
+"separate synthetic message" wording, made after discovering this
+codebase's only precedent for narrating agent-internal events into
+history (`run_auto_verification`) always fakes a complete call+result pair
+against an already-registered real tool, never a bare unpaired note.
+
+A real, subtle bug was found and triple-verified during this phase: the
+plan's own literal code anchored the rollback target from the wrong
+checkpoint ref, colliding `Option<String>`'s `None` between "not yet set"
+and "no prior checkpoint exists" — silently failing to roll back a batch
+with exactly one success before a failure. Fixed by anchoring from the
+checkpoint the successful call itself just minted, rather than whatever
+ref existed before it. Independently re-derived and confirmed correct by
+hand three separate times (implementer, task reviewer, whole-branch
+reviewer).
+
+**Gap 2 — reasoning visibility.** A reasoning-capable model's
+chain-of-thought now renders live as a dimmed/italic "thinking:" line in
+the TUI transcript, distinct from the final answer. Threaded through the
+same three-enum pipeline (`StreamEvent` → `AgentEvent` → `ChatLine`)
+`TextDelta` already uses at each hop, but with one deliberate, load-bearing
+difference: reasoning content never touches `Agent`'s own
+`history`/session JSON — display-only, forgotten once shown. All 4 tasks
+passed individual review with zero findings each; the whole-branch review
+even found a bonus safety property the plan never claimed: reasoning is
+also invisible to prompted-edit-mode's SEARCH/REPLACE parser, since that
+only ever reads `assistant_text`.
+
+A real empirical correction was found during this phase's brainstorming:
+the existing code's own doc comments already flagged the
+"reasoning content is silently dropped" gap, but named the wire field
+`delta.reasoning`, which is wrong. Verified live against a real
+llama-server + Qwen3.5-9B-GGUF response that the actual field is
+`delta.reasoning_content` — the DeepSeek API's original naming, since
+adopted by llama-server/vLLM for compatibility. This was also the first
+time this project needed to stop/restart the user's real running
+local-LLM serving process as a means to an end (to force thinking on for
+the live E2E, confirmed safe with the user first, independently
+re-verified restored byte-identical afterward).
+
+**Gap 3 — structured verification memory.** A failing `[verification]
+command` result now gets a short "N line(s) of this output were not
+present in the immediately preceding verification attempt" note appended
+— a coarse line-set diff against whichever verification run came
+immediately before, regardless of that prior run's own pass/fail outcome.
+This last point is a deliberate, non-obvious semantic: comparing only
+against the last *successful* run would never help either a codebase that
+starts broken or a genuine fix-and-retry loop, a gap found and corrected
+during spec-writing itself (surfaced to the user directly rather than
+silently changed). In-memory only (a new `Agent.last_verification_output`
+field, never persisted to the session JSON), framework-agnostic by design
+— no test-runner-specific parsing, since the configured verification
+command is genuinely user-chosen.
+
+A second correction was found during implementation: the first submission
+discovered its own test asserted on a substring that didn't actually
+appear in the spec's mandated note wording, and "fixed" it backwards —
+shortening the actual model-facing message (deleting the explicit
+"this is a coarse heuristic, not a precise test diff" disclaimer) to make
+the test's string match, rather than fixing the test's own assertion.
+Caught at task review by treating the reviewer's brief as the source of
+truth for exact required wording. Live-E2E-confirmed the note correctly
+named only a newly-broken test while omitting an already-failing one
+present in both attempts' raw output.
+
+**Gap 4 — repo-map multi-language support.** The repo map (tree-sitter
+symbol extraction + PageRank over the cross-file reference graph, appended
+to the system prompt) now covers Python, JavaScript/JSX, and
+TypeScript/TSX in addition to Rust. A data-only `LanguageConfig` table
+(`crates/aivyx-repomap/src/languages/{mod,rust,python,javascript,
+typescript}.rs`) replaced the old hardcoded-to-Rust `Extractor` — a plain
+struct-per-language table, not a trait, matching this crate's existing
+non-abstraction style. The walk/cache/PageRank/render machinery downstream
+of extraction was already 100% language-agnostic, so a mixed-language
+repo gets one unified map for free with zero special-casing. Live-E2E
+confirmed with the strongest possible evidence: the model answered a
+cross-file Python question with zero tool calls, citing "the repository
+map provided" directly.
+
+Three independently-verified real bugs were found during this phase's own
+plan-writing and implementation, a concrete case study in why grounding
+claims against the actual grammar/compiler pays for itself: (1) the
+design spec's own illustrative `js_signature_node` sketch checked only one
+parent hop for JS/TS export detection, but exported
+`const foo = () => {}`-style bindings need a second hop — found by tracing
+the real `tree-sitter-javascript` grammar's `node-types.json` before
+writing the plan; (2) the plan's own illustrative `for_extension()`-as-a-
+method code doesn't compile — Rust's borrow checker can't see through an
+opaque method call to know it only touches one struct field, fixed by
+inlining a direct field-indexed lookup instead; (3) TypeScript's
+`class_declaration.name` field is `type_identifier`, not `identifier` as
+plain JavaScript's is — a real, easy-to-miss grammar divergence between
+the two `tree-sitter-*` crates, caught only by a runtime `Query::new`
+panic if not verified in advance. A related test-quality lesson: a
+TypeScript reference-tracking test initially passed vacuously (a type
+matching its own declaration node, not a genuine usage site) — caught via
+actual mutation testing (temporarily breaking the real mechanism and
+confirming the test then failed), fixed by strengthening the assertion.
+
+**Closing state**: 452 workspace tests, clippy clean across all 4
+sub-projects. No tracked items remain from this audit. `main` was pushed
+to GitHub immediately after the chapter closed.
