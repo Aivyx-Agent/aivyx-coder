@@ -2787,6 +2787,289 @@ async fn verification_never_fires_when_nothing_was_edited() {
     assert!(!agent.unverified_edits);
 }
 
+#[test]
+fn new_lines_note_reports_only_lines_absent_from_previous() {
+    let previous = "test test_a ... FAILED\nfailures:\n    test_a\n";
+    let current = "test test_a ... FAILED\ntest test_b ... FAILED\nfailures:\n    test_a\n    test_b\n";
+
+    let note = new_lines_note(previous, current).expect("current has genuinely new lines");
+    assert!(note.contains("test_b"));
+    assert!(
+        note.contains("2 line(s)"),
+        "expected exactly 2 new lines ('test test_b ... FAILED' and '    test_b'): {note}"
+    );
+
+    // Every line in `current` already present in `previous` (even though
+    // `previous` itself has an extra line `current` lacks) -> None.
+    let previous_superset = "test test_a ... FAILED\nsome extra line only in previous\n";
+    let current_subset = "test test_a ... FAILED\n";
+    assert_eq!(new_lines_note(previous_superset, current_subset), None);
+}
+
+#[test]
+fn new_lines_note_respects_its_cap() {
+    let previous = "";
+    let current: String = (0..5000).map(|i| format!("new line {i}\n")).collect();
+
+    let note = new_lines_note(previous, &current).expect("all lines are new");
+    // The rendered new-lines section itself must be capped, even though the
+    // preamble text ("N line(s) ... attempt:") is uncapped and always present.
+    let capped_section = note.split_once("attempt:\n").unwrap().1;
+    assert!(
+        capped_section.len() <= NEW_LINES_NOTE_CAP + 200,
+        "capped section should stay close to NEW_LINES_NOTE_CAP, got {} bytes",
+        capped_section.len()
+    );
+}
+
+fn stateful_verify_command_spec(name: &str, script: &str) -> CommandSpec {
+    CommandSpec {
+        name: name.to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Extracts, in history order, the text of every `ToolResult::Ok` whose
+/// `call_id` came from `run_auto_verification` (its synthetic IDs are
+/// always `"auto-verify-{n}"`) — lets a test inspect what the model
+/// actually saw for each verification attempt, not just how many happened.
+fn auto_verify_result_texts(history: &[Message]) -> Vec<String> {
+    history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult {
+                call_id,
+                output: ToolOutput::Ok(text),
+            }) if call_id.0.starts_with("auto-verify-") => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn fix_and_retry_note_lists_only_lines_new_since_the_first_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![
+        stateful_verify_command_spec(
+            "verify",
+            "if [ -f marker ]; then \
+                echo 'test test_a ... FAILED'; \
+                echo 'test test_b ... FAILED'; \
+             else \
+                touch marker; \
+                echo 'test test_a ... FAILED'; \
+             fi; exit 1",
+        ),
+    ])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _mock) = build_agent(
+        vec![
+            write_call,
+            text_response("done"),
+            text_response("trying again"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = auto_verify_result_texts(&agent.history);
+    assert_eq!(results.len(), 2, "expected exactly 2 verification attempts");
+    assert!(
+        !results[0].contains("not present in the immediately preceding"),
+        "the first attempt has nothing prior to compare against: {}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("test_b"),
+        "the second attempt's note must mention the newly-appeared failure: {}",
+        results[1]
+    );
+    assert!(
+        !results[1].contains("1 line(s)") || results[1].matches("test_a").count() <= 1,
+        "the note must not re-flag test_a, which was already present in the first attempt: {}",
+        results[1]
+    );
+}
+
+#[tokio::test]
+async fn starts_broken_then_fixed_leaves_the_passing_result_unmodified() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![
+        stateful_verify_command_spec(
+            "verify",
+            "if [ -f marker ]; then \
+                exit 0; \
+             else \
+                touch marker; \
+                echo 'test test_a ... FAILED'; \
+                exit 1; \
+             fi",
+        ),
+    ])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _mock) = build_agent(
+        vec![write_call, text_response("done"), text_response("trying again")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = auto_verify_result_texts(&agent.history);
+    assert_eq!(results.len(), 2, "expected a failing attempt then a passing one");
+    assert!(results[0].contains("(failed)"));
+    assert!(results[1].contains("(success)"));
+    assert!(
+        !results[1].contains("not present in the immediately preceding"),
+        "a passing result must never carry a new-lines note, even though its \
+         output differs hugely from the prior failing attempt: {}",
+        results[1]
+    );
+    assert_eq!(
+        agent.last_verification_output.as_deref(),
+        Some(results[1].as_str()),
+        "the stored reference must be the passing run's own text"
+    );
+}
+
+#[tokio::test]
+async fn the_very_first_verification_call_ever_has_nothing_to_compare_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _mock) = build_agent(
+        vec![write_call, text_response("done"), text_response("still trying")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 1);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = auto_verify_result_texts(&agent.history);
+    assert_eq!(results.len(), 1);
+    assert!(
+        !results[0].contains("not present in the immediately preceding"),
+        "the very first verification call has no prior run to compare against, \
+         so its text must be exactly what command_reported_success/format_output \
+         already produce, unmodified: {}",
+        results[0]
+    );
+}
+
+#[tokio::test]
+async fn last_verification_output_updates_after_every_call_regardless_of_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![
+        stateful_verify_command_spec(
+            "verify",
+            "if [ -f marker ]; then \
+                exit 0; \
+             else \
+                touch marker; \
+                echo 'test test_a ... FAILED'; \
+                exit 1; \
+             fi",
+        ),
+    ])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _mock) = build_agent(
+        vec![write_call, text_response("done"), text_response("trying again")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    assert!(agent.last_verification_output.is_none());
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let results = auto_verify_result_texts(&agent.history);
+    assert_eq!(results.len(), 2);
+    // Updated after the FIRST (failing) call already, not only on success.
+    // We can't directly observe the intermediate value, but the final
+    // stored value must equal the second (passing) call's own text —
+    // proving it was overwritten again after the first failing call's own
+    // update, not left stuck at whatever the first call set.
+    assert_eq!(
+        agent.last_verification_output.as_deref(),
+        Some(results[1].as_str())
+    );
+}
+
 #[tokio::test]
 async fn a_precancelled_turn_is_a_noop_with_only_the_user_message() {
     let (mut agent, _rx, mock) = build_agent(

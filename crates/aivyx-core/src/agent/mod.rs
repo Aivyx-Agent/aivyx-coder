@@ -203,6 +203,16 @@ pub struct Agent {
     /// `run_turn_inner`'s completion check) so the feature never silently
     /// disables itself for the rest of the session.
     verify_retries: u32,
+    /// The raw `run_auto_verification` output text from the immediately
+    /// preceding verification run in this session, *regardless of whether
+    /// that run passed or failed* — `None` until the first verification
+    /// call ever happens, then updated after every subsequent call (pass
+    /// or fail alike). Used to distinguish a genuinely new failure line
+    /// from one that was already present in the last attempt, whatever its
+    /// outcome. In-memory only; never persisted to the session JSON — a
+    /// resumed session starts with nothing to compare against, same as
+    /// before the first verification call in a fresh session.
+    last_verification_output: Option<String>,
     /// The checkpoint ref taken right before the first unverified edit of
     /// the current batch — the rewind target if verification exhausts its
     /// retries in autonomous mode. `None` when there's no unverified batch
@@ -261,6 +271,7 @@ impl Agent {
             verification: None,
             unverified_edits: false,
             verify_retries: 0,
+            last_verification_output: None,
             pre_experiment_ref: None,
             events_tx,
         }
@@ -653,13 +664,39 @@ impl Agent {
             tool_call_id: None,
         });
 
-        let result = self
+        let mut result = self
             .executor
             .dispatch(call, cwd, cancellation.clone())
             .await;
-        self.emit(AgentEvent::ToolResult(result.clone()));
         let passed =
             matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+
+        // Compare against the immediately preceding run (whatever its own
+        // outcome was) using the *original* text, then store that same
+        // original (not the enriched) text as the new reference for next
+        // time — the enrichment note is this turn's feedback only, not
+        // something a future comparison should treat as real command
+        // output. Only a FAILING result gets the note: a passing result's
+        // output almost always differs hugely from a preceding failure
+        // (clean output vs. lines full of FAILED), and `command_reported_
+        // success` already communicates "this passed" plainly — appending
+        // a large "what changed" note to already-unambiguous good news
+        // would be pure noise. `last_verification_output` is still updated
+        // unconditionally on both outcomes, though — comparing against
+        // the last run rather than only the last *successful* one is the
+        // whole point of this feature (see the design spec's Decision 2).
+        if let ToolOutput::Ok(text) = &mut result.output {
+            let current_text = text.clone();
+            if !passed
+                && let Some(previous) = &self.last_verification_output
+                && let Some(note) = new_lines_note(previous, &current_text)
+            {
+                text.push_str(&note);
+            }
+            self.last_verification_output = Some(current_text);
+        }
+
+        self.emit(AgentEvent::ToolResult(result.clone()));
         self.history.push(Message {
             role: Role::Tool,
             tool_call_id: Some(result.call_id.clone()),
@@ -1603,4 +1640,37 @@ fn sanitize_for_display(raw: &str) -> String {
 /// wording `format_output` emits; keep the two in sync if either changes.
 fn command_reported_success(output: &str) -> bool {
     output.contains("exit status:") && output.contains("(success)")
+}
+
+/// Bound on the rendered new-lines note appended to a failing verification
+/// result — small and fixed, unlike `elide_oversized_tool_results`'s own
+/// dynamic, context-budget-driven cap, since this note is a bounded
+/// addition to an already-capped tool result, not the whole history.
+const NEW_LINES_NOTE_CAP: usize = 2000;
+
+/// Compares `current` (this verification run's raw output) against
+/// `previous` (the immediately preceding run's raw output, whatever its
+/// outcome — see docs/superpowers/specs/
+/// 2026-07-19-structured-verification-memory-design.md's Decision 2) line
+/// by line, and returns a short note listing lines present in `current`
+/// but absent from `previous` — a rough "what's new since the last
+/// attempt" signal. `None` if every line in `current` already appeared in
+/// `previous` (nothing new to report). Deliberately coarse: this has no
+/// notion of what a "test" is, so a line that only differs by e.g. a
+/// timestamp will still look new.
+fn new_lines_note(previous: &str, current: &str) -> Option<String> {
+    let previous_lines: std::collections::HashSet<&str> = previous.lines().collect();
+    let new_lines: Vec<&str> = current
+        .lines()
+        .filter(|line| !previous_lines.contains(line))
+        .collect();
+    if new_lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n{} line(s) of this output were not present in the immediately preceding \
+         verification attempt:\n{}",
+        new_lines.len(),
+        elide(&new_lines.join("\n"), NEW_LINES_NOTE_CAP)
+    ))
 }
