@@ -61,9 +61,10 @@ Phase 2 for the A/B measurements behind the default.
 
 **Repository map**: on each turn a token-budgeted map of the repo's
 top-ranked files and symbol signatures (tree-sitter extraction, PageRank
-over the internal reference graph — Rust files only for now) is appended to
-the system prompt, giving the model orientation it wouldn't ask for on its
-own. Gitignore-aware, `deny_paths` excluded, cached per file so only edits
+over the internal reference graph — Rust, Python, JavaScript/JSX, and
+TypeScript/TSX today; other languages degrade gracefully to no map) is
+appended to the system prompt, giving the model orientation it wouldn't ask
+for on its own. Gitignore-aware, `deny_paths` excluded, cached per file so only edits
 re-parse. Its token weight is counted by the compaction estimator. Configure
 or disable under `[repo_map]`; non-Rust projects simply get no map and pay
 no cost.

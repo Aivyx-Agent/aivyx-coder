@@ -2,9 +2,11 @@
 //! the cross-file reference graph, and a token-budgeted rendering that gets
 //! appended to the agent's system prompt each turn.
 //!
-//! v1 parses Rust only (per the Phase 6 design); files in other languages
-//! simply contribute no symbols and the map degrades gracefully — an empty
-//! map renders as `None` so non-Rust projects pay no prompt cost at all.
+//! Parses Rust, Python, JavaScript/JSX, and TypeScript/TSX today (see
+//! `languages/`, one file per language, dispatched by file extension);
+//! files in any other language simply contribute no symbols and the map
+//! degrades gracefully — an empty map renders as `None` so an
+//! unsupported-language project pays no prompt cost at all.
 //!
 //! Deliberately dependency-free of the rest of the workspace: pure
 //! filesystem-in, string-out.
