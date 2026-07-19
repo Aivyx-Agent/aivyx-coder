@@ -48,6 +48,11 @@ pub enum ToolChoice {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     TextDelta(String),
+    /// A reasoning-capable model's chain-of-thought, streamed separately
+    /// from its final answer — see `docs/superpowers/specs/
+    /// 2026-07-19-reasoning-visibility-design.md`. Never accumulated into
+    /// anything persisted; display-only.
+    ReasoningDelta(String),
     /// Emitted once a native tool call's streamed argument fragments have
     /// been fully reassembled into valid JSON.
     ToolCallComplete(ToolCall),

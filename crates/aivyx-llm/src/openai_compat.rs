@@ -84,11 +84,14 @@ impl OpenAiCompatBackend {
 }
 
 /// Opt-in raw request/response capture for diagnosing local-model quirks —
-/// e.g. malformed history assembly, or a reasoning-capable model's
-/// `delta.reasoning` content, which `WireDelta` doesn't model and so
-/// silently drops via serde's default behavior during normal parsing. Set
-/// `AIVYX_DEBUG_LOG=<path>` to capture raw wire traffic there; unset by
-/// default, so this has zero cost for normal use.
+/// e.g. malformed history assembly, or any wire field a future backend
+/// sends that `WireDelta` doesn't yet model and so silently drops via
+/// serde's default behavior during normal parsing (a reasoning-capable
+/// model's `delta.reasoning_content` used to be exactly this case, until
+/// `WireDelta` started modeling it — see `docs/superpowers/specs/
+/// 2026-07-19-reasoning-visibility-design.md`). Set `AIVYX_DEBUG_LOG=<path>`
+/// to capture raw wire traffic there; unset by default, so this has zero
+/// cost for normal use.
 fn debug_log_from_env() -> Option<Arc<Mutex<std::fs::File>>> {
     let path = std::env::var_os("AIVYX_DEBUG_LOG")?;
     let file = std::fs::OpenOptions::new()
@@ -168,8 +171,11 @@ impl LlmBackend for OpenAiCompatBackend {
                     Ok(Ok(event)) => {
                         let data = event.data.trim();
                         // Logged before typed parsing so fields `WireChunk`
-                        // doesn't model (e.g. a reasoning model's
-                        // `delta.reasoning`) still show up in the capture.
+                        // doesn't model still show up in the capture, even
+                        // though `delta.reasoning_content` (a reasoning
+                        // model's chain-of-thought) is one such field
+                        // `WireChunk` now models — see `docs/superpowers/
+                        // specs/2026-07-19-reasoning-visibility-design.md`.
                         if let Some(log) = &debug_log {
                             log_line(log, &format!("=== event ===\n{data}"));
                         }
@@ -227,6 +233,12 @@ impl ToolCallAccumulator {
             && !content.is_empty()
         {
             events.push(Ok(StreamEvent::TextDelta(content)));
+        }
+
+        if let Some(reasoning) = choice.delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            events.push(Ok(StreamEvent::ReasoningDelta(reasoning)));
         }
 
         for tool_call_delta in choice.delta.tool_calls.unwrap_or_default() {
@@ -472,6 +484,8 @@ struct WireDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<WireToolCallDelta>>,
 }
 
@@ -588,5 +602,60 @@ mod tests {
         let events = accumulator.consume(chunk);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], Err(LlmError::ResponseTooLarge)));
+    }
+
+    #[test]
+    fn reasoning_content_delta_produces_a_reasoning_delta_event() {
+        let mut accumulator = ToolCallAccumulator::default();
+
+        let chunk: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"reasoning_content": "Thinking about the problem"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let events = accumulator.consume(chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Ok(StreamEvent::ReasoningDelta(text)) if text == "Thinking about the problem"
+        ));
+    }
+
+    #[test]
+    fn content_only_delta_produces_no_reasoning_delta_event() {
+        let mut accumulator = ToolCallAccumulator::default();
+
+        let chunk: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"content": "4"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let events = accumulator.consume(chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(text)) if text == "4"));
+    }
+
+    #[test]
+    fn a_delta_carrying_both_fields_produces_both_events_content_first() {
+        let mut accumulator = ToolCallAccumulator::default();
+
+        let chunk: WireChunk = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": {"content": "answer", "reasoning_content": "thought"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+
+        let events = accumulator.consume(chunk);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(text)) if text == "answer"));
+        assert!(matches!(&events[1], Ok(StreamEvent::ReasoningDelta(text)) if text == "thought"));
     }
 }
