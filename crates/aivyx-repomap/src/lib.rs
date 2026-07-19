@@ -746,4 +746,80 @@ def caller():
             );
         }
     }
+
+    #[test]
+    fn extracts_js_definitions_with_export_and_signatures() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+export function makeWidget(size) {
+    return { size };
+}
+
+function helper() {
+    return 1;
+}
+
+export class Widget {
+    draw() {
+        return true;
+    }
+}
+
+export const arrowFn = (x) => {
+    return x + 1;
+};
+"#,
+            "js",
+        );
+
+        let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
+        for expected in ["makeWidget", "helper", "Widget", "draw", "arrowFn"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+
+        let make = tags.defs.iter().find(|d| d.name == "makeWidget").unwrap();
+        assert_eq!(make.signature, "export function makeWidget(size)");
+        assert!(make.is_pub);
+
+        let helper = tags.defs.iter().find(|d| d.name == "helper").unwrap();
+        assert_eq!(helper.signature, "function helper()");
+        assert!(!helper.is_pub);
+
+        let widget = tags.defs.iter().find(|d| d.name == "Widget").unwrap();
+        assert!(widget.is_pub);
+
+        // Arrow-function const bindings need the 2-hop export check (see
+        // this plan's Global Constraints) — this is the case that would
+        // silently fail to register as public under a naive 1-hop check.
+        let arrow = tags.defs.iter().find(|d| d.name == "arrowFn").unwrap();
+        assert!(
+            arrow.signature.starts_with("export "),
+            "exported arrow-function const must show the export keyword: {}",
+            arrow.signature
+        );
+        assert!(arrow.is_pub);
+    }
+
+    #[test]
+    fn extracts_js_call_and_new_references() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+function caller() {
+    makeWidget(3);
+    widget.draw();
+    const w = new Widget();
+}
+"#,
+            "js",
+        );
+        for expected in ["makeWidget", "draw", "Widget"] {
+            assert!(
+                tags.refs.contains_key(expected),
+                "missing ref {expected}: {:?}",
+                tags.refs.keys()
+            );
+        }
+    }
 }
