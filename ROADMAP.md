@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-18_
+_Last updated: 2026-07-20_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -25,7 +25,7 @@ autonomous mode (`--auto`), `/council` multi-model deliberation, AGENTS.md
 project instructions, `web_fetch`/`web_search`, full MCP client support, a
 startup probe of the *served* context window, goal-bounded turn pausing
 instead of a hard iteration-cap failure, and enforced post-edit
-verification with automatic fix-and-retry. 381 workspace tests; every
+verification with automatic fix-and-retry. 452 workspace tests; every
 security-critical behavior also proven by live E2E against real serving.
 
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
@@ -81,12 +81,40 @@ embedded control characters — fixed by sanitizing the displayed copy
 while leaving the real path untouched for the security-relevant
 `deny_paths` check.
 
-**In flight / next**: nothing pre-scoped remains. This was a freeform
-addition beyond the original capability audit, not pulled from a
-backlog. Likely next directions — none yet scoped — include a
-"context out" follow-on (surfacing the agent's diffs in the user's
-editor instead of just the terminal) and public-release polish (the
-repo is live and private on GitHub with a working release-build
-pipeline, but no `v0.1.0` tag has been cut and visibility hasn't been
-flipped to public). See `docs/HISTORY.md` for the full phase-by-phase
-narrative behind every item above.
+**Editor approval integration — shipped.** The "context out" follow-on:
+the user's editor can now answer a pending permission decision
+(write/edit/delete/execute/MCP-tool) as a fully equal-trust second surface
+alongside the terminal's own Allow/Deny/Always-Allow prompt — first
+decision wins. Transport is two polled JSON files under
+`~/.local/state/aivyx-coder/editor-approval/`, the same keying scheme as
+`editor_context`/sessions. `[editor_approval] enabled` defaults on — a
+deliberate exception to this project's usual conservative-default posture,
+since the feature is inert without an active external process writing a
+response file. Live-E2E verified; the pre-existing security tier order in
+`ConfirmationGate::check` was independently re-verified twice to be
+completely untouched by the new race logic.
+
+**Capability-gap-closing chapter — shipped (all 4 sub-projects).**
+Following a direct audit of whether aivyx-coder can actually write real
+code/scripts/small applications, 4 concrete gaps were found and closed in
+sequence: (1) multi-file edit atomicity — a batch of mutating tool calls
+in one response now rolls back entirely if a later call in it fails; (2)
+reasoning visibility — a reasoning-capable model's chain-of-thought now
+renders live in the TUI, display-only, never persisted; (3) structured
+verification memory — a failing verification result now gets a short
+"what's new since the last attempt" note, comparing against the
+immediately-preceding run regardless of its own pass/fail outcome; (4)
+repo-map multi-language support — the repo map now covers Python,
+JavaScript/JSX, and TypeScript/TSX, not just Rust, via a new
+per-language `LanguageConfig` dispatch table. Several real bugs were
+found and fixed along the way, independently verified rather than
+trusted from any single report — see `docs/HISTORY.md`'s
+"Capability-gap-closing chapter" section for the full account. `main` was
+pushed to GitHub immediately after this chapter closed.
+
+**In flight / next**: nothing pre-scoped remains. The next real context is
+a bare-metal test-rig trial (previously used for the sibling Aivyx-Agent
+project) — the original motivating goal behind closing all 4
+capability-gap sub-projects — not yet started as of this writing. See
+`docs/HISTORY.md` for the full phase-by-phase narrative behind every item
+above.
