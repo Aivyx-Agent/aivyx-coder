@@ -887,4 +887,57 @@ export function Widget(props: { label: string }) {
         let widget = tags.defs.iter().find(|d| d.name == "Widget").unwrap();
         assert!(widget.is_pub);
     }
+
+    #[test]
+    fn a_python_reference_graph_ranks_a_heavily_called_file_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "core.py",
+            "def start():\n    pass\n",
+        );
+        write(
+            dir.path(),
+            "a.py",
+            "from core import start\n\ndef a():\n    start()\n",
+        );
+        write(
+            dir.path(),
+            "b.py",
+            "from core import start\n\ndef b():\n    start()\n",
+        );
+        write(dir.path(), "lonely.py", "def unused_helper():\n    pass\n");
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).expect("map should render");
+
+        let core_pos = rendered.find("core.py").expect("core.py in map");
+        let lonely_pos = rendered.find("lonely.py").expect("lonely.py in map");
+        assert!(
+            core_pos < lonely_pos,
+            "referenced file should outrank unreferenced one:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_language_repo_gets_one_unified_map() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "engine.rs", "pub fn run_engine() {}\n");
+        write(
+            dir.path(),
+            "widget.ts",
+            "export function makeWidget(): void {}\n",
+        );
+
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).expect("map should render");
+
+        assert!(rendered.contains("engine.rs"), "missing Rust file:\n{rendered}");
+        assert!(rendered.contains("run_engine"), "missing Rust def:\n{rendered}");
+        assert!(rendered.contains("widget.ts"), "missing TS file:\n{rendered}");
+        assert!(
+            rendered.contains("makeWidget"),
+            "missing TS def:\n{rendered}"
+        );
+    }
 }
