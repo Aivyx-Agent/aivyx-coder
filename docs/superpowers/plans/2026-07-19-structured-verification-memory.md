@@ -110,8 +110,9 @@ fn new_lines_note_respects_its_cap() {
 
     let note = new_lines_note(previous, &current).expect("all lines are new");
     // The rendered new-lines section itself must be capped, even though the
-    // preamble text ("N line(s) ... attempt:") is uncapped and always present.
-    let capped_section = note.split_once("attempt:\n").unwrap().1;
+    // preamble text (ending "...non-deterministic content):") is uncapped
+    // and always present.
+    let capped_section = note.split_once("content):\n").unwrap().1;
     assert!(
         capped_section.len() <= NEW_LINES_NOTE_CAP + 200,
         "capped section should stay close to NEW_LINES_NOTE_CAP, got {} bytes",
