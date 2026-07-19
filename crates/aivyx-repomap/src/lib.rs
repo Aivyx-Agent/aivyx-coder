@@ -822,4 +822,63 @@ function caller() {
             );
         }
     }
+
+    #[test]
+    fn extracts_ts_only_definitions_and_type_references() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+export interface Shape {
+    area(): number;
+}
+
+type Point = { x: number; y: number };
+
+enum Color {
+    Red,
+    Green,
+}
+
+function useShape(s: Shape): Point {
+    return { x: 0, y: 0 };
+}
+"#,
+            "ts",
+        );
+
+        let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
+        for expected in ["Shape", "Point", "Color", "useShape"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let shape = tags.defs.iter().find(|d| d.name == "Shape").unwrap();
+        assert!(shape.is_pub);
+
+        // TypeScript has a real `type_identifier` grammar node, so type
+        // annotations alone (not just calls) create reference edges —
+        // the one place TS gets strictly richer references than JS.
+        for expected in ["Shape", "Point"] {
+            assert!(
+                tags.refs.contains_key(expected),
+                "missing type ref {expected}: {:?}",
+                tags.refs.keys()
+            );
+        }
+    }
+
+    #[test]
+    fn tsx_shares_typescripts_queries() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+export function Widget(props: { label: string }) {
+    return <div>{props.label}</div>;
+}
+"#,
+            "tsx",
+        );
+        let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"Widget"), "missing Widget: {names:?}");
+        let widget = tags.defs.iter().find(|d| d.name == "Widget").unwrap();
+        assert!(widget.is_pub);
+    }
 }

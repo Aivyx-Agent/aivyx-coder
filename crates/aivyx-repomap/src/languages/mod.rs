@@ -6,6 +6,7 @@
 mod rust;
 mod python;
 mod javascript;
+mod typescript;
 
 /// Everything the extractor needs to know about one language: which
 /// files it claims, its tree-sitter grammar and def/ref queries, and two
@@ -98,6 +99,22 @@ pub(crate) const LANGUAGES: &[LanguageConfig] = &[
         grammar: javascript::language,
         def_query: javascript::DEF_QUERY,
         ref_query: javascript::REF_QUERY,
+        signature_node: js_signature_node,
+        is_pub: export_is_pub,
+    },
+    LanguageConfig {
+        extensions: &["ts"],
+        grammar: typescript::language_ts,
+        def_query: typescript::DEF_QUERY,
+        ref_query: typescript::REF_QUERY,
+        signature_node: js_signature_node,
+        is_pub: export_is_pub,
+    },
+    LanguageConfig {
+        extensions: &["tsx"],
+        grammar: typescript::language_tsx,
+        def_query: typescript::DEF_QUERY,
+        ref_query: typescript::REF_QUERY,
         signature_node: js_signature_node,
         is_pub: export_is_pub,
     },
