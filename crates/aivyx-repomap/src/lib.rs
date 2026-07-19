@@ -855,12 +855,18 @@ function useShape(s: Shape): Point {
 
         // TypeScript has a real `type_identifier` grammar node, so type
         // annotations alone (not just calls) create reference edges —
-        // the one place TS gets strictly richer references than JS.
+        // the one place TS gets strictly richer references than JS. The
+        // bare `(type_identifier) @ref` query also matches the
+        // interface/type-alias declaration's own `@name` node, so a count
+        // of exactly 1 would just be that self-match; requiring > 1 proves
+        // a genuine usage site (`s: Shape`, `): Point` in `useShape`) was
+        // also captured, not just the definition matching its own name.
         for expected in ["Shape", "Point"] {
+            let count = tags.refs.get(expected).copied().unwrap_or(0);
             assert!(
-                tags.refs.contains_key(expected),
-                "missing type ref {expected}: {:?}",
-                tags.refs.keys()
+                count > 1,
+                "expected more than one ref (definition self-match plus a real usage) for {expected}, got {count}: {:?}",
+                tags.refs
             );
         }
     }
