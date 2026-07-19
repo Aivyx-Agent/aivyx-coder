@@ -4,6 +4,7 @@
 //! this is a plain data table rather than a trait.
 
 mod rust;
+mod python;
 
 /// Everything the extractor needs to know about one language: which
 /// files it claims, its tree-sitter grammar and def/ref queries, and two
@@ -32,11 +33,21 @@ pub(crate) fn identity_node(item: tree_sitter::Node) -> tree_sitter::Node {
     item
 }
 
-pub(crate) const LANGUAGES: &[LanguageConfig] = &[LanguageConfig {
-    extensions: &["rs"],
-    grammar: rust::language,
-    def_query: rust::DEF_QUERY,
-    ref_query: rust::REF_QUERY,
-    signature_node: identity_node,
-    is_pub: rust::is_pub,
-}];
+pub(crate) const LANGUAGES: &[LanguageConfig] = &[
+    LanguageConfig {
+        extensions: &["rs"],
+        grammar: rust::language,
+        def_query: rust::DEF_QUERY,
+        ref_query: rust::REF_QUERY,
+        signature_node: identity_node,
+        is_pub: rust::is_pub,
+    },
+    LanguageConfig {
+        extensions: &["py"],
+        grammar: python::language,
+        def_query: python::DEF_QUERY,
+        ref_query: python::REF_QUERY,
+        signature_node: identity_node,
+        is_pub: python::is_pub,
+    },
+];

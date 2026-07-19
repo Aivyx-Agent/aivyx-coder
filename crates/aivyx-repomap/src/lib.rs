@@ -692,4 +692,58 @@ fn caller() {
             assert!(rendered.chars().count() < 200);
         }
     }
+
+    #[test]
+    fn extracts_python_definitions_with_signatures() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+class Widget:
+    def draw(self):
+        pass
+
+def make_widget(size: int) -> "Widget":
+    return Widget()
+
+def _private_helper():
+    pass
+"#,
+            "py",
+        );
+
+        let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
+        for expected in ["Widget", "draw", "make_widget", "_private_helper"] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        let make = tags.defs.iter().find(|d| d.name == "make_widget").unwrap();
+        assert_eq!(make.signature, "def make_widget(size: int) -> \"Widget\":");
+        assert!(make.is_pub);
+        let helper = tags
+            .defs
+            .iter()
+            .find(|d| d.name == "_private_helper")
+            .unwrap();
+        assert!(!helper.is_pub);
+    }
+
+    #[test]
+    fn extracts_python_call_and_attribute_references() {
+        let mut extractor = Extractor::new();
+        let tags = extractor.extract(
+            r#"
+def caller():
+    make_widget(3)
+    widget.draw()
+    helper.assist()
+"#,
+            "py",
+        );
+        for expected in ["make_widget", "draw", "assist"] {
+            assert!(
+                tags.refs.contains_key(expected),
+                "missing ref {expected}: {:?}",
+                tags.refs.keys()
+            );
+        }
+    }
 }
