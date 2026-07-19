@@ -1892,28 +1892,6 @@ fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
     ]
 }
 
-// Mirrors `write_call`'s shape for a single `edit_file` response — not
-// exercised by any test in this task (they all build multi-call batches via
-// `edit_call_in`/`multi_call_response` instead), but kept as a same-style
-// single-call helper for future single-edit-response tests.
-#[allow(dead_code)]
-fn edit_call(id: &str, path: &str, old_string: &str, new_string: &str) -> Vec<StreamEvent> {
-    vec![
-        StreamEvent::ToolCallComplete(ToolCall {
-            id: ToolCallId(id.to_string()),
-            name: "edit_file".to_string(),
-            arguments: serde_json::json!({
-                "path": path,
-                "old_string": old_string,
-                "new_string": new_string,
-            }),
-            source: ToolCallSource::Native,
-        }),
-        StreamEvent::Done {
-            finish_reason: FinishReason::ToolCalls,
-        },
-    ]
-}
 
 /// A single model response containing every call in `calls`, in order —
 /// used to build the "one batch" scenarios this feature is about (a real
