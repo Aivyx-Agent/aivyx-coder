@@ -71,6 +71,12 @@ fn goal_achieved_notice(iterations_used: u32) -> String {
 enum ChatLine {
     User(String),
     Assistant(String),
+    /// A reasoning-capable model's chain-of-thought, streamed live and
+    /// styled distinctly from the final answer — see
+    /// `docs/superpowers/specs/2026-07-19-reasoning-visibility-design.md`.
+    /// Deliberately never persisted (no `Message`/`ContentBlock`
+    /// equivalent exists) — see that spec's Decision 2.
+    Reasoning(String),
     ToolCall(String),
     ToolResult(String),
     Notice(String),
@@ -354,6 +360,13 @@ impl App {
                     self.transcript.push(ChatLine::Assistant(text));
                 }
             }
+            AgentEvent::ReasoningDelta(text) => {
+                if let Some(ChatLine::Reasoning(existing)) = self.transcript.last_mut() {
+                    existing.push_str(&text);
+                } else {
+                    self.transcript.push(ChatLine::Reasoning(text));
+                }
+            }
             AgentEvent::ToolCallDetected(call) => {
                 // Auto-verification calls are the agent's own doing, not
                 // the model's — labeled distinctly so the transcript never
@@ -578,7 +591,7 @@ fn tool_output_text(output: &ToolOutput) -> String {
 /// distinctly by `chat_line_to_lines`.
 fn sub_agent_event_text(event: &AgentEvent) -> String {
     match event {
-        AgentEvent::TextDelta(text) => text.clone(),
+        AgentEvent::TextDelta(text) | AgentEvent::ReasoningDelta(text) => text.clone(),
         AgentEvent::ToolCallDetected(call) => format!("{}({})", call.name, call.arguments),
         AgentEvent::ToolResult(result) => tool_output_text(&result.output),
         AgentEvent::Error(text) | AgentEvent::TurnPaused(text) => text.clone(),
@@ -770,6 +783,13 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             }
             prefixed_lines(text, "  sub-agent> ", Style::default().fg(Color::LightYellow))
         }
+        ChatLine::Reasoning(text) => prefixed_lines(
+            text,
+            "  thinking: ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ),
     }
 }
 
@@ -876,6 +896,53 @@ mod tests {
 
         let lines = chat_line_to_lines(app.transcript.last().unwrap());
         assert!(lines[0].to_string().starts_with("architect> "));
+    }
+
+    #[test]
+    fn reasoning_delta_renders_as_a_distinguished_chat_line() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ReasoningDelta(
+            "considering the edge cases".to_string(),
+        ));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Reasoning(text)) if text == "considering the edge cases"
+        ));
+
+        let lines = chat_line_to_lines(app.transcript.last().unwrap());
+        assert!(lines[0].to_string().contains("thinking:"));
+    }
+
+    #[test]
+    fn reasoning_then_text_delta_starts_a_fresh_assistant_line() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ReasoningDelta("hmm".to_string()));
+        app.handle_agent_event(AgentEvent::ReasoningDelta(", let me see".to_string()));
+        app.handle_agent_event(AgentEvent::TextDelta("Here's the answer".to_string()));
+
+        assert_eq!(app.transcript.len(), 2);
+        assert!(matches!(
+            &app.transcript[0],
+            ChatLine::Reasoning(text) if text == "hmm, let me see"
+        ));
+        assert!(matches!(
+            &app.transcript[1],
+            ChatLine::Assistant(text) if text == "Here's the answer"
+        ));
+    }
+
+    #[test]
+    fn sub_agent_reasoning_delta_renders_as_a_distinguished_chat_line() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::SubAgentActivity(Box::new(
+            AgentEvent::ReasoningDelta("weighing two approaches".to_string()),
+        )));
+
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::SubAgent(text)) if text == "weighing two approaches"
+        ));
     }
 
     #[test]
