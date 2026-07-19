@@ -21,7 +21,7 @@ use tree_sitter::{Parser, Query, QueryCursor};
 
 mod languages;
 
-use languages::{LanguageConfig, LANGUAGES};
+use languages::{LANGUAGES, LanguageConfig};
 
 /// Files larger than this are skipped — generated monsters would dominate
 /// parse time while contributing noise.
@@ -43,7 +43,6 @@ const PAGERANK_ITERATIONS: usize = 30;
 /// module doc comment at the top of this file). Keep both literals in sync
 /// if this path ever changes.
 const WIKI_DIR: &str = "docs/wiki";
-
 
 #[derive(Debug, Clone)]
 struct Def {
@@ -893,11 +892,7 @@ export function Widget(props: { label: string }) {
     #[test]
     fn a_python_reference_graph_ranks_a_heavily_called_file_first() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            "core.py",
-            "def start():\n    pass\n",
-        );
+        write(dir.path(), "core.py", "def start():\n    pass\n");
         write(
             dir.path(),
             "a.py",
@@ -934,9 +929,18 @@ export function Widget(props: { label: string }) {
         let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
         let rendered = map.render(10_000).expect("map should render");
 
-        assert!(rendered.contains("engine.rs"), "missing Rust file:\n{rendered}");
-        assert!(rendered.contains("run_engine"), "missing Rust def:\n{rendered}");
-        assert!(rendered.contains("widget.ts"), "missing TS file:\n{rendered}");
+        assert!(
+            rendered.contains("engine.rs"),
+            "missing Rust file:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("run_engine"),
+            "missing Rust def:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("widget.ts"),
+            "missing TS file:\n{rendered}"
+        );
         assert!(
             rendered.contains("makeWidget"),
             "missing TS def:\n{rendered}"

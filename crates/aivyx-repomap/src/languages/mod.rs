@@ -3,9 +3,9 @@
 //! 2026-07-19-repo-map-multi-language-design.md` (Decision 3) for why
 //! this is a plain data table rather than a trait.
 
-mod rust;
-mod python;
 mod javascript;
+mod python;
+mod rust;
 mod typescript;
 
 /// Everything the extractor needs to know about one language: which
