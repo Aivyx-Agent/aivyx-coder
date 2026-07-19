@@ -1669,7 +1669,9 @@ fn new_lines_note(previous: &str, current: &str) -> Option<String> {
     }
     Some(format!(
         "\n\n{} line(s) of this output were not present in the immediately preceding \
-         verification attempt:\n{}",
+         verification attempt — a rough signal for what's new since then, not a precise \
+         test-level diff (some noise is possible, e.g. timestamps or other \
+         non-deterministic content):\n{}",
         new_lines.len(),
         elide(&new_lines.join("\n"), NEW_LINES_NOTE_CAP)
     ))
