@@ -17,6 +17,10 @@ use std::time::SystemTime;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
+mod languages;
+
+use languages::{LanguageConfig, LANGUAGES};
+
 /// Files larger than this are skipped — generated monsters would dominate
 /// parse time while contributing noise.
 const MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -38,33 +42,6 @@ const PAGERANK_ITERATIONS: usize = 30;
 /// if this path ever changes.
 const WIKI_DIR: &str = "docs/wiki";
 
-/// Definition captures: the `@name` capture is the symbol, the `@item`
-/// capture is the whole item whose first line becomes the signature.
-const DEF_QUERY: &str = r#"
-(function_item name: (identifier) @name) @item
-(function_signature_item name: (identifier) @name) @item
-(struct_item name: (type_identifier) @name) @item
-(enum_item name: (type_identifier) @name) @item
-(union_item name: (type_identifier) @name) @item
-(trait_item name: (type_identifier) @name) @item
-(mod_item name: (identifier) @name) @item
-(const_item name: (identifier) @name) @item
-(static_item name: (identifier) @name) @item
-(type_item name: (type_identifier) @name) @item
-(macro_definition name: (identifier) @name) @item
-"#;
-
-/// Reference captures: call targets, used type names, invoked macros.
-/// `type_identifier` also matches each type's own definition site; that
-/// self-reference is filtered out when graph edges are built (same-file
-/// references never create an edge).
-const REF_QUERY: &str = r#"
-(call_expression function: (identifier) @ref)
-(call_expression function: (scoped_identifier name: (identifier) @ref))
-(call_expression function: (field_expression field: (field_identifier) @ref))
-(type_identifier) @ref
-(macro_invocation macro: (identifier) @ref)
-"#;
 
 #[derive(Debug, Clone)]
 struct Def {
@@ -197,9 +174,14 @@ impl RepoMap {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
             if !entry.file_type().is_some_and(|ft| ft.is_file())
-                || path.extension().is_none_or(|e| e != "rs")
                 || is_denied(path, &self.deny_paths)
             {
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !is_supported_extension(ext) {
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
@@ -217,7 +199,7 @@ impl RepoMap {
                 let Ok(source) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let tags = extractor.extract(&source);
+                let tags = extractor.extract(&source, ext);
                 cache.insert(
                     path.clone(),
                     CacheEntry {
@@ -248,46 +230,77 @@ fn is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
         .any(|denied| canonical.starts_with(denied) || path.starts_with(denied))
 }
 
-struct Extractor {
-    parser: Parser,
+struct CompiledLanguage {
+    config: &'static LanguageConfig,
+    language: tree_sitter::Language,
     def_query: Query,
     ref_query: Query,
 }
 
+struct Extractor {
+    parser: Parser,
+    languages: Vec<CompiledLanguage>,
+}
+
 impl Extractor {
     fn new() -> Self {
-        let language = tree_sitter::Language::from(tree_sitter_rust::LANGUAGE);
-        let mut parser = Parser::new();
-        parser
-            .set_language(&language)
-            .expect("bundled Rust grammar must load");
-        let def_query = Query::new(&language, DEF_QUERY).expect("DEF_QUERY must compile");
-        let ref_query = Query::new(&language, REF_QUERY).expect("REF_QUERY must compile");
+        let languages = LANGUAGES
+            .iter()
+            .map(|config| {
+                let language = (config.grammar)();
+                let def_query = Query::new(&language, config.def_query).unwrap_or_else(|e| {
+                    panic!("{:?} DEF_QUERY must compile: {e}", config.extensions)
+                });
+                let ref_query = Query::new(&language, config.ref_query).unwrap_or_else(|e| {
+                    panic!("{:?} REF_QUERY must compile: {e}", config.extensions)
+                });
+                CompiledLanguage {
+                    config,
+                    language,
+                    def_query,
+                    ref_query,
+                }
+            })
+            .collect();
         Self {
-            parser,
-            def_query,
-            ref_query,
+            parser: Parser::new(),
+            languages,
         }
     }
 
-    fn extract(&mut self, source: &str) -> FileTags {
+    fn extract(&mut self, source: &str, ext: &str) -> FileTags {
+        // Find the language config and extract what we need before using self.parser
+        let lang_idx = self
+            .languages
+            .iter()
+            .position(|l| l.config.extensions.contains(&ext));
+        let Some(lang_idx) = lang_idx else {
+            return FileTags::default();
+        };
+
+        let lang = &self.languages[lang_idx];
+        let def_query = &lang.def_query;
+        let ref_query = &lang.ref_query;
+        let config = lang.config;
+
+        self.parser
+            .set_language(&lang.language)
+            .expect("bundled grammar must load");
         let Some(tree) = self.parser.parse(source, None) else {
             return FileTags::default();
         };
         let bytes = source.as_bytes();
         let mut tags = FileTags::default();
 
-        let name_index = self
-            .def_query
+        let name_index = def_query
             .capture_index_for_name("name")
             .expect("@name exists");
-        let item_index = self
-            .def_query
+        let item_index = def_query
             .capture_index_for_name("item")
             .expect("@item exists");
 
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.def_query, tree.root_node(), bytes);
+        let mut matches = cursor.matches(def_query, tree.root_node(), bytes);
         while let Some(m) = matches.next() {
             let name = m
                 .captures
@@ -296,17 +309,19 @@ impl Extractor {
                 .and_then(|c| c.node.utf8_text(bytes).ok());
             let item = m.captures.iter().find(|c| c.index == item_index);
             if let (Some(name), Some(item)) = (name, item) {
-                let signature = signature_line(item.node.utf8_text(bytes).unwrap_or(""));
+                let sig_node = (config.signature_node)(item.node);
+                let signature = signature_line(sig_node.utf8_text(bytes).unwrap_or(""));
+                let is_pub = (config.is_pub)(name, &signature);
                 tags.defs.push(Def {
                     name: name.to_string(),
-                    is_pub: signature.starts_with("pub "),
+                    is_pub,
                     signature,
                 });
             }
         }
 
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.ref_query, tree.root_node(), bytes);
+        let mut matches = cursor.matches(ref_query, tree.root_node(), bytes);
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 if let Ok(name) = capture.node.utf8_text(bytes) {
@@ -317,6 +332,12 @@ impl Extractor {
 
         tags
     }
+}
+
+fn is_supported_extension(ext: &str) -> bool {
+    LANGUAGES
+        .iter()
+        .any(|config| config.extensions.contains(&ext))
 }
 
 /// First line of an item, cleaned for display: cut at the body's opening
@@ -444,6 +465,7 @@ const LIMIT: usize = 10;
 mod helpers;
 type Alias = Vec<u8>;
 "#,
+            "rs",
         );
 
         let names: Vec<&str> = tags.defs.iter().map(|d| d.name.as_str()).collect();
@@ -478,6 +500,7 @@ fn caller() {
     println!("done");
 }
 "#,
+            "rs",
         );
         for expected in ["Widget", "make_widget", "assist", "render", "println"] {
             assert!(
