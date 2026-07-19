@@ -1062,6 +1062,15 @@ impl Agent {
                             return Err(err);
                         }
                     }
+                    Ok(StreamEvent::ReasoningDelta(text)) => {
+                        // Deliberately not accumulated into `assistant_text`
+                        // and no size-cap check — reasoning never enters
+                        // `self.history`, so there's no unbounded-growth
+                        // risk on this side to guard against. See
+                        // docs/superpowers/specs/
+                        // 2026-07-19-reasoning-visibility-design.md.
+                        self.emit(AgentEvent::ReasoningDelta(text));
+                    }
                     Ok(StreamEvent::ToolCallComplete(call)) => {
                         self.emit(AgentEvent::ToolCallDetected(call.clone()));
                         tool_calls.push(call);

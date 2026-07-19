@@ -314,6 +314,49 @@ async fn tool_call_then_final_answer_produces_balanced_history() {
 }
 
 #[tokio::test]
+async fn reasoning_delta_emits_but_never_enters_history() {
+    let response = vec![
+        StreamEvent::ReasoningDelta("Let me think about this".to_string()),
+        StreamEvent::TextDelta("Here's my answer".to_string()),
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ];
+    let (mut agent, mut rx, _mock) = build_agent(vec![response], ToolRegistry::new(), 10);
+
+    agent
+        .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ReasoningDelta(text) if text == "Let me think about this")),
+        "expected a ReasoningDelta event to have been emitted"
+    );
+
+    let history_text: String = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !history_text.contains("Let me think about this"),
+        "reasoning content must never enter Agent's own history: {history_text}"
+    );
+    assert!(
+        history_text.contains("Here's my answer"),
+        "the real answer must still be recorded normally: {history_text}"
+    );
+}
+
+#[tokio::test]
 async fn too_many_tool_calls_in_one_response_are_capped_but_all_recorded() {
     let mut first: Vec<StreamEvent> = (0..25)
         .map(|i| StreamEvent::ToolCallComplete(tool_call(&format!("c{i}"), "read_file")))

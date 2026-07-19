@@ -9,6 +9,11 @@ use crate::session::Task;
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TextDelta(String),
+    /// A reasoning-capable model's chain-of-thought, streamed separately
+    /// from its final answer — display-only, never accumulated into
+    /// `Agent`'s own `history`. See `docs/superpowers/specs/
+    /// 2026-07-19-reasoning-visibility-design.md`.
+    ReasoningDelta(String),
     ToolCallDetected(ToolCall),
     ToolResult(ToolResult),
     TurnComplete,
