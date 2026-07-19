@@ -1301,6 +1301,21 @@ impl Agent {
             // any) mutates the list.
             let tasks_before = self.tasks.lock().unwrap().clone();
 
+            // Batch-tracking for automatic rollback: if a later call in this
+            // same response fails after earlier calls in it already mutated
+            // the working tree, every one of those earlier successes gets
+            // rolled back so a cross-file change either fully applies or
+            // leaves no trace. Independent of the is_edit_call/
+            // pre_experiment_ref bookkeeping below — that mechanism only
+            // rewinds on an exhausted *verification* retry loop in
+            // autonomous mode; this one fires on any mutating tool
+            // returning `ToolOutput::Error` within the same response,
+            // regardless of mode.
+            let mut last_checkpoint_ref = self.executor.latest_checkpoint_ref(&cancellation).await;
+            let mut batch_start_ref: Option<String> = None;
+            let mut batch_touched_paths: Vec<String> = Vec::new();
+            let mut batch_rolled_back = false;
+
             for (index, call) in tool_calls.into_iter().enumerate() {
                 // Every one of these calls is already recorded as a
                 // ContentBlock::ToolCall in the assistant message just
@@ -1325,6 +1340,13 @@ impl Agent {
                     );
                     continue;
                 }
+                if batch_rolled_back {
+                    self.record_skipped_tool_result(
+                        call,
+                        "skipped — a failure earlier in this response rolled back the batch of edits",
+                    );
+                    continue;
+                }
 
                 // Captured before the move below — feeds
                 // `unverified_edits` for the enforced-verification check at
@@ -1333,7 +1355,8 @@ impl Agent {
                 // rather than a second hardcoded pair.
                 let is_edit_call = PROMPTED_EDIT_HIDDEN_TOOLS.contains(&call.name.as_str());
                 let was_already_unverified = self.unverified_edits;
-                let result = self
+                let call_description = describe_tool_call_target(&call);
+                let mut result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
                     .await;
@@ -1350,6 +1373,57 @@ impl Agent {
                             self.executor.latest_checkpoint_ref(&cancellation).await;
                     }
                 }
+
+                // Batch-checkpoint tracking, independent of the
+                // pre_experiment_ref bookkeeping above. `ToolExecutor::
+                // dispatch` checkpoints *before* running the tool, so the
+                // ref that becomes "latest" right after a successful
+                // mutating call is the snapshot of the worktree as it stood
+                // immediately before that call ran — exactly the anchor to
+                // restore to in order to undo this call (and everything
+                // after it). Only the first successful call in the batch
+                // gets to set `batch_start_ref`; later ones must not move
+                // it forward.
+                let ref_after_this_call = self.executor.latest_checkpoint_ref(&cancellation).await;
+                let minted_new_checkpoint = ref_after_this_call != last_checkpoint_ref;
+                last_checkpoint_ref = ref_after_this_call.clone();
+                if matches!(result.output, ToolOutput::Ok(_)) && minted_new_checkpoint {
+                    if batch_start_ref.is_none() {
+                        batch_start_ref = ref_after_this_call;
+                    }
+                    batch_touched_paths.push(call_description);
+                }
+                if let ToolOutput::Error(original_error) = &result.output
+                    && let Some(start_ref) = batch_start_ref.take()
+                {
+                    match self.executor.restore_to_checkpoint(&start_ref, &cancellation).await {
+                        Ok(()) => {
+                            result.output = ToolOutput::Error(format!(
+                                "{original_error}\n\nThis failure automatically rolled back {} \
+                                 earlier edit(s) in this same response to keep the codebase \
+                                 consistent: {}. The codebase is now back to its state before \
+                                 this response's edits began.",
+                                batch_touched_paths.len(),
+                                batch_touched_paths.join(", "),
+                            ));
+                        }
+                        Err(restore_err) => {
+                            result.output = ToolOutput::Error(format!(
+                                "{original_error}\n\nAdditionally, an automatic rollback of {} \
+                                 earlier edit(s) in this same response was attempted (to keep the \
+                                 codebase consistent) but FAILED ({restore_err}) — the codebase \
+                                 may now be in a partially-edited, inconsistent state. Affected \
+                                 files: {}. Inspect manually via `git log \
+                                 refs/aivyx/checkpoints/`.",
+                                batch_touched_paths.len(),
+                                batch_touched_paths.join(", "),
+                            ));
+                        }
+                    }
+                    batch_rolled_back = true;
+                    batch_touched_paths.clear();
+                }
+
                 self.emit(AgentEvent::ToolResult(result.clone()));
                 self.history.push(Message {
                     role: Role::Tool,
@@ -1467,6 +1541,17 @@ fn elide(text: &str, cap: usize) -> String {
         "{head}\n[... {} characters elided to fit the context window ...]\n{tail}",
         chars.len() - 2 * half
     )
+}
+
+/// Best-effort human-readable description of what a tool call touched, for
+/// the batch-rollback notice — most mutating tools (`write_file`,
+/// `edit_file`, `delete_file`) take a `"path"` argument; anything else
+/// falls back to just the tool's name.
+fn describe_tool_call_target(call: &ToolCall) -> String {
+    match call.arguments.get("path").and_then(|v| v.as_str()) {
+        Some(path) => format!("{path} ({})", call.name),
+        None => call.name.clone(),
+    }
 }
 
 /// Bound on the displayed length of the editor-context `file` value injected

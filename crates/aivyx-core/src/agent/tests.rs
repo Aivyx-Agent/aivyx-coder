@@ -1892,6 +1892,339 @@ fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
     ]
 }
 
+// Mirrors `write_call`'s shape for a single `edit_file` response — not
+// exercised by any test in this task (they all build multi-call batches via
+// `edit_call_in`/`multi_call_response` instead), but kept as a same-style
+// single-call helper for future single-edit-response tests.
+#[allow(dead_code)]
+fn edit_call(id: &str, path: &str, old_string: &str, new_string: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId(id.to_string()),
+            name: "edit_file".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "old_string": old_string,
+                "new_string": new_string,
+            }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+/// A single model response containing every call in `calls`, in order —
+/// used to build the "one batch" scenarios this feature is about (a real
+/// model response emits all its tool calls before any of them execute).
+fn multi_call_response(calls: Vec<ToolCall>) -> Vec<StreamEvent> {
+    let mut events: Vec<StreamEvent> = calls
+        .into_iter()
+        .map(StreamEvent::ToolCallComplete)
+        .collect();
+    events.push(StreamEvent::Done {
+        finish_reason: FinishReason::ToolCalls,
+    });
+    events
+}
+
+fn write_call_in(path: &str, content: &str, id: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.to_string()),
+        name: "write_file".to_string(),
+        arguments: serde_json::json!({ "path": path, "content": content }),
+        source: ToolCallSource::Native,
+    }
+}
+
+fn edit_call_in(path: &str, old_string: &str, new_string: &str, id: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.to_string()),
+        name: "edit_file".to_string(),
+        arguments: serde_json::json!({
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+        }),
+        source: ToolCallSource::Native,
+    }
+}
+
+async fn checkpointed_agent(
+    dir: &Path,
+    responses: Vec<Vec<StreamEvent>>,
+    autonomous: bool,
+) -> (Agent, UnboundedReceiver<AgentEvent>, Arc<MockBackend>) {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+    let (tx, rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(responses));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let mut executor = ToolExecutor::new(registry, gate, confiner);
+    executor.set_checkpointer(Arc::new(
+        aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap(),
+    ));
+
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(autonomous);
+    let agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode,
+        tx,
+    );
+    (agent, rx, mock)
+}
+
+#[tokio::test]
+async fn batch_rollback_undoes_earlier_successful_edits_on_a_later_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        write_call_in("b.txt", "B\n", "c2"),
+        edit_call_in("a.txt", "this text does not exist", "replacement", "c3"),
+    ]);
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], false).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "a.txt was created in this same batch — must be rolled back"
+    );
+    assert!(
+        !dir.path().join("b.txt").exists(),
+        "b.txt was created in this same batch — must be rolled back too"
+    );
+}
+
+#[tokio::test]
+async fn batch_rollback_notice_lists_every_rolled_back_path() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        write_call_in("b.txt", "B\n", "c2"),
+        edit_call_in("a.txt", "does not exist", "x", "c3"),
+    ]);
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], false).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error_text = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { call_id, output: ToolOutput::Error(text) })
+                if call_id.0 == "c3" =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("expected an Error result for the failing edit_file call");
+
+    assert!(error_text.contains("a.txt"), "notice must name a.txt: {error_text}");
+    assert!(error_text.contains("b.txt"), "notice must name b.txt: {error_text}");
+    assert!(
+        error_text.contains("rolled back") || error_text.contains("rollback"),
+        "notice must explain what happened: {error_text}"
+    );
+}
+
+#[tokio::test]
+async fn remaining_calls_in_a_rolled_back_batch_are_skipped_not_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        edit_call_in("a.txt", "does not exist", "x", "c2"),
+        write_call_in("never_created.txt", "should not exist\n", "c3"),
+    ]);
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], false).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("never_created.txt").exists(),
+        "the call after the failure must never have been dispatched"
+    );
+
+    let c3_output = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { call_id, output })
+                if call_id.0 == "c3" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .expect("c3 must still have a matching Role::Tool result (skipped, not dropped)");
+    assert!(
+        matches!(&c3_output, ToolOutput::Denied(reason) if reason.contains("rolled back")),
+        "skipped call must say why: {c3_output:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deny_partway_through_a_batch_does_not_roll_back_earlier_approved_calls() {
+    struct DenySecondCallGate;
+    #[async_trait::async_trait]
+    impl PermissionGate for DenySecondCallGate {
+        async fn check(&self, request: &PermissionRequest) -> PermissionDecision {
+            if let PermissionTarget::Path(path) = &request.target
+                && path.ends_with("b.txt")
+            {
+                return PermissionDecision::Deny(Some("test denial".to_string()));
+            }
+            PermissionDecision::Allow
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        write_call_in("b.txt", "B\n", "c2"), // denied by the gate above
+    ]);
+    let (tx, _rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![response, text_response("done")]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(DenySecondCallGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let mut executor = ToolExecutor::new(registry, gate, confiner);
+    executor.set_checkpointer(Arc::new(
+        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap(),
+    ));
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        dir.path().join("a.txt").exists(),
+        "a.txt was approved and written — a later Deny must not roll it back"
+    );
+}
+
+#[tokio::test]
+async fn a_solo_failing_call_with_no_earlier_success_behaves_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![edit_call_in(
+        "tracked.txt",
+        "text that is not in the file",
+        "x",
+        "c1",
+    )]);
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], false).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error_text = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { call_id, output: ToolOutput::Error(text) })
+                if call_id.0 == "c1" =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("expected an Error result");
+    assert!(
+        !error_text.contains("rolled back") && !error_text.contains("rollback"),
+        "a solo failing call has nothing to roll back — must not claim it did: {error_text}"
+    );
+}
+
+#[tokio::test]
+async fn batch_rollback_fires_in_autonomous_mode_too() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        edit_call_in("a.txt", "does not exist", "x", "c2"),
+    ]);
+    // autonomous = true, and no [verification] command configured at all,
+    // so the *existing* pre_experiment_ref mechanism (which only fires on
+    // verification failure) can't be the thing producing this result —
+    // proving this plan's mechanism is independent of it.
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], true).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "batch rollback must fire in autonomous mode too, independent of pre_experiment_ref"
+    );
+}
+
 #[tokio::test]
 async fn wiki_batch_regenerates_missing_pages_and_stamps_frontmatter() {
     // Uses `run_wiki_turn_for_pages` directly (an explicit page list)
