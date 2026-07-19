@@ -59,6 +59,12 @@ and checkpoints all behave identically in both formats; malformed blocks
 get corrective feedback the model can retry from. See `docs/HISTORY.md`'s
 Phase 2 for the A/B measurements behind the default.
 
+**Reasoning visibility**: a reasoning-capable model's chain-of-thought
+renders live as a dimmed, italicized "thinking:" line in the terminal
+transcript, distinct from its final answer. Display-only — reasoning
+content never enters the agent's own history or the session JSON, and is
+invisible to prompted-edit-mode's SEARCH/REPLACE parser.
+
 **Repository map**: on each turn a token-budgeted map of the repo's
 top-ranked files and symbol signatures (tree-sitter extraction, PageRank
 over the internal reference graph — Rust, Python, JavaScript/JSX, and
@@ -66,8 +72,8 @@ TypeScript/TSX today; other languages degrade gracefully to no map) is
 appended to the system prompt, giving the model orientation it wouldn't ask
 for on its own. Gitignore-aware, `deny_paths` excluded, cached per file so only edits
 re-parse. Its token weight is counted by the compaction estimator. Configure
-or disable under `[repo_map]`; non-Rust projects simply get no map and pay
-no cost.
+or disable under `[repo_map]`; a project in an unsupported language simply
+gets no map and pays no cost.
 
 **Worktree checkpoints**: when the working directory is a git repository,
 the agent snapshots the entire worktree to `refs/aivyx/checkpoints/<ts>`
@@ -86,7 +92,13 @@ git checkout <ref> -- .                           # restore everything
 
 Disable with `[git] checkpoints = false`. Checkpoints use a synthetic
 `aivyx` author identity and never appear in your branch history — deleting
-a ref is enough to let its objects age out via normal `git gc`.
+a ref is enough to let its objects age out via normal `git gc`. When a single model response contains multiple mutating tool calls and a
+later one fails, every earlier successful call in that same response is
+automatically rolled back to the checkpoint from before the batch started
+— the model doesn't have to notice and manually undo a partial multi-file
+change itself. The rollback notice is folded directly into the failing
+call's own error text, so the model sees exactly what happened and what
+was undone in the same turn.
 
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
@@ -107,7 +119,13 @@ model round-trip; retries exhausted still ends the turn (never blocks
 completion) but with a loud, un-missable notice pointing at the worktree
 checkpoints already taken before each edit. The auto-triggered call is
 labeled `auto-verify:` in the transcript so it's never mistaken for
-something the model asked for itself.
+something the model asked for itself. A failing verification result also gets a short note appended listing
+which lines are new since the immediately preceding verification attempt
+— whatever that prior attempt's own outcome was — so the model can tell a
+newly-introduced regression apart from an already-known failure without
+re-deriving that context from raw output each time. This is a coarse,
+framework-agnostic line-set comparison, not real test-parsing, and says so
+explicitly in the note itself.
 
 **Autonomous mode** (`aivyx --auto "<goal>"`): runs unattended — the TUI
 stays up so you can watch (and Ctrl+C at any point), but nothing waits on a
