@@ -625,9 +625,11 @@ as the editor's own permission UI instead of a modal.
 extension, then point it at the same `aivyx --acp` command — no
 aivyx-specific VS Code extension exists or is needed.
 
-**Not yet supported over ACP**: `--auto` (autonomous mode), mid-turn
-cancellation (`session/cancel`), and non-text prompt content (images,
-embedded resources) — see `docs/superpowers/specs/
+**Not yet supported over ACP**: `--auto` (autonomous mode), `--resume`
+(TUI-only — the editor manages its own conversation view, so resumed
+history would be invisible to it; `--acp --resume` is rejected at
+startup), mid-turn cancellation (`session/cancel`), and non-text prompt
+content (images, embedded resources) — see `docs/superpowers/specs/
 2026-07-20-acp-editor-integration-design.md` for the full scope.
 
 ## Tools

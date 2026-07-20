@@ -115,9 +115,11 @@ struct Cli {
     /// Run as an Agent Client Protocol (ACP) server over stdin/stdout,
     /// for embedding in an editor (Zed, or VS Code via the
     /// formulahendry.acp-client extension) instead of the TUI. Mutually
-    /// exclusive with --plan (ACP's own session/set_mode supersedes it)
-    /// and --auto (not yet supported together — see docs/superpowers/
-    /// specs/2026-07-20-acp-editor-integration-design.md's Out of Scope).
+    /// exclusive with --plan (ACP's own session/set_mode supersedes it),
+    /// --auto (not yet supported together — see docs/superpowers/
+    /// specs/2026-07-20-acp-editor-integration-design.md's Out of Scope),
+    /// and --resume (the editor manages its own conversation view, so
+    /// resumed history would be invisible to it).
     #[arg(long)]
     acp: bool,
 }
@@ -149,6 +151,12 @@ async fn main() -> anyhow::Result<()> {
         }
         if cli.auto.is_some() {
             anyhow::bail!("--acp and --auto cannot be used together");
+        }
+        if cli.resume {
+            anyhow::bail!(
+                "--acp and --resume cannot be used together (the editor manages its own \
+                 conversation view; resumed history would be invisible to it)"
+            );
         }
         return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
             agent: built.agent,

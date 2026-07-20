@@ -121,7 +121,10 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
         }
     }
     if dropped_any {
-        text.push_str("\n(non-text content in this message was not forwarded)");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("(non-text content in this message was not forwarded)");
     }
     text
 }
@@ -362,7 +365,7 @@ mod tests {
         ))];
         assert_eq!(
             extract_prompt_text(&blocks),
-            "\n(non-text content in this message was not forwarded)"
+            "(non-text content in this message was not forwarded)"
         );
     }
 }

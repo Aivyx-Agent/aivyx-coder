@@ -40,7 +40,15 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         AgentEvent::ReasoningDelta(text) => {
             SessionUpdate::AgentThoughtChunk(text_chunk(text.clone()))
         }
-        AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) => {
+        // `Error` is a non-terminal advisory event — `Agent::run_turn` keeps
+        // going and still returns `Ok(())` afterward in most cases (backend/
+        // tool failures, verification failures, AGENTS.md load failures,
+        // context-truncation warnings), so it cannot be mapped to a JSON-RPC
+        // error response for the in-flight `session/prompt` call (that
+        // response is for the turn's *final* outcome). Surfaced the same way
+        // as `CouncilNote`/`ArchitectNote` — and the same way the TUI already
+        // renders it, as a transcript line rather than a fatal condition.
+        AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) | AgentEvent::Error(text) => {
             SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
         }
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
@@ -84,12 +92,12 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
                 .collect(),
         )),
         AgentEvent::SubAgentActivity(inner) => return translate_event(session_id, inner),
-        // Turn-terminal and non-notification events — handled by
-        // `terminal_stop_reason` instead, not surfaced as a SessionUpdate.
-        AgentEvent::TurnComplete
-        | AgentEvent::TurnPaused(_)
-        | AgentEvent::Error(_)
-        | AgentEvent::ContextUsage { .. } => return None,
+        // Turn-terminal (handled by `terminal_stop_reason` instead) or
+        // deliberately non-notification events — not surfaced as a
+        // SessionUpdate.
+        AgentEvent::TurnComplete | AgentEvent::TurnPaused(_) | AgentEvent::ContextUsage { .. } => {
+            return None
+        }
     };
     let _ = session_id; // session_id threading happens at the SessionNotification wrapper in Task 5
     Some(update)
@@ -194,6 +202,16 @@ mod tests {
         assert_eq!(plan.entries.len(), 2);
         assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
         assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
+    }
+
+    #[test]
+    fn error_becomes_plain_message_text_not_dropped() {
+        let update =
+            translate_event(&sid(), &AgentEvent::Error("backend timed out".to_string())).unwrap();
+        assert!(matches!(update, SessionUpdate::AgentMessageChunk(_)));
+        // Non-terminal: an Error event must never itself resolve the
+        // in-flight `session/prompt` call.
+        assert!(terminal_stop_reason(&AgentEvent::Error("backend timed out".to_string())).is_none());
     }
 
     #[test]
