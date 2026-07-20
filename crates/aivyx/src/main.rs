@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use aivyx_config::Settings;
 use aivyx_core::EditFormat;
+use aivyx_sandbox::PermissionPrompter;
 use aivyx_tools::ToolExecutor;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -110,6 +111,15 @@ struct Cli {
     /// for this session — mainly for comparing the two on a given model.
     #[arg(long, value_parser = ["native", "prompted"])]
     edit_format: Option<String>,
+
+    /// Run as an Agent Client Protocol (ACP) server over stdin/stdout,
+    /// for embedding in an editor (Zed, or VS Code via the
+    /// formulahendry.acp-client extension) instead of the TUI. Mutually
+    /// exclusive with --plan (ACP's own session/set_mode supersedes it)
+    /// and --auto (not yet supported together — see docs/superpowers/
+    /// specs/2026-07-20-acp-editor-integration-design.md's Out of Scope).
+    #[arg(long)]
+    acp: bool,
 }
 
 #[tokio::main]
@@ -120,9 +130,38 @@ async fn main() -> anyhow::Result<()> {
     let mut settings = Settings::load()?;
     settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
 
-    let (tui_prompter, permission_rx) = aivyx_tui::permission_channel();
-    let built = crate::agent_builder::build_agent(&cli, &settings, Arc::new(tui_prompter)).await?;
+    let (prompter, tui_permission_rx, acp_prompter_installer): (
+        Arc<dyn PermissionPrompter>,
+        Option<aivyx_tui::PermissionModalReceiver>,
+        Option<aivyx_acp::PrompterInstaller>,
+    ) = if cli.acp {
+        let (deferred, installer) = aivyx_acp::deferred_prompter();
+        (Arc::new(deferred), None, Some(installer))
+    } else {
+        let (tui_prompter, permission_rx) = aivyx_tui::permission_channel();
+        (Arc::new(tui_prompter), Some(permission_rx), None)
+    };
+    let built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
 
+    if cli.acp {
+        if cli.plan {
+            anyhow::bail!("--acp and --plan cannot be used together");
+        }
+        if cli.auto.is_some() {
+            anyhow::bail!("--acp and --auto cannot be used together");
+        }
+        return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
+            agent: built.agent,
+            events_rx: built.events_rx,
+            cwd: built.cwd,
+            plan_mode: built.plan_mode,
+            prompter_installer: acp_prompter_installer.expect("set above when cli.acp"),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
+
+    let permission_rx = tui_permission_rx.expect("TUI path always sets this");
     let autonomous_run = cli.auto.map(|goal| aivyx_tui::AutonomousRun {
         goal,
         max_iterations: settings.autonomous.max_iterations,

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aivyx-acp = { version = "0.1.0", path = "../aivyx-acp" }
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
@@ -20,3 +21,8 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+
+[dev-dependencies]
+agent-client-protocol = "1.2.0"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "test-util"] }

@@ -63,6 +63,8 @@ dependencies = [
 name = "aivyx"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
+ "aivyx-acp",
  "aivyx-config",
  "aivyx-core",
  "aivyx-llm",
@@ -73,6 +75,7 @@ dependencies = [
  "anyhow",
  "clap",
  "shell-escape",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
