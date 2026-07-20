@@ -1,0 +1,22 @@
+[package]
+name = "aivyx-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-client-protocol = "1.2.0"
+aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
+aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "process"] }
+
+[[bin]]
+name = "aivyx_acp_test_stub"
+path = "tests/bin/stub.rs"
+test = false
