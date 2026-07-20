@@ -92,8 +92,9 @@ git checkout <ref> -- .                           # restore everything
 
 Disable with `[git] checkpoints = false`. Checkpoints use a synthetic
 `aivyx` author identity and never appear in your branch history — deleting
-a ref is enough to let its objects age out via normal `git gc`. When a single model response contains multiple mutating tool calls and a
-later one fails, every earlier successful call in that same response is
+a ref is enough to let its objects age out via normal `git gc`. When a
+single model response contains multiple mutating tool calls and a later
+one fails, every earlier successful call in that same response is
 automatically rolled back to the checkpoint from before the batch started
 — the model doesn't have to notice and manually undo a partial multi-file
 change itself. The rollback notice is folded directly into the failing
@@ -119,8 +120,9 @@ model round-trip; retries exhausted still ends the turn (never blocks
 completion) but with a loud, un-missable notice pointing at the worktree
 checkpoints already taken before each edit. The auto-triggered call is
 labeled `auto-verify:` in the transcript so it's never mistaken for
-something the model asked for itself. A failing verification result also gets a short note appended listing
-which lines are new since the immediately preceding verification attempt
+something the model asked for itself. A failing verification result also
+gets a short note appended listing which lines are new since the
+immediately preceding verification attempt
 — whatever that prior attempt's own outcome was — so the model can tell a
 newly-introduced regression apart from an already-known failure without
 re-deriving that context from raw output each time. This is a coarse,
