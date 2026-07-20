@@ -20,23 +20,28 @@ directional, not committed fact, until spot-checked.
 
 ## Where things stand today
 
-*(Updated 2026-07-18 — the phase sections below carry the full history
+*(Updated 2026-07-20 — the phase sections below carry the full history
 and evidence; this is the summary.)*
 
 **Shipped and live-verified** (Phases 1–8, 10 Parts A & B, 11a/11b/11c,
-12, and the full Phase 9 stretch-goal list): the full agent loop —
-streaming chat, native + prompted SEARCH/REPLACE edit formats
-(A/B-measured, native default), grep/glob search, `run_command`/`run_shell`
-behind real Landlock+seccomp confinement, git tools (including
-`git_branch`/`git_push`/`git_pr`) + automatic worktree checkpoint refs,
-`delete_file` (`ActionKind::Delete`'s first constructor), tree-sitter repo
-map injection, an agent-maintained wiki (`/wiki`), session
-persistence/resume, context budget + compaction, plan mode (gate-enforced
-read-only), autonomous mode (`--auto`), `/council` multi-model
+12, the full Phase 9 stretch-goal list, editor/IDE context integration,
+editor approval integration, and the 4-phase capability-gap-closing
+chapter): the full agent loop — streaming chat, native + prompted
+SEARCH/REPLACE edit formats (A/B-measured, native default), grep/glob
+search, `run_command`/`run_shell` behind real Landlock+seccomp
+confinement, git tools (including `git_branch`/`git_push`/`git_pr`) +
+automatic worktree checkpoint refs (with automatic multi-file-edit
+rollback on a mid-batch failure), `delete_file` (`ActionKind::Delete`'s
+first constructor), tree-sitter repo map injection (Rust, Python,
+JavaScript/JSX, and TypeScript/TSX), an agent-maintained wiki (`/wiki`),
+session persistence/resume, context budget + compaction, plan mode
+(gate-enforced read-only), autonomous mode (`--auto`), `/council` multi-model
 deliberation, AGENTS.md project instructions, `web_fetch`/`web_search`,
 full MCP client support, a startup probe of the *served* context window,
-goal-bounded turn pausing instead of a hard iteration-cap failure, and
-enforced post-edit verification with automatic fix-and-retry. 381
+goal-bounded turn pausing instead of a hard iteration-cap failure,
+enforced post-edit verification with automatic fix-and-retry and a
+cross-attempt "what's new" note, live reasoning visibility in the TUI,
+editor/IDE context awareness, and editor-side permission approval. 452
 workspace tests; every security-critical behavior also proven by live
 E2E against real serving.
 
