@@ -45,7 +45,15 @@ fn target_string(target: &PermissionTarget) -> String {
 /// `editor_approval::build_pending_request` does — this is the *only*
 /// place in `aivyx-acp` where a real diff reaches the client, per the
 /// Global Constraints note in the plan.
-fn pending_tool_call(request: &PermissionRequest) -> ToolCallUpdate {
+///
+/// `call_id` must be unique per pending permission request within the
+/// session — `ToolCallId` is documented in the ACP schema as unique
+/// *within the session*, and `PermissionRequest` carries no call-level id
+/// of its own (only `tool_name`, e.g. `"write_file"`, which repeats across
+/// every call to the same tool). Mirrors `ConfirmationGate::check`'s
+/// `request_id` (a fresh `uuid::Uuid::new_v4()` per pending decision) in
+/// `crates/aivyx-sandbox/src/confirmation.rs`.
+fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpdate {
     let title = target_string(&request.target);
     let content = match (request.action, &request.diff) {
         (ActionKind::Write | ActionKind::Delete, Some(diff)) => {
@@ -86,14 +94,15 @@ fn pending_tool_call(request: &PermissionRequest) -> ToolCallUpdate {
         .title(title)
         .content(content)
         .raw_input(request.arguments_preview.clone());
-    ToolCallUpdate::new(request.tool_name.clone(), fields)
+    ToolCallUpdate::new(call_id.to_string(), fields)
 }
 
 pub(crate) fn permission_request_to_acp(
     session_id: SessionId,
     request: &PermissionRequest,
+    call_id: &str,
 ) -> RequestPermissionRequest {
-    RequestPermissionRequest::new(session_id, pending_tool_call(request), fixed_options())
+    RequestPermissionRequest::new(session_id, pending_tool_call(request, call_id), fixed_options())
 }
 
 /// `RejectOnce`/`RejectAlways` both deny this one call — aivyx-coder's
@@ -136,7 +145,8 @@ impl AcpPrompter {
 #[async_trait]
 impl PermissionPrompter for AcpPrompter {
     async fn prompt(&self, request: &PermissionRequest) -> UserResponse {
-        let acp_request = permission_request_to_acp(self.session_id.clone(), request);
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let acp_request = permission_request_to_acp(self.session_id.clone(), request, &call_id);
         match self.connection.send_request(acp_request).block_task().await {
             Ok(response) => acp_response_to_user_response(response),
             // Connection gone / request failed — fail closed, matching
@@ -226,8 +236,9 @@ mod tests {
             old_content: "old\n".to_string(),
             new_content: "new\n".to_string(),
         }));
-        let acp = permission_request_to_acp(sid(), &request);
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
         assert_eq!(acp.options.len(), 4);
+        assert_eq!(acp.tool_call.tool_call_id.0.as_ref(), "call-1");
         let ToolCallContent::Diff(diff) = &acp.tool_call.fields.content.as_ref().unwrap()[0] else {
             panic!("expected a Diff content block");
         };
@@ -245,9 +256,10 @@ mod tests {
             preview: None,
             diff: None,
         };
-        let acp = permission_request_to_acp(sid(), &request);
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
         assert!(acp.tool_call.fields.content.as_ref().unwrap().is_empty());
         assert_eq!(acp.tool_call.fields.kind, Some(ToolKind::Execute));
+        assert_eq!(acp.tool_call.tool_call_id.0.as_ref(), "call-1");
     }
 
     #[test]

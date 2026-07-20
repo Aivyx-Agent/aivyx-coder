@@ -92,6 +92,7 @@ dependencies = [
  "async-trait",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
