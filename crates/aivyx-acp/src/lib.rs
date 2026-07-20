@@ -4,6 +4,8 @@
 use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
 use agent_client_protocol::{Agent, Dispatch, Result, Stdio};
 
+mod translate;
+
 /// Runs the ACP server loop over stdin/stdout until the connection
 /// closes. Only `initialize` is handled so far — `NewSessionRequest`/
 /// `PromptRequest`/`SetSessionModeRequest` are added in Task 5.

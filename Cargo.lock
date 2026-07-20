@@ -90,6 +90,7 @@ dependencies = [
  "aivyx-types",
  "anyhow",
  "async-trait",
+ "serde_json",
  "tokio",
 ]
 
