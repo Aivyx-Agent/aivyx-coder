@@ -4,7 +4,10 @@
 use agent_client_protocol::schema::v1::{AgentCapabilities, InitializeRequest, InitializeResponse};
 use agent_client_protocol::{Agent, Dispatch, Result, Stdio};
 
+mod prompter;
 mod translate;
+
+pub use prompter::{AcpPrompter, DeferredPrompter, PrompterInstaller, deferred_prompter};
 
 /// Runs the ACP server loop over stdin/stdout until the connection
 /// closes. Only `initialize` is handled so far — `NewSessionRequest`/
