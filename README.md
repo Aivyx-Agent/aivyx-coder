@@ -600,6 +600,38 @@ control (no Ollama-style hidden default), and the Phase 10 acceptance
 benchmark reproduced the native 9/9 / prompted 6/9 result exactly against
 a Lemonade-managed `qwen3.5:9b`.
 
+## Editor integration (ACP)
+
+`aivyx --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)
+server over stdin/stdout, for embedding aivyx-coder directly in an
+editor's own UI instead of the terminal. Same security model as the TUI
+— every tool call still passes through `ConfirmationGate`, now surfaced
+as the editor's own permission UI instead of a modal.
+
+**Zed**: add to your `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "aivyx": {
+      "command": "/path/to/aivyx",
+      "args": ["--acp"]
+    }
+  }
+}
+```
+
+**VS Code**: install the [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client)
+extension, then point it at the same `aivyx --acp` command — no
+aivyx-specific VS Code extension exists or is needed.
+
+**Not yet supported over ACP**: `--auto` (autonomous mode), `--resume`
+(TUI-only — the editor manages its own conversation view, so resumed
+history would be invisible to it; `--acp --resume` is rejected at
+startup), mid-turn cancellation (`session/cancel`), and non-text prompt
+content (images, embedded resources) — see `docs/superpowers/specs/
+2026-07-20-acp-editor-integration-design.md` for the full scope.
+
 ## Tools
 
 | Tool | Action | Confirmation |
