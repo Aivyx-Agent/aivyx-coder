@@ -247,6 +247,17 @@ skip a permission tier or bypass the approval gate on a mutating action, so
 review the file the same way you'd review any other project instructions
 before trusting them, not as a sandboxed-away concern.
 
+**Learning over time**: the agent can propose updates to your *global*
+`AGENTS.md` itself, via a dedicated `remember_preference` tool — either
+because you asked it to remember something, or because it noticed a
+clear, repeated pattern. Every proposed change goes through the exact
+same review as any other file write: you see the diff, you approve or
+deny it. Disable with `[persona] enabled = false`. Unlike every other
+mutating tool, this one never uses the Always-Allow cache — you always
+see every change to this file, individually, even if you've approved a
+previous one. Not available in `--auto` (autonomous) mode: there's no
+human to review the change.
+
 **Editor context**: an optional per-project JSON file
 (`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
 canonicalized-`cwd` hash as session files) that any editor integration can

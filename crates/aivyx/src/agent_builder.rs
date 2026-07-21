@@ -23,8 +23,9 @@ use aivyx_tools::{
     CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
-    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RunCommandTool, RunShellTool, SetTasksTool,
-    ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
+    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, RunCommandTool,
+    RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use tokio::sync::mpsc;
 
@@ -230,6 +231,17 @@ pub(crate) async fn build_agent(
     // opted into any commands.
     if !command_specs.is_empty() {
         registry.register(Arc::new(RunCommandTool::new(command_specs.clone())));
+    }
+
+    // Registered only when persona learning + AGENTS.md loading are both
+    // enabled, and a global AGENTS.md location can even be resolved —
+    // otherwise the agent could "successfully" remember something into a
+    // file this session never reads back into context.
+    if settings.persona.enabled
+        && settings.agents_file.enabled
+        && let Ok(path) = aivyx_config::Settings::agents_file_path()
+    {
+        registry.register(Arc::new(RememberPreferenceTool::new(path)));
     }
 
     // Both tools are only registered when explicitly enabled — network
