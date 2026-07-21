@@ -518,7 +518,11 @@ impl Default for PermissionSettings {
     fn default() -> Self {
         Self {
             mode: PermissionMode::Confirm,
-            deny_paths: vec!["~/.ssh".to_string(), "~/.aws".to_string()],
+            deny_paths: vec![
+                "~/.ssh".to_string(),
+                "~/.aws".to_string(),
+                "~/.config/aivyx-coder".to_string(),
+            ],
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
         }
@@ -711,6 +715,15 @@ mod tests {
         assert_eq!(
             parsed.permissions.deny_paths,
             PermissionSettings::default().deny_paths
+        );
+    }
+
+    #[test]
+    fn default_deny_paths_includes_the_config_directory() {
+        assert!(
+            PermissionSettings::default()
+                .deny_paths
+                .contains(&"~/.config/aivyx-coder".to_string())
         );
     }
 
