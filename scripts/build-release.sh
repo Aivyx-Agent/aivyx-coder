@@ -43,7 +43,7 @@ if ! cargo build --release --target "${TARGET}" -p aivyx 2>&1 | tee "${BUILD_LOG
   exit 1
 fi
 
-BINARY="target/${TARGET}/release/aivyx"
+BINARY="target/${TARGET}/release/aivyx-coder"
 if [ ! -f "${BINARY}" ]; then
   echo "ERROR: expected binary not found at ${BINARY}"
   exit 1
@@ -56,7 +56,7 @@ TARBALL_NAME="${STAGE_NAME}.tar.gz"
 
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
-cp "${BINARY}" "${STAGE_DIR}/aivyx"
+cp "${BINARY}" "${STAGE_DIR}/aivyx-coder"
 cp README.md LICENSE-MIT LICENSE-APACHE "${STAGE_DIR}/"
 
 tar -czf "${DIST_DIR}/${TARBALL_NAME}" -C "${DIST_DIR}" "${STAGE_NAME}"

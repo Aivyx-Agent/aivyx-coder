@@ -147,7 +147,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
 
     AcpAgentBuilder
         .builder()
-        .name("aivyx")
+        .name("aivyx-coder")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
                 responder.respond(

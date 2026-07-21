@@ -76,7 +76,7 @@ fn build_system_prompt(executor: &ToolExecutor, edit_format: EditFormat) -> Stri
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "aivyx",
+    name = "aivyx-coder",
     about = "A TUI coding agent for local LLMs (Ollama / vLLM / llama.cpp)"
 )]
 struct Cli {

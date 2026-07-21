@@ -30,6 +30,13 @@ built and published automatically via GitHub Actions once this
 repository is pushed to GitHub — check the repository's Releases page
 for pre-built downloads at that point.
 
+The installed executable is named `aivyx-coder`, not `aivyx` — the
+crate's package name is still `aivyx` (so `cargo run -p aivyx` above
+works), but the produced binary is renamed via `[[bin]]` in
+`crates/aivyx/Cargo.toml` so it can't collide on `PATH` with the
+unrelated `Rust/aivyx` Personal Assistant project, which also ships a
+binary literally named `aivyx`.
+
 Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
 pointing at Ollama (`http://localhost:11434/v1`); edit it to taste.
@@ -38,7 +45,7 @@ Sessions persist automatically: after every completed turn the conversation
 history and task list are saved (one session per project directory, keyed by
 the canonicalized cwd, under `~/.local/state/aivyx-coder/sessions/`, written
 `0600` since they embed file contents and command output read during the
-session). `aivyx --resume` restores the previous session for the current
+session). `aivyx-coder --resume` restores the previous session for the current
 directory — transcript, task list, and all; without the flag a fresh session
 starts and its first completed turn replaces the stored one.
 
@@ -101,7 +108,7 @@ change itself. The rollback notice is folded directly into the failing
 call's own error text, so the model sees exactly what happened and what
 was undone in the same turn.
 
-**Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx --plan`) makes the
+**Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx-coder --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
 task list (the task panel becomes the reviewable plan), but tools that touch
 files or run commands are withheld from the model entirely — and the
@@ -129,7 +136,7 @@ re-deriving that context from raw output each time. This is a coarse,
 framework-agnostic line-set comparison, not real test-parsing, and says so
 explicitly in the note itself.
 
-**Autonomous mode** (`aivyx --auto "<goal>"`): runs unattended — the TUI
+**Autonomous mode** (`aivyx-coder --auto "<goal>"`): runs unattended — the TUI
 stays up so you can watch (and Ctrl+C at any point), but nothing waits on a
 permission modal. `ConfirmationGate` gains a dedicated autonomous-mode tier
 that trades the interactive prompt for a narrower, unconditional trust
@@ -621,7 +628,7 @@ a Lemonade-managed `qwen3.5:9b`.
 
 ## Editor integration (ACP)
 
-`aivyx --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)
+`aivyx-coder --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)
 server over stdin/stdout, for embedding aivyx-coder directly in an
 editor's own UI instead of the terminal. Same security model as the TUI
 — every tool call still passes through `ConfirmationGate`, now surfaced
@@ -632,8 +639,8 @@ as the editor's own permission UI instead of a modal.
 ```json
 {
   "agent_servers": {
-    "aivyx": {
-      "command": "/path/to/aivyx",
+    "aivyx-coder": {
+      "command": "/path/to/aivyx-coder",
       "args": ["--acp"]
     }
   }
@@ -641,7 +648,7 @@ as the editor's own permission UI instead of a modal.
 ```
 
 **VS Code**: install the [ACP Client](https://marketplace.visualstudio.com/items?itemName=formulahendry.acp-client)
-extension, then point it at the same `aivyx --acp` command — no
+extension, then point it at the same `aivyx-coder --acp` command — no
 aivyx-specific VS Code extension exists or is needed.
 
 **Not yet supported over ACP**: `--auto` (autonomous mode), `--resume`

@@ -10,7 +10,7 @@ use tempfile::tempdir;
 /// `initialize`/`session/new` never call the model.
 #[tokio::test]
 async fn acp_initialize_and_new_session_round_trip() {
-    let bin = env!("CARGO_BIN_EXE_aivyx");
+    let bin = env!("CARGO_BIN_EXE_aivyx-coder");
     let cwd = tempdir().unwrap();
     // A dummy backend URL is fine here — this test never sends a prompt,
     // so the LLM backend is never actually contacted.

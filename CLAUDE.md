@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`aivyx-coder` (binary name `aivyx`, crate `crates/aivyx`) is a terminal (TUI)
+`aivyx-coder` (binary name `aivyx-coder`, crate `crates/aivyx`) is a terminal (TUI)
 coding agent that talks **only** to local LLMs — Ollama, vLLM, or llama.cpp's
 `llama-server`, all via their OpenAI-compatible `/v1/chat/completions`
 endpoint. It never calls a cloud API. The model drives tool calls

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "aivyx-coder"
+path = "src/main.rs"
+
 [dependencies]
 aivyx-acp = { version = "0.1.0", path = "../aivyx-acp" }
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
