@@ -25,6 +25,7 @@ logic in `aivyx-core`.
 
 ```sh
 cargo run -p aivyx                         # run the TUI agent
+cargo run -p aivyx -- --acp                # run as an ACP server (Zed/VS Code), stdio
 
 cargo build --workspace
 cargo test --workspace
@@ -60,7 +61,8 @@ Workspace crates (`crates/*`), roughly bottom-up:
 | `aivyx-config` | `Settings` — XDG config loading, defaults, `0600` writing |
 | `aivyx-core` | `Agent`/`AgentConfig`/`AgentEvent`, the turn loop, `EditFormat` (native tool-call JSON vs. prompted SEARCH/REPLACE), `council` (multi-model `/council` mode), `session` (persistence + `--resume`), `edit_blocks` (SEARCH/REPLACE parsing) |
 | `aivyx-tui` | The ratatui terminal UI: `app::run` (`app.rs` — spawns the agent as a background task, `tokio::select!`s over input/agent-events/permission-requests), `permission.rs` (`TuiPrompter` bridges `PermissionPrompter::prompt` from the background agent task to the render loop via a `oneshot` reply — fails closed to Deny if the render loop is gone), status line (context-budget indicator, plan-mode badge) |
-| `aivyx` (`crates/aivyx`) | The binary — wires config → backend → agent → TUI |
+| `aivyx-acp` | An [Agent Client Protocol](https://agentclientprotocol.com) frontend (JSON-RPC over stdio, via the `agent-client-protocol` crate) — the same `Agent` core embedded directly in an editor (Zed's Agent panel; VS Code via the third-party `formulahendry.acp-client` extension) instead of the terminal. `translate.rs` (pure `AgentEvent` → ACP `SessionUpdate`/`StopReason` mapping, no I/O), `prompter.rs` (`AcpPrompter` — `PermissionPrompter` over `session/request_permission`; `DeferredPrompter`/`PrompterInstaller` bridge the gap between `ConfirmationGate` construction, which happens before any ACP connection exists, and `NewSessionRequest`, which is when a real connection first does), `session.rs` (one session per process; `session/prompt` runs `Agent::run_turn` inside `connection.spawn(...)`, not inline in the request handler — a deadlock fix, since `AcpPrompter`'s own `session/request_permission` round-trip needs the dispatch loop the handler would otherwise be blocking). See `docs/superpowers/specs/2026-07-20-acp-editor-integration-design.md` and README's "Editor integration (ACP)" section. |
+| `aivyx` (`crates/aivyx`) | The binary — `agent_builder.rs` builds `Agent` + every collaborator identically regardless of frontend (only the `PermissionPrompter` differs); `main.rs` wires config → backend → agent → either the TUI or, behind `--acp`, `aivyx-acp` |
 
 ### Data flow for one turn
 
@@ -111,9 +113,10 @@ filters the tool list sent to the model down to `!mutates_outside_session()`
 tools, *and* `ConfirmationGate::check`'s plan-mode branch independently
 denies a mutating call if the model invents one anyway — belt-and-braces,
 with the type-level omission as the primary UX and the gate as backstop.
-`PlanMode` is an `Arc<AtomicBool>` shared between the TUI (the only writer,
-via Ctrl+P) and the gate (a reader) — the model has no path to it at all,
-not just no incentive to flip it.
+`PlanMode` is an `Arc<AtomicBool>` shared between whichever frontend is
+running (the TUI, the only writer via Ctrl+P; or `aivyx-acp`, via ACP's
+`session/set_mode`) and the gate (a reader) — the model has no path to it
+at all, not just no incentive to flip it.
 
 ## Sandbox internals (`aivyx-sandbox/src/confiner.rs`)
 

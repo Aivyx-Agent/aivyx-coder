@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-20_
+_Last updated: 2026-07-21_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -24,9 +24,10 @@ context budget + compaction, plan mode (gate-enforced read-only),
 autonomous mode (`--auto`), `/council` multi-model deliberation, AGENTS.md
 project instructions, `web_fetch`/`web_search`, full MCP client support, a
 startup probe of the *served* context window, goal-bounded turn pausing
-instead of a hard iteration-cap failure, and enforced post-edit
-verification with automatic fix-and-retry. 452 workspace tests; every
-security-critical behavior also proven by live E2E against real serving.
+instead of a hard iteration-cap failure, enforced post-edit verification
+with automatic fix-and-retry, and an ACP editor-integration frontend
+(see below). 473 workspace tests; every security-critical behavior also
+proven by live E2E against real serving.
 
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
@@ -112,9 +113,39 @@ trusted from any single report — see `docs/HISTORY.md`'s
 "Capability-gap-closing chapter" section for the full account. `main` was
 pushed to GitHub immediately after this chapter closed.
 
-**In flight / next**: nothing pre-scoped remains. The next real context is
-a bare-metal test-rig trial (previously used for the sibling Aivyx-Agent
-project) — the original motivating goal behind closing all 4
-capability-gap sub-projects — not yet started as of this writing. See
-`docs/HISTORY.md` for the full phase-by-phase narrative behind every item
-above.
+**ACP editor integration — shipped, one verification step still open.**
+`aivyx --acp` is a new frontend — a new `aivyx-acp` crate speaking the
+[Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over
+stdio) — letting Zed's Agent panel, and VS Code via the existing
+third-party `formulahendry.acp-client` extension, drive the exact same
+`Agent` core the TUI does, with zero editor-specific plugin code of this
+project's own. What started as a request to scope two bespoke editor
+extensions turned out, on investigation, to be one protocol adapter
+instead: Zed's own extension API can no longer build custom agent UI at
+all (extension-provided agents are deprecated in favor of ACP), and VS
+Code already has a mature community ACP client — so a single `--acp`
+mode covers both. `crates/aivyx/src/main.rs`'s large TUI-agnostic
+construction sequence was first extracted into a shared
+`agent_builder.rs` so both frontends build `Agent` identically. Two real
+bugs were caught during review, not just at plan-writing time: (1) a
+genuine deadlock — running a turn inline inside the ACP `PromptRequest`
+handler would hang the first time a permission decision was needed,
+since that round-trip needs the same dispatch loop the handler would be
+blocking; fixed by offloading the turn to a spawned task, independently
+re-verified against the actual crate internals rather than trusted from
+the fix's own claim; (2) `AgentEvent::Error` was silently dropped
+instead of reaching the editor — a bug in the original design's own
+protocol mapping, not just the implementation, caught only by the final
+whole-branch review. **Still open**: the deadlock fix has only been
+verified by deep source-level static analysis, never against a real Zed
+session — this project's usual live-E2E bar hasn't been cleared for this
+feature yet, pending a human running the manual smoke test documented in
+`README.md`'s "Editor integration (ACP)" section.
+
+**In flight / next**: the ACP manual Zed smoke test above is the
+immediate next action — small and concrete. After that, nothing else
+pre-scoped remains; the next real context is a bare-metal test-rig trial
+(previously used for the sibling Aivyx-Agent project) — the original
+motivating goal behind closing all 4 capability-gap sub-projects — not
+yet started as of this writing. See `docs/HISTORY.md` for the full
+phase-by-phase narrative behind every item above.

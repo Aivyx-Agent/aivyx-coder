@@ -20,7 +20,7 @@ directional, not committed fact, until spot-checked.
 
 ## Where things stand today
 
-*(Updated 2026-07-20 — the phase sections below carry the full history
+*(Updated 2026-07-21 — the phase sections below carry the full history
 and evidence; this is the summary.)*
 
 **Shipped and live-verified** (Phases 1–8, 10 Parts A & B, 11a/11b/11c,
@@ -41,9 +41,12 @@ full MCP client support, a startup probe of the *served* context window,
 goal-bounded turn pausing instead of a hard iteration-cap failure,
 enforced post-edit verification with automatic fix-and-retry and a
 cross-attempt "what's new" note, live reasoning visibility in the TUI,
-editor/IDE context awareness, and editor-side permission approval. 452
-workspace tests; every security-critical behavior also proven by live
-E2E against real serving.
+editor/IDE context awareness, editor-side permission approval, and an
+ACP editor-integration frontend. 473 workspace tests; every
+security-critical behavior also proven by live E2E against real serving
+— **except** the ACP frontend's concurrency fix, verified only by deep
+source-level static analysis so far, pending a human-run manual Zed
+smoke test (see "ACP editor integration" below).
 
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not
 the model, not the edit format — was the dominant reliability variable.
@@ -80,9 +83,13 @@ in the agent loop itself (closed via Phase 12) plus five smaller gaps
 support, branch/PR tooling, `delete_file`). No tracked items remain from
 this audit.
 
-**In flight / next**: nothing pre-scoped remains in this ROADMAP. All
-previously-tracked threads (including the vLLM compat pass) are closed.
-Anything beyond that needs fresh brainstorming.
+**In flight / next**: a human-run manual smoke test of the ACP frontend
+against real Zed (small, concrete, documented in `README.md`'s "Editor
+integration (ACP)" section) is the immediate next action. After that,
+the next real context is a bare-metal test-rig trial (previously used
+for the sibling Aivyx-Agent project) — the original motivating goal
+behind closing all 4 capability-gap sub-projects — not yet started as of
+this writing.
 
 ## What the research says a coding agent needs
 
@@ -2184,3 +2191,132 @@ confirming the test then failed), fixed by strengthening the assertion.
 **Closing state**: 452 workspace tests, clippy clean across all 4
 sub-projects. No tracked items remain from this audit. `main` was pushed
 to GitHub immediately after the chapter closed.
+
+### ACP editor integration — ✅ shipped, one verification step still open
+
+The user asked to scope a VS Code extension and a Zed extension so an
+end user could plug aivyx-coder into their editor (2026-07-20). Research
+done before any design work changed the shape of the ask: Zed's own
+WASM extension API cannot build custom agent UI at all any more — no
+panels, and "extension-provided agents are deprecated" — leaving the
+[Agent Client Protocol](https://agentclientprotocol.com) (ACP), a
+JSON-RPC-over-stdio standard Zed authored and open-sourced, as the
+*only* integration point for Zed. VS Code turned out not to need bespoke
+code either: a mature, open-source community extension
+(`formulahendry.acp-client`) already connects to any ACP-compatible
+agent. So "two bespoke editor extensions" became "one ACP server mode,"
+confirmed with the user before any design was written. This is also the
+follow-on the two prior editor-integration phases (context-in, approval-out,
+both above) explicitly deferred: their specs both said "no
+VS Code/Neovim/other plugin code ships here — that's a separate, later
+project."
+
+**What shipped**: a new crate, `crates/aivyx-acp`, structurally a
+sibling to `aivyx-tui` — a thin frontend over the same
+`aivyx-core::Agent`, built on the official `agent-client-protocol` Rust
+crate (resolved to 1.2.0, pulling in `agent-client-protocol-schema`
+1.4.0). `aivyx --acp` runs the ACP server loop over stdio instead of the
+TUI. `translate.rs` maps `AgentEvent` to ACP `SessionUpdate`/`StopReason`
+values, pure and unit-tested with no I/O. `prompter.rs`'s `AcpPrompter`
+implements the same `PermissionPrompter` trait `TuiPrompter` does,
+sending `session/request_permission` instead of bridging to a render
+loop — and is the *only* place in the whole crate a real diff reaches
+the client, mirroring `editor_approval::build_pending_request`'s
+existing `ActionKind` match. `session.rs` owns session lifecycle: one
+session per process (parallelism is the editor spawning multiple
+processes, not this crate hosting multiple sessions), `session/prompt`
+drives one turn of `Agent::run_turn` while streaming events out,
+`session/set_mode` toggles `PlanMode` the same shared flag the TUI's
+Ctrl+P does. A prerequisite refactor pulled `main.rs`'s ~460-line
+TUI-agnostic construction sequence (config → tools → MCP discovery →
+`ConfirmationGate` → `Agent::new` → every `agent.set_*` call) into a new
+`agent_builder.rs`, so both frontends build `Agent` from provably
+identical code — verified behavior-preserving by an unchanged full test
+suite plus a manual TUI smoke check, before any ACP code was written on
+top of it.
+
+**Real deadlock found and fixed during implementation, not caught by
+design or planning.** The plan's own code ran `agent.run_turn(...)`
+inline inside the ACP `PromptRequest` handler. This deadlocks: the
+handler runs on `agent-client-protocol`'s single serial dispatch loop
+(`incoming_protocol_actor`), and `AcpPrompter`'s own
+`session/request_permission` call uses `block_task()`, which needs that
+same loop free to route the response back — so the first gated tool
+call in any real prompt (any `write_file`) would hang the whole
+connection forever. Found by the task's own implementer investigating a
+flag raised during the *previous* task's review (Task 4's reviewer
+independently noticed `block_task()`'s own doc comment warns against
+exactly this call shape). Fixed by moving the whole turn body into
+`connection.spawn(...)` — offloading it to a task outside the blocking
+dispatch loop, following a pattern the `agent-client-protocol-cookbook`
+crate itself recommends for "expensive work." A second-order version of
+the same class of bug was caught in the same pass: `session/set_mode`
+or a second `session/new` arriving mid-turn would deadlock identically
+if either awaited the session mutex a live turn holds — fixed by making
+`PlanMode` toggling lock-free (the existing shared `Arc<AtomicBool>`,
+untouched by the session mutex). Both fixes were independently
+re-verified against the actual installed crate source by an opus-tier
+task reviewer (dispatch-loop serialization, `Responder` being `Send`
+and safely deferrable into a spawned task, no double-response) — not
+accepted on the implementer's word — and re-confirmed by the final
+whole-branch reviewer. The honest caveat every reviewer in this chain
+recorded: **static analysis cannot fully prove the absence of a runtime
+deadlock**; only a real permission round-trip against a real ACP client
+can. See "Still open" below.
+
+**Real bug found only by the final whole-branch review, not by any
+individual task review**: `translate_event` grouped `AgentEvent::Error`
+into the same "turn-terminal, handled elsewhere" bucket as
+`TurnComplete`/`TurnPaused`, with a comment claiming `terminal_stop_reason`
+handled it — but `terminal_stop_reason` never matches `Error` at all, so
+the event was silently dropped. This was a defect in the plan's own
+Protocol Mapping table, not just the implementation: `AgentEvent::Error`
+fires from roughly a dozen call sites inside `run_turn` for advisory
+conditions that do *not* end the turn (backend/tool failures,
+verification failures, context-truncation warnings), so a Zed/VS Code
+user saw nothing where a TUI user sees a transcript line. Exactly the
+kind of cross-task seam a single task's reviewer can't catch — Task 3's
+reviewer had no reason to doubt the mapping the plan itself specified,
+and Task 5's reviewer was focused on the concurrency fix. Fixed by
+surfacing `Error` the same way `CouncilNote`/`ArchitectNote` already
+are: a plain `AgentMessageChunk`, not a dropped event or a
+prompt-failing JSON-RPC error.
+
+**Other real findings along the way**: agent-client-protocol-schema
+1.4.0's types are almost universally `#[non_exhaustive]`, so the
+research-phase design code's plain struct literals don't compile against
+the real crate — every construction site needed each type's `::new(...)`
++ builder-setter pattern instead, discovered incrementally task-by-task
+and each time carried forward as explicit context into the next
+dispatch. `ToolCallContent`'s blanket `From` impl lives on the enum, not
+its inner `Content` struct — a subtle trap where the "obviously right"
+`.into()` call silently targets the wrong level. A permission request's
+`ToolCallUpdate.tool_call_id` was originally derived from the tool's
+*name* (`"write_file"`), not a per-call identifier — collides across
+repeat calls to the same tool in one session (editing file A, then file
+B) exactly the way `ConfirmationGate`'s sibling `editor_approval`
+channel had already solved once with its own `request_id`; fixed the
+same way, a fresh UUID per permission request.
+
+**Still open**: the deadlock fix has been verified two independent ways
+by static/source-level analysis and by construction (the same shared
+`PlanMode`/lock-free pattern this codebase already trusted elsewhere),
+but never by a real end-to-end run — no LLM backend or Zed installation
+existed in the sandboxed environment this chapter was implemented in.
+`README.md`'s "Editor integration (ACP)" section documents the exact
+manual steps: point Zed's `settings.json` at the built binary, send a
+prompt that triggers a real gated tool call (to exercise
+`AcpPrompter`'s `block_task()` path for real) and, per the final
+review's recommendation, a prompt that deliberately errors (to exercise
+the `AgentEvent::Error`-surfacing fix too). This project's own
+live-E2E-over-static-claims bar — the same standard every phase above
+this one was held to — hasn't been cleared for this feature yet.
+
+**Closing state**: 473 workspace tests (up from 452), clippy clean
+across the whole workspace. Seven-task subagent-driven-development plan
+executed in one branch (`docs/superpowers/plans/
+2026-07-20-acp-editor-integration.md`), every task individually
+reviewed, one Important finding fixed mid-stream (the `tool_call_id`
+collision above), a final whole-branch review that caught and fixed the
+`AgentEvent::Error` bug above before merge. Merged to `main` and pushed
+to GitHub.
