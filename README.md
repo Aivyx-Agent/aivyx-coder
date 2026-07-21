@@ -258,6 +258,14 @@ see every change to this file, individually, even if you've approved a
 previous one. Not available in `--auto` (autonomous) mode: there's no
 human to review the change.
 
+This feature also added `~/.config/aivyx-coder` to the *default*
+`deny_paths` list, protecting the config directory (which can hold
+`backend.api_key`) from the generic `write_file`/`edit_file`/`delete_file`/
+`read_file`/`grep` tools. Since it's a default, it only applies to fresh
+installs — an existing `config.toml` won't pick it up automatically; add
+`"~/.config/aivyx-coder"` to your own `[permissions] deny_paths` list by
+hand to get the same protection.
+
 **Editor context**: an optional per-project JSON file
 (`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
 canonicalized-`cwd` hash as session files) that any editor integration can

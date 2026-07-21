@@ -418,6 +418,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deny_paths_blocks_a_generic_write_under_the_config_directory() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.config/aivyx-coder")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request(
+                "/home/user/.config/aivyx-coder/config.toml",
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn reads_auto_allow_without_prompting() {
         let prompter = Arc::new(FakePrompter {
             response: UserResponse::Deny,
