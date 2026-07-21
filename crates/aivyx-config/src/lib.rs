@@ -48,6 +48,7 @@ pub struct Settings {
     pub editor_approval: EditorApprovalSettings,
     pub web: WebSettings,
     pub mcp: McpSettings,
+    pub persona: PersonaSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -189,6 +190,25 @@ pub struct EditorApprovalSettings {
 }
 
 impl Default for EditorApprovalSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Gates whether the agent can propose edits to its own global
+/// `AGENTS.md` via the `remember_preference` tool (see
+/// docs/superpowers/specs/2026-07-21-agent-learned-preferences-design.md).
+/// Defaults to `true` — same reasoning as `EditorApprovalSettings`: every
+/// use is still individually gated by `ConfirmationGate`, so the
+/// capability alone grants nothing without the model choosing to use it
+/// and the user approving that specific call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersonaSettings {
+    pub enabled: bool,
+}
+
+impl Default for PersonaSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -518,7 +538,11 @@ impl Default for PermissionSettings {
     fn default() -> Self {
         Self {
             mode: PermissionMode::Confirm,
-            deny_paths: vec!["~/.ssh".to_string(), "~/.aws".to_string()],
+            deny_paths: vec![
+                "~/.ssh".to_string(),
+                "~/.aws".to_string(),
+                "~/.config/aivyx-coder".to_string(),
+            ],
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
         }
@@ -711,6 +735,15 @@ mod tests {
         assert_eq!(
             parsed.permissions.deny_paths,
             PermissionSettings::default().deny_paths
+        );
+    }
+
+    #[test]
+    fn default_deny_paths_includes_the_config_directory() {
+        assert!(
+            PermissionSettings::default()
+                .deny_paths
+                .contains(&"~/.config/aivyx-coder".to_string())
         );
     }
 

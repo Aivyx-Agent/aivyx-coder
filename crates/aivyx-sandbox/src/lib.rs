@@ -72,6 +72,20 @@ pub enum ActionKind {
     /// confirmation modal can honestly say "this is an MCP call," not
     /// mislabel it as a filesystem write or local command execution.
     McpTool,
+    /// The agent proposing an update to its own global, cross-project
+    /// preferences file (`remember_preference`). Always confirm-gated —
+    /// like `McpTool`, this is uniformly never auto-allowed, and unlike
+    /// every other `ActionKind`, a call is never satisfied *or* recorded
+    /// by the Always-Allow cache even in interactive mode (see
+    /// `ConfirmationGate::check`): the target description is a fixed
+    /// constant string regardless of what content is actually being
+    /// proposed, so caching it would silently bless every future,
+    /// unreviewed rewrite after the first approval. Unconditionally
+    /// denied under `--auto` for the same reason `McpTool` is — this
+    /// file persists and applies to every future project, unlike an
+    /// in-worktree edit `--auto`'s checkpoint/rollback safety net
+    /// already covers.
+    Memory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

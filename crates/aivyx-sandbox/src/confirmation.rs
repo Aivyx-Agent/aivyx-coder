@@ -34,6 +34,14 @@ const AUTONOMOUS_OUTSIDE_CWD_DENIAL: &str =
 const AUTONOMOUS_MCP_TOOL_DENIAL: &str =
     "MCP tools require interactive confirmation and cannot run in autonomous mode";
 
+/// Told to the model when a `remember_preference` call reaches autonomous
+/// mode. Same reasoning as `AUTONOMOUS_MCP_TOOL_DENIAL`: there is no human
+/// to review the proposed change, and this file's effect isn't scoped to
+/// the current worktree the way `is_outside_autonomous_worktree` already
+/// bounds ordinary Write/Delete actions.
+const AUTONOMOUS_MEMORY_DENIAL: &str =
+    "remembering preferences requires interactive confirmation and cannot happen in autonomous mode";
+
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
 /// must not silently bless every future write anywhere.
@@ -242,6 +250,15 @@ impl PermissionGate for ConfirmationGate {
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_MCP_TOOL_DENIAL.to_string()));
             }
+            if request.action == ActionKind::Memory {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "permission denied: remember_preference call in autonomous mode"
+                );
+                return PermissionDecision::Deny(Some(AUTONOMOUS_MEMORY_DENIAL.to_string()));
+            }
             if self.is_outside_autonomous_worktree(request, &self.cwd) {
                 tracing::warn!(
                     tool = %request.tool_name,
@@ -293,8 +310,13 @@ impl PermissionGate for ConfirmationGate {
             };
         }
 
+        // `Memory` actions never participate in the Always-Allow cache,
+        // in either direction — see ActionKind::Memory's doc comment for
+        // why (the target description is fixed regardless of proposed
+        // content, so caching would silently bless every future rewrite).
+        let never_cached = request.action == ActionKind::Memory;
         let key = PermissionKey::from_request(request);
-        if self.always_allow.lock().unwrap().contains(&key) {
+        if !never_cached && self.always_allow.lock().unwrap().contains(&key) {
             tracing::info!(
                 tool = %request.tool_name,
                 action = ?request.action,
@@ -307,7 +329,9 @@ impl PermissionGate for ConfirmationGate {
         let decision = match self.resolve_via_prompter_or_editor(request).await {
             UserResponse::Allow => PermissionDecision::Allow,
             UserResponse::AllowAlways => {
-                self.always_allow.lock().unwrap().insert(key);
+                if !never_cached {
+                    self.always_allow.lock().unwrap().insert(key);
+                }
                 PermissionDecision::AllowAlways
             }
             UserResponse::Deny => {
@@ -387,6 +411,32 @@ mod tests {
 
         let decision = gate
             .check(&write_request("/home/user/.ssh/id_ed25519"))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deny_paths_blocks_a_generic_write_under_the_config_directory() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.config/aivyx-coder")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request(
+                "/home/user/.config/aivyx-coder/config.toml",
+            ))
             .await;
 
         assert!(matches!(decision, PermissionDecision::Deny(_)));
@@ -1044,6 +1094,97 @@ mod tests {
             0,
             "autonomous mode must never prompt, even for MCP tool calls"
         );
+    }
+
+    fn memory_request() -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "remember_preference".to_string(),
+            action: ActionKind::Memory,
+            target: PermissionTarget::Other("your global preferences (AGENTS.md)".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_memory_actions_unconditionally() {
+        // Mirrors autonomous_mode_denies_mcp_tool_calls_unconditionally
+        // exactly: the FakePrompter is configured to Allow, to prove the
+        // denial isn't accidentally coming from the prompter path —
+        // autonomous mode must never reach it at all for a Memory action.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&memory_request()).await;
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_actions_are_never_cached_even_after_always_allow() {
+        // Mirrors always_allow_caches_per_exact_target_only's structure,
+        // but proves the OPPOSITE property for ActionKind::Memory: two
+        // calls with the identical (fixed) target must both reach the
+        // prompter — `calls` must be 2, not 1 — since a fixed target
+        // description means "same target" would otherwise wrongly imply
+        // "same proposed content" the way it correctly does for
+        // PermissionTarget::Path.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let first = gate.check(&memory_request()).await;
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        let second = gate.check(&memory_request()).await;
+        assert_eq!(second, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn memory_actions_are_not_affected_by_deny_paths() {
+        let gate = ConfirmationGate::new(
+            Arc::new(FakePrompter {
+                response: UserResponse::Allow,
+                calls: AtomicUsize::new(0),
+            }),
+            vec![PathBuf::from("/home/user/.config/aivyx-coder")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        // A Memory action's target is PermissionTarget::Other, never
+        // Path — is_denied (confirmation.rs:130-134) only matches Path,
+        // so this must be false regardless of deny_paths content.
+        assert!(!gate.is_denied(&memory_request()));
     }
 
     #[tokio::test]
