@@ -18,7 +18,9 @@ use aivyx_config::Settings;
 // site is needed either.
 use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilSeat, EditFormat, session};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
-use aivyx_sandbox::{AutonomousMode, ConfirmationGate, PermissionGate, PermissionPrompter, PlanMode};
+use aivyx_sandbox::{
+    AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
+};
 use aivyx_tools::{
     CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
@@ -44,6 +46,7 @@ pub(crate) struct BuiltAgent {
     pub(crate) plan_mode: PlanMode,
     pub(crate) restored: Option<session::SessionState>,
     pub(crate) tasks: Arc<std::sync::Mutex<Vec<session::Task>>>,
+    pub(crate) injection_taint: InjectionTaint,
 }
 
 /// Builds `Agent` + every collaborator it needs, identically regardless
@@ -148,6 +151,12 @@ pub(crate) async fn build_agent(
     }
     let autonomous_mode = AutonomousMode::new();
     autonomous_mode.set_active(cli.auto.is_some());
+    // One shared handle, three consumers: the agent flags it when
+    // scanning, the gate consults it to deny further autonomous-mode
+    // mutations, the TUI's autonomous driver consults it to stop the
+    // whole run. See docs/superpowers/specs/
+    // 2026-07-22-autonomous-mode-injection-guard-design.md.
+    let injection_taint = InjectionTaint::new();
     // Auto-approving edits is only defensible because deterministic
     // verification is the safety net — without it, "autonomous" would mean
     // "unchecked." Refuse to start rather than run degraded.
@@ -158,15 +167,18 @@ pub(crate) async fn build_agent(
         );
     }
 
-    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
-        Arc::clone(&prompter),
-        deny_paths.clone(),
-        pre_approved_commands,
-        plan_mode.clone(),
-        autonomous_mode.clone(),
-        cwd.clone(),
-        settings.editor_approval.enabled,
-    ));
+    let gate: Arc<dyn PermissionGate> = Arc::new(
+        ConfirmationGate::new(
+            Arc::clone(&prompter),
+            deny_paths.clone(),
+            pre_approved_commands,
+            plan_mode.clone(),
+            autonomous_mode.clone(),
+            cwd.clone(),
+            settings.editor_approval.enabled,
+        )
+        .with_injection_taint(injection_taint.clone()),
+    );
     let confiner = aivyx_sandbox::default_confiner(
         &cwd,
         &settings.sandbox.resolved_extra_read_paths(),
@@ -427,6 +439,7 @@ pub(crate) async fn build_agent(
         autonomous_mode.clone(),
         events_tx,
     );
+    agent.set_injection_taint(injection_taint.clone());
 
     if let Some((map, budget)) = &repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
@@ -529,5 +542,13 @@ pub(crate) async fn build_agent(
         }
     };
 
-    Ok(BuiltAgent { agent, events_rx, cwd, plan_mode, restored, tasks })
+    Ok(BuiltAgent {
+        agent,
+        events_rx,
+        cwd,
+        plan_mode,
+        restored,
+        tasks,
+        injection_taint,
+    })
 }

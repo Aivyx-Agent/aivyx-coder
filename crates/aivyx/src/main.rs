@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         max_iterations: settings.autonomous.max_iterations,
         max_duration: Duration::from_secs(settings.autonomous.max_duration_secs),
         tasks: Arc::clone(&built.tasks),
+        injection_taint: built.injection_taint.clone(),
     });
     aivyx_tui::run(
         built.agent,
