@@ -417,6 +417,11 @@ impl Agent {
                 context.cursor.line, sel.start_line, sel.end_line
             ),
         });
+        if let Some(text) = &self.editor_context_text
+            && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, "editor context")
+        {
+            self.injection_taint.flag(finding);
+        }
     }
 
     /// Re-renders the map off the async runtime. Best-effort: a failure
@@ -434,6 +439,11 @@ impl Agent {
                 None
             }
         };
+        if let Some(text) = &self.repo_map_text
+            && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, "repo map")
+        {
+            self.injection_taint.flag(finding);
+        }
     }
 
     /// Re-reads both `AGENTS.md` files off the async runtime. Best-effort:
@@ -461,6 +471,11 @@ impl Agent {
                 if content.chars().count() > budget_chars {
                     over_budget_labels.push("user-level AGENTS.md");
                 }
+                if let Some(finding) =
+                    aivyx_sandbox::scan_for_injection_markers(content, "user-level AGENTS.md")
+                {
+                    self.injection_taint.flag(finding);
+                }
                 sections.push(format!("User preferences ({}):\n{content}", path.display()));
             }
         }
@@ -470,6 +485,11 @@ impl Agent {
             if !content.is_empty() {
                 if content.chars().count() > budget_chars {
                     over_budget_labels.push("project AGENTS.md");
+                }
+                if let Some(finding) =
+                    aivyx_sandbox::scan_for_injection_markers(content, "project AGENTS.md")
+                {
+                    self.injection_taint.flag(finding);
                 }
                 sections.push(format!("Project instructions (AGENTS.md):\n{content}"));
             }
