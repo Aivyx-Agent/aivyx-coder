@@ -274,24 +274,23 @@ impl PermissionGate for ConfirmationGate {
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_MEMORY_DENIAL.to_string()));
             }
-            if matches!(request.action, ActionKind::Write | ActionKind::Delete)
-                || matches!(request.target, PermissionTarget::Command { .. })
+            if (matches!(request.action, ActionKind::Write | ActionKind::Delete)
+                || matches!(request.target, PermissionTarget::Command { .. }))
+                && let Some(finding) = self.injection_taint.current()
             {
-                if let Some(finding) = self.injection_taint.current() {
-                    tracing::warn!(
-                        tool = %request.tool_name,
-                        action = ?request.action,
-                        target = ?request.target,
-                        source = %finding.source,
-                        "permission denied: injection-flagged content ingested this session"
-                    );
-                    return PermissionDecision::Deny(Some(format!(
-                        "permission denied: flagged content was ingested this session \
-                         (possible prompt injection from {}) — autonomous mode is \
-                         pausing for human review",
-                        finding.source
-                    )));
-                }
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    source = %finding.source,
+                    "permission denied: injection-flagged content ingested this session"
+                );
+                return PermissionDecision::Deny(Some(format!(
+                    "permission denied: flagged content was ingested this session \
+                     (possible prompt injection from {}) — autonomous mode is \
+                     pausing for human review",
+                    finding.source
+                )));
             }
             if self.is_outside_autonomous_worktree(request, &self.cwd) {
                 tracing::warn!(

@@ -678,7 +678,9 @@ impl Agent {
     /// scanning happens: a flagged `ToolOutput::Ok` result taints
     /// `self.injection_taint`, consulted by `ConfirmationGate` and the
     /// autonomous driver. See docs/superpowers/specs/
-    /// 2026-07-22-autonomous-mode-injection-guard-design.md.
+    /// 2026-07-22-autonomous-mode-injection-guard-design.md. Only
+    /// `ToolOutput::Ok` content is scanned — `Error`/`Denied` results are
+    /// tool-framing text, not ingested external content.
     fn record_tool_result(&mut self, result: ToolResult, source: &str) {
         if let ToolOutput::Ok(text) = &result.output
             && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, source)
@@ -1494,6 +1496,8 @@ impl Agent {
                     if batch_start_ref.is_none() {
                         batch_start_ref = ref_after_this_call;
                     }
+                    // Cloned — call_description is still needed below when
+                    // record_tool_result is called with it.
                     batch_touched_paths.push(call_description.clone());
                 }
                 if let ToolOutput::Error(original_error) = &result.output

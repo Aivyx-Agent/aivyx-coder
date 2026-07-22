@@ -16,6 +16,10 @@ use std::sync::{Arc, Mutex};
 /// Case-insensitive substrings that, when found in untrusted content, are
 /// treated as a likely prompt-injection attempt. Deliberately not
 /// exhaustive — expected to grow based on what real usage surfaces.
+/// Every entry here must be lowercase ASCII — the scan lowercases the
+/// haystack with `to_ascii_lowercase()` (not `to_lowercase()`, to keep byte
+/// offsets stable), so an uppercase or non-ASCII entry would silently never
+/// match.
 const INJECTION_MARKERS: &[&str] = &[
     "ignore previous instructions",
     "ignore all previous instructions",
