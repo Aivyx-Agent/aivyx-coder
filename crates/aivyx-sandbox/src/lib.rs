@@ -18,9 +18,11 @@ use async_trait::async_trait;
 mod confiner;
 mod confirmation;
 mod editor_approval;
+mod injection_scan;
 #[cfg(feature = "sandbox-backend")]
 pub use confiner::LandlockConfiner;
 pub use confirmation::ConfirmationGate;
+pub use injection_scan::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 
 /// What a tool is asking to do, described *before* any side effect happens.
 #[derive(Debug, Clone)]

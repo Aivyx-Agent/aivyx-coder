@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
-use aivyx_sandbox::{PermissionRequest, PermissionTarget, PlanMode, UserResponse};
+use aivyx_sandbox::{
+    InjectionFinding, InjectionTaint, PermissionRequest, PermissionTarget, PlanMode, UserResponse,
+};
 use aivyx_types::{ContentBlock, Message, Role, ToolCallSource, ToolOutput};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
@@ -68,6 +70,14 @@ fn goal_achieved_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
 }
 
+fn injection_detected_notice(iterations_used: u32, finding: &InjectionFinding) -> String {
+    format!(
+        "autonomous run stopped: possible prompt injection detected after {iterations_used} \
+         iteration(s) — flagged content from {} matched \"{}\": \"{}\"",
+        finding.source, finding.matched_pattern, finding.excerpt
+    )
+}
+
 enum ChatLine {
     User(String),
     Assistant(String),
@@ -112,6 +122,7 @@ pub struct AutonomousRun {
     pub max_iterations: u32,
     pub max_duration: Duration,
     pub tasks: Arc<Mutex<Vec<Task>>>,
+    pub injection_taint: InjectionTaint,
 }
 
 /// Owns the ratatui render loop. Takes an already-constructed `Agent` (the
@@ -157,6 +168,10 @@ pub async fn run(
                     // The user hit Ctrl+C wanting this to stop — do not
                     // send another message.
                     agent.notify(cancelled_notice(iterations_used));
+                    break;
+                }
+                if let Some(finding) = autonomous.injection_taint.take() {
+                    agent.notify(injection_detected_notice(iterations_used, &finding));
                     break;
                 }
                 let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
@@ -1111,6 +1126,20 @@ mod tests {
         let message = goal_achieved_notice(4);
         assert!(message.contains("goal achieved"));
         assert!(message.contains('4'));
+    }
+
+    #[test]
+    fn injection_detected_notice_reports_iterations_source_and_pattern() {
+        let finding = InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...IGNORE PREVIOUS INSTRUCTIONS...".to_string(),
+        };
+        let message = injection_detected_notice(3, &finding);
+        assert!(message.contains("possible prompt injection"));
+        assert!(message.contains('3'));
+        assert!(message.contains("read_file: notes.txt"));
+        assert!(message.contains("ignore previous instructions"));
     }
 
     fn modal_request() -> (crate::permission::ModalRequest, oneshot::Receiver<UserResponse>) {

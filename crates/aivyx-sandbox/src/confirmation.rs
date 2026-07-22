@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::{
-    ActionKind, AutonomousMode, PermissionDecision, PermissionGate, PermissionPrompter,
-    PermissionRequest, PermissionTarget, PlanMode, UserResponse, editor_approval, path_is_denied,
+    ActionKind, AutonomousMode, InjectionTaint, PermissionDecision, PermissionGate,
+    PermissionPrompter, PermissionRequest, PermissionTarget, PlanMode, UserResponse,
+    editor_approval, path_is_denied,
 };
 
 /// Told to the model on a plan-mode denial. This is a backstop message: in
@@ -93,6 +94,7 @@ pub struct ConfirmationGate {
     cwd: PathBuf,
     always_allow: Mutex<HashSet<PermissionKey>>,
     editor_approval_enabled: bool,
+    injection_taint: InjectionTaint,
 }
 
 impl ConfirmationGate {
@@ -131,7 +133,20 @@ impl ConfirmationGate {
             cwd,
             always_allow: Mutex::new(always_allow),
             editor_approval_enabled,
+            injection_taint: InjectionTaint::new(),
         }
+    }
+
+    /// Attaches the shared `InjectionTaint` handle the agent (which
+    /// writes to it) and the TUI's autonomous driver (which reads it to
+    /// decide when to stop) also hold — must be the *same* instance for
+    /// the pause behavior below to fire. Without a call to this, the gate
+    /// keeps its own private, never-flagged instance and behaves exactly
+    /// as it did before this feature existed. See docs/superpowers/specs/
+    /// 2026-07-22-autonomous-mode-injection-guard-design.md.
+    pub fn with_injection_taint(mut self, injection_taint: InjectionTaint) -> Self {
+        self.injection_taint = injection_taint;
+        self
     }
 
     fn is_denied(&self, request: &PermissionRequest) -> bool {
@@ -259,6 +274,24 @@ impl PermissionGate for ConfirmationGate {
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_MEMORY_DENIAL.to_string()));
             }
+            if (matches!(request.action, ActionKind::Write | ActionKind::Delete)
+                || matches!(request.target, PermissionTarget::Command { .. }))
+                && let Some(finding) = self.injection_taint.current()
+            {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    source = %finding.source,
+                    "permission denied: injection-flagged content ingested this session"
+                );
+                return PermissionDecision::Deny(Some(format!(
+                    "permission denied: flagged content was ingested this session \
+                     (possible prompt injection from {}) — autonomous mode is \
+                     pausing for human review",
+                    finding.source
+                )));
+            }
             if self.is_outside_autonomous_worktree(request, &self.cwd) {
                 tracing::warn!(
                     tool = %request.tool_name,
@@ -360,6 +393,7 @@ impl PermissionGate for ConfirmationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InjectionFinding;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakePrompter {
@@ -985,6 +1019,152 @@ mod tests {
         };
         assert!(matches!(gate.check(&request).await, PermissionDecision::Deny(_)));
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_writes_once_injection_taint_is_flagged() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let injection_taint = InjectionTaint::new();
+        injection_taint.flag(InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(injection_taint);
+
+        let decision = gate
+            .check(&write_request("/home/user/project/src/a.rs"))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("notes.txt"), "reason: {reason}");
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_pre_approved_commands_once_injection_taint_is_flagged() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let injection_taint = InjectionTaint::new();
+        injection_taint.flag(InjectionFinding {
+            source: "web_fetch: https://example.com".to_string(),
+            matched_pattern: "new system prompt".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![("cargo".to_string(), vec!["build".to_string()])],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(injection_taint);
+
+        let request = PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["build".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let decision = gate.check(&request).await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_is_unaffected_when_injection_taint_is_never_flagged() {
+        // Regression: the new taint check must not change any existing
+        // autonomous-mode behavior when nothing has been flagged.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/src/a.rs"))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn interactive_mode_still_prompts_normally_when_injection_taint_is_flagged() {
+        // Explicitly out of scope (design doc): the interactive
+        // confirmation modal is unaffected by the taint flag — a human
+        // already reviews the raw diff before approving.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let injection_taint = InjectionTaint::new();
+        injection_taint.flag(InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(injection_taint);
+
+        let decision = gate
+            .check(&write_request("/home/user/project/src/a.rs"))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "interactive mode must still prompt"
+        );
     }
 
     #[tokio::test]
