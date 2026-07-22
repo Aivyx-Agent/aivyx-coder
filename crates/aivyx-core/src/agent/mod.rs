@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
-use aivyx_sandbox::{AutonomousMode, PlanMode};
+use aivyx_sandbox::{AutonomousMode, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
@@ -147,6 +147,15 @@ pub struct Agent {
     /// consulted by the discard/rewind path (Task 6); the gate holds its
     /// own clone for enforcement. See ROADMAP.md Phase 11c.
     autonomous_mode: AutonomousMode,
+    /// Shared record of whether injection-flagged content has been
+    /// ingested this session — set here when scanning tool outputs, the
+    /// repo map, AGENTS.md, or the editor-context descriptor; consulted
+    /// by `ConfirmationGate` (autonomous mode) and the TUI's autonomous
+    /// driver. Defaults to a fresh, never-flagged `InjectionTaint` unless
+    /// `set_injection_taint` attaches the same shared instance those
+    /// other consumers hold — see docs/superpowers/specs/
+    /// 2026-07-22-autonomous-mode-injection-guard-design.md.
+    injection_taint: InjectionTaint,
     /// Set to `true` right before emitting `AgentEvent::TurnPaused`, `false`
     /// at the start of every `run_turn`/`run_council_turn` call and right
     /// before emitting `AgentEvent::TurnComplete`. Exists so a caller that
@@ -257,6 +266,7 @@ impl Agent {
             session_path: None,
             plan_mode,
             autonomous_mode,
+            injection_taint: InjectionTaint::new(),
             last_turn_paused: false,
             repo_map: None,
             agents_file_config: None,
@@ -344,6 +354,13 @@ impl Agent {
     /// project.
     pub fn set_editor_context(&mut self, deny_paths: Vec<PathBuf>) {
         self.editor_context_config = Some(EditorContextConfig { deny_paths });
+    }
+
+    /// Attaches the shared `InjectionTaint` handle `ConfirmationGate` and
+    /// the TUI's autonomous driver also hold. See the field doc comment
+    /// above for why this must be the same instance.
+    pub fn set_injection_taint(&mut self, injection_taint: InjectionTaint) {
+        self.injection_taint = injection_taint;
     }
 
     /// Re-reads the editor-context file (if configured) and stores a
@@ -632,6 +649,30 @@ impl Agent {
         });
     }
 
+    /// Emits `AgentEvent::ToolResult` and appends the matching
+    /// `Role::Tool` history entry — the shared tail both
+    /// `run_auto_verification` and the main per-turn dispatch loop need,
+    /// since every dispatched `ToolCall` requires a matching `Role::Tool`
+    /// result or the next request's unanswered `tool_calls` entry gets
+    /// rejected by most OpenAI-compatible backends. Also where injection
+    /// scanning happens: a flagged `ToolOutput::Ok` result taints
+    /// `self.injection_taint`, consulted by `ConfirmationGate` and the
+    /// autonomous driver. See docs/superpowers/specs/
+    /// 2026-07-22-autonomous-mode-injection-guard-design.md.
+    fn record_tool_result(&mut self, result: ToolResult, source: &str) {
+        if let ToolOutput::Ok(text) = &result.output
+            && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, source)
+        {
+            self.injection_taint.flag(finding);
+        }
+        self.emit(AgentEvent::ToolResult(result.clone()));
+        self.history.push(Message {
+            role: Role::Tool,
+            tool_call_id: Some(result.call_id.clone()),
+            content: vec![ContentBlock::ToolResult(result)],
+        });
+    }
+
     /// Synthesizes and dispatches the configured `[verification] command`
     /// via the `run_command` tool — reusing its existing trust tier (the
     /// name must already be pre-approved through
@@ -664,6 +705,7 @@ impl Agent {
             tool_call_id: None,
         });
 
+        let source = describe_tool_call_target(&call);
         let mut result = self
             .executor
             .dispatch(call, cwd, cancellation.clone())
@@ -696,12 +738,7 @@ impl Agent {
             self.last_verification_output = Some(current_text);
         }
 
-        self.emit(AgentEvent::ToolResult(result.clone()));
-        self.history.push(Message {
-            role: Role::Tool,
-            tool_call_id: Some(result.call_id.clone()),
-            content: vec![ContentBlock::ToolResult(result)],
-        });
+        self.record_tool_result(result, &source);
         passed
     }
 
@@ -1437,7 +1474,7 @@ impl Agent {
                     if batch_start_ref.is_none() {
                         batch_start_ref = ref_after_this_call;
                     }
-                    batch_touched_paths.push(call_description);
+                    batch_touched_paths.push(call_description.clone());
                 }
                 if let ToolOutput::Error(original_error) = &result.output
                     && let Some(start_ref) = batch_start_ref.take()
@@ -1470,12 +1507,7 @@ impl Agent {
                     batch_touched_paths.clear();
                 }
 
-                self.emit(AgentEvent::ToolResult(result.clone()));
-                self.history.push(Message {
-                    role: Role::Tool,
-                    tool_call_id: Some(result.call_id.clone()),
-                    content: vec![ContentBlock::ToolResult(result)],
-                });
+                self.record_tool_result(result, &call_description);
             }
 
             let tasks_after = self.tasks.lock().unwrap().clone();
