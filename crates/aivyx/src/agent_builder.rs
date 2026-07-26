@@ -25,9 +25,9 @@ use aivyx_tools::{
     CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
-    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, RunCommandTool,
-    RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplSendTool,
+    ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -227,6 +227,22 @@ pub(crate) async fn build_agent(
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
     registry.register(Arc::new(RunShellTool));
+    let repl_session = new_shared_repl_session();
+    let repl_quiet_window = Duration::from_millis(settings.repl.quiet_window_ms);
+    let repl_max_wait = Duration::from_secs(settings.repl.max_wait_secs);
+    let repl_idle_timeout = Duration::from_secs(settings.repl.idle_timeout_secs);
+    registry.register(Arc::new(ReplStartTool::new(
+        Arc::clone(&repl_session),
+        repl_quiet_window,
+        repl_max_wait,
+        repl_idle_timeout,
+    )));
+    registry.register(Arc::new(ReplSendTool::new(
+        Arc::clone(&repl_session),
+        repl_quiet_window,
+        repl_max_wait,
+    )));
+    registry.register(Arc::new(ReplStopTool::new(repl_session)));
     registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));

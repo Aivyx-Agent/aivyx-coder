@@ -108,8 +108,13 @@ issue based on its output; it will run again automatically once you stop making 
 /// denied in autonomous mode (checkpoints are the record; a human reviews
 /// and commits afterward) — offering either would just invite the small-
 /// model retry-loop-on-unavailable-action failure mode Phase 8 already
-/// found and designed plan mode around.
-const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit"];
+/// found and designed plan mode around. `repl_start` is hidden for the
+/// same reason — an unattended session has no one to review an
+/// interactive process's arbitrary back-and-forth, and `ActionKind::Interact`
+/// (what `repl_send`/`repl_stop` report) is independently denied by
+/// `ConfirmationGate` in autonomous mode as a backstop even though
+/// `repl_start` being hidden already makes a session unreachable there.
+const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit", "repl_start"];
 
 /// Appended to the system prompt while autonomous mode is active.
 const AUTONOMOUS_PROMPT: &str = "You are running unattended (autonomous mode): no human will \

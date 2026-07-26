@@ -268,6 +268,18 @@ mod tests {
         registry.register(Arc::new(SetTasksTool::new(Arc::default())));
         registry.register(Arc::new(GitReadTool::new(vec![])));
         registry.register(Arc::new(GitCommitTool::new(vec![])));
+        registry.register(Arc::new(ReplStartTool::new(
+            new_shared_repl_session(),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(1),
+        )));
+        registry.register(Arc::new(ReplSendTool::new(
+            new_shared_repl_session(),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(1),
+        )));
+        registry.register(Arc::new(ReplStopTool::new(new_shared_repl_session())));
 
         let all: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
         let plan: Vec<String> = registry
@@ -276,10 +288,12 @@ mod tests {
             .map(|d| d.name)
             .collect();
 
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 12);
         assert_eq!(
             plan,
-            vec!["read_file", "grep", "glob", "set_tasks", "git_read"]
+            vec![
+                "read_file", "grep", "glob", "set_tasks", "git_read", "repl_send", "repl_stop"
+            ]
         );
     }
 
