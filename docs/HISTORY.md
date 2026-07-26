@@ -2320,3 +2320,108 @@ reviewed, one Important finding fixed mid-stream (the `tool_call_id`
 collision above), a final whole-branch review that caught and fixed the
 `AgentEvent::Error` bug above before merge. Merged to `main` and pushed
 to GitHub.
+
+### Bare-metal trial: PATH collision fix, live testing, and a real `agent-client-protocol` bug — ✅ done
+
+The motivating question: can `aivyx-coder` and the sibling Aivyx
+Personal Assistant (a separate, unrelated project sharing only naming
+and authorship — see the top-level workspace `CLAUDE.md`) coexist on
+the same machine an end user might run both on? Investigation found
+their config/data directories are already fully disjoint
+(`~/.config/aivyx-coder` vs. `~/.aivyx`, `~/.local/state/aivyx-coder`
+vs. `~/.local/share/aivyx`), but both projects built a binary literally
+named `aivyx` — a real collision if a user installed both to the same
+`bin/` directory, with whichever installed second silently overwriting
+the first. Fixed by renaming the installed binary to `aivyx-coder` via
+`[[bin]]` in `crates/aivyx/Cargo.toml`, keeping the package name `aivyx`
+(so `cargo run -p aivyx` and the ~38 existing test call sites across
+`confirmation.rs`/`agent/tests.rs` needed no changes) — a builder/setter
+pattern over new required parameters, the same trade-off later reused
+for the autonomous-mode injection guard below.
+
+**Live testing on real hardware.** Deployed the release binary to a
+bare-metal rig (CachyOS, RTX 3090) with `llama-server` + `qwen3.5:9b`
+— this project's own documented best-serving-config verdict from Phase
+10. First attempt used Qwen2.5-Coder-7B instead; its GGUF chat template
+didn't parse into structured `tool_calls` at all with this
+`llama-server` build (the model narrated `{"name": "read_file", ...}`
+as plain text instead of a real tool call) — switching to `qwen3.5:9b`
+fixed it immediately, independent confirmation of why this project
+settled on that model for `llama-server` in the first place. A
+graduated series of coding tasks — a small script (FizzBuzz), a bigger
+task (a temperature-converter CLI with pytest coverage, including the
+model correctly self-correcting a floating-point precision test
+failure), and a small application (a Flask TODO REST API with tests) —
+all completed correctly, independently re-verified by re-running the
+test suites and, for the Flask app, driving the real running server
+with live HTTP requests rather than trusting the model's own summary.
+
+**Bug found: the permission modal's Allow/Deny legend could go
+invisible.** `render_permission_modal` (`aivyx-tui/src/app.rs`)
+appended the `[y] Allow ...` legend as the last entry in one long
+`Vec<Line>` rendered by a single unscrolled `Paragraph` — a diff taller
+than the popup's available height (e.g. a new ~100-line file) silently
+pushed the legend off-screen entirely, leaving a human with no visible
+way to know how to respond. Confirmed via a `ratatui::backend::TestBackend`
+regression test (`permission_modal_button_row_stays_visible_for_a_long_diff`)
+that fails against the old code and passes after splitting the modal
+into a fixed-height footer (the legend, always rendered last, never
+clipped) and a separate scroll-clipped content area above it for the
+diff.
+
+**Bug found: `agent-client-protocol` 1.2.0 silently denied every ACP
+permission request.** The ACP editor-integration chapter above shipped
+with its deadlock fix "verified two independent ways... but never by a
+real end-to-end run." This chapter finally ran that real end-to-end
+test, against a real Zed session on the bare-metal rig — every edit was
+denied, no matter what the user clicked "Allow" on. Root-caused through
+escalating diagnostics: (1) a scripted ACP client that always
+auto-approves (the crate's own official `yolo_one_shot_client` example)
+reproduced the same denial, ruling out a Zed-side UI issue; (2)
+file-based logging inside `AcpPrompter::prompt` (`eprintln!` is silently
+discarded — the ACP transport layer pipes and swallows the agent
+subprocess's stderr unless the client wires up a debug callback, which
+neither Zed nor the reference client does) revealed the real error:
+`send_request(...).block_task()` received a spurious `-32601 Method not
+found`, despite the client genuinely having received the request and
+sent back a valid "Allow" response; (3) a from-scratch, in-process
+reproduction using *only* `agent-client-protocol`'s own public API — no
+`aivyx` code at all, an agent and client exchanging a permission
+request over an in-memory duplex stream, sent from a spawned task
+exactly as the crate's own deadlock-avoidance docs prescribe —
+reproduced the identical failure, conclusively ruling out a bug in this
+project's own code.
+
+Checked crates.io: `agent-client-protocol` 2.0.0 had shipped three days
+earlier. Its own migration guide confirmed the exact symptom as a known,
+now-fixed defect: "The 1.x documentation said that `on_receiving_result`
+and `on_receiving_ok_result` callbacks held the dispatch loop until
+completion, but the implementation did not enforce that ordering," and
+2.0 "routes response-handler failures to the pending local request"
+instead of surfacing "the misleading generic failure that previously
+appeared when the real interceptor error was lost" — precisely the
+spurious `Method not found` observed. Despite the 2.0 changelog's long
+breaking-change list, the actual upgrade touched almost nothing: this
+crate only uses the high-level `Stdio` transport and the standard
+`on_receive_request`/`connect_with`/`connect_to` builder pattern, never
+the low-level `Channel`/`ResponseRouter` APIs that changed. The one real
+change was deleting `session.rs`'s `on_receive_dispatch` catch-all
+handler entirely — the migration guide's own recommendation, since 2.0's
+built-in default now does the same thing (`Method not found` for
+unmatched requests) while also correctly routing responses. Verified
+twice live against the real rig (two different edits, both landed
+correctly on disk) before committing to the fix, then closed with a
+permanent regression test — `prompter.rs`'s
+`prompt_resolves_to_allow_over_a_real_connection` — that exercises
+`AcpPrompter` against a real in-process `agent-client-protocol`
+connection (no subprocess, no LLM) so this exact class of bug can't
+silently regress again; the existing pure-mapping-function tests
+(`acp_response_to_user_response`, etc.) could never have caught it,
+since the bug was in response routing before that function ever runs.
+
+**Closing state**: full workspace build, test suite, and clippy all
+clean on `agent-client-protocol` 2.0.0. The ACP editor-integration
+chapter's "still open" live-verification gap is now closed — real gated
+tool calls, real permission approvals, real edits, all confirmed against
+a real Zed session. The bare-metal Aivyx Personal Assistant coexistence
+trial itself remains the next open item (see `ROADMAP.md`).

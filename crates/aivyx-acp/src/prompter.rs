@@ -291,4 +291,137 @@ mod tests {
         assert_eq!(acp_response_to_user_response(reject_always), UserResponse::Deny);
         assert_eq!(acp_response_to_user_response(cancelled), UserResponse::Deny);
     }
+
+    /// End-to-end regression test for a real bug: `agent-client-protocol`
+    /// 1.2.0's response-dispatch ordering wasn't actually enforced despite
+    /// being documented as if it were (confirmed by the 2.0 migration
+    /// guide's own changelog: "the implementation did not enforce that
+    /// ordering" / fixes "the misleading generic failure that previously
+    /// appeared when the real interceptor error was lost"). In practice,
+    /// this meant `AcpPrompter::prompt`'s `send_request(...).block_task()`
+    /// — called from inside a `connection.spawn`'d task, exactly as this
+    /// crate's own deadlock-avoidance design requires (see session.rs's
+    /// module doc comment) — could receive a spurious `-32601 Method not
+    /// found` instead of the real answer a client had genuinely already
+    /// sent. A real Zed session hit this directly: every edit was denied
+    /// no matter what the user clicked. Unlike the other tests in this
+    /// file, this one exercises `AcpPrompter` against a *real*
+    /// `agent-client-protocol` connection (in-process duplex streams, no
+    /// subprocess, no LLM needed) rather than just the pure mapping
+    /// functions — those alone couldn't have caught this, since the bug
+    /// was in response routing before `acp_response_to_user_response` ever
+    /// runs.
+    #[tokio::test]
+    async fn prompt_resolves_to_allow_over_a_real_connection() {
+        use agent_client_protocol::schema::v1::{InitializeRequest, InitializeResponse};
+        use agent_client_protocol::{Agent as AgentRole, Client as ClientRole};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (agent_writer, client_reader) = tokio::io::duplex(65536);
+        let (client_writer, agent_reader) = tokio::io::duplex(65536);
+        let agent_transport = agent_client_protocol::ByteStreams::new(
+            agent_writer.compat_write(),
+            agent_reader.compat(),
+        );
+        let client_transport = agent_client_protocol::ByteStreams::new(
+            client_writer.compat_write(),
+            client_reader.compat(),
+        );
+
+        // Drives the client role: initiates the handshake (which is what
+        // triggers the agent's `InitializeRequest` handler below to start
+        // the permission round trip) *and* answers the resulting
+        // `RequestPermissionRequest` exactly like a human clicking "Allow"
+        // in Zed would — both responsibilities on one connection, since a
+        // transport can only be claimed by one builder.
+        let client_task = tokio::spawn(async move {
+            ClientRole
+                .builder()
+                .on_receive_request(
+                    async move |_req: RequestPermissionRequest, responder, _connection| {
+                        responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                ALLOW_ONCE,
+                            )),
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(client_transport, async |cx| {
+                    let _ = cx
+                        .send_request(InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V1,
+                        ))
+                        .block_task()
+                        .await;
+                    // Stay connected long enough for the permission round
+                    // trip triggered by the handler above to complete —
+                    // it's near-instant in-process, this just needs to
+                    // outlast it, well inside the 5s timeout below.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    Ok::<(), agent_client_protocol::Error>(())
+                })
+                .await
+        });
+
+        // The result of `AcpPrompter::prompt` travels out of the spawned
+        // task via this channel — `block_task()` can only run inside a
+        // task spawned via `ConnectionTo::spawn`, exactly mirroring how
+        // `session.rs`'s `PromptRequest` handler reaches `AcpPrompter`.
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let result_tx = std::sync::Mutex::new(Some(result_tx));
+
+        // `.connect_to` runs the connection's full receive loop until the
+        // transport closes, not just until one request is handled — so it
+        // must run in the background alongside the client, not be awaited
+        // directly here (this test only needs the one response, not a
+        // graceful protocol shutdown).
+        let agent_task = tokio::spawn(async move {
+            AgentRole
+                .builder()
+                .on_receive_request(
+                    async move |req: InitializeRequest, responder, connection| {
+                        let session_id = SessionId::new("test-session");
+                        // `AcpPrompter::new` takes the connection by value,
+                        // but `connection.spawn(...)` below also needs a
+                        // handle — `ConnectionTo` is a cheap `Clone`, same
+                        // pattern `session.rs` uses (e.g. `spawn_connection
+                        // = connection.clone()`).
+                        let prompter = AcpPrompter::new(session_id, connection.clone());
+                        let request = write_request(None);
+                        let tx = result_tx.lock().unwrap().take();
+                        let _ = connection.spawn(async move {
+                            let response = prompter.prompt(&request).await;
+                            if let Some(tx) = tx {
+                                let _ = tx.send(response);
+                            }
+                            Ok(())
+                        });
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version).agent_capabilities(
+                                agent_client_protocol::schema::v1::AgentCapabilities::new(),
+                            ),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport)
+                .await
+        });
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), result_rx)
+            .await
+            .expect("prompt() should resolve within 5s, not hang")
+            .expect("result channel should not be dropped without sending");
+
+        assert_eq!(
+            response,
+            UserResponse::Allow,
+            "a client answering allow_once must resolve to UserResponse::Allow, \
+             not a spurious denial from a lost/misrouted response"
+        );
+
+        client_task.abort();
+        agent_task.abort();
+    }
 }

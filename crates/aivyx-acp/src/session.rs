@@ -9,7 +9,7 @@
 //!
 //! `agent-client-protocol`'s `Builder` runs every `on_receive_request`
 //! handler *inline*, on the single task that also reads incoming JSON-RPC
-//! messages off the transport (`agent-client-protocol-1.2.0/src/jsonrpc.rs`,
+//! messages off the transport (`agent-client-protocol-2.0.0/src/jsonrpc.rs`,
 //! `incoming_protocol_actor` in `jsonrpc/incoming_actor.rs`: one `while let
 //! Some(message) = my_rx.next().await { ... dispatch_dispatch(handler).await
 //! ... }` loop that both dispatches new requests *and* routes incoming
@@ -19,6 +19,23 @@
 //! until it completes." `SentRequest::block_task()`'s own docs are more
 //! blunt: safe only in a task spawned via `ConnectionTo::spawn`, "using it
 //! directly in a handler callback will deadlock the connection."
+//!
+//! This spawned-task requirement isn't just about deadlock avoidance —
+//! `agent-client-protocol` 1.2.0 (used through the ACP integration's
+//! first live Zed session) had a real bug where response-dispatch
+//! ordering wasn't actually enforced despite being documented as if it
+//! were, so `AcpPrompter::prompt`'s `block_task()` could receive a
+//! spurious `-32601 Method not found` instead of a client's genuine
+//! answer — every edit was denied no matter what the user clicked in
+//! Zed. Root-caused via a from-scratch, in-process reproduction using
+//! only the crate's own public API (see `prompter.rs`'s
+//! `prompt_resolves_to_allow_over_a_real_connection` test); fixed by
+//! upgrading to 2.0.0, which the migration guide confirms: "the
+//! implementation did not enforce that ordering" in 1.x, and 2.0 "routes
+//! response-handler failures to the pending local request" instead of
+//! surfacing "the misleading generic failure that previously appeared
+//! when the real interceptor error was lost." See
+//! `docs/HISTORY.md` for the full account.
 //!
 //! `AcpPrompter::prompt()` (`crate::prompter`) does exactly
 //! `.send_request(...).block_task().await` for every `session/request_permission`
@@ -70,7 +87,7 @@ use agent_client_protocol::schema::v1::{
     SessionModeState, SessionNotification, SetSessionModeRequest, SetSessionModeResponse,
     StopReason,
 };
-use agent_client_protocol::{Agent as AcpAgentBuilder, Dispatch, Error as AcpError, Result, Stdio};
+use agent_client_protocol::{Agent as AcpAgentBuilder, Result, Stdio};
 use aivyx_core::{Agent, AgentEvent};
 use aivyx_sandbox::PlanMode;
 use tokio::sync::{mpsc, Mutex};
@@ -315,12 +332,6 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_dispatch(
-            async move |message: Dispatch, cx| {
-                message.respond_with_error(AcpError::method_not_found(), cx)
-            },
-            agent_client_protocol::on_receive_dispatch!(),
         )
         .connect_to(Stdio::new())
         .await

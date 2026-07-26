@@ -136,16 +136,48 @@ re-verified against the actual crate internals rather than trusted from
 the fix's own claim; (2) `AgentEvent::Error` was silently dropped
 instead of reaching the editor — a bug in the original design's own
 protocol mapping, not just the implementation, caught only by the final
-whole-branch review. **Still open**: the deadlock fix has only been
-verified by deep source-level static analysis, never against a real Zed
-session — this project's usual live-E2E bar hasn't been cleared for this
-feature yet, pending a human running the manual smoke test documented in
-`README.md`'s "Editor integration (ACP)" section.
+whole-branch review.
 
-**In flight / next**: the ACP manual Zed smoke test above is the
-immediate next action — small and concrete. After that, nothing else
-pre-scoped remains; the next real context is a bare-metal test-rig trial
-(previously used for the sibling Aivyx-Agent project) — the original
-motivating goal behind closing all 4 capability-gap sub-projects — not
-yet started as of this writing. See `docs/HISTORY.md` for the full
+**ACP manual Zed smoke test — done, and it found a real bug.** Run live
+against a real Zed session on the bare-metal test rig (see below): every
+edit was denied no matter what the user clicked. Root-caused to a bug in
+`agent-client-protocol` 1.2.0 itself — the crate's response-dispatch
+ordering wasn't actually enforced despite being documented as if it
+were, so `AcpPrompter::prompt`'s `block_task()` could receive a spurious
+`-32601 Method not found` instead of a client's genuine "Allow" —
+confirmed with a from-scratch, in-process reproduction using only the
+crate's own public API, independent of any of this project's code.
+Fixed by upgrading to `agent-client-protocol` 2.0.0 (the maintainers'
+own migration guide describes fixing exactly this class of bug), which
+turned out to need almost no source changes on our side — the affected
+usage surface was small enough that only one now-redundant
+`on_receive_dispatch` catch-all needed removing (2.0's built-in default
+already does the same thing, correctly). A new regression test
+(`prompter.rs`'s `prompt_resolves_to_allow_over_a_real_connection`)
+exercises the exact mechanism that broke — an agent-initiated request
+sent from a spawned task, resolved over a real in-process connection, no
+LLM required — so this class of bug can't silently regress again. The
+deadlock fix itself is now also live-verified, not just statically
+analyzed: the same session exercised real gated tool calls end to end.
+See `docs/HISTORY.md` for the full account.
+
+**Bare-metal test-rig trial — in progress.** The `aivyx-coder` binary
+was renamed to avoid a `PATH` collision with the sibling Aivyx
+Personal Assistant (both previously built a binary literally named
+`aivyx`), deployed and live-tested on real hardware against a real
+local backend (`llama-server` + `qwen3.5:9b`, matching this project's
+own documented best-serving-config verdict): a graduated series of
+coding tasks (a script, a multi-file task with tests, a small Flask
+application) all completed correctly end to end, and the ACP/Zed
+integration above was exercised as part of the same trial. One more
+real bug found and fixed along the way: the TUI's permission modal
+(`render_permission_modal`) rendered the diff and the Allow/Deny key
+legend in one unscrolled `Paragraph`, so a diff taller than the popup
+silently pushed the legend off-screen — a human approving a large new
+file would see the diff but have no visible way to know how to
+respond. Fixed by splitting the modal into a scrollable content area
+and an always-visible fixed footer. **Still open**: installing the
+sibling Aivyx Personal Assistant alongside `aivyx-coder` on the same
+rig to confirm real coexistence, the original motivating question
+behind the rename above. See `docs/HISTORY.md` for the full
 phase-by-phase narrative behind every item above.
