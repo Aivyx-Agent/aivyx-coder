@@ -62,10 +62,17 @@ impl Tool for McpToolAdapter {
         Ok(PermissionRequest {
             tool_name: self.registered_name.clone(),
             action: ActionKind::McpTool,
+            // Arguments are baked into the target description, not just
+            // `tool`/`server`, so the Always-Allow cache (keyed on this
+            // description alone for `Other` targets) can't bless a future
+            // call with different arguments — the same reason
+            // `PermissionTarget::Command` keys on full argv rather than
+            // `program` alone.
             target: PermissionTarget::Other(format!(
-                "{} (server: {})",
+                "{} (server: {}, args: {})",
                 self.tool_info.name,
-                self.client.server_name()
+                self.client.server_name(),
+                arguments
             )),
             arguments_preview: arguments.clone(),
             preview: None,
@@ -187,6 +194,44 @@ mod tests {
             .unwrap();
         assert_eq!(request.action, ActionKind::McpTool);
         assert!(matches!(request.target, PermissionTarget::Other(_)));
+    }
+
+    #[test]
+    fn permission_request_target_varies_by_arguments() {
+        // Regression test: `ConfirmationGate`'s Always-Allow cache keys an
+        // `Other` target on its description string alone
+        // (`PermissionKey::Other { action, description }`,
+        // `crates/aivyx-sandbox/src/confirmation.rs`). If this description
+        // doesn't vary by call arguments, approving one call with "Always
+        // Allow" silently blesses every future call to the same tool
+        // regardless of what arguments are passed — the exact failure
+        // mode `PermissionTarget::Command` already guards against by
+        // keying on full argv (see
+        // `always_allow_for_a_command_does_not_cover_a_different_argv_with_the_same_program`
+        // in confirmation.rs).
+        let client = Arc::new(crate::mcp::McpClient::new(
+            "docs".to_string(),
+            "unused".to_string(),
+            vec![],
+            vec![],
+        ));
+        let adapter = McpToolAdapter::new(client, "docs", tool_info());
+        let first = adapter
+            .permission_request(&serde_json::json!({"q": "rust"}), Path::new("."))
+            .unwrap();
+        let second = adapter
+            .permission_request(&serde_json::json!({"q": "python"}), Path::new("."))
+            .unwrap();
+        let PermissionTarget::Other(first_desc) = first.target else {
+            panic!("expected an Other target");
+        };
+        let PermissionTarget::Other(second_desc) = second.target else {
+            panic!("expected an Other target");
+        };
+        assert_ne!(
+            first_desc, second_desc,
+            "different arguments must produce different Always-Allow cache keys"
+        );
     }
 
     #[tokio::test]
