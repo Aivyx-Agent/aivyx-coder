@@ -700,6 +700,9 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 | `list_mcp_resources` / `read_mcp_resource` | list/read resources from connected MCP servers | none (auto-allowed) |
 | `list_mcp_prompts` / `get_mcp_prompt` | list/get prompts from connected MCP servers | none (auto-allowed) |
 | `mcp__<server>__<tool>` | dynamically discovered tool from a connected MCP server | prompt (then cacheable) |
+| `repl_start` | start a persistent process (e.g. a language REPL, `psql`, or a dev server) | prompt (then cacheable) |
+| `repl_send` | send input to / poll output from the running process | none (auto-allowed once started) |
+| `repl_stop` | stop the running process | none (auto-allowed once started) |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command
@@ -903,6 +906,15 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 #                              # on this round of edits — never silently:
 #                              # the turn still ends, with a loud notice.
 
+# REPL/interactive-process support (repl_start/repl_send/repl_stop):
+# timing knobs for deciding when a call has "enough" output to return,
+# and for auto-killing a forgotten session. All optional — zero-config
+# works out of the box with the defaults shown.
+# [repl]
+# quiet_window_ms = 300     # how long output must be silent before repl_send returns
+# max_wait_secs = 10        # hard per-call backstop, in case output never goes quiet
+# idle_timeout_secs = 600   # auto-kill a session with no repl_send activity for this long
+
 # /council — several local models answer, cross-rank, and a chairman
 # synthesizes. Off until at least two members AND a chairman are set. Any
 # OpenAI-compatible endpoint works per seat; with one GPU, pointing members
@@ -949,6 +961,10 @@ Deliberately not (yet) addressed — documented rather than hidden:
   for debugging, it logs the full conversation (including file/command content)
   in plaintext, append-only, forever. The file is `0600` but has no rotation or
   expiry — treat it as sensitive and delete it when done.
+- **`repl_start`/`repl_send` use plain pipes, not a real pseudo-terminal
+  (PTY)**: a program that checks `isatty()` may behave differently than it
+  would in a real terminal — disabled line-editing/readline history, no
+  color, or in the worst case refusing to run non-interactively at all.
 - **`Tool::execute` bypass**: the "all tool calls go through the permission
   gate" property is enforced by convention (the executor is the only caller),
   not by the type system.
