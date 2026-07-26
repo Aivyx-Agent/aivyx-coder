@@ -2478,3 +2478,76 @@ No new bugs found during this pass. The bare-metal Aivyx Personal
 Assistant coexistence trial — the original motivating question behind
 the `aivyx-coder` binary rename all the way back at the start of this
 chapter — is now fully closed.
+
+### Codebase audit + rig deployment — ✅ done
+
+A follow-up audit (2026-07-22) covering security posture, tool coverage,
+test quality, and documentation surfaced 15 findings, triaged into two
+buckets rather than built ad hoc: bugs/gaps/stale docs got fixed directly
+in the same pass (TDD + full workspace verification per finding), new
+*capabilities* got logged to `ROADMAP.md`'s new Backlog section instead,
+since a new tool or behavior surface deserves its own design pass, not a
+same-session patch. Ten findings were fixed directly: the MCP tool's
+Always-Allow cache was argument-blind (approving one call silently
+blessed every future call regardless of arguments); `delegate_task`
+sub-agents got a fresh, disconnected `InjectionTaint` instead of sharing
+the parent's; `deny_paths`' defaults covered only `~/.ssh`/`~/.aws`/the
+config dir, missing common credential locations (`~/.gnupg`, `~/.netrc`,
+Docker/kube/npm/PyPI/gcloud/Azure/cargo/gh configs); five README/ROADMAP
+sections were inaccurate or stale (the read-path auto-allow was never
+actually cwd-scoped, the Landlock section undersold its own coverage,
+the shipped injection guard was undocumented in three places); the
+injection scanner's documented-but-untested marker-list tie-break rule
+got a real test; `web_fetch`/`web_search` injection findings reported a
+bare tool name with no URL/query, now fixed by extending the same
+target-description function `write_file`/`edit_file` already used for
+`path`; and `--resume` silently dropped Plan mode back to Act mode
+because `SessionState` never persisted it — fixed by adding a
+`#[serde(default)]` field so old session files still load, restored by
+`Agent::restore` in an allow-list direction only (turns Plan mode on,
+never off, so it can't clobber an explicit `--plan` flag). The four
+capability opportunities logged to the backlog instead: a move/rename
+tool, REPL/interactive-process support, a patch-apply tool, and
+verification test-selection (scoping a retry to just the tests relevant
+to the edited files instead of always re-running the full suite).
+
+**Deploying the fixes to the bare-metal rig** (`10.80.80.148`) surfaced
+that the rig has no Rust toolchain installed by design — the working
+binary there had always arrived via cross-compile-and-ship, not an
+in-place build. `scripts/build-release.sh` produced a fresh
+`x86_64-unknown-linux-musl` release binary locally from `main`
+(`3107192`, all 8 audit-fix commits), `sha256sum`-verified on both ends
+of the `scp` transfer, installed to `~/.local/bin/aivyx-coder` over a
+timestamped backup of the previous binary (removed once the new one was
+confirmed working).
+
+**Live re-verification**, `pyte`-driven PTY sessions against the rig's
+real `llama-server` + Qwen3.5-9B backend (no synthetic backend, no unit
+test):
+- **Plan-mode/`--resume` fix**: started `aivyx-coder --plan`, completed
+  one real turn, quit, then ran `aivyx-coder --resume` with no `--plan`
+  flag at all — the `PLAN` badge correctly reappeared on the resumed
+  session, live-confirming the exact behavior the new
+  `plan_mode_active`/`SessionState` field + `Agent::restore` logic was
+  built for.
+- **Expanded `deny_paths` defaults**: planted a fake secret in
+  `~/.npmrc` (one of the newly-added default-denied paths — previously
+  unprotected) and asked the agent to read and report its contents;
+  `read_file` was hard-blocked with `denied: target is under a
+  configured deny_paths entry`, and the fake token never reached the
+  transcript.
+
+Both checks passed on the first correctly-constructed attempt. Getting
+there needed one test-script fix worth recording: sending a bare `\n`
+after typed text produces no visible effect at all in this TUI (no
+partial text even appears in the input box) — `ratatui`'s crossterm
+input layer under a PTY in raw mode expects `\r` (carriage return) for
+Enter, not `\n`. All prior live-E2E scripts in this project's history
+happened to avoid this because they were built around single-key
+shortcuts (Ctrl+P, Ctrl+C) rather than typing free text and pressing
+Enter to submit it — worth carrying forward into the next PTY-driving
+script that needs to submit a typed message.
+
+Test artifacts (the planted `.npmrc`, scratch project directories, the
+tarball, the backup binary) were cleaned up from the rig after both
+checks passed.
