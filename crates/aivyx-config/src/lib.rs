@@ -49,6 +49,7 @@ pub struct Settings {
     pub web: WebSettings,
     pub mcp: McpSettings,
     pub persona: PersonaSettings,
+    pub repl: ReplSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -96,6 +97,35 @@ impl Default for AutonomousSettings {
         Self {
             max_iterations: 20,
             max_duration_secs: 3600,
+        }
+    }
+}
+
+/// REPL/interactive-process support (`repl_start`/`repl_send`/
+/// `repl_stop`): timing knobs for deciding when a call has "enough"
+/// output to return, and for auto-killing a forgotten session. All
+/// optional with usable defaults — zero-config works out of the box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplSettings {
+    /// How long output must be silent (no new bytes) before `repl_send`
+    /// returns, in milliseconds.
+    pub quiet_window_ms: u64,
+    /// Hard per-call backstop, in seconds, in case output never goes
+    /// quiet (e.g. a build tool spewing output continuously).
+    pub max_wait_secs: u64,
+    /// Auto-kill a session with no `repl_send` activity for this long, in
+    /// seconds — a safety net against a forgotten session lingering
+    /// indefinitely.
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for ReplSettings {
+    fn default() -> Self {
+        Self {
+            quiet_window_ms: 300,
+            max_wait_secs: 10,
+            idle_timeout_secs: 600,
         }
     }
 }
@@ -1147,5 +1177,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn repl_settings_default_to_a_usable_zero_config_shape() {
+        let settings = ReplSettings::default();
+        assert_eq!(settings.quiet_window_ms, 300);
+        assert_eq!(settings.max_wait_secs, 10);
+        assert_eq!(settings.idle_timeout_secs, 600);
     }
 }
