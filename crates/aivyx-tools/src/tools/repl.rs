@@ -340,6 +340,126 @@ impl Tool for ReplStartTool {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ReplSendArgs {
+    /// Text to send to the running process's stdin, e.g. "print(1+1)". \
+    /// Omit or send an empty string to just check for new output without \
+    /// sending anything (useful for polling a long-running process like a \
+    /// dev server).
+    #[serde(default)]
+    input: Option<String>,
+}
+
+/// Sends input to (or, with no input, just polls) the running session
+/// started by `repl_start`. `ActionKind::Interact` — auto-allowed, no
+/// re-prompt (see the design spec's "send-gating" decision and
+/// `ActionKind::Interact`'s own doc comment for why this is safe: the
+/// real boundary is `repl_start`'s own `Execute`-tier approval plus
+/// Landlock/seccomp confinement on the process itself, not per-line
+/// review). `mutates_outside_session()` overridden to `false` — no new
+/// checkpoint per send.
+pub struct ReplSendTool {
+    session: SharedReplSession,
+    quiet_window: Duration,
+    max_wait: Duration,
+}
+
+impl ReplSendTool {
+    pub fn new(session: SharedReplSession, quiet_window: Duration, max_wait: Duration) -> Self {
+        Self {
+            session,
+            quiet_window,
+            max_wait,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReplSendTool {
+    fn name(&self) -> &str {
+        "repl_send"
+    }
+
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: "Send input to the process started by repl_start and get its output \
+                back. Omit input (or send an empty string) to just check for new output without \
+                sending anything — useful for polling a long-running process. Errors if no \
+                session is running."
+                .to_string(),
+            parameters_schema: serde_json::Value::from(schemars::schema_for!(ReplSendArgs)),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: self.name().to_string(),
+            action: ActionKind::Interact,
+            target: PermissionTarget::Other("repl session".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let args: ReplSendArgs = serde_json::from_value(arguments)
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+
+        let mut guard = self.session.lock().await;
+        let Some(session) = guard.as_mut() else {
+            return Ok(ToolOutput::Error(
+                "no REPL session is running — call repl_start first".to_string(),
+            ));
+        };
+
+        // Opportunistic, non-blocking: if the child already exited on its
+        // own since the last call, report that instead of trying to
+        // interact with a dead process.
+        if let Ok(Some(status)) = session.child.try_wait() {
+            let final_output = drain_output(&session.output);
+            *guard = None;
+            return Ok(ToolOutput::Ok(format!(
+                "process exited with status {}\n{final_output}",
+                format_exit_status(status)
+            )));
+        }
+
+        session.last_activity = Instant::now();
+
+        if let Some(input) = args.input.as_deref().filter(|s| !s.is_empty()) {
+            let mut line = input.to_string();
+            line.push('\n');
+            if session.stdin.write_all(line.as_bytes()).await.is_err() {
+                // Most likely a broken pipe in the narrow window since the
+                // try_wait() check above — the process exited right then.
+                let final_output = drain_output(&session.output);
+                *guard = None;
+                return Ok(ToolOutput::Ok(format!(
+                    "process exited (broken pipe while sending input)\n{final_output}"
+                )));
+            }
+        }
+
+        wait_for_quiet(&session.output, self.quiet_window, self.max_wait, &ctx.cancellation).await;
+        let output = drain_output(&session.output);
+        Ok(ToolOutput::Ok(output))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +633,135 @@ mod tests {
         // effect and the process is gone.
         let alive = unsafe { libc::kill(pid, 0) == 0 };
         assert!(!alive, "process should have been killed when ReplSession was dropped");
+    }
+
+    async fn started_session(
+        quiet_window: Duration,
+        max_wait: Duration,
+    ) -> (SharedReplSession, ReplStartTool) {
+        let session = new_shared_repl_session();
+        let start_tool = ReplStartTool::new(
+            Arc::clone(&session),
+            quiet_window,
+            max_wait,
+            Duration::from_secs(120),
+        );
+        let (program, args) = fake_repl_args();
+        start_tool
+            .execute(serde_json::json!({ "program": program, "args": args }), &ctx())
+            .await
+            .unwrap();
+        (session, start_tool)
+    }
+
+    #[tokio::test]
+    async fn repl_send_writes_input_and_returns_the_echoed_response() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let (session, _start) = started_session(quiet_window, max_wait).await;
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+
+        let output = send_tool
+            .execute(serde_json::json!({ "input": "hello" }), &ctx())
+            .await
+            .unwrap();
+
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        assert!(text.contains("echo: hello"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn repl_send_with_no_input_only_polls_without_writing() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let (session, _start) = started_session(quiet_window, max_wait).await;
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+
+        let output = send_tool
+            .execute(serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        assert!(
+            !text.contains("echo:"),
+            "a poll with no input must not trigger any echoed output, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_send_errors_when_no_session_is_running() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let session = new_shared_repl_session();
+        let send_tool = ReplSendTool::new(session, quiet_window, max_wait);
+
+        let output = send_tool
+            .execute(serde_json::json!({ "input": "hello" }), &ctx())
+            .await
+            .unwrap();
+
+        let aivyx_types::ToolOutput::Error(text) = output else {
+            panic!("expected Error output");
+        };
+        assert!(text.contains("no REPL session is running"));
+    }
+
+    #[tokio::test]
+    async fn repl_send_detects_and_reports_a_spontaneous_exit() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let (session, _start) = started_session(quiet_window, max_wait).await;
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+
+        // "quit" makes the fake REPL exit(7) on its own.
+        send_tool
+            .execute(serde_json::json!({ "input": "quit" }), &ctx())
+            .await
+            .unwrap();
+        // The exit itself races the pipe closing; a short sleep lets the
+        // child's exit status become observable via try_wait() on the
+        // next call.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let output = send_tool
+            .execute(serde_json::json!({}), &ctx())
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output reporting the exit");
+        };
+        assert!(text.contains("exited with status 7"), "got: {text}");
+
+        assert!(
+            session.lock().await.is_none(),
+            "state must be cleared so repl_start works again without an explicit repl_stop"
+        );
+    }
+
+    #[test]
+    fn repl_send_permission_request_is_interact() {
+        let tool = ReplSendTool::new(
+            new_shared_repl_session(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let request = tool
+            .permission_request(&serde_json::json!({ "input": "x" }), std::path::Path::new("."))
+            .unwrap();
+        assert_eq!(request.action, ActionKind::Interact);
+    }
+
+    #[test]
+    fn repl_send_does_not_mutate_outside_session() {
+        // No new checkpoint per send — see the design spec's reasoning
+        // (mirrors git_read overriding to false despite touching the
+        // outside world in a read-only way).
+        let tool = ReplSendTool::new(
+            new_shared_repl_session(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        assert!(!tool.mutates_outside_session());
     }
 }
