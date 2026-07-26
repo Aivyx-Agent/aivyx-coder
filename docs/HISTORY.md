@@ -2551,3 +2551,84 @@ script that needs to submit a typed message.
 Test artifacts (the planted `.npmrc`, scratch project directories, the
 tarball, the backup binary) were cleaned up from the rig after both
 checks passed.
+
+### REPL / interactive-process support — ✅ shipped, live-verified
+
+Audit backlog item #12 (the same follow-up audit above): `run_command`/
+`run_shell` are strictly one-shot — spawn, drain to completion, reap —
+with no way to hold a process open across multiple tool calls, so the
+model couldn't interactively drive a language REPL, a database/debugger
+CLI, or poll a long-running dev server. Design spec at
+`docs/superpowers/specs/2026-07-26-repl-interactive-process-support-design.md`,
+implementation plan at `docs/superpowers/plans/2026-07-26-repl-interactive-process-support.md`,
+executed via `subagent-driven-development` across 7 tasks (fresh
+implementer + reviewer per task, one fix round on Task 1, a final
+whole-branch review with one more small fix round) rather than a single
+inline pass — this project's first feature built entirely through that
+workflow.
+
+**What shipped**: `repl_start(program, args)` / `repl_send(input?)` /
+`repl_stop()`, sharing one `Arc<tokio::sync::Mutex<Option<ReplSession>>>`
+(the same "constructed once, cloned per tool" pattern `set_tasks`'s
+shared task list already used). Plain pipes, not a PTY — deliberately,
+to avoid importing the exact ANSI-escape/`\r`-vs-`\n` complexity the
+bare-metal trial's own test scripts had just hit (see the chapter
+immediately above). One session at a time. A background reader keeps
+draining stdout/stderr into a bounded, tail-capped buffer even between
+calls (what makes polling a dev server work); a quiet-window strategy
+(300ms of silence, 10s hard cap, both configurable under a new `[repl]`
+section) decides when a call has "enough" output to return, with no
+per-program prompt-pattern knowledge. An idle-timeout auto-kills a
+forgotten session; a `Drop` impl (not `Command::kill_on_drop`, which
+only kills the direct PID, not the process group) is the shutdown
+safety net.
+
+**The security-critical design decision**: a new `ActionKind::Interact`
+lets `repl_send`/`repl_stop` skip re-prompting after `repl_start`'s own
+`Execute`-tier approval — prompting on every line sent to a REPL would
+be as unusable as prompting on every `read_file` call — but it's checked
+in `ConfirmationGate` *after* the Plan-mode/Autonomous-mode denial tiers,
+not alongside the early `Read`/`Internal` auto-allow. Placing it in the
+early tier would have reproduced, for a live process instead of a cached
+decision, the exact leak-through failure mode this project already
+fenced off once for the Always-Allow cache (an approval granted before
+Plan mode must not survive entering it) — a session started in Act mode
+and still running when the user presses Ctrl+P must stop accepting
+input immediately, not keep quietly executing whatever the model sends
+it.
+
+**Two subagent-dispatch pitfalls surfaced during execution**, both
+caught by verifying `git log` after every dispatch rather than trusting
+an implementer's "DONE" claim: dispatching a per-task implementer with
+`isolation: "worktree"` spawns a *separate* nested worktree branching
+from `origin/main`, not the controller's already-established shared
+worktree — wrong for this workflow, where every task's commit needs to
+land sequentially on one branch; and, independent of that, at least one
+subagent's final `git commit` landed against the main checkout instead
+of the worktree path it was explicitly told to work in, leaving one
+duplicate commit on local `main` and one stray uncommitted file. Neither
+lost any work (both were exact duplicates of content already correctly
+committed on the feature branch, confirmed by diff before cleanup), but
+both needed reconciling — a cherry-pick in the first case, a
+`git reset --hard origin/main` plus `git checkout --` in the second —
+before the branch could be merged.
+
+**Live E2E verification**, `pyte`-driven PTY sessions against the rig's
+real `llama-server` + Qwen3.5-9B backend, after the usual cross-compile-
+and-ship deploy (`3ae8caf`):
+- A real model chained all three tool calls against a real `python3 -i`
+  process — `repl_start`, `repl_send("6*7")`, `repl_stop` — and correctly
+  reported the result, `42`.
+- The Plan-mode leak-through guard held live, not just in the unit
+  tests written for it: a session started in Act mode, still running
+  when Ctrl+P entered Plan mode mid-conversation, had its next
+  `repl_send` denied with the plan-mode reason — the model itself
+  explained why and told the user how to unblock it.
+- The `Drop`-based shutdown safety net held too: Test 2's session was
+  deliberately never explicitly stopped; after the TUI process was
+  killed, no orphaned `python3` process remained on the rig.
+
+All three checks passed on the first correctly-constructed attempt.
+Test artifacts (scratch project directories, stray session files from
+this and the prior chapter's trials, the tarball, the backup binary)
+were cleaned up from the rig afterward.
