@@ -196,3 +196,37 @@ provably untouched afterward.
 
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
+
+## Backlog — capability opportunities, not yet scheduled
+
+A follow-up audit (2026-07-22) covering security posture, tool coverage,
+test quality, and documentation closed 10 findings directly (argument-blind
+MCP Always-Allow cache, sub-agent injection-taint isolation, thin
+`deny_paths` defaults, five documentation-accuracy fixes, an untested
+injection-scan tie-break rule, unlabeled web_fetch/web_search injection
+sources, and Plan mode not surviving `--resume`). The remaining four are
+sized as their own features — each needs a real design pass (tool-trait
+shape, permission/`ActionKind` wiring, config surface) rather than a
+same-session patch — so they're tracked here instead of built ad hoc:
+
+- **Move/rename tool**: the tool set has `read_file`/`write_file`/
+  `edit_file`/`delete_file` but no atomic move/rename primitive. The model
+  currently has to synthesize a rename via read + write + delete — three
+  separate permission prompts and checkpoints for one logical operation,
+  with no atomicity guarantee if the write succeeds but the delete is
+  denied.
+- **REPL / interactive-process support**: `run_command`/`run_shell` are
+  one-shot — each call spawns, runs to completion, and the process is
+  gone. There's no way to hold open a stateful interactive process (a
+  language REPL, `psql`, `python -i`) across multiple tool calls, which
+  a "vibe coding" workflow (iterative, exploratory) would benefit from.
+- **Patch-apply tool**: edits go through `edit_file` (single search/replace)
+  or a full `write_file` rewrite; there's no tool that takes ready-made
+  unified-diff/patch text and applies it directly. Relevant when a model
+  (or the user) already has a well-formed patch rather than needing to
+  re-derive one as a search/replace pair.
+- **Verification test-selection**: enforced verification always re-runs
+  the entire configured `[verification] command`. There's no mechanism to
+  scope a retry to just the tests relevant to the files touched in that
+  batch of edits, so the auto-fix-and-retry loop pays the full suite's
+  cost on every retry even for a large test suite and a small edit.
