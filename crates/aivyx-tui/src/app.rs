@@ -666,6 +666,13 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     let area = centered_rect(70, 60, frame.area());
     frame.render_widget(Clear, area);
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Permission required")
+        .style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let mut lines: Vec<Line> = vec![
         Line::from(format!("Tool: {}", request.tool_name))
             .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -679,21 +686,31 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
         _ => lines.push(Line::from(format!("Args: {}", request.arguments_preview))),
     }
 
-    lines.push(Line::from(""));
-    lines.push(
-        Line::from("[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny")
-            .style(Style::default().fg(Color::DarkGray)),
-    );
+    // The action-key legend renders in its own fixed-height footer row,
+    // never inside the same scroll-clipped Paragraph as the diff/content
+    // above — a diff taller than `inner`'s height used to push this line
+    // off-screen entirely (it was just the last entry in one long `Vec<Line>`),
+    // leaving a human with no visible way to know how to respond to a large
+    // new-file write. Splitting the two guarantees the legend always shows,
+    // regardless of how long the content above it is.
+    let footer_height = 2u16.min(inner.height);
+    let content_height = inner.height.saturating_sub(footer_height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(content_height),
+            Constraint::Length(footer_height),
+        ])
+        .split(inner);
 
-    let modal = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Permission required")
-                .style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(modal, area);
+    let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(content, rows[0]);
+
+    let footer = Paragraph::new(Line::from(
+        "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny",
+    ))
+    .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, rows[1]);
 }
 
 fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
@@ -830,7 +847,59 @@ fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'s
 mod tests {
     use super::*;
     use aivyx_sandbox::ActionKind;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use tokio::sync::oneshot;
+
+    /// Row-major text dump of a rendered `Buffer`, with a `\n` inserted at
+    /// every row boundary — `Buffer::content()` alone is a flat cell slice,
+    /// so joining cells naively across rows without a row-boundary marker
+    /// risks two real words merging into one and silently passing a
+    /// substring assertion that should have failed.
+    fn render_to_string(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let mut rendered = String::new();
+        for (i, cell) in buffer.content().iter().enumerate() {
+            if i > 0 && i % width == 0 {
+                rendered.push('\n');
+            }
+            rendered.push_str(cell.symbol());
+        }
+        rendered
+    }
+
+    #[test]
+    fn permission_modal_button_row_stays_visible_for_a_long_diff() {
+        // Regression test: `render_permission_modal` used to append the
+        // Allow/Deny button row to the *same* unscrolled `Paragraph` as the
+        // diff preview, so a diff taller than the popup's available height
+        // pushed the button row off-screen entirely — a human approving a
+        // large new-file write would see the diff but have no visible way
+        // to know how to respond. The footer must always render, regardless
+        // of how long the diff above it is.
+        let long_preview: String = (0..200).map(|i| format!("+line {i}\n")).collect();
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/tmp/big_file.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: Some(long_preview),
+            diff: None,
+        };
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("Allow"),
+            "the Allow/Deny button row must always be visible, even for a long diff:\n{rendered}"
+        );
+    }
 
     #[test]
     fn command_target_with_embedded_newline_splits_into_visible_lines() {
