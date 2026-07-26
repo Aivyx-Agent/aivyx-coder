@@ -151,10 +151,8 @@ fn drain_output(output: &Arc<std::sync::Mutex<VecDeque<u8>>>) -> String {
     String::from_utf8_lossy(&drained.into_iter().collect::<Vec<u8>>()).into_owned()
 }
 
-// Not called by this task's own code — Task 4's `repl_send` and Task 5's
-// `repl_stop` both call this to report a process's exit code/signal once
-// they detect the child has exited.
-#[allow(dead_code)]
+/// Called by both `repl_send` and `repl_stop` to report a process's exit
+/// code/signal once they detect the child has exited.
 fn format_exit_status(status: std::process::ExitStatus) -> String {
     status
         .code()
@@ -460,6 +458,83 @@ impl Tool for ReplSendTool {
     }
 }
 
+/// Stops the running session started by `repl_start`. `ActionKind::
+/// Interact` (same reasoning as `ReplSendTool` — no re-prompt to stop
+/// something already approved). `mutates_outside_session()` overridden to
+/// `false`, same reasoning as `ReplSendTool`.
+pub struct ReplStopTool {
+    session: SharedReplSession,
+}
+
+impl ReplStopTool {
+    pub fn new(session: SharedReplSession) -> Self {
+        Self { session }
+    }
+}
+
+#[async_trait]
+impl Tool for ReplStopTool {
+    fn name(&self) -> &str {
+        "repl_stop"
+    }
+
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: "Stop the process started by repl_start. Errors if no session is \
+                running."
+                .to_string(),
+            parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: self.name().to_string(),
+            action: ActionKind::Interact,
+            target: PermissionTarget::Other("repl session".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let mut guard = self.session.lock().await;
+        let Some(mut session) = guard.take() else {
+            return Ok(ToolOutput::Error(
+                "no REPL session is running — call repl_start first".to_string(),
+            ));
+        };
+        drop(guard);
+
+        if let Ok(Some(status)) = session.child.try_wait() {
+            let final_output = drain_output(&session.output);
+            return Ok(ToolOutput::Ok(format!(
+                "process had already exited with status {} before repl_stop was called\n{final_output}",
+                format_exit_status(status)
+            )));
+        }
+
+        crate::process::kill_process_group(&session.child);
+        let _ = session.child.wait().await;
+        let final_output = drain_output(&session.output);
+        Ok(ToolOutput::Ok(format!("process stopped\n{final_output}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,6 +837,86 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_millis(1),
         );
+        assert!(!tool.mutates_outside_session());
+    }
+
+    #[tokio::test]
+    async fn repl_stop_kills_the_process_and_a_subsequent_send_errors() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let (session, _start) = started_session(quiet_window, max_wait).await;
+        let stop_tool = ReplStopTool::new(Arc::clone(&session));
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+
+        let output = stop_tool.execute(serde_json::json!({}), &ctx()).await.unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        assert!(text.contains("stopped"), "got: {text}");
+        assert!(session.lock().await.is_none());
+
+        let after = send_tool
+            .execute(serde_json::json!({ "input": "hi" }), &ctx())
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Error(text) = after else {
+            panic!("expected Error output after stop");
+        };
+        assert!(text.contains("no REPL session is running"));
+    }
+
+    #[tokio::test]
+    async fn repl_stop_errors_when_no_session_is_running() {
+        let stop_tool = ReplStopTool::new(new_shared_repl_session());
+        let output = stop_tool.execute(serde_json::json!({}), &ctx()).await.unwrap();
+        let aivyx_types::ToolOutput::Error(text) = output else {
+            panic!("expected Error output");
+        };
+        assert!(text.contains("no REPL session is running"));
+    }
+
+    #[tokio::test]
+    async fn repl_stop_reports_an_already_exited_process_instead_of_pretending_to_kill_it() {
+        let (quiet_window, max_wait, _) = short_timing();
+        let (session, _start) = started_session(quiet_window, max_wait).await;
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let stop_tool = ReplStopTool::new(Arc::clone(&session));
+
+        // Re-inject a session snapshot manually is unnecessary here: send
+        // "quit" to make the fake REPL exit on its own, but WITHOUT
+        // calling repl_send again afterward (which would already clear
+        // state) — call repl_stop directly while the exited-but-not-yet-
+        // observed child is still sitting in the shared slot.
+        {
+            let mut guard = session.lock().await;
+            let s = guard.as_mut().unwrap();
+            use tokio::io::AsyncWriteExt;
+            s.stdin.write_all(b"quit\n").await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let output = stop_tool.execute(serde_json::json!({}), &ctx()).await.unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        assert!(
+            text.contains("already exited") && text.contains("7"),
+            "got: {text}"
+        );
+        let _ = send_tool; // silence unused-var lint if not otherwise referenced
+    }
+
+    #[test]
+    fn repl_stop_permission_request_is_interact() {
+        let tool = ReplStopTool::new(new_shared_repl_session());
+        let request = tool
+            .permission_request(&serde_json::json!({}), std::path::Path::new("."))
+            .unwrap();
+        assert_eq!(request.action, ActionKind::Interact);
+    }
+
+    #[test]
+    fn repl_stop_does_not_mutate_outside_session() {
+        let tool = ReplStopTool::new(new_shared_repl_session());
         assert!(!tool.mutates_outside_session());
     }
 }
