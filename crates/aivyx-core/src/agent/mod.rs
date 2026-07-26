@@ -523,10 +523,16 @@ impl Agent {
     }
 
     /// Seeds history and tasks from a resumed session, replacing whatever
-    /// the agent currently holds. Call before the first turn.
+    /// the agent currently holds. Call before the first turn. Restores Plan
+    /// mode too, but only ever turns it *on* — a session saved while Plan
+    /// mode was active resumes into Plan mode even without `--plan`, but a
+    /// session saved in Act mode never clobbers an explicit `--plan` flag.
     pub fn restore(&mut self, state: SessionState) {
         self.history = state.history;
         *self.tasks.lock().unwrap() = state.tasks;
+        if state.plan_mode_active {
+            self.plan_mode.set_active(true);
+        }
     }
 
     /// Best-effort snapshot to disk. A persistence failure is logged, never
@@ -536,7 +542,7 @@ impl Agent {
             return;
         };
         let tasks = self.tasks.lock().unwrap().clone();
-        let state = SessionState::new(self.history.clone(), tasks);
+        let state = SessionState::new(self.history.clone(), tasks, self.plan_mode.active());
         if let Err(err) = session::save(path, &state) {
             tracing::warn!(error = %err, "failed to persist session");
         }

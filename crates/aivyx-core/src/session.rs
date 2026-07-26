@@ -17,14 +17,22 @@ pub struct SessionState {
     pub version: u32,
     pub history: Vec<Message>,
     pub tasks: Vec<Task>,
+    /// Whether Plan mode was active when this session was last persisted.
+    /// `--resume` restores it (`Agent::restore`) so quitting mid-review
+    /// doesn't silently drop back into Act mode on the next run.
+    /// `#[serde(default)]` so a session file written before this field
+    /// existed still loads — as `false`, the only behavior possible then.
+    #[serde(default)]
+    pub plan_mode_active: bool,
 }
 
 impl SessionState {
-    pub fn new(history: Vec<Message>, tasks: Vec<Task>) -> Self {
+    pub fn new(history: Vec<Message>, tasks: Vec<Task>, plan_mode_active: bool) -> Self {
         Self {
             version: SESSION_VERSION,
             history,
             tasks,
+            plan_mode_active,
         }
     }
 }
@@ -120,6 +128,7 @@ mod tests {
                 text: "do the thing".to_string(),
                 status: TaskStatus::InProgress,
             }],
+            true,
         );
 
         save(&path, &state).unwrap();
@@ -128,6 +137,22 @@ mod tests {
         assert_eq!(loaded.history.len(), 1);
         assert_eq!(loaded.history[0].text_content(), "hello");
         assert_eq!(loaded.tasks, state.tasks);
+        assert!(loaded.plan_mode_active);
+    }
+
+    #[test]
+    fn a_session_file_predating_plan_mode_active_still_loads_as_act_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "history": [], "tasks": [] }).to_string(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).expect("pre-existing-field-free session should still load");
+
+        assert!(!loaded.plan_mode_active);
     }
 
     #[test]
@@ -179,7 +204,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
-        save(&path, &SessionState::new(vec![], vec![])).unwrap();
+        save(&path, &SessionState::new(vec![], vec![], false)).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }

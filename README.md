@@ -46,8 +46,10 @@ history and task list are saved (one session per project directory, keyed by
 the canonicalized cwd, under `~/.local/state/aivyx-coder/sessions/`, written
 `0600` since they embed file contents and command output read during the
 session). `aivyx-coder --resume` restores the previous session for the current
-directory — transcript, task list, and all; without the flag a fresh session
-starts and its first completed turn replaces the stored one.
+directory — transcript, task list, and Plan mode's on/off state, and all;
+without the flag a fresh session starts and its first completed turn
+replaces the stored one. A resumed Plan mode only ever turns *on* — it
+never overrides an explicit `--plan` flag by turning it off.
 
 The status line shows a live context-budget indicator (`ctx 6.1k/8.2k (74%)`,
 colored green/amber/red) once the backend reports token usage. When the

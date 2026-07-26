@@ -190,6 +190,39 @@ fn describe_tool_call_target_falls_back_to_url_then_query_when_no_path() {
     );
 }
 
+#[test]
+fn restore_turns_plan_mode_on_when_the_resumed_session_had_it_active_but_never_turns_it_off() {
+    let (tx, _rx) = unbounded_channel();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(ToolRegistry::new(), gate, confiner);
+    let plan_mode = PlanMode::new();
+    let mut agent = Agent::new(
+        Arc::new(MockBackend::new(vec![])),
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        plan_mode.clone(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent.restore(crate::session::SessionState::new(vec![], vec![], true));
+    assert!(
+        plan_mode.active(),
+        "restoring a session saved in plan mode should switch plan mode on"
+    );
+
+    // A session saved in Act mode must not clobber a plan mode already
+    // turned on some other way (e.g. an explicit --plan flag).
+    agent.restore(crate::session::SessionState::new(vec![], vec![], false));
+    assert!(
+        plan_mode.active(),
+        "restoring a session saved outside plan mode must not turn plan mode off"
+    );
+}
+
 fn user_msg(text: &str) -> Message {
     Message::text(Role::User, text)
 }
