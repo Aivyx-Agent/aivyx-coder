@@ -396,6 +396,7 @@ pub(crate) async fn build_agent(
             sub_agent_registry,
             plan_mode: plan_mode.clone(),
             autonomous_mode: autonomous_mode.clone(),
+            injection_taint: injection_taint.clone(),
             context_tokens: settings.backend.context_tokens,
             edit_format,
             verification: verification.clone(),
