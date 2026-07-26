@@ -1645,15 +1645,25 @@ fn elide(text: &str, cap: usize) -> String {
     )
 }
 
-/// Best-effort human-readable description of what a tool call touched, for
-/// the batch-rollback notice — most mutating tools (`write_file`,
-/// `edit_file`, `delete_file`) take a `"path"` argument; anything else
-/// falls back to just the tool's name.
+/// Best-effort human-readable description of what a tool call touched —
+/// used both for the batch-rollback notice and as the injection scan's
+/// `source` label (`record_tool_result`). Most mutating tools (`write_file`,
+/// `edit_file`, `delete_file`) take a `"path"` argument; `web_fetch`/
+/// `web_search` take `"url"`/`"query"` instead, so those are checked next —
+/// without this, a flagged `web_fetch` finding's source would read as the
+/// bare string `"web_fetch"` with no indication of which URL it came from.
+/// Anything else falls back to just the tool's name.
 fn describe_tool_call_target(call: &ToolCall) -> String {
-    match call.arguments.get("path").and_then(|v| v.as_str()) {
-        Some(path) => format!("{path} ({})", call.name),
-        None => call.name.clone(),
+    if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
+        return format!("{path} ({})", call.name);
     }
+    if let Some(url) = call.arguments.get("url").and_then(|v| v.as_str()) {
+        return format!("{url} ({})", call.name);
+    }
+    if let Some(query) = call.arguments.get("query").and_then(|v| v.as_str()) {
+        return format!("{query} ({})", call.name);
+    }
+    call.name.clone()
 }
 
 /// Bound on the displayed length of the editor-context `file` value injected

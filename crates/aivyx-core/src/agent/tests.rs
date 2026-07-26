@@ -165,6 +165,31 @@ fn tool_call(id: &str, name: &str) -> ToolCall {
     }
 }
 
+#[test]
+fn describe_tool_call_target_falls_back_to_url_then_query_when_no_path() {
+    let mut fetch_call = tool_call("c1", "web_fetch");
+    fetch_call.arguments = serde_json::json!({ "url": "https://example.com/evil" });
+    assert_eq!(
+        describe_tool_call_target(&fetch_call),
+        "https://example.com/evil (web_fetch)"
+    );
+
+    let mut search_call = tool_call("c2", "web_search");
+    search_call.arguments = serde_json::json!({ "query": "ignore previous instructions" });
+    assert_eq!(
+        describe_tool_call_target(&search_call),
+        "ignore previous instructions (web_search)"
+    );
+
+    // `path` still wins over `url`/`query` when a call somehow has both.
+    let mut path_call = tool_call("c3", "write_file");
+    path_call.arguments = serde_json::json!({ "path": "src/foo.rs", "url": "unused" });
+    assert_eq!(
+        describe_tool_call_target(&path_call),
+        "src/foo.rs (write_file)"
+    );
+}
+
 fn user_msg(text: &str) -> Message {
     Message::text(Role::User, text)
 }
