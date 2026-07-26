@@ -161,23 +161,37 @@ deadlock fix itself is now also live-verified, not just statically
 analyzed: the same session exercised real gated tool calls end to end.
 See `docs/HISTORY.md` for the full account.
 
-**Bare-metal test-rig trial — in progress.** The `aivyx-coder` binary
-was renamed to avoid a `PATH` collision with the sibling Aivyx
-Personal Assistant (both previously built a binary literally named
-`aivyx`), deployed and live-tested on real hardware against a real
-local backend (`llama-server` + `qwen3.5:9b`, matching this project's
-own documented best-serving-config verdict): a graduated series of
-coding tasks (a script, a multi-file task with tests, a small Flask
-application) all completed correctly end to end, and the ACP/Zed
-integration above was exercised as part of the same trial. One more
-real bug found and fixed along the way: the TUI's permission modal
-(`render_permission_modal`) rendered the diff and the Allow/Deny key
-legend in one unscrolled `Paragraph`, so a diff taller than the popup
-silently pushed the legend off-screen — a human approving a large new
-file would see the diff but have no visible way to know how to
-respond. Fixed by splitting the modal into a scrollable content area
-and an always-visible fixed footer. **Still open**: installing the
-sibling Aivyx Personal Assistant alongside `aivyx-coder` on the same
-rig to confirm real coexistence, the original motivating question
-behind the rename above. See `docs/HISTORY.md` for the full
-phase-by-phase narrative behind every item above.
+**Bare-metal test-rig trial — done.** The `aivyx-coder` binary was
+renamed to avoid a `PATH` collision with the sibling Aivyx Personal
+Assistant (both previously built a binary literally named `aivyx`),
+deployed and live-tested on real hardware against a real local backend
+(`llama-server` + `qwen3.5:9b`, matching this project's own documented
+best-serving-config verdict): a graduated series of coding tasks (a
+script, a multi-file task with tests, a small Flask application) all
+completed correctly end to end, and the ACP/Zed integration above was
+exercised as part of the same trial. Two real bugs found and fixed
+along the way: the TUI permission modal's Allow/Deny legend going
+invisible for long diffs, and the `agent-client-protocol` 1.2.0
+response-routing bug covered above.
+
+The sibling Aivyx Personal Assistant was then built, deployed, and run
+on the same rig alongside `aivyx-coder` — the original motivating
+question behind the rename. Confirmed genuinely disjoint: `~/.aivyx/` +
+`~/.local/share/aivyx/` for the assistant vs. `~/.config/aivyx-coder/`
++ `~/.local/state/aivyx-coder/` for the coder, no `PATH` collision, and
+both ran concurrently against the *same* shared `llama-server` instance
+(via the assistant's `llamacpp` provider) with no interference —
+verified by re-running the ACP permission round-trip live while the
+assistant's daemon was active.
+
+A final verification pass re-confirmed both fixes live in the actual
+release binary (not just the automated regression tests) and closed the
+one remaining deferred item from the autonomous-mode injection guard's
+own plan: a live `--auto` run seeded with a real prompt-injection
+payload correctly detected it, refused to act on it (both the model
+itself and the guard independently), and stopped the run with the
+designed notice — `config.toml` and the project's git state both
+provably untouched afterward.
+
+See `docs/HISTORY.md` for the full phase-by-phase narrative behind
+every item above.

@@ -2423,5 +2423,58 @@ since the bug was in response routing before that function ever runs.
 clean on `agent-client-protocol` 2.0.0. The ACP editor-integration
 chapter's "still open" live-verification gap is now closed — real gated
 tool calls, real permission approvals, real edits, all confirmed against
-a real Zed session. The bare-metal Aivyx Personal Assistant coexistence
-trial itself remains the next open item (see `ROADMAP.md`).
+a real Zed session.
+
+### Aivyx Personal Assistant coexistence + a final verification pass — ✅ done
+
+The sibling Aivyx Personal Assistant (`/home/julian/Projects/Rust/aivyx`
+— a separate, unrelated project sharing only naming and authorship) was
+built natively on the same CachyOS build as the rig (no musl
+cross-compile needed — a dynamically-linked glibc binary was directly
+portable), deployed as `~/.local/bin/aivyx` — its correct real name,
+now free of the earlier `PATH` collision since `aivyx-coder` no longer
+claims it — and configured via the `llamacpp` provider to share the
+*same* `llama-server` instance `aivyx-coder` was already using, rather
+than standing up a second redundant backend. Daemon started cleanly,
+the web Studio UI responded, a real headless turn did real arithmetic
+correctly, and a real tool call wrote a real file — all while
+`aivyx-coder`'s own session against the same backend kept working
+without any interference. Footprints confirmed genuinely disjoint on
+disk: `~/.aivyx/` + `~/.local/share/aivyx/` for the assistant, `~/.config/
+aivyx-coder/` + `~/.local/state/aivyx-coder/` for the coder — exactly as
+the original PATH-collision investigation predicted, now proven on real
+hardware with both real binaries installed side by side.
+
+**Final verification pass**, run explicitly to check for regressions
+and close out anything still deferred, before moving on from this
+chapter:
+
+- The modal-scrolling fix, re-verified live in the actual release
+  binary (not just the synthetic `TestBackend` regression test): a real
+  write of a 40-function, 201-line file produced a diff taller than the
+  popup, and the `[y] Allow ...` legend stayed visible exactly as
+  designed.
+- The `agent-client-protocol` 2.0.0 fix, re-verified live a second time
+  — this time with the Personal Assistant's daemon *also* running
+  concurrently against the same shared `llama-server` — confirming the
+  ACP permission round trip has no cross-process interference.
+- The autonomous-mode injection guard's own plan (`docs/superpowers/
+  plans/2026-07-22-autonomous-mode-injection-guard.md`) left one item
+  explicitly deferred: Task 6, a live E2E run against a real backend,
+  blocked at the time by no reachable local LLM. Run now: `--auto`
+  against a project seeded with a real injection payload in a file the
+  goal would naturally read. The model itself correctly recognized and
+  refused the injection independently of the guard; the guard also
+  independently fired, halting the run with `autonomous run stopped:
+  possible prompt injection detected after 1 iteration(s) — flagged
+  content from notes.txt (read_file) matched "ignore previous
+  instructions"` — the exact designed notice, quoting the exact
+  matched source and excerpt. `config.toml` and the test project's git
+  state were both confirmed byte-for-byte untouched afterward (no
+  checkpoint refs were even created, since no mutating call was ever
+  attempted). This closes the injection guard's last open item.
+
+No new bugs found during this pass. The bare-metal Aivyx Personal
+Assistant coexistence trial — the original motivating question behind
+the `aivyx-coder` binary rename all the way back at the start of this
+chapter — is now fully closed.
