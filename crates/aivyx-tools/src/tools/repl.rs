@@ -10,11 +10,6 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-// `AsyncWriteExt` isn't used by this task's own code (only `repl_start`
-// lives here so far) — it's needed for the `stdin.write_all(...)` call
-// Task 4's `repl_send` adds to this same file. Importing it now (per the
-// brief's exact `use` list) rather than waiting for Task 4 to add it.
-#[allow(unused_imports)]
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -41,12 +36,6 @@ pub fn new_shared_repl_session() -> SharedReplSession {
 /// scoped, and does not survive `--resume`.
 pub struct ReplSession {
     child: tokio::process::Child,
-    // Neither `stdin` nor `output` is read by this task's own code (only
-    // `repl_start`, which just constructs the session, lives here so
-    // far) — `stdin` is written to by Task 4's `repl_send`, and `output`
-    // is drained by both Task 4's `repl_send` and Task 5's `repl_stop`.
-    // `#[allow(dead_code)]` rather than leaving these unused for now.
-    #[allow(dead_code)]
     stdin: tokio::process::ChildStdin,
     /// Combined stdout+stderr, continuously appended to by two background
     /// reader tasks spawned in `ReplStartTool::execute` — this is what
@@ -55,7 +44,6 @@ pub struct ReplSession {
     /// even between calls. A plain `std::sync::Mutex`, not the async one
     /// above: every touch of this buffer is a short, synchronous
     /// append-or-drain, never held across an `.await`.
-    #[allow(dead_code)]
     output: Arc<std::sync::Mutex<VecDeque<u8>>>,
     last_activity: Instant,
     program: String,
@@ -277,15 +265,21 @@ impl Tool for ReplStartTool {
         let args: ReplStartArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
-        {
-            let guard = self.session.lock().await;
-            if let Some(existing) = guard.as_ref() {
-                return Ok(ToolOutput::Error(format!(
-                    "a REPL session is already running (`{} {}`) — call repl_stop first",
-                    existing.program,
-                    existing.args.join(" ")
-                )));
-            }
+        // A single guard held across both the "already running" check and
+        // the eventual store below — not two separate lock acquisitions —
+        // so the check-then-store is atomic with respect to this mutex.
+        // (In practice this project's tool dispatch is strictly sequential,
+        // so two racing `repl_start` calls can't happen today anyway; this
+        // just avoids a redundant second lock acquisition.) Nothing between
+        // the check and the store below is `.await`-ing, so holding the
+        // guard across the spawn doesn't block anything else that needs it.
+        let mut guard = self.session.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(ToolOutput::Error(format!(
+                "a REPL session is already running (`{} {}`) — call repl_stop first",
+                existing.program,
+                existing.args.join(" ")
+            )));
         }
 
         let mut command = tokio::process::Command::new(&args.program);
@@ -316,7 +310,7 @@ impl Tool for ReplStartTool {
         // (default 10s) is longer than that — storing late would let the
         // watcher's very first wake-up see `None` and exit immediately,
         // permanently orphaning idle-timeout protection for this session.
-        *self.session.lock().await = Some(ReplSession {
+        *guard = Some(ReplSession {
             child,
             stdin,
             output: Arc::clone(&output),
@@ -324,6 +318,7 @@ impl Tool for ReplStartTool {
             program: args.program.clone(),
             args: args.args.clone(),
         });
+        drop(guard);
 
         tokio::spawn(idle_watcher(Arc::clone(&self.session), self.idle_timeout));
 
@@ -428,6 +423,10 @@ impl Tool for ReplSendTool {
         // own since the last call, report that instead of trying to
         // interact with a dead process.
         if let Ok(Some(status)) = session.child.try_wait() {
+            // Best-effort, not a guarantee: the background reader's final
+            // read and this `try_wait()` observation aren't atomic, so the
+            // very last bytes written right before exit can occasionally
+            // be missed.
             let final_output = drain_output(&session.output);
             *guard = None;
             return Ok(ToolOutput::Ok(format!(
@@ -605,6 +604,22 @@ mod tests {
             panic!("expected Error output for a double start");
         };
         assert!(text.contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn repl_start_fails_gracefully_for_a_nonexistent_program() {
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+        let session = new_shared_repl_session();
+        let tool = ReplStartTool::new(session, quiet_window, max_wait, idle_timeout);
+
+        let result = tool
+            .execute(
+                serde_json::json!({ "program": "definitely-not-a-real-binary-xyz", "args": [] }),
+                &ctx(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
     }
 
     #[tokio::test]
