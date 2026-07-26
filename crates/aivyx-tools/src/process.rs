@@ -125,7 +125,7 @@ pub(crate) async fn run(
 /// spawned with `.process_group(0)` (done in `run` above), which makes the
 /// child its own process-group leader — killing `-pid` then reaches it and
 /// everything it spawned into the same group.
-fn kill_process_group(child: &tokio::process::Child) {
+pub(crate) fn kill_process_group(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
         // SAFETY: sending a signal to a pid is a plain syscall wrapper with
         // no memory-safety concerns. `pid` is a process we just spawned

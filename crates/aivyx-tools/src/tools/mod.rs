@@ -13,6 +13,7 @@ mod mcp_meta;
 mod mcp_tool;
 mod read_file;
 mod remember_preference;
+mod repl;
 mod run_command;
 mod run_shell;
 mod set_tasks;
@@ -35,6 +36,7 @@ pub use mcp_meta::{GetMcpPromptTool, ListMcpPromptsTool, ListMcpResourcesTool, R
 pub use mcp_tool::McpToolAdapter;
 pub use read_file::ReadFileTool;
 pub use remember_preference::RememberPreferenceTool;
+pub use repl::{ReplStartTool, SharedReplSession, new_shared_repl_session};
 pub use run_command::RunCommandTool;
 pub use run_shell::RunShellTool;
 pub use set_tasks::SetTasksTool;

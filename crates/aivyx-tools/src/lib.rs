@@ -33,8 +33,8 @@ pub use tools::{
     DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool,
     GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool,
     ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter, ReadFileTool, ReadMcpResourceTool,
-    RememberPreferenceTool, RunCommandTool, RunShellTool, SetTasksTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    RememberPreferenceTool, ReplStartTool, RunCommandTool, RunShellTool, SetTasksTool,
+    SharedReplSession, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 
 #[derive(Debug, Error)]
