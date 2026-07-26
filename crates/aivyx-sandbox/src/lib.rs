@@ -88,6 +88,18 @@ pub enum ActionKind {
     /// in-worktree edit `--auto`'s checkpoint/rollback safety net
     /// already covers.
     Memory,
+    /// An already-approved interactive process (`repl_send`/`repl_stop`)
+    /// continuing to talk to a process `repl_start` already put through
+    /// the `Execute` tier. Auto-allowed like `Read`/`Internal` in Act
+    /// mode, but — unlike them — checked *after* the plan-mode and
+    /// autonomous-mode denial tiers in `ConfirmationGate::check`, not
+    /// alongside them: an approval implied by an earlier `Execute` call
+    /// must not let a live process keep accepting input once the user
+    /// enters plan mode. Distinct from `Internal` (which is documented as
+    /// "no filesystem, process, or network effect" — dishonest for a tool
+    /// that writes to a live process's stdin) and from `Execute` (which
+    /// would mean re-prompting on every send, defeating the point).
+    Interact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

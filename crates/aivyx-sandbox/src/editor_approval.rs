@@ -160,12 +160,12 @@ pub(crate) fn build_pending_request(
         ActionKind::McpTool => ApprovalContent::McpTool {
             description: request.preview.clone().unwrap_or_else(|| target.clone()),
         },
-        // `Memory` falls back to the terminal-only path like Read/Internal:
-        // there's no `ApprovalContent` shape defined for it yet, and the
-        // editor-approval channel simply not participating for this one
-        // request is the documented "no editor connected" fallback above,
+        // `Memory` and `Interact` fall back to the terminal-only path like Read/Internal:
+        // there's no `ApprovalContent` shape defined for them yet, and the
+        // editor-approval channel simply not participating for these
+        // requests is the documented "no editor connected" fallback above,
         // not a functional regression — the terminal prompt still runs.
-        ActionKind::Read | ActionKind::Internal | ActionKind::Memory => return None,
+        ActionKind::Read | ActionKind::Internal | ActionKind::Memory | ActionKind::Interact => return None,
     };
 
     Some(PendingApprovalRequest {

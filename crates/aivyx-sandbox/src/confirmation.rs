@@ -43,6 +43,16 @@ const AUTONOMOUS_MCP_TOOL_DENIAL: &str =
 const AUTONOMOUS_MEMORY_DENIAL: &str =
     "remembering preferences requires interactive confirmation and cannot happen in autonomous mode";
 
+/// Told to the model when a `repl_send`/`repl_stop` call reaches
+/// autonomous mode. `repl_start` (the `Execute`-tier action that would
+/// actually spawn the process) is already hidden from the model in
+/// autonomous mode (`AUTONOMOUS_HIDDEN_TOOLS` in `aivyx-core`), so this is
+/// defense in depth — the same reasoning already applied to
+/// `git_commit`'s target being permanently non-cacheable as a backstop
+/// even though it's also hidden.
+const AUTONOMOUS_INTERACT_DENIAL: &str =
+    "interacting with a REPL/process session cannot happen in autonomous mode";
+
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
 /// must not silently bless every future write anywhere.
@@ -274,6 +284,15 @@ impl PermissionGate for ConfirmationGate {
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_MEMORY_DENIAL.to_string()));
             }
+            if request.action == ActionKind::Interact {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "permission denied: Interact call in autonomous mode"
+                );
+                return PermissionDecision::Deny(Some(AUTONOMOUS_INTERACT_DENIAL.to_string()));
+            }
             if (matches!(request.action, ActionKind::Write | ActionKind::Delete)
                 || matches!(request.target, PermissionTarget::Command { .. }))
                 && let Some(finding) = self.injection_taint.current()
@@ -341,6 +360,22 @@ impl PermissionGate for ConfirmationGate {
                     }
                 }
             };
+        }
+
+        // An already-approved REPL/process session (repl_send/repl_stop)
+        // continuing to interact with a process repl_start already put
+        // through the Execute tier above. Checked here — after plan-mode
+        // and autonomous-mode denial, both of which already returned
+        // above if active — not alongside the Read/Internal auto-allow
+        // near the top of this function, which sits BEFORE plan-mode
+        // specifically so a pre-plan-mode approval can't leak through it
+        // (see that check's own comment). If Interact auto-allowed in
+        // that same early tier, a session still running when the user
+        // enters plan mode would keep silently accepting input during
+        // it — exactly the leak-through failure mode that comment guards
+        // against, just via a live process instead of a cached decision.
+        if request.action == ActionKind::Interact {
+            return PermissionDecision::Allow;
         }
 
         // `Memory` actions never participate in the Always-Allow cache,
@@ -1229,6 +1264,103 @@ mod tests {
         // The point of this test: unlike Read/Internal, the prompter was
         // actually invoked — this call did NOT short-circuit to auto-allow.
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn interact_request() -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "repl_send".to_string(),
+            action: ActionKind::Interact,
+            target: PermissionTarget::Other("repl session".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn interact_actions_auto_allow_in_act_mode_without_prompting() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&interact_request()).await;
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "Interact must auto-allow without prompting"
+        );
+    }
+
+    #[tokio::test]
+    async fn interact_actions_are_denied_during_plan_mode() {
+        // Regression test for the leak-through failure mode this tier's
+        // placement specifically guards against: a session still running
+        // when the user enters plan mode must stop accepting input
+        // immediately, not keep auto-allowing because Interact "looks
+        // like" Read/Internal.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode,
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&interact_request()).await;
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a plan-mode denial, got {decision:?}");
+        };
+        assert!(reason.contains("plan mode"));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn interact_actions_are_denied_in_autonomous_mode() {
+        // FakePrompter is set to Allow to prove the denial isn't
+        // accidentally coming from the prompter path — autonomous mode
+        // must never reach it for an Interact action, mirroring
+        // autonomous_mode_denies_mcp_tool_calls_unconditionally.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&interact_request()).await;
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected an autonomous-mode denial, got {decision:?}");
+        };
+        assert!(reason.contains("autonomous"), "reason: {reason}");
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
