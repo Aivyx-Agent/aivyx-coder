@@ -168,6 +168,20 @@ Mutually exclusive with `--plan` and `--resume`. See `docs/HISTORY.md`'s
 Phase 11 section (the "11c" subsection) for the full trust-profile
 rationale and design forks.
 
+Because autonomous mode removes the human from the approval loop, tool
+results (file contents, command output, search hits) are scanned for
+prompt-injection markers as they re-enter context — text that looks like it's
+trying to redirect the agent's instructions rather than answer its request.
+A hit taints the run: the agent is told what was found and where, and that
+taint is carried forward across turns (and into any sub-agent spawned via
+`delegate_task`, which shares the parent's taint state rather than starting
+fresh) so a later turn can't act on an earlier injection attempt just because
+the flagged content has scrolled out of the visible context. A
+high-confidence detection pauses the run outright with a loud notice instead
+of continuing unattended. This is a heuristic guard, not a guarantee — see
+"Known limitations" — and only runs in autonomous mode; interactive mode
+relies on the human reviewing each permission prompt instead.
+
 **Agent-maintained wiki** (`/wiki`, `/wiki <page>`): generates and keeps
 `docs/wiki/*.md` up to date — one page per workspace crate plus
 `architecture-overview.md` — using the agent's normal gated tools, no new
@@ -746,8 +760,15 @@ Every tool call passes through the gate before it runs:
 1. **Denied** (`deny_paths`) → blocked, no prompt.
 2. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
    no side effect on its own, so prompting on every read would make the tool
-   unusable. (But note: read output re-enters the model's context — see
-   "Known limitations".) `Internal` actions (`set_tasks`, which mutates only
+   unusable. This auto-allow is **not** scoped to the project's working
+   directory — any path the model asks to read is served unless it falls
+   under a `deny_paths` entry, since there is no Landlock-style kernel
+   enforcement on in-process file reads (Landlock only confines spawned
+   child processes, see "Landlock + seccomp" below). `deny_paths` is
+   therefore the *only* boundary on what the model can read; keep it
+   current for anything sensitive outside the default list. (But note: read
+   output re-enters the model's context — see "Known limitations".)
+   `Internal` actions (`set_tasks`, which mutates only
    the agent's own session state) are auto-allowed on the same basis, but are
    a distinct action kind so audit logs never record a state change as a
    "read" — and so a tool that touches the outside world can't honestly
@@ -778,9 +799,12 @@ fact.
 
 ### 3. Landlock + seccomp — kernel-enforced process confinement
 
-When a command runs (`run_command`/`run_shell`), the child process is confined
-via Linux **Landlock** (filesystem scoping) and a **seccomp-bpf** syscall
-denylist, applied in the forked child before `exec`:
+Confinement isn't limited to `run_command`/`run_shell` — it applies to every
+tool that spawns a child process: `git_commit`/`git_push`/`git_branch`/
+`git_pr`/`git_read`'s `git` invocations, `find_references`/`go_to_definition`'s
+`rust-analyzer` spawn, and MCP servers at startup. Each such child process is
+confined via Linux **Landlock** (filesystem scoping) and a **seccomp-bpf**
+syscall denylist, applied in the forked child before `exec`:
 
 - **Write** access: the working directory + the system temp dir(s), minus any
   `deny_paths` nested inside them (carved out precisely, since Landlock has no
@@ -902,7 +926,12 @@ Deliberately not (yet) addressed — documented rather than hidden:
   such content as data, not instructions, but this is a mitigation, not a
   guarantee. Be especially careful pointing the agent at untrusted repositories
   while `allowed_commands` is configured, since a pre-approved command runs
-  without a per-invocation prompt.
+  without a per-invocation prompt. **Autonomous mode** (see above) adds a
+  heuristic scan-and-pause guard on top of this, since there's no human
+  reviewing each prompt to catch an injection manually — but it's a
+  pattern-based heuristic, not a structural fix, and it doesn't run in
+  interactive mode at all (there, the permission modal is the mitigation:
+  a human reviewing the actual command/diff before it executes).
 - **Network is not restricted** by the sandbox. A command you approve can make
   network connections (needed for `cargo build`, `npm install`, `git clone`,
   etc.). Combined with the read scope, an approved command could in principle

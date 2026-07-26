@@ -21,7 +21,8 @@ Landlock+seccomp confinement, git tools (including `git_branch`/
 (`ActionKind::Delete`'s first constructor), tree-sitter repo map
 injection, an agent-maintained wiki (`/wiki`), session persistence/resume,
 context budget + compaction, plan mode (gate-enforced read-only),
-autonomous mode (`--auto`), `/council` multi-model deliberation, AGENTS.md
+autonomous mode (`--auto`) with a heuristic prompt-injection scan/taint/pause
+guard, `/council` multi-model deliberation, AGENTS.md
 project instructions, `web_fetch`/`web_search`, full MCP client support, a
 startup probe of the *served* context window, goal-bounded turn pausing
 instead of a hard iteration-cap failure, enforced post-edit verification
