@@ -538,10 +538,29 @@ impl Default for PermissionSettings {
     fn default() -> Self {
         Self {
             mode: PermissionMode::Confirm,
+            // `read_file` has no OS-level backstop at all — Landlock only
+            // confines spawned child processes, never this crate's own
+            // in-process file reads — so this list is the *sole*
+            // protection against the model reading plaintext credentials
+            // via a normal, auto-allowed `ActionKind::Read` call. Not
+            // exhaustive (impossible to be), but covers the common,
+            // high-value cases beyond SSH/AWS: GPG, generic netrc-style
+            // creds, container/cluster/cloud-CLI auth, and package-registry
+            // tokens (including this project's own toolchain's).
             deny_paths: vec![
                 "~/.ssh".to_string(),
                 "~/.aws".to_string(),
                 "~/.config/aivyx-coder".to_string(),
+                "~/.gnupg".to_string(),
+                "~/.netrc".to_string(),
+                "~/.docker/config.json".to_string(),
+                "~/.kube/config".to_string(),
+                "~/.npmrc".to_string(),
+                "~/.pypirc".to_string(),
+                "~/.config/gcloud".to_string(),
+                "~/.azure".to_string(),
+                "~/.cargo/credentials.toml".to_string(),
+                "~/.config/gh".to_string(),
             ],
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
@@ -745,6 +764,36 @@ mod tests {
                 .deny_paths
                 .contains(&"~/.config/aivyx-coder".to_string())
         );
+    }
+
+    #[test]
+    fn default_deny_paths_covers_common_credential_locations() {
+        // Regression test for a full-codebase audit finding: `~/.ssh`/
+        // `~/.aws` covered the two most obvious cases, but `read_file`
+        // has no OS-level backstop at all (Landlock only wraps spawned
+        // child processes, never in-process file reads — see
+        // `ConfirmationGate::check`, which auto-allows `ActionKind::Read`
+        // unconditionally once past this exact list) — so this list is
+        // the *only* protection for reads, and it was missing several
+        // other common plaintext-credential locations.
+        let deny_paths = PermissionSettings::default().deny_paths;
+        for expected in [
+            "~/.gnupg",
+            "~/.netrc",
+            "~/.docker/config.json",
+            "~/.kube/config",
+            "~/.npmrc",
+            "~/.pypirc",
+            "~/.config/gcloud",
+            "~/.azure",
+            "~/.cargo/credentials.toml",
+            "~/.config/gh",
+        ] {
+            assert!(
+                deny_paths.contains(&expected.to_string()),
+                "expected default deny_paths to include {expected:?}, got {deny_paths:?}"
+            );
+        }
     }
 
     #[test]
