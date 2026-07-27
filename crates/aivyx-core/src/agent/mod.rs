@@ -77,6 +77,19 @@ Do not claim to have made any changes — you cannot make any in this mode.";
 /// calls dispatch to them) while `EditFormat::Prompted` is active.
 const PROMPTED_EDIT_HIDDEN_TOOLS: &[&str] = &["edit_file", "write_file"];
 
+/// Tools whose successful, `Ok`-outcome call sets `unverified_edits` (Phase
+/// 12 Part B) — every tool that mutates a file's content or existence.
+/// Deliberately a separate list from `PROMPTED_EDIT_HIDDEN_TOOLS` above,
+/// which this check used to (incorrectly) share: that constant's purpose is
+/// hiding `edit_file`/`write_file`'s native tool-call forms while
+/// `EditFormat::Prompted` synthesizes SEARCH/REPLACE blocks into them
+/// instead — unrelated to which tools should trigger enforced verification,
+/// and `patch_file`/`delete_file`/`move_file` have nothing to do with
+/// SEARCH/REPLACE block synthesis. Sharing the list meant those three tools
+/// never triggered verification at all until this fix.
+const VERIFICATION_TRIGGER_TOOLS: &[&str] =
+    &["edit_file", "write_file", "patch_file", "delete_file", "move_file"];
+
 /// Appended to the system prompt in prompted edit mode (outside plan mode).
 const EDIT_FORMAT_PROMPT: &str = "To modify or create files, do NOT call tools. Write \
 SEARCH/REPLACE blocks directly in your reply, formatted exactly like this:\n\
@@ -1470,7 +1483,7 @@ impl Agent {
                 // the top of this loop (Phase 12 Part B). Reuses the same
                 // name list prompted mode already hides edit tools behind,
                 // rather than a second hardcoded pair.
-                let is_edit_call = PROMPTED_EDIT_HIDDEN_TOOLS.contains(&call.name.as_str());
+                let is_edit_call = VERIFICATION_TRIGGER_TOOLS.contains(&call.name.as_str());
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
                 let mut result = self

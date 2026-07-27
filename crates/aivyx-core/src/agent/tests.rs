@@ -2851,6 +2851,43 @@ async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip()
 }
 
 #[tokio::test]
+async fn delete_file_triggers_enforced_verification_same_as_edit_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("gone.txt"), "bye\n").unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::DeleteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
+
+    let delete_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "delete_file".to_string(),
+            arguments: serde_json::json!({ "path": "gone.txt" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _) =
+        build_agent(vec![delete_call, text_response("done")], registry, 10);
+    agent.set_verification("verify".to_string(), 3);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        1,
+        "delete_file must trigger enforced verification, same as edit_file/write_file already do"
+    );
+}
+
+#[tokio::test]
 async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::new();
