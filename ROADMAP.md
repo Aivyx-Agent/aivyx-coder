@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-21_
+_Last updated: 2026-07-27_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -194,6 +194,45 @@ itself and the guard independently), and stopped the run with the
 designed notice — `config.toml` and the project's git state both
 provably untouched afterward.
 
+**REPL / interactive-process support — shipped.** `run_command`/`run_shell`
+were strictly one-shot — spawn, run to completion, reap — with no way to
+hold a process open across multiple tool calls. Three new tools
+(`repl_start`/`repl_send`/`repl_stop`) share one process slot: starting
+goes through the normal `Execute`-tier gate and checkpoint like any other
+command, but a new `ActionKind::Interact` lets subsequent sends/stops
+auto-allow in Act mode (re-prompting on every REPL line would be as
+unusable as re-prompting on every `read_file` call) while still being
+correctly denied the instant Plan mode is entered mid-session — a
+deliberate leak-through guard, checked *after* the plan-mode tier rather
+than alongside the ordinary Read/Internal auto-allow. Plain pipes, not a
+real PTY (documented in Known limitations below). Live-E2E verified: a
+real model chaining `repl_start`/`repl_send`/`repl_stop` against a real
+`python3` process, the Plan-mode leak-through guard holding under a live
+Ctrl+P mid-session, and Drop-based shutdown confirmed not to orphan a
+never-stopped process. See `docs/HISTORY.md` for the full account.
+
+**Move/rename tool — shipped.** The tool set had `read_file`/`write_file`/
+`edit_file`/`delete_file` but no atomic move/rename primitive — the model
+had to synthesize a rename via read+write+delete, three separate prompts
+with no atomicity guarantee. `move_file` closes this with a single atomic
+`tokio::fs::rename`, covering both files and directories, via a new
+`ActionKind::Move`/`PermissionTarget::Move{from,to}` threaded through
+every gate tier (deny_paths on both endpoints, autonomous-mode worktree
+boundary on both endpoints, exact-pair Always-Allow caching) and every
+protocol surface (TUI modal, ACP, editor-approval). Refuses outright on an
+existing destination (no overwrite mode) and on a cross-filesystem move
+(no copy+delete fallback) — both deliberate choices favoring atomicity
+and predictability over flexibility. A directory move runs an extra,
+security-critical recursive scan (deliberately *not* gitignore-aware,
+unlike this project's `grep`/`glob` walks) so a `deny_paths` entry nested
+inside the moved tree — a gitignored `.env`, say — can't be silently
+relocated out of protection. See `docs/HISTORY.md` for the full account,
+including two real bugs review caught: a TOCTOU window on the
+destination-exists check (narrowed via a re-check immediately before the
+rename, a deliberate tradeoff over a full `renameat2(RENAME_NOREPLACE)`
+fix to avoid musl-cross-compile complexity), and a second ACP tool-kind
+mapping site the original plan's inventory missed entirely.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -204,16 +243,11 @@ test quality, and documentation closed 10 findings directly (argument-blind
 MCP Always-Allow cache, sub-agent injection-taint isolation, thin
 `deny_paths` defaults, five documentation-accuracy fixes, an untested
 injection-scan tie-break rule, unlabeled web_fetch/web_search injection
-sources, and Plan mode not surviving `--resume`). The remaining four are
+sources, and Plan mode not surviving `--resume`). The remaining two are
 sized as their own features — each needs a real design pass (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
 same-session patch — so they're tracked here instead of built ad hoc:
 
-- **REPL / interactive-process support**: `run_command`/`run_shell` are
-  one-shot — each call spawns, runs to completion, and the process is
-  gone. There's no way to hold open a stateful interactive process (a
-  language REPL, `psql`, `python -i`) across multiple tool calls, which
-  a "vibe coding" workflow (iterative, exploratory) would benefit from.
 - **Patch-apply tool**: edits go through `edit_file` (single search/replace)
   or a full `write_file` rewrite; there's no tool that takes ready-made
   unified-diff/patch text and applies it directly. Relevant when a model

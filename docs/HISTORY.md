@@ -2632,3 +2632,101 @@ All three checks passed on the first correctly-constructed attempt.
 Test artifacts (scratch project directories, stray session files from
 this and the prior chapter's trials, the tarball, the backup binary)
 were cleaned up from the rig afterward.
+
+### Move/rename tool — ✅ shipped, one verification step still open
+
+The last item in the same 2026-07-22 follow-up audit's backlog: the tool
+set had `read_file`/`write_file`/`edit_file`/`delete_file` but no atomic
+move/rename primitive, so the model had to synthesize a rename via
+read+write+delete — three separate permission prompts and checkpoints
+for one logical operation, with no atomicity guarantee if the write
+succeeded but the delete was denied. Design spec at
+`docs/superpowers/specs/2026-07-27-move-rename-tool-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-27-move-rename-tool.md`, executed via
+`subagent-driven-development` across 7 tasks (fresh implementer +
+reviewer per task, one fix round each on Tasks 4 and 5, a final
+whole-branch review with one more fix round).
+
+**What shipped**: `move_file(from, to)`, built on a new
+`ActionKind::Move` and `PermissionTarget::Move { from, to }` — the first
+`PermissionTarget` shape to carry two paths instead of one. Threaded
+through every gate tier (`deny_paths` checked against both endpoints,
+autonomous-mode's worktree-boundary check against both endpoints, the
+Always-Allow cache keyed on the exact `(from, to)` pair so approving one
+move never blesses a different one) and every UI/protocol surface (the
+TUI modal, the ACP protocol, the editor-approval channel). A single
+atomic `tokio::fs::rename` covers files and whole directory trees alike.
+Three scope decisions were made explicitly with the user during
+brainstorming rather than assumed: files *and* directories are in scope
+(not file-only, unlike `delete_file`'s own precedent); an existing
+destination is refused outright, no overwrite mode; and a cross-
+filesystem move (`EXDEV`/`CrossesDevices`) is refused rather than
+silently falling back to copy+delete — all three favoring atomicity and
+predictability over flexibility.
+
+**The security-critical design decision**: a directory move needs more
+than the top-level `from`/`to` deny_paths check, since relocating a
+directory could silently carry a *nested* denied path (a gitignored
+`.env`, say) to a location `deny_paths` no longer matches. Closed with a
+second, tool-level recursive scan (`find_denied_descendant`) using
+`ignore::WalkBuilder::new(root).standard_filters(false)` — deliberately
+**not** gitignore-aware, the opposite of this project's `grep`/`glob`
+walks, which exist for search relevance rather than security and would
+silently miss exactly the case this scan exists to catch.
+
+**Two real bugs found only by review, not by the plan or the initial
+implementation**: (1) task-level review caught that `execute()` never
+re-checked the destination didn't already exist — `rename(2)` silently
+*replaces* an existing destination, so a file created at `to` during the
+gap between the confirmation prompt and the user's approval would be
+clobbered without warning, a materially wider TOCTOU window than this
+project's already-accepted symlink-swap class. Presented to the user as
+a genuine three-way tradeoff (a narrow `symlink_metadata` re-check vs. a
+full `renameat2(RENAME_NOREPLACE)` fix vs. documenting it as an accepted
+limitation); the narrow re-check was chosen, to avoid the musl-cross-
+compile complexity a `renameat2` fallback would need for the project's
+static-musl release build, in exchange for narrowing (not eliminating)
+the window to the same order of magnitude as the already-accepted case.
+(2) the **final whole-branch review** caught that ACP has two separate
+tool-kind mapping sites, not one: `prompter.rs`'s `ActionKind`-keyed map
+(correctly updated by the plan) and `translate.rs`'s independent tool-
+*name*-keyed map for the streamed `ToolCallDetected` event, missed
+entirely by the plan's own match-exhaustiveness inventory — that
+function's `match` has a wildcard `_` arm, so a missing `move_file` case
+compiles silently instead of failing loudly, and only a reviewer who
+understood the feature (two ACP surfaces exist) rather than one grepping
+for compile-forced sites could have found it.
+
+**A test-fidelity bug in the plan's own reference code**, also caught by
+task-level review: the plan's regression test for the gitignore-aware
+scan created a `.gitignore` file but no `.git` directory, and
+`ignore::WalkBuilder` only honors `.gitignore` when a `.git` directory
+is present (`require_git` defaults to true) — so the test was actually
+passing via a separate hidden-dotfile filter, not the gitignore
+mechanism it claimed to guard against. Fixed by adding a second test
+with a real `.git` directory and a non-dotfile path, verified
+empirically (temporarily removing `standard_filters(false)` and
+confirming only the new test failed) rather than trusted from
+inspection alone.
+
+**The same subagent-dispatch worktree pitfall from the REPL chapter
+above recurred, twice**, confirming it's a standing risk of this
+workflow rather than a one-off: two implementer subagents' `Write`-tool
+calls (Tasks 4 and 6) landed in the main checkout instead of the
+controller's worktree, even though each subagent's own `git commit` (run
+via Bash, correctly `cd`'d) landed on the right branch. Caught only by
+checking the main checkout's `git status`, not just the feature
+worktree, immediately before the merge step — confirmed by diff that the
+stray content was a strict subset of what was already safely committed
+on the worktree branch, then cleaned up with `git stash push -u` rather
+than a hard reset.
+
+**Still open**: the design's own "Live E2E verification" step — driving
+a real file and directory move through the actual release binary,
+confirming the TUI preview renders correctly for both and that a
+directory move containing a denied path is refused live, not just in
+the unit tests — has not been run. No interactive TUI session or
+configured LLM backend was available in the sandboxed environment this
+feature was built in; this needs the bare-metal rig, matching how every
+other security-relevant tool in this project has been verified.
