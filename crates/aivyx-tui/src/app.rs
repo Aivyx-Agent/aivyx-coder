@@ -727,6 +727,9 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
             ("Command: ", format!("{program} {}", args.join(" ")))
         }
         PermissionTarget::Other(description) => ("Target: ", description.clone()),
+        PermissionTarget::Move { from, to } => {
+            ("Move: ", format!("{} -> {}", from.display(), to.display()))
+        }
     };
 
     if body.is_empty() {
@@ -921,6 +924,18 @@ mod tests {
         assert_eq!(lines[0].to_string(), "Command: sh -c echo first");
         // The second statement must be present as its own visible line.
         assert!(lines[1].to_string().contains("echo second"));
+    }
+
+    #[test]
+    fn move_target_renders_as_from_arrow_to() {
+        let target = PermissionTarget::Move {
+            from: PathBuf::from("/project/old.rs"),
+            to: PathBuf::from("/project/new.rs"),
+        };
+
+        let lines = target_lines(&target);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "Move: /project/old.rs -> /project/new.rs");
     }
 
     fn task(id: u32, text: &str, status: TaskStatus) -> Task {
