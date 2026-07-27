@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
+use ignore::WalkBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::path_resolve::resolve;
+use crate::path_resolve::{is_denied, resolve};
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -70,7 +71,7 @@ impl Tool for MoveFileTool {
         let from = resolve(cwd, &args.from);
         let to = resolve(cwd, &args.to);
 
-        std::fs::metadata(&from).map_err(|_| {
+        let metadata = std::fs::metadata(&from).map_err(|_| {
             ToolError::ExecutionFailed(format!("{} does not exist", from.display()))
         })?;
         if std::fs::metadata(&to).is_ok() {
@@ -81,14 +82,32 @@ impl Tool for MoveFileTool {
             )));
         }
 
-        let preview = match std::fs::read_to_string(&from) {
-            Ok(content) => format!("Move {} to {}\n\n{}", from.display(), to.display(), content),
-            Err(_) => format!(
-                "WARNING: {} could not be read as text (binary file?). This will move it to {} \
-                 unchanged.",
+        let preview = if metadata.is_dir() {
+            if let Some(denied) = find_denied_descendant(&from, &self.deny_paths) {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "{} is under a configured deny_paths entry — refusing to move a directory \
+                     that contains it (moving would relocate it outside deny_paths' protection)",
+                    denied.display()
+                )));
+            }
+            format!(
+                "Move directory {} to {}\n\n{}",
                 from.display(),
-                to.display()
-            ),
+                to.display(),
+                directory_listing(&from)
+            )
+        } else {
+            match std::fs::read_to_string(&from) {
+                Ok(content) => {
+                    format!("Move {} to {}\n\n{}", from.display(), to.display(), content)
+                }
+                Err(_) => format!(
+                    "WARNING: {} could not be read as text (binary file?). This will move it to \
+                     {} unchanged.",
+                    from.display(),
+                    to.display()
+                ),
+            }
         };
 
         Ok(PermissionRequest {
@@ -145,6 +164,58 @@ fn map_rename_error(err: std::io::Error, from: &Path, to: &Path) -> ToolError {
     } else {
         ToolError::Io(err)
     }
+}
+
+/// Independent of `permission_request`'s own `from`/`to` top-level check
+/// (`ConfirmationGate::is_denied`, which only sees the two endpoints) — a
+/// nested `deny_paths` entry several levels inside a directory being moved
+/// would otherwise silently relocate to a path `deny_paths` no longer
+/// matches. `standard_filters(false)` is deliberate and load-bearing:
+/// unlike `grep`/`glob`'s gitignore-aware walk (relevance, not security),
+/// this scan must see every real entry regardless of `.gitignore` — see
+/// `a_gitignored_deny_path_nested_in_the_directory_is_still_caught`.
+fn find_denied_descendant(root: &Path, deny_paths: &[PathBuf]) -> Option<PathBuf> {
+    for entry in WalkBuilder::new(root).standard_filters(false).build() {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if is_denied(path, deny_paths) {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Cosmetic only (not security-relevant, unlike `find_denied_descendant`
+/// above) — gitignore-aware and capped, matching `glob.rs`'s own
+/// `MAX_PATHS` truncation convention, so a human isn't shown an unbounded
+/// dump for a large directory.
+const MAX_LISTED_ENTRIES: usize = 200;
+
+fn directory_listing(root: &Path) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for entry in WalkBuilder::new(root).build() {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        if entries.len() >= MAX_LISTED_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let path = entry.path();
+        entries.push(path.strip_prefix(root).unwrap_or(path).display().to_string());
+    }
+    let mut output = entries.join("\n");
+    if truncated {
+        output.push_str(&format!(
+            "\n... {MAX_LISTED_ENTRIES}+ files, showing first {MAX_LISTED_ENTRIES}"
+        ));
+    }
+    if output.is_empty() {
+        output = "(empty directory)".to_string();
+    }
+    output
 }
 
 #[cfg(test)]
@@ -298,5 +369,103 @@ mod tests {
             "the pre-existing destination content must survive"
         );
         assert!(dir.path().join("old.txt").exists(), "the source must not have moved");
+    }
+
+    #[tokio::test]
+    async fn execute_moves_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![]);
+        let output = tool
+            .execute(json!({ "from": "src", "to": "lib" }), &ctx(dir.path()))
+            .await
+            .unwrap();
+
+        let ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("moved"), "text: {text}");
+        assert!(!dir.path().join("src").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lib/a.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+    }
+
+    #[test]
+    fn an_existing_destination_directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+
+        let tool = MoveFileTool::new(vec![]);
+        let result = tool.permission_request(&json!({ "from": "src", "to": "lib" }), dir.path());
+
+        let Err(ToolError::ExecutionFailed(message)) = result else {
+            panic!("expected ExecutionFailed, got {result:?}");
+        };
+        assert!(message.contains("already exists"), "message: {message}");
+    }
+
+    #[test]
+    fn preview_lists_directory_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![]);
+        let request = tool
+            .permission_request(&json!({ "from": "src", "to": "lib" }), dir.path())
+            .unwrap();
+
+        let preview = request.preview.expect("expected a preview");
+        assert!(preview.contains("a.rs"));
+        assert!(preview.contains("b.rs"));
+    }
+
+    #[test]
+    fn a_directory_move_is_refused_when_a_deny_path_is_nested_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/.env"), "SECRET=1\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![dir.path().join("secrets/.env")]);
+        let result = tool.permission_request(
+            &json!({ "from": "secrets", "to": "archive/secrets" }),
+            dir.path(),
+        );
+
+        let Err(ToolError::ExecutionFailed(message)) = result else {
+            panic!("expected ExecutionFailed, got {result:?}");
+        };
+        assert!(message.contains(".env"), "message: {message}");
+        // Nothing was moved — the walk happens before any mutation.
+        assert!(dir.path().join("secrets/.env").exists());
+    }
+
+    #[test]
+    fn a_gitignored_deny_path_nested_in_the_directory_is_still_caught() {
+        // Regression test for the reason this scan can't reuse grep/glob's
+        // own walk unmodified: a `.env` is exactly the kind of file that's
+        // both deny_paths-worthy and routinely gitignored. If the scan were
+        // gitignore-aware, a nested .env would be silently invisible to it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "secrets/.env\n").unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/.env"), "SECRET=1\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![dir.path().join("secrets/.env")]);
+        let result = tool.permission_request(
+            &json!({ "from": "secrets", "to": "archive/secrets" }),
+            dir.path(),
+        );
+
+        assert!(
+            matches!(result, Err(ToolError::ExecutionFailed(_))),
+            "a gitignored deny_paths entry must still block the move"
+        );
     }
 }
