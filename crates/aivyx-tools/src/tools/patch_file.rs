@@ -212,6 +212,34 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_hunk_patch_applies_both_hunks_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        )
+        .unwrap();
+
+        // Two independent hunks in one patch: the first replaces "two",
+        // the second replaces "seven" — well past the first hunk, and
+        // each correctly numbered per standard unified-diff convention
+        // (each hunk's old-side line number is relative to the original
+        // file, unaffected by earlier hunks in the same patch).
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -2,1 +2,1 @@\n-two\n+TWO\n@@ -7,1 +7,1 @@\n-seven\n+SEVEN\n";
+
+        let tool = PatchFileTool;
+        let request = tool
+            .permission_request(&json!({ "path": "a.txt", "patch": patch }), dir.path())
+            .unwrap();
+
+        let diff = request.diff.expect("expected diff content");
+        assert_eq!(
+            diff.new_content,
+            "one\nTWO\nthree\nfour\nfive\nsix\nSEVEN\neight\n"
+        );
+    }
+
+    #[test]
     fn a_malformed_hunk_header_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "x\ny\nz\n").unwrap();
