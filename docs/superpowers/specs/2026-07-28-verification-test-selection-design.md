@@ -65,6 +65,36 @@ during the initial round of questions:
    dispatch path (through `ConfirmationGate`, cached by its own fixed,
    unchanging args) is completely unchanged.
 
+### Pre-existing gap fixed as part of this plan (found during design, not the original backlog framing)
+
+`unverified_edits` (`crates/aivyx-core/src/agent/mod.rs:1472`, the flag that
+triggers enforced verification at all) currently only fires when
+`edit_file` or `write_file` succeeds — it reuses
+`PROMPTED_EDIT_HIDDEN_TOOLS` (`&["edit_file", "write_file"]`), a constant
+whose actual purpose is unrelated: hiding the native tool-call forms of
+those two tools while `EditFormat::Prompted` is active (since prompted
+mode synthesizes SEARCH/REPLACE blocks into those same two calls). That
+constant predates `patch_file`/`delete_file`/`move_file` and was never
+widened when they shipped, so editing a file via any of those three
+*never* triggers auto-verification today, even though they're the same
+kind of content/structure mutation `edit_file`/`write_file` already
+trigger it for. Confirmed with the user this is a real, pre-existing bug
+worth fixing here rather than deferring, since this feature's own
+touched-paths accumulator would otherwise be silently inert for 3 of the
+5 mutating file tools.
+
+**Fix, precisely**: do **not** widen `PROMPTED_EDIT_HIDDEN_TOOLS` itself —
+that would incorrectly hide `patch_file`/`delete_file`/`move_file` from
+the model whenever prompted edit mode is active, which is unrelated to
+and unwanted alongside this fix (those three tools have nothing to do
+with SEARCH/REPLACE block synthesis). Instead, a new, separate constant —
+e.g. `VERIFICATION_TRIGGER_TOOLS: &[&str] = &["edit_file", "write_file",
+"patch_file", "delete_file", "move_file"]` — is checked at the
+`is_edit_call` site (`crates/aivyx-core/src/agent/mod.rs:1472`) instead of
+reusing `PROMPTED_EDIT_HIDDEN_TOOLS`, decoupling the two concerns
+(prompted-mode tool hiding vs. verification triggering) that constant was
+incorrectly conflating.
+
 ## Decisions
 
 ### Config: a new optional `scoped_command` field
@@ -230,6 +260,18 @@ unconditional overwrite.
   `run_shell`/`git_commit`) — only the five file-content/structure tools
   listed above contribute, matching the existing `unverified_edits`
   trigger set.
+- **Sub-agents (`delegate_task`)**: `DelegateTaskConfig` already threads a
+  `verification: Option<(String, u32)>` tuple through to give a sub-agent
+  its own `Agent::set_verification` call, mirroring the parent. This plan
+  does **not** extend that plumbing to also carry `scoped_command`/the
+  confiner handle — sub-agents keep using only the full command,
+  unchanged from today. `Agent::set_verification`'s existing signature is
+  not touched; scoped verification is wired in via a new, separate,
+  additive method the parent agent's own construction calls, so every
+  existing call site (including the sub-agent one) keeps compiling and
+  behaving exactly as it does today without modification. Extending
+  sub-agent support is a reasonable future increment, not a requirement
+  of closing this backlog item.
 
 ## Testing / verification
 
