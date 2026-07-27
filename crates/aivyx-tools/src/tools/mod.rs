@@ -11,6 +11,7 @@ mod go_to_definition;
 mod grep;
 mod mcp_meta;
 mod mcp_tool;
+mod move_file;
 mod read_file;
 mod remember_preference;
 mod repl;
@@ -34,6 +35,7 @@ pub use go_to_definition::GoToDefinitionTool;
 pub use grep::GrepTool;
 pub use mcp_meta::{GetMcpPromptTool, ListMcpPromptsTool, ListMcpResourcesTool, ReadMcpResourceTool};
 pub use mcp_tool::McpToolAdapter;
+pub use move_file::MoveFileTool;
 pub use read_file::ReadFileTool;
 pub use remember_preference::RememberPreferenceTool;
 pub use repl::{
