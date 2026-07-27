@@ -32,10 +32,10 @@ pub use process::CommandSpec;
 pub use tools::{
     DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool,
     GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool,
-    ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter, MoveFileTool, ReadFileTool,
-    ReadMcpResourceTool, RememberPreferenceTool, ReplSendTool, ReplStartTool, ReplStopTool,
-    RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool, WebSearchTool,
-    WriteFileTool, new_shared_repl_session,
+    ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter, MoveFileTool, PatchFileTool,
+    ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplSendTool, ReplStartTool,
+    ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool,
+    WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 
 #[derive(Debug, Error)]

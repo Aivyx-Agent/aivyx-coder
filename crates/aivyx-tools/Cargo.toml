@@ -8,6 +8,7 @@ license.workspace = true
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 async-trait = "0.1.89"
+diffy = "0.5.1"
 futures = "0.3.32"
 globset = "0.4.18"
 grep-regex = "0.1.14"
