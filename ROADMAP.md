@@ -209,12 +209,6 @@ sized as their own features — each needs a real design pass (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
 same-session patch — so they're tracked here instead of built ad hoc:
 
-- **Move/rename tool**: the tool set has `read_file`/`write_file`/
-  `edit_file`/`delete_file` but no atomic move/rename primitive. The model
-  currently has to synthesize a rename via read + write + delete — three
-  separate permission prompts and checkpoints for one logical operation,
-  with no atomicity guarantee if the write succeeds but the delete is
-  denied.
 - **REPL / interactive-process support**: `run_command`/`run_shell` are
   one-shot — each call spawns, runs to completion, and the process is
   gone. There's no way to hold open a stateful interactive process (a

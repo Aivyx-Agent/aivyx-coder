@@ -489,6 +489,18 @@ gitignored file (staged via `git add -A`, which never picks up ignored
 paths) has no checkpoint to restore from, and a non-git working directory
 has no checkpointer active at all.
 
+**`move_file(from, to)`**: `ActionKind::Move`'s only constructor — closes
+the last item in the second capability audit's backlog. Files and
+directories both supported via a single atomic `tokio::fs::rename`. Refuses
+outright if `to` already exists (no overwrite mode) and if `from`/`to` are
+on different filesystems (`EXDEV`/`CrossesDevices` — no copy+delete
+fallback, so the tool's atomicity guarantee stays honest). A directory move
+additionally scans its full contents for any nested `deny_paths` entry
+before prompting — not gitignore-filtered like `grep`/`glob`'s own walk,
+since a `.env` is exactly the kind of file that's both `deny_paths`-worthy
+and routinely gitignored, and a gitignore-aware scan would silently miss
+exactly the case it exists to catch.
+
 Build/test the workspace:
 
 ```
@@ -689,6 +701,7 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 | `git_read` | git status / diff / log (read-only, fixed argv shapes) | none (auto-allowed) |
 | `git_commit` | stage + commit, with your identity/hooks/config | prompt, with a change-summary preview |
 | `delete_file` | delete a file | prompt (then cacheable) |
+| `move_file` | move or rename a file or directory | prompt (then cacheable) |
 | `git_branch` | create or switch git branches | prompt (then cacheable) |
 | `git_push` | push the current branch to a remote | prompt (then cacheable) |
 | `git_pr` | open a pull request via `gh` | prompt (then cacheable) |
@@ -975,6 +988,11 @@ Deliberately not (yet) addressed — documented rather than hidden:
   confinement. `git_read`'s status/diff exclude `deny_paths` via pathspecs,
   but `log` shows committed history as-is — anything already committed is
   considered yours to see.
+- **`move_file` cross-filesystem moves**: refused outright rather than
+  transparently falling back to a recursive copy+delete, to keep the
+  tool's atomicity guarantee honest. In practice this only bites when
+  `from`/`to` resolve onto different mounted filesystems, which is rare
+  for an in-project rename.
 
 See `ROADMAP.md` for current status and `docs/HISTORY.md` for the full
 phase-by-phase history and audit trail.

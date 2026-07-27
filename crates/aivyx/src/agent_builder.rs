@@ -25,9 +25,9 @@ use aivyx_tools::{
     CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
-    McpToolAdapter, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplSendTool,
-    ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
+    McpToolAdapter, MoveFileTool, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool,
+    ReplSendTool, ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool,
+    ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -224,6 +224,7 @@ pub(crate) async fn build_agent(
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(DeleteFileTool));
+    registry.register(Arc::new(MoveFileTool::new(deny_paths.clone())));
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
     registry.register(Arc::new(RunShellTool));
