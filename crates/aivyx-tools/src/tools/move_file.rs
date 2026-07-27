@@ -468,4 +468,32 @@ mod tests {
             "a gitignored deny_paths entry must still block the move"
         );
     }
+
+    #[test]
+    fn a_non_dotfile_deny_path_hidden_only_by_gitignore_is_still_caught() {
+        // Regression test distinguishing the git-ignore-specific mechanism
+        // from the hidden-dotfile filter the sibling test above actually
+        // exercises: `ignore::WalkBuilder` only consults `.gitignore` when a
+        // `.git` directory is present (`require_git` defaults to true), so
+        // this test creates a real one. `secrets/creds.txt` is not a
+        // dotfile, so the hidden-file filter can't be what's hiding it here
+        // — only gitignore awareness could, and `standard_filters(false)`
+        // must defeat it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "secrets/creds.txt\n").unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/creds.txt"), "SECRET=1\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![dir.path().join("secrets/creds.txt")]);
+        let result = tool.permission_request(
+            &json!({ "from": "secrets", "to": "archive/secrets" }),
+            dir.path(),
+        );
+
+        assert!(
+            matches!(result, Err(ToolError::ExecutionFailed(_))),
+            "a deny_paths entry hidden only by .gitignore (not a dotfile) must still block the move"
+        );
+    }
 }
