@@ -501,6 +501,19 @@ since a `.env` is exactly the kind of file that's both `deny_paths`-worthy
 and routinely gitignored, and a gitignore-aware scan would silently miss
 exactly the case it exists to catch.
 
+**`patch_file(path, patch)`**: applies a unified-diff patch to an
+existing file via the `diffy` crate, reusing `ActionKind::Write` — this
+is content mutation on an existing path, exactly like `edit_file`, so it
+needed no new gate primitive (unlike `delete_file`'s/`move_file`'s own
+first-of-their-kind `ActionKind`s). Tolerates hunk line numbers that have
+drifted from the file's actual current content — `diffy` searches nearby
+for matching context rather than requiring an exact position, since a
+model-generated patch's line numbers drift easily even when its actual
+content is correct — but still fails clearly if the patch's context
+doesn't match anywhere. Existing files only; a patch that would create a
+new file or delete one entirely isn't supported — use `write_file`/
+`delete_file` for those.
+
 Build/test the workspace:
 
 ```
@@ -695,6 +708,7 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 | `glob` | path search under a directory | none (auto-allowed) |
 | `write_file` | create/overwrite a file | prompt (then cacheable) |
 | `edit_file` | exact-substring replace in a file | prompt (then cacheable) |
+| `patch_file` | apply a unified-diff patch to an existing file | prompt (then cacheable) |
 | `run_command` | run one of a fixed, configured allowlist by name | prompt / pre-approved |
 | `run_shell` | run an arbitrary `sh -c` command | prompt / pre-approved |
 | `set_tasks` | replace the agent's own task list (shown in the TUI) | none (internal state only) |

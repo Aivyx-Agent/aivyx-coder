@@ -243,16 +243,11 @@ test quality, and documentation closed 10 findings directly (argument-blind
 MCP Always-Allow cache, sub-agent injection-taint isolation, thin
 `deny_paths` defaults, five documentation-accuracy fixes, an untested
 injection-scan tie-break rule, unlabeled web_fetch/web_search injection
-sources, and Plan mode not surviving `--resume`). The remaining two are
-sized as their own features — each needs a real design pass (tool-trait
+sources, and Plan mode not surviving `--resume`). The remaining one is
+sized as its own feature — it needs a real design pass (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
-same-session patch — so they're tracked here instead of built ad hoc:
+same-session patch — so it's tracked here instead of built ad hoc:
 
-- **Patch-apply tool**: edits go through `edit_file` (single search/replace)
-  or a full `write_file` rewrite; there's no tool that takes ready-made
-  unified-diff/patch text and applies it directly. Relevant when a model
-  (or the user) already has a well-formed patch rather than needing to
-  re-derive one as a search/replace pair.
 - **Verification test-selection**: enforced verification always re-runs
   the entire configured `[verification] command`. There's no mechanism to
   scope a retry to just the tests relevant to the files touched in that
