@@ -44,7 +44,7 @@ enum RunOutcome {
 /// failing test/build run is expected, informative verification-loop
 /// information, not a tool-level failure. `Err` is reserved for the tool
 /// failing to run the command at all (spawn failure, timeout, cancellation).
-pub(crate) async fn run(
+pub async fn run(
     mut command: tokio::process::Command,
     timeout: Duration,
     cancellation: tokio_util::sync::CancellationToken,
