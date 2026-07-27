@@ -20,6 +20,7 @@ fn tool_kind(name: &str) -> ToolKind {
         "read_file" | "grep" | "glob" | "git_read" => ToolKind::Read,
         "write_file" | "edit_file" => ToolKind::Edit,
         "delete_file" => ToolKind::Delete,
+        "move_file" => ToolKind::Move,
         "run_command" | "run_shell" | "git_commit" | "git_branch" | "git_push" | "git_pr" => {
             ToolKind::Execute
         }
@@ -161,6 +162,21 @@ mod tests {
         assert_eq!(tool_call.title, "write_file");
         assert_eq!(tool_call.kind, ToolKind::Edit);
         assert!(tool_call.content.is_empty());
+    }
+
+    #[test]
+    fn tool_call_detected_for_move_file_maps_to_move_kind() {
+        let call = ToolCall {
+            id: ToolCallId("call-1".to_string()),
+            name: "move_file".to_string(),
+            arguments: serde_json::json!({"from": "a.rs", "to": "b.rs"}),
+            source: ToolCallSource::Native,
+        };
+        let update = translate_event(&sid(), &AgentEvent::ToolCallDetected(call)).unwrap();
+        let SessionUpdate::ToolCall(tool_call) = update else {
+            panic!("expected ToolCall");
+        };
+        assert_eq!(tool_call.kind, ToolKind::Move);
     }
 
     #[test]

@@ -553,6 +553,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deny_paths_blocks_a_move_whose_source_and_destination_both_match() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.ssh")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/.ssh/id_ed25519",
+                "/home/user/.ssh/id_ed25519.bak",
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn always_allow_for_a_move_does_not_cover_a_different_destination_with_the_same_source() {
         let prompter = Arc::new(FakePrompter {
             response: UserResponse::AllowAlways,
@@ -640,6 +667,38 @@ mod tests {
             .check(&move_request(
                 "/home/user/project/src/a.rs",
                 "/tmp/exfiltrated.rs",
+            ))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("cwd") || reason.contains("worktree"), "reason: {reason}");
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_a_move_whose_source_is_outside_the_worktree() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/tmp/outside.rs",
+                "/home/user/project/src/inside.rs",
             ))
             .await;
 

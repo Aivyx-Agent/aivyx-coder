@@ -331,6 +331,20 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_path_onto_itself_is_rejected_as_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![]);
+        let result = tool.permission_request(&json!({ "from": "a.txt", "to": "a.txt" }), dir.path());
+
+        let Err(ToolError::ExecutionFailed(message)) = result else {
+            panic!("expected ExecutionFailed, got {result:?}");
+        };
+        assert!(message.contains("already exists"), "message: {message}");
+    }
+
+    #[test]
     fn cross_filesystem_rename_error_is_surfaced_clearly() {
         let err = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
         let mapped = map_rename_error(err, Path::new("/a/old.txt"), Path::new("/b/new.txt"));
@@ -424,6 +438,25 @@ mod tests {
         let preview = request.preview.expect("expected a preview");
         assert!(preview.contains("a.rs"));
         assert!(preview.contains("b.rs"));
+    }
+
+    #[test]
+    fn preview_truncates_directory_listing_when_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        for i in 0..(MAX_LISTED_ENTRIES + 5) {
+            std::fs::write(dir.path().join(format!("src/f{i}.txt")), "").unwrap();
+        }
+
+        let tool = MoveFileTool::new(vec![]);
+        let request = tool
+            .permission_request(&json!({ "from": "src", "to": "lib" }), dir.path())
+            .unwrap();
+
+        let preview = request.preview.expect("expected a preview");
+        let listed = preview.lines().filter(|l| l.ends_with(".txt")).count();
+        assert_eq!(listed, MAX_LISTED_ENTRIES);
+        assert!(preview.contains(&format!("{MAX_LISTED_ENTRIES}+ files")));
     }
 
     #[test]
