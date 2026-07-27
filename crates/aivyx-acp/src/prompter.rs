@@ -37,6 +37,7 @@ fn target_string(target: &PermissionTarget) -> String {
         PermissionTarget::Path(path) => path.display().to_string(),
         PermissionTarget::Command { program, args } => format!("{program} {}", args.join(" ")),
         PermissionTarget::Other(description) => description.clone(),
+        PermissionTarget::Move { from, to } => format!("{} -> {}", from.display(), to.display()),
     }
 }
 
@@ -85,6 +86,7 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
         ActionKind::Write => ToolKind::Edit,
         ActionKind::Delete => ToolKind::Delete,
         ActionKind::Execute => ToolKind::Execute,
+        ActionKind::Move => ToolKind::Move,
         ActionKind::McpTool | ActionKind::Memory | ActionKind::Interact => ToolKind::Other,
         ActionKind::Read | ActionKind::Internal => ToolKind::Other,
     };
@@ -260,6 +262,27 @@ mod tests {
         assert!(acp.tool_call.fields.content.as_ref().unwrap().is_empty());
         assert_eq!(acp.tool_call.fields.kind, Some(ToolKind::Execute));
         assert_eq!(acp.tool_call.tool_call_id.0.as_ref(), "call-1");
+    }
+
+    #[test]
+    fn move_request_maps_to_move_tool_kind_and_arrow_title() {
+        let request = PermissionRequest {
+            tool_name: "move_file".to_string(),
+            action: ActionKind::Move,
+            target: PermissionTarget::Move {
+                from: PathBuf::from("/project/old.rs"),
+                to: PathBuf::from("/project/new.rs"),
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
+        assert_eq!(acp.tool_call.fields.kind, Some(ToolKind::Move));
+        assert_eq!(
+            acp.tool_call.fields.title.as_deref(),
+            Some("/project/old.rs -> /project/new.rs")
+        );
     }
 
     #[test]
