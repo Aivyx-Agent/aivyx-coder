@@ -70,6 +70,13 @@ enum PermissionKey {
         action: ActionKind,
         description: String,
     },
+    /// No `action` field, same reasoning as `Command`'s own key: a `Move`
+    /// target only ever pairs with `ActionKind::Move`, so the shape is
+    /// already 1:1 without it.
+    Move {
+        from: PathBuf,
+        to: PathBuf,
+    },
 }
 
 impl PermissionKey {
@@ -86,6 +93,10 @@ impl PermissionKey {
             PermissionTarget::Other(description) => PermissionKey::Other {
                 action: request.action,
                 description: description.clone(),
+            },
+            PermissionTarget::Move { from, to } => PermissionKey::Move {
+                from: from.clone(),
+                to: to.clone(),
             },
         }
     }
@@ -160,25 +171,33 @@ impl ConfirmationGate {
     }
 
     fn is_denied(&self, request: &PermissionRequest) -> bool {
-        let PermissionTarget::Path(path) = &request.target else {
-            return false;
-        };
-        path_is_denied(path, &self.deny_paths)
+        match &request.target {
+            PermissionTarget::Path(path) => path_is_denied(path, &self.deny_paths),
+            PermissionTarget::Move { from, to } => {
+                path_is_denied(from, &self.deny_paths) || path_is_denied(to, &self.deny_paths)
+            }
+            PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
+        }
     }
 
-    /// The autonomous-mode edit boundary: a `Write`/`Delete` action on a
-    /// `Path` target is only in-scope if the resolved path is at-or-under
-    /// `cwd`. Only meaningful for autonomous mode — interactive mode relies
-    /// on a human seeing the target in the confirmation modal instead (see
-    /// the Phase 11c design doc's "gap found during design" section).
+    /// The autonomous-mode edit boundary: a `Write`/`Delete`/`Move` action
+    /// is only in-scope if every path it touches is at-or-under `cwd` — for
+    /// `Move` that means both `from` and `to`. Only meaningful for
+    /// autonomous mode — interactive mode relies on a human seeing the
+    /// target in the confirmation modal instead (see the Phase 11c design
+    /// doc's "gap found during design" section).
     fn is_outside_autonomous_worktree(&self, request: &PermissionRequest, cwd: &Path) -> bool {
-        if !matches!(request.action, ActionKind::Write | ActionKind::Delete) {
+        if !matches!(
+            request.action,
+            ActionKind::Write | ActionKind::Delete | ActionKind::Move
+        ) {
             return false;
         }
-        let PermissionTarget::Path(path) = &request.target else {
-            return false;
-        };
-        !path.starts_with(cwd)
+        match &request.target {
+            PermissionTarget::Path(path) => !path.starts_with(cwd),
+            PermissionTarget::Move { from, to } => !from.starts_with(cwd) || !to.starts_with(cwd),
+            PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
+        }
     }
 
     /// Races the terminal's own prompt against a possible editor-side
@@ -293,8 +312,10 @@ impl PermissionGate for ConfirmationGate {
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_INTERACT_DENIAL.to_string()));
             }
-            if (matches!(request.action, ActionKind::Write | ActionKind::Delete)
-                || matches!(request.target, PermissionTarget::Command { .. }))
+            if (matches!(
+                request.action,
+                ActionKind::Write | ActionKind::Delete | ActionKind::Move
+            ) || matches!(request.target, PermissionTarget::Command { .. }))
                 && let Some(finding) = self.injection_taint.current()
             {
                 tracing::warn!(
@@ -322,11 +343,12 @@ impl PermissionGate for ConfirmationGate {
             }
             return match &request.target {
                 // Already passed the cwd-boundary check above (or wasn't a
-                // Write/Delete-on-Path at all, e.g. a Read/Internal target
-                // reaching here would be unusual since tier 2 already
-                // caught those — but Other targets like set_tasks's aren't
-                // Path/Command, so they fall here too and must be allowed).
-                PermissionTarget::Path(_) | PermissionTarget::Other(_) => {
+                // Write/Delete/Move-on-Path(-like) target at all, e.g. a
+                // Read/Internal target reaching here would be unusual since
+                // tier 2 already caught those — but Other targets like
+                // set_tasks's aren't Path/Command, so they fall here too
+                // and must be allowed).
+                PermissionTarget::Path(_) | PermissionTarget::Other(_) | PermissionTarget::Move { .. } => {
                     tracing::info!(
                         tool = %request.tool_name,
                         action = ?request.action,
@@ -460,6 +482,211 @@ mod tests {
             action: ActionKind::Read,
             ..write_request(path)
         }
+    }
+
+    fn move_request(from: &str, to: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "move_file".to_string(),
+            action: ActionKind::Move,
+            target: PermissionTarget::Move {
+                from: PathBuf::from(from),
+                to: PathBuf::from(to),
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_paths_blocks_a_move_whose_source_matches() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.ssh")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/.ssh/id_ed25519",
+                "/home/user/project/stolen_key",
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deny_paths_blocks_a_move_whose_destination_matches() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![PathBuf::from("/home/user/.config/aivyx-coder")],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/project/notes.txt",
+                "/home/user/.config/aivyx-coder/notes.txt",
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn always_allow_for_a_move_does_not_cover_a_different_destination_with_the_same_source() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let first = gate
+            .check(&move_request("/home/user/project/a.rs", "/home/user/project/b.rs"))
+            .await;
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // Same exact pair again: cached, no second prompt.
+        let second = gate
+            .check(&move_request("/home/user/project/a.rs", "/home/user/project/b.rs"))
+            .await;
+        assert_eq!(second, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // Same source, different destination: still prompts.
+        let third = gate
+            .check(&move_request("/home/user/project/a.rs", "/home/user/project/c.rs"))
+            .await;
+        assert_eq!(third, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_allows_a_move_within_the_worktree() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/project/src/a.rs",
+                "/home/user/project/src/b.rs",
+            ))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_a_move_whose_destination_is_outside_the_worktree() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/project/src/a.rs",
+                "/tmp/exfiltrated.rs",
+            ))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("cwd") || reason.contains("worktree"), "reason: {reason}");
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_a_move_once_injection_taint_is_flagged() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let injection_taint = InjectionTaint::new();
+        injection_taint.flag(InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(injection_taint);
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/project/src/a.rs",
+                "/home/user/project/src/b.rs",
+            ))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("notes.txt"), "reason: {reason}");
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

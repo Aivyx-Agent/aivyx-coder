@@ -100,6 +100,13 @@ pub enum ActionKind {
     /// that writes to a live process's stdin) and from `Execute` (which
     /// would mean re-prompting on every send, defeating the point).
     Interact,
+    /// Relocating or renaming a file or directory (`move_file`). Neither a
+    /// pure `Write` (the old path stops existing) nor a pure `Delete` (the
+    /// content survives, just at a new path) — kept distinct so the
+    /// confirmation modal, audit log, and autonomous-mode gating can
+    /// describe it honestly, the same reasoning `ActionKind::Delete`'s own
+    /// doc comment already gives for not folding deletion into `Write`.
+    Move,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +114,12 @@ pub enum PermissionTarget {
     Path(PathBuf),
     Command { program: String, args: Vec<String> },
     Other(String),
+    /// A move/rename's two endpoints. Kept structured (not folded into
+    /// `Other(String)`) because `deny_paths` and the autonomous-mode
+    /// worktree-boundary check both need real `PathBuf`s for *both* ends —
+    /// approving `move a.rs b.rs` must not bless `move c.rs d.rs`, the same
+    /// exact-target discipline `Command`'s cache key already documents.
+    Move { from: PathBuf, to: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

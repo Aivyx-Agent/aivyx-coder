@@ -48,6 +48,11 @@ pub(crate) enum ApprovalContent {
     McpTool {
         description: String,
     },
+    Move {
+        from: String,
+        to: String,
+        preview: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +136,7 @@ pub(crate) fn build_pending_request(
         PermissionTarget::Path(path) => path.display().to_string(),
         PermissionTarget::Command { program, args } => format!("{program} {}", args.join(" ")),
         PermissionTarget::Other(description) => description.clone(),
+        PermissionTarget::Move { from, to } => format!("{} -> {}", from.display(), to.display()),
     };
 
     let content = match request.action {
@@ -160,6 +166,16 @@ pub(crate) fn build_pending_request(
         ActionKind::McpTool => ApprovalContent::McpTool {
             description: request.preview.clone().unwrap_or_else(|| target.clone()),
         },
+        ActionKind::Move => {
+            let PermissionTarget::Move { from, to } = &request.target else {
+                return None;
+            };
+            ApprovalContent::Move {
+                from: from.display().to_string(),
+                to: to.display().to_string(),
+                preview: request.preview.clone(),
+            }
+        }
         // `Memory` and `Interact` fall back to the terminal-only path like Read/Internal:
         // there's no `ApprovalContent` shape defined for them yet, and the
         // editor-approval channel simply not participating for these
@@ -354,6 +370,30 @@ mod tests {
             panic!("expected McpTool content");
         };
         assert_eq!(description, "search_docs(query=\"foo\")");
+    }
+
+    #[test]
+    fn builds_move_content_from_the_move_target() {
+        let request = PermissionRequest {
+            tool_name: "move_file".to_string(),
+            action: ActionKind::Move,
+            target: PermissionTarget::Move {
+                from: PathBuf::from("/project/old.rs"),
+                to: PathBuf::from("/project/new.rs"),
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: Some("fn main() {}\n".to_string()),
+            diff: None,
+        };
+
+        let pending = build_pending_request(&request, "req-1".to_string()).unwrap();
+        assert_eq!(pending.target, "/project/old.rs -> /project/new.rs");
+        let ApprovalContent::Move { from, to, preview } = pending.content else {
+            panic!("expected Move content");
+        };
+        assert_eq!(from, "/project/old.rs");
+        assert_eq!(to, "/project/new.rs");
+        assert_eq!(preview, Some("fn main() {}\n".to_string()));
     }
 
     #[test]
