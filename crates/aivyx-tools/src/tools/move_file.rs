@@ -111,6 +111,19 @@ impl Tool for MoveFileTool {
         let from = resolve(&ctx.cwd, &args.from);
         let to = resolve(&ctx.cwd, &args.to);
 
+        // Re-checked here, not just in permission_request: narrows (does not
+        // eliminate) the window between the user approving the move and this
+        // call actually running, during which something could have created
+        // `to` — rename(2) would otherwise silently replace it. symlink_metadata
+        // (not metadata) so a symlink planted at `to` is caught without
+        // following it.
+        if std::fs::symlink_metadata(&to).is_ok() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "{} now exists (created after this move was approved) — refusing to overwrite it",
+                to.display()
+            )));
+        }
+
         tokio::fs::rename(&from, &to)
             .await
             .map_err(|err| map_rename_error(err, &from, &to))?;
@@ -261,5 +274,29 @@ mod tests {
         let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let mapped = map_rename_error(err, Path::new("/a/old.txt"), Path::new("/b/new.txt"));
         assert!(matches!(mapped, ToolError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_a_destination_that_appeared_after_permission_was_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "hello\n").unwrap();
+        // Simulates the race: permission_request ran (and approved) when
+        // new.txt didn't exist yet, but something created it before execute()
+        // ran — calling execute() directly here skips permission_request
+        // entirely, which is exactly that scenario.
+        std::fs::write(dir.path().join("new.txt"), "raced in\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![]);
+        let result = tool
+            .execute(json!({ "from": "old.txt", "to": "new.txt" }), &ctx(dir.path()))
+            .await;
+
+        assert!(result.is_err(), "execute must refuse rather than silently clobber");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "raced in\n",
+            "the pre-existing destination content must survive"
+        );
+        assert!(dir.path().join("old.txt").exists(), "the source must not have moved");
     }
 }
