@@ -80,6 +80,41 @@ pub(crate) struct VerificationConfig {
     /// would report "still failing" without ever actually attempting a
     /// verification run.
     pub(crate) max_retries: u32,
+    /// Set via `Agent::set_scoped_verification` (called separately, after
+    /// `set_verification` establishes the base config this field attaches
+    /// to). `None` means every retry always runs the full `command_name`,
+    /// exactly as before this feature existed. See
+    /// docs/superpowers/specs/2026-07-28-verification-test-selection-design.md.
+    pub(crate) scoped: Option<ScopedVerificationConfig>,
+}
+
+/// Which command produced a `run_auto_verification`-style result — tags
+/// `Agent::last_verification_output` so the "what's new since last
+/// attempt" comparison never compares a scoped run's (small, targeted)
+/// output against a full run's (large, comprehensive) one, which would
+/// produce a misleading note dominated by irrelevant noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationKind {
+    Full,
+    Scoped,
+}
+
+/// The scoped-verification command and the confiner to sandbox it with —
+/// bundled together since the scoped run bypasses `ToolExecutor::dispatch`
+/// entirely (see the design doc's Decision 4) and must apply the same
+/// confinement `dispatch` would have applied, manually.
+#[derive(Clone)]
+pub(crate) struct ScopedVerificationConfig {
+    pub(crate) spec: aivyx_tools::CommandSpec,
+    pub(crate) confiner: std::sync::Arc<dyn aivyx_sandbox::ExecutionConfiner>,
+}
+
+impl std::fmt::Debug for ScopedVerificationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedVerificationConfig")
+            .field("spec", &self.spec)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Scalar knobs for an `Agent`, grouped so `Agent::new`'s arity stays sane
@@ -136,4 +171,40 @@ pub(crate) struct AgentsFileConfig {
 /// mirroring `AgentsFileConfig`'s own pattern.
 pub(crate) struct EditorContextConfig {
     pub(crate) deny_paths: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivyx_sandbox::NoopConfiner;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn scoped_verification_config_is_cloneable_and_debug_formattable() {
+        let scoped = ScopedVerificationConfig {
+            spec: aivyx_tools::CommandSpec {
+                name: "test_scoped".to_string(),
+                program: "pytest".to_string(),
+                args: vec!["{touched_paths}".to_string()],
+                timeout: Duration::from_secs(30),
+            },
+            confiner: Arc::new(NoopConfiner),
+        };
+        let cloned = scoped.clone();
+        assert_eq!(cloned.spec.name, "test_scoped");
+        // Must not panic and must not attempt to format the confiner itself.
+        let debug_text = format!("{scoped:?}");
+        assert!(debug_text.contains("test_scoped"));
+    }
+
+    #[test]
+    fn verification_config_carries_an_optional_scoped_config() {
+        let config = VerificationConfig {
+            command_name: "test".to_string(),
+            max_retries: 3,
+            scoped: None,
+        };
+        assert!(config.scoped.is_none());
+    }
 }

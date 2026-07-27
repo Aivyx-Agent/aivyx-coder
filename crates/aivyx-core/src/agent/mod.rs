@@ -330,6 +330,7 @@ impl Agent {
         self.verification = Some(VerificationConfig {
             command_name,
             max_retries: max_retries.max(1),
+            scoped: None,
         });
     }
 
