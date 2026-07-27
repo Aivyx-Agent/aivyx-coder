@@ -66,6 +66,12 @@ pub struct VerificationSettings {
     /// on this round of edits and lets the turn end anyway, with a loud
     /// notice rather than silence. Clamped to a minimum of 1 by the agent.
     pub max_auto_verify_retries: u32,
+    /// Another `[[permissions.allowed_commands]]` entry name, whose `args`
+    /// may contain the literal token `"{touched_paths}"` — substituted at
+    /// runtime with the files touched since edits became unverified, one
+    /// argv entry per path. `None` (the default) means every retry always
+    /// runs the full `command`, exactly as before this field existed.
+    pub scoped_command: Option<String>,
 }
 
 impl Default for VerificationSettings {
@@ -73,6 +79,7 @@ impl Default for VerificationSettings {
         Self {
             command: None,
             max_auto_verify_retries: 3,
+            scoped_command: None,
         }
     }
 }
@@ -907,6 +914,29 @@ mod tests {
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.verification.command.as_deref(), Some("test"));
         assert_eq!(settings.verification.max_auto_verify_retries, 5);
+    }
+
+    #[test]
+    fn scoped_command_defaults_to_none() {
+        let settings = VerificationSettings::default();
+        assert_eq!(settings.scoped_command, None);
+    }
+
+    #[test]
+    fn scoped_command_deserializes_when_present() {
+        let toml = r#"
+            command = "test"
+            scoped_command = "test_scoped"
+        "#;
+        let settings: VerificationSettings = toml::from_str(toml).unwrap();
+        assert_eq!(settings.scoped_command, Some("test_scoped".to_string()));
+    }
+
+    #[test]
+    fn scoped_command_defaults_to_none_when_absent_from_toml() {
+        let toml = r#"command = "test""#;
+        let settings: VerificationSettings = toml::from_str(toml).unwrap();
+        assert_eq!(settings.scoped_command, None);
     }
 
     #[test]
