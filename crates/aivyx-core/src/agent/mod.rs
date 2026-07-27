@@ -1480,9 +1480,10 @@ impl Agent {
 
                 // Captured before the move below — feeds
                 // `unverified_edits` for the enforced-verification check at
-                // the top of this loop (Phase 12 Part B). Reuses the same
-                // name list prompted mode already hides edit tools behind,
-                // rather than a second hardcoded pair.
+                // the top of this loop (Phase 12 Part B). Uses the dedicated
+                // `VERIFICATION_TRIGGER_TOOLS` list (see its own doc comment
+                // for why this is deliberately not the same list prompted
+                // mode hides edit tools behind).
                 let is_edit_call = VERIFICATION_TRIGGER_TOOLS.contains(&call.name.as_str());
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
