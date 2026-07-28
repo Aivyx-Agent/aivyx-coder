@@ -3089,3 +3089,35 @@ absolute-path defaults, closing the exact gap the audit found out of the
 box rather than shipping the mechanism only and requiring users to opt
 in — consistent with this project's existing conservative-security-default
 posture.
+
+**The final whole-branch review found two Important gaps neither the
+design nor any task-level review had surfaced**, both fixed before merge
+rather than expanding the feature's scope mid-review: (1) `README.md`
+overstated Landlock's kernel-level enforcement for command tools —
+`grant_paths_excluding` (`crates/aivyx-sandbox/src/confiner.rs`) only
+understands fixed-path carve-outs, so a bare basename-glob entry is
+silently never carved out and a confined `run_shell`/`run_command` child
+can still read a file matching one; the README now says so honestly, and
+full Landlock closure is logged to `ROADMAP.md`'s backlog as its own
+future design pass. (2) A **third, previously-unknown duplicate** of the
+matching logic exists in `crates/aivyx-repomap/src/lib.rs`'s own
+`is_denied` — missed during design because that crate is deliberately
+zero-dependency on every other workspace crate (can't call
+`aivyx_sandbox::path_is_denied` or add `globset`); documented in place and
+in the backlog rather than fixed, since no default entry has a
+repomap-parsed extension so current impact is nil. A third, smaller
+Important finding — a malformed bare glob pattern (e.g. a typo) silently
+never matching anything, with no warning — was fixed directly: validated
+once at settings-resolution time in `resolved_deny_paths` (not per-call,
+which would spam), mirroring the project's existing `~username`-syntax
+warning precedent. Two Minor findings (a documented trailing-slash
+classification edge case with no real-world trigger, and a test comment
+that overclaimed the scenario it demonstrated) were also fixed. **General
+lesson, worth carrying into any future security-boundary change in this
+project**: a feature that reuses one canonical matching function correctly
+across its planned call sites can still miss enforcement surfaces the plan
+never enumerated — the final whole-branch review, not any task-level
+review, is what caught both the Landlock gap and the third duplicate,
+because only a review scoped to "does this genuinely hold across the
+*whole* workspace" rather than "does this task's diff do what its brief
+says" would think to check `confiner.rs` and `aivyx-repomap` at all.
