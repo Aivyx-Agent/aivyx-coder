@@ -3556,6 +3556,147 @@ async fn last_verification_output_updates_after_every_call_regardless_of_outcome
 }
 
 #[tokio::test]
+async fn a_failing_scoped_run_skips_the_full_command_this_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    // The full command would pass if it ever ran — this test proves it
+    // never does, since the scoped command fails first.
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _) = build_agent(
+        vec![write_call, text_response("done"), text_response("still trying")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 1);
+    agent.verification.as_mut().unwrap().scoped = Some(ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "scoped".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    });
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    // Only the scoped attempt ran — exactly 1 AutoVerification call for
+    // max_retries: 1, proving the full command never ran.
+    assert_eq!(auto_verify_calls(&agent.history), 1);
+    assert!(agent.unverified_edits, "the iteration must report failure");
+}
+
+#[tokio::test]
+async fn a_passing_scoped_run_is_confirmed_by_a_full_run_that_can_still_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _) = build_agent(
+        vec![write_call, text_response("done"), text_response("still trying")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 1);
+    agent.verification.as_mut().unwrap().scoped = Some(ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "scoped".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    });
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    // Both the scoped (pass) and full (fail) commands ran in this single
+    // retry-budget iteration — 2 AutoVerification calls for max_retries: 1.
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        2,
+        "a passing scoped run must still be confirmed by one full run"
+    );
+    assert!(
+        agent.unverified_edits,
+        "the iteration's overall result is the full command's (failing) outcome, not the scoped pass"
+    );
+}
+
+#[tokio::test]
+async fn run_verification_attempt_falls_back_to_full_only_when_no_paths_are_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
+    let (mut agent, _rx, _) = build_agent(vec![], registry, 10);
+    agent.set_verification("verify".to_string(), 3);
+    agent.verification.as_mut().unwrap().scoped = Some(ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "scoped".to_string(),
+            program: "sh".to_string(),
+            // Would leave a marker file if it ever ran — proves it doesn't.
+            args: vec!["-c".to_string(), "touch scoped_ran".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    });
+    let verification = agent.verification.clone().unwrap();
+
+    // verification_touched_paths is empty — build_agent never dispatched
+    // any edit tool call, so run_verification_attempt is called directly
+    // here rather than through run_turn, isolating this one fallback case.
+    let passed = agent
+        .run_verification_attempt(&verification, dir.path(), &CancellationToken::new())
+        .await;
+
+    assert!(
+        passed,
+        "with no touched paths, only the (passing) full command should run"
+    );
+    assert!(
+        !dir.path().join("scoped_ran").exists(),
+        "the scoped command must never run when there are no touched paths to scope to"
+    );
+}
+
+#[tokio::test]
 async fn a_precancelled_turn_is_a_noop_with_only_the_user_message() {
     let (mut agent, _rx, mock) = build_agent(
         vec![vec![StreamEvent::Done {

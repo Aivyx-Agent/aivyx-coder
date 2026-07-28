@@ -884,6 +884,38 @@ impl Agent {
         passed
     }
 
+    /// One retry-budget attempt: if a scoped command is configured and at
+    /// least one path has been touched since edits became unverified, try
+    /// it first (bypassing the gate — see `run_scoped_verification`'s own
+    /// doc comment). A scoped pass is not yet a verified batch — one full
+    /// run is still required as the final gate, preserving the same
+    /// completeness guarantee this feature had before scoping existed. If
+    /// the scoped run fails, the full command is skipped entirely for
+    /// this iteration (that's the whole point of scoping: avoiding its
+    /// cost when it wouldn't change the outcome). Exactly one
+    /// `verify_retries` slot is consumed per call to this method by its
+    /// caller, regardless of whether it runs one command or two.
+    async fn run_verification_attempt(
+        &mut self,
+        verification: &VerificationConfig,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        if let Some(scoped) = verification.scoped.clone()
+            && !self.verification_touched_paths.is_empty()
+        {
+            let touched = self.verification_touched_paths.clone();
+            let scoped_passed = self
+                .run_scoped_verification(scoped, &touched, cwd, cancellation)
+                .await;
+            if !scoped_passed {
+                return false;
+            }
+        }
+        self.run_auto_verification(&verification.command_name, cwd, cancellation)
+            .await
+    }
+
     /// Runs one user turn to completion, then persists the session — the
     /// wrapper ensures *every* exit path of the inner loop (normal, error,
     /// iteration-cap, cancellation) saves, without threading a save into
@@ -1451,7 +1483,7 @@ impl Agent {
                     if self.verify_retries < verification.max_retries {
                         self.verify_retries += 1;
                         let passed = self
-                            .run_auto_verification(&verification.command_name, cwd, &cancellation)
+                            .run_verification_attempt(&verification, cwd, &cancellation)
                             .await;
                         if passed {
                             self.unverified_edits = false;
