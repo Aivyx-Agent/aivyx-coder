@@ -583,7 +583,11 @@ impl Default for PermissionSettings {
             // exhaustive (impossible to be), but covers the common,
             // high-value cases beyond SSH/AWS: GPG, generic netrc-style
             // creds, container/cluster/cloud-CLI auth, and package-registry
-            // tokens (including this project's own toolchain's).
+            // tokens (including this project's own toolchain's). The
+            // basename-glob entries below (no leading `~`) match by file
+            // name anywhere rather than one fixed location, covering
+            // project-local secrets like `.env` that recur across
+            // arbitrary project directories.
             deny_paths: vec![
                 "~/.ssh".to_string(),
                 "~/.aws".to_string(),
@@ -598,6 +602,12 @@ impl Default for PermissionSettings {
                 "~/.azure".to_string(),
                 "~/.cargo/credentials.toml".to_string(),
                 "~/.config/gh".to_string(),
+                ".env".to_string(),
+                ".env.*".to_string(),
+                "id_rsa".to_string(),
+                "id_ed25519".to_string(),
+                "*.pem".to_string(),
+                "*.key".to_string(),
             ],
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
@@ -840,6 +850,16 @@ mod tests {
             "~/.azure",
             "~/.cargo/credentials.toml",
             "~/.config/gh",
+            // Basename-glob entries (2026-07-28 capability audit): these
+            // recur across arbitrary project directories, unlike the
+            // fixed `~/`-anchored entries above, so they need matching
+            // by name rather than by one absolute location.
+            ".env",
+            ".env.*",
+            "id_rsa",
+            "id_ed25519",
+            "*.pem",
+            "*.key",
         ] {
             assert!(
                 deny_paths.contains(&expected.to_string()),
