@@ -503,6 +503,25 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_basename_deny_paths_entry_blocks_a_nested_move() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/.env"), "SECRET=1\n").unwrap();
+
+        let tool = MoveFileTool::new(vec![PathBuf::from(".env")]);
+        let result = tool.permission_request(
+            &json!({ "from": "secrets", "to": "archive/secrets" }),
+            dir.path(),
+        );
+
+        let Err(ToolError::ExecutionFailed(message)) = result else {
+            panic!("expected ExecutionFailed, got {result:?}");
+        };
+        assert!(message.contains(".env"), "message: {message}");
+        assert!(dir.path().join("secrets/.env").exists());
+    }
+
+    #[test]
     fn a_non_dotfile_deny_path_hidden_only_by_gitignore_is_still_caught() {
         // Regression test distinguishing the git-ignore-specific mechanism
         // from the hidden-dotfile filter the sibling test above actually

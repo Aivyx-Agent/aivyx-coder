@@ -297,6 +297,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bare_basename_deny_paths_entry_rejects_a_matching_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("secret")).unwrap();
+        std::fs::write(cwd.join("secret/.env"), "TOP-SECRET\n").unwrap();
+
+        let tool = GitCommitTool::new(vec![PathBuf::from(".env")]);
+        let result = tool
+            .execute(
+                json!({ "message": "sneaky", "paths": ["secret/.env"] }),
+                &ctx(&cwd),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
     async fn commit_all_excludes_denied_subpaths() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).await;

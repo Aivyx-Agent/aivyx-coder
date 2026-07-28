@@ -232,6 +232,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bare_basename_deny_paths_entry_blocks_a_nested_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_dir = dir.path().join("secret");
+        std::fs::create_dir(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("id_rsa.txt"), "").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "").unwrap();
+
+        let tool = GlobTool::new(vec![PathBuf::from("id_rsa.txt")]);
+        let output = run(&tool, dir.path(), args("**/*.txt", None)).await;
+
+        let ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("public.txt"));
+        assert!(!text.contains("id_rsa.txt"));
+    }
+
+    #[tokio::test]
     async fn does_not_follow_a_symlink_out_of_the_tree() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
