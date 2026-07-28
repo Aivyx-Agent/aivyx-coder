@@ -638,13 +638,25 @@ impl PermissionSettings {
     /// pattern to whatever the process's actual launch directory happens
     /// to contain instead. Path-like entries that can't be expanded (no
     /// home directory found) are skipped rather than left unresolved and
-    /// silently wrong.
+    /// silently wrong. A bare entry that isn't valid glob syntax (e.g. a
+    /// typo like `a[`) is warned about via `tracing::warn!` but still
+    /// passed through unchanged — the warning is purely additive
+    /// visibility, not a behavior change.
     pub fn resolved_deny_paths(&self) -> Vec<PathBuf> {
         let (bare, path_like): (Vec<String>, Vec<String>) = self
             .deny_paths
             .iter()
             .cloned()
             .partition(|raw| !raw.starts_with('~') && !raw.contains('/'));
+        for pattern in &bare {
+            if let Err(err) = globset::Glob::new(pattern) {
+                tracing::warn!(
+                    entry = %pattern,
+                    error = %err,
+                    "malformed basename-glob deny_paths entry; it will never match anything until fixed"
+                );
+            }
+        }
         let mut resolved = resolve_tilde_paths(&path_like);
         resolved.extend(bare.into_iter().map(PathBuf::from));
         resolved
@@ -918,6 +930,23 @@ mod tests {
         };
 
         assert!(settings.resolved_deny_paths().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_bare_glob_pattern_still_resolves_unchanged() {
+        // The warning this now emits isn't asserted here (this project's
+        // existing tests don't assert on tracing output either — see
+        // tilde_username_syntax_is_skipped_not_treated_as_literal above,
+        // which only checks behavior) — this just proves the fix is
+        // purely additive visibility, not a behavior change: a malformed
+        // pattern still passes through exactly as before, just now with
+        // a warning logged alongside it.
+        let settings = PermissionSettings {
+            deny_paths: vec!["a[".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert_eq!(settings.resolved_deny_paths(), vec![PathBuf::from("a[")]);
     }
 
     #[test]
@@ -1270,12 +1299,14 @@ mod tests {
         // were run through tilde/symlink resolution like a real path,
         // `canonicalize` could silently rewrite it into an absolute path
         // tied to wherever the process happened to be launched from —
-        // breaking the "matches this basename anywhere" semantic. Proven
-        // here by asserting the entry stays the literal configured
-        // string regardless of what the test process's own cwd contains
-        // (this test does not need to create a real `.env` file or
-        // change directory to prove it — the fix means resolution is
-        // never attempted at all for a bare entry).
+        // breaking the "matches this basename anywhere" semantic. This
+        // test does NOT create a colliding file or change directory to
+        // demonstrate the pre-fix bug directly (that would require
+        // mutating the test process's real cwd, which is fragile under
+        // parallel test execution) — it instead asserts the guaranteed
+        // post-fix invariant: resolution is never even attempted for a
+        // bare entry, so the result is deterministic regardless of what
+        // exists on disk anywhere.
         let settings = PermissionSettings {
             deny_paths: vec![".env".to_string()],
             ..PermissionSettings::default()

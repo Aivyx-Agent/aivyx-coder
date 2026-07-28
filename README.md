@@ -834,11 +834,18 @@ pointed at, which a fixed absolute path can't express. This covers:
   is checked directly.
 - **Search tools** (`grep`/`glob`): every walked entry is checked, so a search
   rooted *above* a denied directory still can't descend into it.
-- **Command tools** (`run_command`/`run_shell`): the shell can reference any
-  path, so `deny_paths` here is enforced at the **kernel** level — the Landlock
-  sandbox (below) simply never grants access to a denied path, so a shell
-  command physically cannot read or write it regardless of how the command is
-  phrased (redirection, env vars, etc.).
+- **Command tools** (`run_command`/`run_shell`): for a path-separator entry,
+  `deny_paths` is enforced at the **kernel** level — the Landlock sandbox
+  (below) simply never grants access to a denied path, so a shell command
+  physically cannot read or write it regardless of how the command is phrased
+  (redirection, env vars, etc.). **Basename-glob entries (no separator, e.g.
+  `.env`, `*.pem`) are not yet enforced at this layer** — Landlock's grant
+  construction (`grant_paths_excluding` in `confiner.rs`) only understands
+  fixed-path carve-outs, so a confined command can still read a file matching
+  a bare pattern. This is a known, tracked gap (see `ROADMAP.md`'s backlog) —
+  the basename-glob feature's primary protection is against the model's own
+  auto-allowed `read_file`/`grep`/`glob` calls (see tier 2 below), which *are*
+  fully covered.
 
 ### 2. `ConfirmationGate` — human-in-the-loop, tiered trust
 

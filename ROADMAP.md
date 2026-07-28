@@ -333,3 +333,22 @@ No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
+
+**Found at the deny_paths basename-glob feature's final whole-branch
+review (2026-07-29), logged rather than expanding that feature's scope
+mid-review**: basename-glob `deny_paths` entries (`.env`, `*.pem`, etc.)
+are enforced for the model's own file/search/git tools, but not yet for
+two other surfaces. (1) **Landlock command-tool grants**:
+`grant_paths_excluding` (`crates/aivyx-sandbox/src/confiner.rs`) only
+understands fixed-path carve-outs, so a confined `run_shell`/`run_command`
+child can still read a file matching a bare pattern — closing this needs
+real design work (translating a "matches anywhere" pattern into concrete
+filesystem grants at confiner-construction time, e.g. scanning a granted
+root for matching basenames the way nested absolute-path denials are
+already carved out). (2) **`aivyx-repomap`'s own duplicate `is_denied`**
+(a third copy never accounted for during that feature's design, since this
+crate is deliberately zero-dependency on every other workspace crate) has
+no basename-glob awareness either, though no *default* deny_paths entry
+has a repomap-parsed extension, so current impact is nil. Both are
+documented as known limitations in the affected code and in `README.md`
+(the Landlock one) rather than left silently wrong.

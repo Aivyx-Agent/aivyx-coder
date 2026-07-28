@@ -106,6 +106,7 @@ name = "aivyx-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "globset",
  "serde",
  "tempfile",
  "thiserror",
@@ -171,6 +172,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "directories",
+ "globset",
  "landlock",
  "libc",
  "seccompiler",

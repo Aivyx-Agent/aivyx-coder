@@ -275,6 +275,15 @@ pub fn default_confiner(
 /// single component in the first place when `aivyx-config`'s
 /// `resolved_deny_paths` deliberately left it unresolved for exactly this
 /// reason (see that function's own doc comment).
+///
+/// One documented edge case: a relative, non-`~`-prefixed entry that
+/// doesn't exist on disk at resolve time (e.g. a stray trailing-slash
+/// entry like `"secrets/"`) can reach here as an unresolved multi- or
+/// single-component relative `PathBuf` depending on its shape, which may
+/// not classify the way a human reading the raw config string would
+/// expect. No default entry or documented usage triggers this — deny_paths
+/// entries are meant to be absolute, `~`-prefixed, or bare basename
+/// patterns.
 pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     deny_paths.iter().any(|denied| {
         if denied.parent() == Some(Path::new("")) {

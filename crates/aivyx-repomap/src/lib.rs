@@ -221,6 +221,23 @@ impl RepoMap {
     }
 }
 
+/// Denies a path if it (or a symlink-resolved alias) sits under one of
+/// `deny_paths`' absolute/tilde-prefixed entries.
+///
+/// **Known gap (2026-07-29, found at the deny_paths basename-glob
+/// feature's final review):** this does NOT support the basename-glob
+/// matching `aivyx_sandbox::path_is_denied` added for bare entries like
+/// `.env`/`*.pem` — this crate is deliberately zero-dependency on every
+/// other workspace crate, so it can't call that function or add
+/// `globset`. A bare pattern here is compared via `starts_with` against
+/// an absolute path and will practically never match, so a repo-map-parsed
+/// source file matching a user's own bare `deny_paths` pattern would still
+/// have its symbols/signatures reach the system prompt. Lower severity
+/// than the file-read surface `path_is_denied` protects (only
+/// signatures reach the prompt here, not file content), and no *default*
+/// deny_paths entry has a repomap-parsed extension (`.rs`/`.py`/`.js`/
+/// `.jsx`/`.ts`/`.tsx`), so this wasn't treated as merge-blocking — see
+/// `ROADMAP.md`'s backlog for the tracked follow-up.
 fn is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     // Denied entries are canonicalized at config load; canonicalize the
     // candidate too so a symlinked spelling can't slip past the comparison
