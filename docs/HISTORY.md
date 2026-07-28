@@ -2951,3 +2951,81 @@ feature session as of this writing.
 backlog is closed** — no tracked items remain. The next
 capability-opportunity pass needs a fresh audit or brainstorm, not a pick
 from this list.
+
+### 2026-07-28 capability audit — done
+
+A fresh audit against the same four dimensions as the 2026-07-22 one
+(security posture, tool coverage, test quality, documentation), scoped
+explicitly to what's new since that audit closed: `move_file`
+(`ActionKind::Move`), `repl_start`/`repl_send`/`repl_stop`
+(`ActionKind::Interact`), `patch_file`, and `[verification]
+scoped_command`. Every finding below was independently re-verified by
+reading the actual code before being fixed or logged, not accepted from
+the audit pass alone — this project's own established practice for any
+audit finding.
+
+**Two documentation-accuracy gaps, fixed directly in `README.md`**:
+
+1. The autonomous-mode trust-profile paragraph was written before
+   `repl_start` was added to `AUTONOMOUS_HIDDEN_TOOLS`
+   (`crates/aivyx-core/src/agent/mod.rs:133`) and before
+   `ConfirmationGate` grew its MCP-tool, `remember_preference`, and
+   `repl_send`/`repl_stop` denial branches (`crates/aivyx-sandbox/src/confirmation.rs`'s
+   `AUTONOMOUS_MCP_TOOL_DENIAL`/`AUTONOMOUS_MEMORY_DENIAL`/
+   `AUTONOMOUS_INTERACT_DENIAL`) — none of these four denials were
+   mentioned anywhere in the documented trust profile. Fixed by
+   extending the paragraph to name all of them.
+2. The TOCTOU "Known limitations" bullet listed `write_file`/`edit_file`/
+   `read_file` as resolving their path twice (once for the confirmation
+   preview, once at execution) but omitted `patch_file`, which has the
+   identical two-resolve shape
+   (`crates/aivyx-tools/src/tools/patch_file.rs`'s `permission_request`
+   and `execute` each independently call `resolve`). Fixed by adding it
+   to the bullet.
+
+**Two genuine new-capability gaps, logged to `ROADMAP.md`'s Backlog
+section rather than patched ad hoc** (both need a user-facing design
+decision, not a mechanical fix):
+
+1. **`deny_paths` has no basename/glob matching** — `path_is_denied`
+   (`crates/aivyx-sandbox/src/lib.rs`) is a plain `starts_with` over fixed
+   absolute paths, so a project-local secret file like `.env` — which
+   recurs across arbitrary project directories the agent might be pointed
+   at — has no default protection the way `~/.ssh`/`~/.aws`/etc. do.
+   `README.md` describes `deny_paths` as the *sole* protection against
+   the model reading plaintext credentials via a normal, auto-allowed
+   read — a fresh clone's `.env` is invisible to it today. Notably, this
+   project's own `move_file` test suite already comments on `.env` by
+   name as "exactly the kind of file that's both deny_paths-worthy and
+   routinely gitignored" (in the context of `move_file`'s own, unrelated
+   nested-directory recursive scan) — the audit connected that existing
+   observation to a gap in the *default* protection mechanism itself,
+   which no prior phase had addressed.
+2. **`delegate_task` sub-agents share the parent's single global REPL
+   session** — `crates/aivyx/src/agent_builder.rs` clones the same
+   `ToolRegistry` (same underlying `Arc<Mutex<Option<ReplSession>>>`,
+   since the REPL tools were constructed with `Arc::clone`d handles
+   before registration) into the sub-agent registry; the only sub-agent
+   tool exclusion that exists (`sub_agent_registry_never_contains_delegate_task_itself`)
+   prevents recursive delegation, not REPL access. This breaks
+   `delegate_task`'s own documented "fresh, isolated agent, completely
+   separate conversation history" invariant: a sub-agent's `repl_start`
+   is invisible to the parent's history, yet the spawned process outlives
+   the sub-agent and can collide with the parent's own REPL usage. This
+   is the second sub-agent-parity gap found in this project (the first,
+   `scoped_command` not being threaded through to sub-agents, was
+   explicitly scoped out of the verification-test-selection design above
+   as a reasonable future increment rather than a defect) — but unlike
+   that one, this is a genuine isolation-invariant break, not just a
+   missing feature.
+
+**Nothing new found in test quality or the security
+gate-tier-order/Landlock dimension**: every current tool's
+`ActionKind`/`PermissionTarget` pairing was checked against its real
+capability (no under-claiming found), `ConfirmationGate`'s tier order and
+its three newest denial branches are independently tested, and a spot
+check of the newest tests (`move_file.rs`, `patch_file.rs`, `repl.rs`, and
+the scoped-verification tests in `agent/tests.rs`) found no vacuous
+assertions or hidden-mechanism shortcuts of the kind this project has hit
+before (the TypeScript reference-tracking test, the non-gitignore-aware
+move-scan test).

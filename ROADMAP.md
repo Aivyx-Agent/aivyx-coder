@@ -286,5 +286,43 @@ verification test-selection, needed a real design pass of its own (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
 same-session patch; it shipped as `[verification] scoped_command` (see
 "Verification test-selection" above). With that done, this audit's
-backlog is now fully resolved — the next capability-opportunity pass needs
-a fresh audit, not a pick from this list.
+backlog is now fully resolved.
+
+A fresh audit (2026-07-28) covering the same four dimensions against the
+current codebase found two documentation-accuracy gaps, fixed directly
+(the autonomous-mode paragraph was missing `repl_start`/MCP-tool/
+`remember_preference` denials added since it was written; the TOCTOU
+known-limitation bullet was missing `patch_file`, which has the identical
+resolve-twice exposure) — and two genuine new-capability gaps, logged
+here rather than patched ad hoc:
+
+- **`deny_paths` has no way to protect a project-local secret file (e.g.
+  `.env`) that recurs across arbitrary project directories** — matching is
+  `starts_with` on fixed, absolute/home-relative paths only
+  (`crates/aivyx-sandbox/src/lib.rs`'s `path_is_denied`), so a user would
+  have to hand-add every project's own absolute `.env` path one at a time.
+  `deny_paths` is documented as the *sole* protection against the model
+  reading plaintext credentials via a normal, auto-allowed
+  `ActionKind::Read` call — a fresh clone's `.env` is invisible to it by
+  default. Needs its own design pass: basename matching, glob patterns, or
+  gitignore-style relative patterns are all plausible, each with different
+  false-positive/complexity tradeoffs worth walking through with the user
+  rather than picking unilaterally.
+- **`delegate_task` sub-agents share the parent's single global REPL
+  session slot**, breaking the "fresh, isolated agent, completely separate
+  conversation history" invariant `delegate_task` is documented to
+  provide. `crates/aivyx/src/agent_builder.rs` clones the same
+  `ToolRegistry` (same underlying `Arc<Mutex<Option<ReplSession>>>`) for
+  sub-agents; `sub_agent_registry_never_contains_delegate_task_itself` is
+  the only sub-agent tool exclusion that exists today. A sub-agent's
+  `repl_start` call is invisible to the parent's own history, yet the
+  process it starts outlives the sub-agent and can collide with (or be
+  silently reused/blocked by) the parent's own REPL usage. Needs its own
+  design pass: exclude REPL tools from the sub-agent registry entirely,
+  give each sub-agent a private session slot, or auto-stop any session a
+  sub-agent leaves running when it completes.
+
+No new capability opportunities were found in test quality or the
+security/gate-tier-order/Landlock dimension this pass — see
+`docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
+account of what was checked.

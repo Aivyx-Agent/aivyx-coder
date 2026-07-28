@@ -188,10 +188,17 @@ profile: `write_file`/`edit_file` are auto-allowed only when the resolved
 target is inside the process's `cwd` (a new boundary check — file edits
 have no Landlock scoping the way spawned commands do) and outside
 `deny_paths`; `run_command` is auto-allowed only for a pre-seeded
-`allowed_commands` entry; `run_shell` and `git_commit` are hidden from the
-model entirely and denied at the gate as a backstop if invoked anyway
-(`git_commit`'s target is never cacheable, so it falls out of the same
-cache-miss-denies rule with no special-casing). A driver loop sends the
+`allowed_commands` entry; `run_shell`, `git_commit`, and `repl_start` are
+hidden from the model entirely and denied at the gate as a backstop if
+invoked anyway (`git_commit`'s target is never cacheable, so it falls out
+of the same cache-miss-denies rule with no special-casing). `repl_send`/
+`repl_stop` are likewise denied outright if a hidden `repl_start` is
+somehow still reached — there is no human to answer a REPL prompt in
+autonomous mode. Every MCP tool call and `remember_preference` are also
+unconditionally denied: there's no way to pre-approve an MCP tool the way
+`allowed_commands` pre-approves a shell command, and `remember_preference`
+edits a file whose effect isn't scoped to the current worktree the normal
+Write/Delete boundary check bounds. A driver loop sends the
 goal, continues on `AgentEvent::TurnPaused`, and stops once every task in
 the task list is `Done`, the iteration/wall-clock budget from `[autonomous]`
 is exhausted, or you cancel. If enforced verification (above) exhausts its
@@ -1028,10 +1035,10 @@ Deliberately not (yet) addressed — documented rather than hidden:
 - **Environment variables are inherited** by spawned commands (needed by real
   toolchains). A command like `env` will see whatever secrets are in your
   shell environment. This is standard for shell tools but worth knowing.
-- **TOCTOU windows**: `write_file`/`edit_file`/`read_file` resolve their path
-  once for the confirmation preview and again at execution; a symlink swapped
-  in between could redirect the operation. `deny_paths` and the Landlock scope
-  still bound the blast radius.
+- **TOCTOU windows**: `write_file`/`edit_file`/`read_file`/`patch_file` resolve
+  their path once for the confirmation preview and again at execution; a
+  symlink swapped in between could redirect the operation. `deny_paths` and
+  the Landlock scope still bound the blast radius.
 - **`AIVYX_DEBUG_LOG`**: if you set this env var to capture raw wire traffic
   for debugging, it logs the full conversation (including file/command content)
   in plaintext, append-only, forever. The file is `0600` but has no rotation or
