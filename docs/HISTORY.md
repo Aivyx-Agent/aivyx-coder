@@ -3029,3 +3029,63 @@ the scoped-verification tests in `agent/tests.rs`) found no vacuous
 assertions or hidden-mechanism shortcuts of the kind this project has hit
 before (the TypeScript reference-tracking test, the non-gitignore-aware
 move-scan test).
+
+### `deny_paths` basename-glob matching — ✅ shipped
+
+The first item in the 2026-07-28 capability audit's backlog: `deny_paths`
+matching (`aivyx_sandbox::path_is_denied`) was `starts_with` over fixed,
+absolute/home-relative paths only, with no way to protect a project-local
+secret file — e.g. `.env` — that recurs across arbitrary project
+directories the agent might be pointed at. Design spec at
+`docs/superpowers/specs/2026-07-28-deny-paths-basename-glob-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-28-deny-paths-basename-glob.md`, executed
+via `subagent-driven-development`.
+
+**What shipped**: a `deny_paths` entry with no path separator (`.env`,
+`*.pem`, `id_rsa`) is now a basename-glob pattern, matched via the
+`globset` crate against a path's file name wherever it appears, rather
+than a fixed absolute location. No new config schema — the existing
+`deny_paths: Vec<String>` list infers which shape an entry is from
+whether it contains a `/` (and whether it starts with `~`, which always
+routes through the existing tilde-expansion path even for the bare `"~"`
+case). `path_is_denied`'s public signature never changed — every existing
+caller (`ConfirmationGate::check`, `LandlockConfiner`'s grant
+construction, the autonomous-mode worktree-boundary check) needed zero
+changes, since classification happens by inspecting the entry itself
+(a single-component `PathBuf` is a basename-glob pattern; anything else
+keeps the original `starts_with` check).
+
+**A correctness fix needed in `aivyx-config`, caught during design rather
+than left as a live bug**: `resolve_tilde_paths` ran every `deny_paths`
+entry through symlink-canonicalization, including bare ones. For a
+nonexistent bare pattern this already happened to no-op (canonicalize
+fails, the walk-up logic bottoms out, the original string returns
+unchanged) — but this was an accident of that function's "canonicalize
+what exists, keep the rest literal" behavior, not a guarantee. If a file
+literally named `.env` happened to exist wherever the process was
+launched from — not necessarily the project directory being worked on —
+canonicalize would have silently rewritten the pattern into an absolute
+path tied to that incidental location, defeating the "matches anywhere"
+semantic the feature exists to provide. Fixed by classifying each entry
+*before* attempting resolution: a bare entry (no `/`, no leading `~`)
+skips tilde-expansion and symlink-canonicalization entirely.
+
+**A second, pre-existing bug closed as a side effect of this work, not a
+separately-scoped task**: `aivyx-tools::path_resolve::is_denied` was a
+byte-for-byte duplicate of `aivyx_sandbox::path_is_denied` — its own doc
+comment said "Mirrors `ConfirmationGate::is_denied`'s exact `starts_with`
+logic" — used by `grep`/`glob`/`move_file`/`git_commit` for their own
+per-entry directory-walk checks. Since `aivyx-tools` already depends on
+`aivyx-sandbox`, the duplicate was deleted and its four call sites
+switched to calling the canonical function directly, closing the exact
+drift risk the duplication represented (a future change to the matching
+logic — like this one — landing in one copy and not the other) as a
+natural side effect of touching this code.
+
+**Default list gained six new basename-glob entries** (`.env`, `.env.*`,
+`id_rsa`, `id_ed25519`, `*.pem`, `*.key`) alongside the existing
+absolute-path defaults, closing the exact gap the audit found out of the
+box rather than shipping the mechanism only and requiring users to opt
+in — consistent with this project's existing conservative-security-default
+posture.

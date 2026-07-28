@@ -271,6 +271,25 @@ mutating file tools added in earlier phases (`patch_file`, `delete_file`,
 `move_file`) never triggered enforced verification retries at all, only
 `edit_file`/`write_file` did. See `docs/HISTORY.md` for the full account.
 
+**`deny_paths` basename-glob matching — shipped.** The first item in the
+2026-07-28 capability audit's backlog: `deny_paths` matching was
+`starts_with` on fixed, absolute/home-relative paths only, so a
+project-local secret file like `.env` — which recurs across arbitrary
+project directories the agent might be pointed at — had no default
+protection; a user would have had to hand-add every project's own
+absolute path one at a time. A `deny_paths` entry with no path separator
+(e.g. `.env`, `*.pem`) is now a basename-glob pattern instead, matching
+any file with that name anywhere via the `globset` crate. No new config
+schema — the existing `deny_paths: Vec<String>` list accepts both shapes,
+distinguished by whether the entry contains a `/`. The default list gained
+six new basename-glob entries (`.env`, `.env.*`, `id_rsa`, `id_ed25519`,
+`*.pem`, `*.key`) alongside the existing absolute-path defaults, closing
+the exact gap the audit found out of the box. A pre-existing duplicate of
+the matching logic in `aivyx-tools` (used by `grep`/`glob`/`move_file`/
+`git_commit`'s own directory-walk checks, and flagged by the same audit as
+a drift risk) was consolidated onto the one canonical
+`aivyx_sandbox::path_is_denied` function as part of this work.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -293,34 +312,22 @@ current codebase found two documentation-accuracy gaps, fixed directly
 (the autonomous-mode paragraph was missing `repl_start`/MCP-tool/
 `remember_preference` denials added since it was written; the TOCTOU
 known-limitation bullet was missing `patch_file`, which has the identical
-resolve-twice exposure) — and two genuine new-capability gaps, logged
-here rather than patched ad hoc:
-
-- **`deny_paths` has no way to protect a project-local secret file (e.g.
-  `.env`) that recurs across arbitrary project directories** — matching is
-  `starts_with` on fixed, absolute/home-relative paths only
-  (`crates/aivyx-sandbox/src/lib.rs`'s `path_is_denied`), so a user would
-  have to hand-add every project's own absolute `.env` path one at a time.
-  `deny_paths` is documented as the *sole* protection against the model
-  reading plaintext credentials via a normal, auto-allowed
-  `ActionKind::Read` call — a fresh clone's `.env` is invisible to it by
-  default. Needs its own design pass: basename matching, glob patterns, or
-  gitignore-style relative patterns are all plausible, each with different
-  false-positive/complexity tradeoffs worth walking through with the user
-  rather than picking unilaterally.
-- **`delegate_task` sub-agents share the parent's single global REPL
-  session slot**, breaking the "fresh, isolated agent, completely separate
-  conversation history" invariant `delegate_task` is documented to
-  provide. `crates/aivyx/src/agent_builder.rs` clones the same
-  `ToolRegistry` (same underlying `Arc<Mutex<Option<ReplSession>>>`) for
-  sub-agents; `sub_agent_registry_never_contains_delegate_task_itself` is
-  the only sub-agent tool exclusion that exists today. A sub-agent's
-  `repl_start` call is invisible to the parent's own history, yet the
-  process it starts outlives the sub-agent and can collide with (or be
-  silently reused/blocked by) the parent's own REPL usage. Needs its own
-  design pass: exclude REPL tools from the sub-agent registry entirely,
-  give each sub-agent a private session slot, or auto-stop any session a
-  sub-agent leaves running when it completes.
+resolve-twice exposure), and one genuine new-capability gap, logged here
+rather than patched ad hoc: **`delegate_task` sub-agents share the
+parent's single global REPL session slot**, breaking the "fresh, isolated
+agent, completely separate conversation history" invariant `delegate_task`
+is documented to provide. `crates/aivyx/src/agent_builder.rs` clones the
+same `ToolRegistry` (same underlying `Arc<Mutex<Option<ReplSession>>>`)
+for sub-agents; `sub_agent_registry_never_contains_delegate_task_itself`
+is the only sub-agent tool exclusion that exists today. A sub-agent's
+`repl_start` call is invisible to the parent's own history, yet the
+process it starts outlives the sub-agent and can collide with (or be
+silently reused/blocked by) the parent's own REPL usage. Needs its own
+design pass: exclude REPL tools from the sub-agent registry entirely,
+give each sub-agent a private session slot, or auto-stop any session a
+sub-agent leaves running when it completes. (The `deny_paths` gap
+previously logged alongside this one shipped — see "`deny_paths`
+basename-glob matching" above.)
 
 No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see

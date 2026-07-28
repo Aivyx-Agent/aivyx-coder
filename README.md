@@ -819,10 +819,16 @@ no single layer is the whole story.
 
 ### 1. `deny_paths` — a hard block
 
-`permissions.deny_paths` (default `~/.ssh`, `~/.aws`) are paths that are never
-accessible, checked before any prompt or cache. Entries are `~`-expanded and
-**symlink-canonicalized**, and the check matches any path *at or under* a
-denied entry. This covers:
+`permissions.deny_paths` (default `~/.ssh`, `~/.aws`, plus several more —
+see the config reference below) are paths that are never accessible,
+checked before any prompt or cache. An entry containing a `/` (or a bare
+`~`) is `~`-expanded and **symlink-canonicalized**, and the check matches
+any path *at or under* that denied entry — unchanged from before. An
+entry with **no path separator** (e.g. `.env`, `*.pem`) is instead a
+**basename-glob pattern**: it matches any file with that name anywhere,
+not just one fixed absolute location — useful for a project-local secret
+file that recurs across every project directory the agent might be
+pointed at, which a fixed absolute path can't express. This covers:
 
 - **File tools** (`read_file`/`write_file`/`edit_file`): the resolved target
   is checked directly.
@@ -940,7 +946,11 @@ model = "qwen3.5:9b"
 context_tokens = 8192
 
 [permissions]
-deny_paths = ["~/.ssh", "~/.aws"]
+# A path-separator entry (or a bare "~") is an exact absolute location,
+# ~-expanded and symlink-canonicalized. A bare entry with no separator
+# (e.g. ".env", "*.pem") is a basename-glob pattern instead, matching any
+# file with that name anywhere rather than one fixed location.
+deny_paths = ["~/.ssh", "~/.aws", ".env", "*.pem"]
 max_tool_iterations_per_turn = 25
 
 # Commands the model may run by name (run_command), or that skip the
