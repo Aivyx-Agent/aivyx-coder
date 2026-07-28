@@ -3254,6 +3254,47 @@ async fn run_scoped_verification_substitutes_touched_paths_into_argv() {
     );
 }
 
+#[test]
+fn set_scoped_verification_attaches_to_an_already_configured_verification() {
+    let (mut agent, _rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.set_verification("test".to_string(), 3);
+
+    agent.set_scoped_verification(
+        CommandSpec {
+            name: "test_scoped".to_string(),
+            program: "pytest".to_string(),
+            args: vec!["{touched_paths}".to_string()],
+            timeout: Duration::from_secs(30),
+        },
+        Arc::new(NoopConfiner),
+    );
+
+    let scoped = agent.verification.as_ref().unwrap().scoped.as_ref();
+    assert!(scoped.is_some());
+    assert_eq!(scoped.unwrap().spec.name, "test_scoped");
+}
+
+#[test]
+fn set_scoped_verification_before_set_verification_is_a_harmless_no_op() {
+    let (mut agent, _rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    // set_verification was never called — verification is None.
+
+    agent.set_scoped_verification(
+        CommandSpec {
+            name: "test_scoped".to_string(),
+            program: "pytest".to_string(),
+            args: vec![],
+            timeout: Duration::from_secs(30),
+        },
+        Arc::new(NoopConfiner),
+    );
+
+    assert!(
+        agent.verification.is_none(),
+        "must stay disabled, not panic or silently enable itself"
+    );
+}
+
 #[tokio::test]
 async fn verification_never_fires_when_nothing_was_edited() {
     let mut registry = ToolRegistry::new();

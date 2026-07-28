@@ -527,6 +527,32 @@ pub(crate) async fn build_agent(
     // enabled but never actually verify anything.
     if let Some((command, max_retries)) = &verification {
         agent.set_verification(command.clone(), *max_retries);
+
+        // Scoped verification (docs/superpowers/specs/
+        // 2026-07-28-verification-test-selection-design.md): only
+        // resolved if the base command above was itself valid — scoping
+        // an already-disabled verification setup makes no sense. Same
+        // "warn, don't silently do nothing" posture as the base command's
+        // own validation, but scoping alone being misconfigured must not
+        // disable verification entirely — it falls back to always
+        // running the full command, exactly as if scoped_command had
+        // never been set.
+        if let Some(scoped_name) = &settings.verification.scoped_command {
+            match command_specs.iter().find(|spec| &spec.name == scoped_name) {
+                Some(spec) => {
+                    agent.set_scoped_verification(spec.clone(), Arc::clone(&confiner));
+                }
+                None => {
+                    tracing::warn!(
+                        scoped_command = %scoped_name,
+                        "verification.scoped_command does not match any \
+                         [[permissions.allowed_commands]] entry name — scoped verification is \
+                         unavailable this session (falling back to always running the full \
+                         command)"
+                    );
+                }
+            }
+        }
     } else if let Some(command) = &settings.verification.command {
         tracing::warn!(
             command = %command,

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
-use aivyx_sandbox::{AutonomousMode, InjectionTaint, PlanMode};
+use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
@@ -363,6 +363,21 @@ impl Agent {
             max_retries: max_retries.max(1),
             scoped: None,
         });
+    }
+
+    /// Attaches scoped-verification support to an already-configured base
+    /// verification (call `set_verification` first). A no-op if
+    /// verification isn't enabled at all — scoping is meaningless without
+    /// a base command to run as the final gate. See
+    /// docs/superpowers/specs/2026-07-28-verification-test-selection-design.md.
+    pub fn set_scoped_verification(
+        &mut self,
+        spec: aivyx_tools::CommandSpec,
+        confiner: std::sync::Arc<dyn ExecutionConfiner>,
+    ) {
+        if let Some(verification) = &mut self.verification {
+            verification.scoped = Some(ScopedVerificationConfig { spec, confiner });
+        }
     }
 
     /// Adds `path` to `verification_touched_paths` unless it's already
