@@ -2730,3 +2730,224 @@ the unit tests — has not been run. No interactive TUI session or
 configured LLM backend was available in the sandboxed environment this
 feature was built in; this needs the bare-metal rig, matching how every
 other security-relevant tool in this project has been verified.
+
+### Patch-apply tool — ✅ shipped, one verification step still open
+
+The second-to-last item in the 2026-07-22 backlog: the tool set had
+`edit_file` (exact-substring search/replace) and `write_file` (full
+rewrite) but no tool that takes ready-made unified-diff/patch text and
+applies it directly — relevant when a model (or the user) already has a
+well-formed patch rather than needing to re-derive it as a search/replace
+pair, e.g. a patch pasted from elsewhere, or a model that reasons more
+reliably in diff form for a multi-hunk change to one file. Design spec at
+`docs/superpowers/specs/2026-07-27-patch-apply-tool-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-27-patch-apply-tool.md`, executed via
+`subagent-driven-development`.
+
+**What shipped**: `patch_file(path, patch)`, built on the `diffy` crate
+(a new dependency for `aivyx-tools` — `similar`, already present, computes
+and renders diffs but doesn't parse-and-apply externally-supplied unified-
+diff text, a genuinely different capability). Chosen specifically for its
+fuzzy hunk-position matching: per its own documentation, it "can detect
+when line numbers specified in the patch are incorrect and will attempt
+to find the correct place to apply each hunk by iterating forward and
+backward from the given position until all context lines from a hunk
+match the base image." This is exactly the failure mode a model-generated
+patch is prone to — the hunk's `-`/`+`/context lines are correct, but the
+`@@ -X,Y +A,B @@` header's line numbers have drifted from working off
+slightly-stale file content. Scoped to existing files only (no
+patch-driven create/delete — `write_file`/`delete_file` already own
+those) and one file per call, matching every other file tool's shape. The
+preview/diff shown to the human is always **recomputed from the real
+before/after content** of a dry-run apply, never an echo of the model's
+raw supplied patch text — this guarantees the approval prompt reflects
+where the fuzzy matcher actually placed the change, not the model's
+possibly-stale assumption about where its patch would land. The target
+file is also never derived from the patch's own `---`/`+++` header paths
+(frequently synthetic, e.g. `a/file.rs`/`b/file.rs`) — only the explicit
+`path` argument, resolved and `deny_paths`-checked exactly like every
+other file tool's target, the same principle `move_file`'s design already
+established.
+
+**Unlike `move_file` the same day, this needed zero new gate primitive.**
+Applying a patch to an existing file is architecturally identical to
+`edit_file`: content mutation on one existing path. `ActionKind::Write` +
+`PermissionTarget::Path` cover it precisely, so the feature touches
+**zero** lines in `aivyx-sandbox`, `aivyx-tui`, or `aivyx-acp` — the gate,
+the confirmation modal, the ACP protocol mapping, and the editor-approval
+channel all already handle this shape correctly, with full existing test
+coverage. The final whole-branch review specifically verified this claim
+held end-to-end rather than just trusting the design doc's assertion.
+
+**A genuinely surprising `diffy` behavior, verified empirically before a
+single test was written into the plan** (not assumed from documentation):
+`diffy::Patch::from_str` does **not** error on text with no recognizable
+diff syntax at all — pure prose parses successfully as an empty
+(zero-hunk) patch, and applying zero hunks is indistinguishable from a
+no-op. A genuine parse error only fires for text that *attempts* diff
+syntax but gets it wrong (a malformed `@@ ... @@` header). This reshaped
+the tool's error handling: garbage input is caught by the existing no-op
+guard (the same one `edit_file` already uses to prevent a confused model
+looping on "successful" edits that change nothing), not a dedicated
+"malformed patch" branch — with a test pinning down this exact
+distinction, added specifically because a documentation-only read of the
+crate would have gotten it wrong.
+
+**A missing multi-hunk test, caught after the fact rather than at
+review**: the original test suite only exercised single-hunk patches; a
+follow-up commit (`5b6044e`) added a real multi-hunk case to close that
+gap before considering the feature complete.
+
+**Second, worse recurrence of the subagent-worktree pitfall the same
+day** — Task 1's implementer wrote its entire task (all file edits *and*
+the `git commit`) to the main checkout, not just a stray file, the
+worktree branch left completely untouched. Recovered cleanly via `git
+merge main --ff-only` in the worktree (adopting the same commit object,
+no cherry-pick needed) plus `git reset --hard` on the main checkout — see
+`feedback_subagent_dispatch_worktree_pitfalls` memory for the full
+prevention writeup that followed.
+
+**Still open**: the design's own "Live E2E verification" step — a real
+model generating a genuine multi-hunk unified diff and applying it
+through the actual release binary, confirming the permission preview
+renders correctly and the fuzzy matcher actually engages against
+real (not synthetic) drift — has not been run, for the same reason as
+`move_file` above: no interactive TUI/LLM backend in this sandboxed build
+environment.
+
+### Verification test-selection — ✅ shipped
+
+The last item in the 2026-07-22 backlog, closing it out entirely. Design
+spec at
+`docs/superpowers/specs/2026-07-28-verification-test-selection-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-28-verification-test-selection.md`,
+executed via `subagent-driven-development` across 8 tasks plus a
+final-review fix pass.
+
+**The problem**: enforced verification's auto-fix-and-retry loop always
+re-ran the *entire* configured `[verification] command` on every retry,
+paying the full test suite's cost even for a one-line edit. This project
+has zero test-framework awareness by design — `[verification] command` is
+just a name resolved against `[[permissions.allowed_commands]]` — so any
+fix needed to avoid inventing framework-specific heuristics the agent
+would have to maintain.
+
+**What shipped**: a new optional `[verification] scoped_command` config
+field, paired with an `allowed_commands` entry whose `args` contains a
+`{touched_paths}` placeholder. On each retry, if a scoped command is
+configured and paths have actually been touched, it runs first —
+expanding to one argv entry per touched path (not a joined string,
+matching how most multi-path test runners like `pytest a.py b.py` already
+work) substituted as an **exact whole-token match**, not partial-string
+interpolation. If it fails, that's the iteration's result; if it passes
+(or no scoped command/no touched paths are available — today's exact
+behavior), the full command still runs through its existing, unchanged,
+gate-checked path. **One full, unscoped run is still mandatory before a
+batch is ever declared verified** — this is a safety net for the
+iteration loop, not a replacement for the final check. Deliberately one
+`verify_retries` increment per iteration regardless of whether it ran one
+command or two, since a scoped-pass-then-full-fail is still exactly one
+failed attempt from the model's own perspective.
+
+**The architecturally significant decision, resolved only after tracing
+the permission gate's actual caching mechanics during design** (not
+anticipated in the original backlog framing): a scoped command's args
+change on every retry (different touched files each time), but
+`ConfirmationGate`'s Always-Allow cache is keyed on the **exact**
+`(program, args)` pair, by design — approving one call must never bless a
+different one. Routing the scoped command through the normal gate would
+mean either a fresh prompt every single retry in interactive mode, or an
+outright denial in autonomous mode (which never prompts for anything not
+already cached) — either defeats scoping's entire point. Resolved: the
+scoped run **bypasses `ConfirmationGate`/`ToolExecutor::dispatch`
+entirely** for this one specific internal call, building a
+`tokio::process::Command` directly and passing it through the same
+`ExecutionConfiner` (Landlock+seccomp) every other command uses — on the
+reasoning that the only dynamic input is file paths the model already had
+gated permission to edit via the normal edit-tool path, so no new
+capability is granted, only automation of an already-authorized action.
+This is the first call path in the project deliberately *not* gated by
+`ConfirmationGate`, and `README.md` documents it explicitly alongside this
+project's other known, deliberate trust-model exceptions (e.g.
+`editor_approval`'s default-on posture).
+
+**A real, pre-existing bug fixed as part of this same plan, confirmed
+with the user first since it predates this feature**: the
+verification-retry trigger check reused `PROMPTED_EDIT_HIDDEN_TOOLS`
+(`&["edit_file", "write_file"]`) — a constant whose actual purpose is
+unrelated, hiding the native tool-call forms of those two tools while
+`EditFormat::Prompted` is active. That constant predates `patch_file`/
+`delete_file`/`move_file` and was never widened when they shipped, so
+editing a file via any of those three tools never triggered
+auto-verification at all, even though they're the same kind of
+content/structure mutation `edit_file`/`write_file` already trigger it
+for. Fixed with a new, separate constant —
+`VERIFICATION_TRIGGER_TOOLS: &[&str] = &["edit_file", "write_file",
+"patch_file", "delete_file", "move_file"]` — checked at the trigger site
+instead of reusing the prompted-mode constant, deliberately decoupling
+two concerns (prompted-mode tool hiding vs. verification triggering) that
+constant was incorrectly conflating. Widening `PROMPTED_EDIT_HIDDEN_TOOLS`
+itself would have incorrectly hidden three unrelated tools from the model
+whenever prompted edit mode is active.
+
+**A real empirical finding, verified live in this repo before it was
+written into the spec's worked example** (not assumed from `cargo`'s
+documentation): `cargo test <file-path>` does **not** filter cargo's test
+binary at all — it silently matches zero tests and reports success
+("test result: ok. 0 passed; 0 failed... 247 filtered out"), since
+cargo's positional filter matches a fully-qualified test *name*
+(`tools::patch_file::tests::execute_applies_a_patch`), not a file path.
+`pytest <file-path>` works natively, so the spec's worked example uses
+`pytest`, with an honest caveat that a `cargo`-based `scoped_command`
+needs a user-authored wrapper script translating a file path into a
+module-path filter.
+
+**A design-level bug caught only by the final whole-branch review, not
+any task-level review**: the original design used a single shared
+`last_verification_output: Option<(VerificationKind, String)>` slot,
+tagged by kind, for both the scoped and full verification "what's new"
+note. In a scoped-pass/full-fail-repeat retry cycle, a `Scoped` entry
+always sits between two `Full` entries in that one slot — so the note
+explaining what's newly broken in the full run never fires, since it
+always compares against the wrong kind's prior output. Fixed by splitting
+into two fully independent fields
+(`last_full_verification_output`/`last_scoped_verification_output`), each
+written only by its own code path, and the now-fully-unused
+`VerificationKind` enum was deleted after confirming by grep that nothing
+else referenced it. The same root-cause shape (a single "last output"
+slot shared across two logically distinct producers) as Gap 1's
+`Option<String>` double-duty checkpoint-ref bug from the
+capability-gap-closing chapter above — worth watching for as a recurring
+pattern in this codebase.
+
+**Sub-agents (`delegate_task`) were explicitly scoped out**, confirmed
+with the user during design: `DelegateTaskConfig` already threads a
+`verification` tuple through for a sub-agent's own full-command
+verification, but this plan does not extend that plumbing to also carry
+`scoped_command`/the confiner handle — sub-agents keep using only the
+full command, unchanged. `Agent::set_verification`'s existing signature
+is untouched; scoped verification is wired in via a new, separate,
+additive `Agent::set_scoped_verification` method, so every existing call
+site (including the sub-agent one) keeps compiling and behaving exactly
+as it does today.
+
+**The subagent-worktree pollution pitfall recurred a fourth time in this
+same feature's Task 1** — this time the whole task landed correctly on
+the worktree *and* was separately, byte-identically duplicated on the
+main checkout, the worst variant yet since even the prevention
+instruction added after the patch-apply-tool recurrence didn't fully stop
+it. This was the recurrence that led directly to a structural fix rather
+than continued prose mitigation, outside the scope of this feature
+itself: `worktree.baseRef: "head"` set globally, with future
+subagent-driven-development dispatches using per-task `isolation:
+"worktree"` (an OS-level pinned directory) instead of a prose "cd to X"
+instruction. See the `feedback_subagent_dispatch_worktree_pitfalls`
+memory for the full writeup; not yet exercised end-to-end in a real
+feature session as of this writing.
+
+**With this feature's merge, the entire 2026-07-22 capability-audit
+backlog is closed** — no tracked items remain. The next
+capability-opportunity pass needs a fresh audit or brainstorm, not a pick
+from this list.

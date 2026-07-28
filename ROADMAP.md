@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-27_
+_Last updated: 2026-07-28_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -233,6 +233,44 @@ rename, a deliberate tradeoff over a full `renameat2(RENAME_NOREPLACE)`
 fix to avoid musl-cross-compile complexity), and a second ACP tool-kind
 mapping site the original plan's inventory missed entirely.
 
+**Patch-apply tool — shipped.** The tool set had `edit_file` (exact-substring
+search/replace) and `write_file` (full rewrite) but no way to apply
+ready-made unified-diff/patch text directly — relevant when a model (or
+the user) already has a well-formed patch rather than needing to re-derive
+it as a search/replace pair. `patch_file` closes this via the `diffy`
+crate, chosen specifically for its fuzzy hunk-position matching (tolerates
+a model-generated patch's drifted line numbers by searching nearby for
+matching context). Unlike `move_file`, this needed **zero** new gate
+primitive — applying a patch to an existing file is architecturally
+identical to `edit_file` (content mutation on one existing path), so it
+reuses `ActionKind::Write`/`PermissionTarget::Path` verbatim, touching zero
+lines in `aivyx-sandbox`, `aivyx-tui`, or `aivyx-acp`. Scoped to existing
+files only (no patch-driven create/delete — `write_file`/`delete_file`
+already own those) and one file per call, matching every other file tool's
+shape. See `docs/HISTORY.md` for the full account, including a real
+`diffy` behavior verified empirically before it was written into the
+plan: parsing non-diff text does not error, it silently succeeds as a
+zero-hunk patch.
+
+**Verification test-selection — shipped.** The last item in the
+2026-07-22 backlog, closing it out entirely. Enforced verification's
+fix-and-retry loop always re-ran the *entire* configured `[verification]
+command` on every retry, even for a one-line edit in a large test suite.
+A new optional `[verification] scoped_command` config field lets interim
+retries run a fast, user-configured command scoped to just the files
+touched by that batch of edits, falling back to the full command only once
+scoping passes (or isn't configured) — one full, unscoped run is still
+mandatory before a batch is ever declared verified, preserving today's
+completeness guarantee. The scoped run deliberately bypasses
+`ConfirmationGate` for this one internal call (its arguments legitimately
+vary every retry — different touched files — which the gate's exact-match
+Always-Allow cache can't accommodate without either re-prompting every
+retry or weakening that cache's invariant for every other tool). Also
+fixed a real pre-existing bug found during this feature's own design: three
+mutating file tools added in earlier phases (`patch_file`, `delete_file`,
+`move_file`) never triggered enforced verification retries at all, only
+`edit_file`/`write_file` did. See `docs/HISTORY.md` for the full account.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -247,5 +285,6 @@ sources, and Plan mode not surviving `--resume`). The remaining finding,
 verification test-selection, needed a real design pass of its own (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
 same-session patch; it shipped as `[verification] scoped_command` (see
-"Enforced verification" above). With that done, this audit's backlog is
-now fully resolved.
+"Verification test-selection" above). With that done, this audit's
+backlog is now fully resolved — the next capability-opportunity pass needs
+a fresh audit, not a pick from this list.
