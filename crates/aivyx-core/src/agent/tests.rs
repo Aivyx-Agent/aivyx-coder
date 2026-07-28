@@ -191,6 +191,47 @@ fn describe_tool_call_target_falls_back_to_url_then_query_when_no_path() {
 }
 
 #[test]
+fn touched_path_for_uses_the_path_argument_for_ordinary_edit_tools() {
+    let call = ToolCall {
+        id: ToolCallId("c1".to_string()),
+        name: "edit_file".to_string(),
+        arguments: serde_json::json!({ "path": "src/foo.rs" }),
+        source: ToolCallSource::Native,
+    };
+    let cwd = Path::new("/project");
+    assert_eq!(
+        touched_path_for(&call, cwd),
+        Some(PathBuf::from("/project/src/foo.rs"))
+    );
+}
+
+#[test]
+fn touched_path_for_uses_the_to_argument_for_move_file() {
+    let call = ToolCall {
+        id: ToolCallId("c1".to_string()),
+        name: "move_file".to_string(),
+        arguments: serde_json::json!({ "from": "old.rs", "to": "new.rs" }),
+        source: ToolCallSource::Native,
+    };
+    let cwd = Path::new("/project");
+    assert_eq!(
+        touched_path_for(&call, cwd),
+        Some(PathBuf::from("/project/new.rs"))
+    );
+}
+
+#[test]
+fn touched_path_for_returns_none_for_a_call_with_no_recognized_path_argument() {
+    let call = ToolCall {
+        id: ToolCallId("c1".to_string()),
+        name: "set_tasks".to_string(),
+        arguments: serde_json::json!({ "tasks": [] }),
+        source: ToolCallSource::Native,
+    };
+    assert_eq!(touched_path_for(&call, Path::new("/project")), None);
+}
+
+#[test]
 fn restore_turns_plan_mode_on_when_the_resumed_session_had_it_active_but_never_turns_it_off() {
     let (tx, _rx) = unbounded_channel();
     let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
@@ -2945,6 +2986,154 @@ async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
     // unverified — the very next attempt to end a turn must re-check.
     assert_eq!(agent.verify_retries, 0);
     assert!(agent.unverified_edits);
+}
+
+#[tokio::test]
+async fn move_file_contributes_its_destination_not_its_source_to_touched_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("old.txt"), "hi\n").unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::MoveFileTool::new(vec![])));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
+
+    let move_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "move_file".to_string(),
+            arguments: serde_json::json!({ "from": "old.txt", "to": "new.txt" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    // Two filler no-tool-call responses after move_call: with max_retries:
+    // 1, the retry-check runs after "done" (fails), then needs one more
+    // response ("still trying") to trigger the second (exhausting) check —
+    // matches the existing `the_very_first_verification_call_ever_has_
+    // nothing_to_compare_against` test's identical script shape for the
+    // same max_retries: 1.
+    let (mut agent, _rx, _) = build_agent(
+        vec![move_call, text_response("done"), text_response("still trying")],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 1);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let expected_dest = dir.path().join("new.txt");
+    let unexpected_source = dir.path().join("old.txt");
+    assert!(
+        agent.verification_touched_paths.contains(&expected_dest),
+        "expected {expected_dest:?} in {:?}",
+        agent.verification_touched_paths
+    );
+    assert!(
+        !agent.verification_touched_paths.contains(&unexpected_source),
+        "the source path must not be tracked — it no longer exists after the move"
+    );
+}
+
+#[tokio::test]
+async fn touched_paths_accumulate_across_multiple_retry_iterations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
+
+    let write_a = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "a.txt", "content": "a\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let write_b = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c2".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "b.txt", "content": "b\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _) = build_agent(
+        vec![
+            write_a,
+            write_b,
+            text_response("trying"),
+            text_response("still trying"),
+            text_response("giving up"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        agent
+            .verification_touched_paths
+            .contains(&dir.path().join("a.txt"))
+    );
+    assert!(
+        agent
+            .verification_touched_paths
+            .contains(&dir.path().join("b.txt"))
+    );
+}
+
+#[tokio::test]
+async fn touched_paths_are_cleared_once_verification_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", true,
+    )])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, _) =
+        build_agent(vec![write_call, text_response("done")], registry, 10);
+    agent.set_verification("verify".to_string(), 3);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        agent.verification_touched_paths.is_empty(),
+        "a passing verification must clear the accumulator, not carry stale paths into the next batch"
+    );
 }
 
 #[tokio::test]

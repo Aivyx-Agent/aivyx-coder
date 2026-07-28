@@ -240,6 +240,19 @@ pub struct Agent {
     /// resumed session starts with nothing to compare against, same as
     /// before the first verification call in a fresh session.
     last_verification_output: Option<String>,
+    /// Resolved paths (relative-to-`cwd` at substitution time, stored
+    /// absolute) touched by a mutating file tool while `unverified_edits`
+    /// is `true` — accumulated across the *whole* unverified-edits window,
+    /// not per-retry-attempt, since a later edit made in response to a
+    /// failed scoped run might need an *earlier* touched file's tests
+    /// re-confirmed too, not just the newest one. Cleared only when the
+    /// window closes the same way `unverified_edits` itself does: a
+    /// passing final verification, or a successful autonomous-mode
+    /// rewind — *not* on interactive-mode exhaustion without a rewind,
+    /// where `unverified_edits` deliberately stays `true` for a future
+    /// turn to keep trying. A `Vec` with dedup-on-insert (not a `HashSet`)
+    /// so args built from it are in a deterministic, testable order.
+    verification_touched_paths: Vec<PathBuf>,
     /// The checkpoint ref taken right before the first unverified edit of
     /// the current batch — the rewind target if verification exhausts its
     /// retries in autonomous mode. `None` when there's no unverified batch
@@ -300,6 +313,7 @@ impl Agent {
             unverified_edits: false,
             verify_retries: 0,
             last_verification_output: None,
+            verification_touched_paths: Vec::new(),
             pre_experiment_ref: None,
             events_tx,
         }
@@ -345,6 +359,15 @@ impl Agent {
             max_retries: max_retries.max(1),
             scoped: None,
         });
+    }
+
+    /// Adds `path` to `verification_touched_paths` unless it's already
+    /// present — the same file can legitimately be touched more than once
+    /// across a multi-retry window.
+    fn record_touched_path(&mut self, path: PathBuf) {
+        if !self.verification_touched_paths.contains(&path) {
+            self.verification_touched_paths.push(path);
+        }
     }
 
     /// Enables the repository map: rendered per turn, appended to the
@@ -1362,6 +1385,7 @@ impl Agent {
                             self.unverified_edits = false;
                             self.verify_retries = 0;
                             self.pre_experiment_ref = None;
+                            self.verification_touched_paths.clear();
                             self.emit(AgentEvent::TurnComplete);
                             return Ok(());
                         }
@@ -1389,6 +1413,7 @@ impl Agent {
                         {
                             Ok(()) => {
                                 self.unverified_edits = false;
+                                self.verification_touched_paths.clear();
                                 self.emit(AgentEvent::Error(format!(
                                     "verification (`{}`) still failing after {} attempt(s) — \
                                      discarded this round of edits and restored the worktree to \
@@ -1485,6 +1510,11 @@ impl Agent {
                 // for why this is deliberately not the same list prompted
                 // mode hides edit tools behind).
                 let is_edit_call = VERIFICATION_TRIGGER_TOOLS.contains(&call.name.as_str());
+                let touched_path = if is_edit_call {
+                    touched_path_for(&call, cwd)
+                } else {
+                    None
+                };
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
                 let mut result = self
@@ -1493,6 +1523,9 @@ impl Agent {
                     .await;
                 if is_edit_call && matches!(result.output, ToolOutput::Ok(_)) {
                     self.unverified_edits = true;
+                    if let Some(path) = touched_path {
+                        self.record_touched_path(path);
+                    }
                     if self.autonomous_mode.active() && !was_already_unverified {
                         // First edit of a new batch: the checkpoint dispatch
                         // just took (ToolExecutor::dispatch checkpoints
@@ -1690,6 +1723,24 @@ fn describe_tool_call_target(call: &ToolCall) -> String {
         return format!("{query} ({})", call.name);
     }
     call.name.clone()
+}
+
+/// The path a successful `VERIFICATION_TRIGGER_TOOLS` call should
+/// contribute to `Agent::verification_touched_paths` — `move_file`'s
+/// destination (`to`), since its source no longer exists after a
+/// successful move and testing a nonexistent path would be meaningless;
+/// every other trigger tool's ordinary `path` argument. Not a full
+/// `path_resolve`-style canonicalization — this is bookkeeping for a
+/// diagnostic test command's arguments, not a filesystem-access decision,
+/// so a plain `cwd.join` is enough (the tool call itself already went
+/// through real path resolution when it executed).
+fn touched_path_for(call: &ToolCall, cwd: &Path) -> Option<PathBuf> {
+    let raw = if call.name == "move_file" {
+        call.arguments.get("to").and_then(|v| v.as_str())?
+    } else {
+        call.arguments.get("path").and_then(|v| v.as_str())?
+    };
+    Some(cwd.join(raw))
 }
 
 /// Bound on the displayed length of the editor-context `file` value injected
