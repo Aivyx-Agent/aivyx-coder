@@ -92,17 +92,6 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
-
-/// Mirrors `ConfirmationGate::is_denied`'s exact `starts_with` logic. Needed
-/// separately by `grep`/`glob`: their top-level `permission_request` target
-/// is the search *root*, which the gate correctly denies if the root itself
-/// is under a denied path — but a root that is instead an *ancestor* of a
-/// denied path passes that check, so a recursive walk still needs its own
-/// per-entry check to avoid silently reading into the denied subtree.
-pub(crate) fn is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
-    deny_paths.iter().any(|denied| path.starts_with(denied))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

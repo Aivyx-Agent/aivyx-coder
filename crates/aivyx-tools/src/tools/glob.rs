@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use globset::Glob;
@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::path_resolve::{is_denied, resolve};
+use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 /// See `grep.rs`'s `MAX_MATCHES` for the same reasoning — bounded,
@@ -127,7 +127,7 @@ fn run_glob(
     for entry in WalkBuilder::new(root).build() {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if is_denied(path, deny_paths) {
+        if path_is_denied(path, deny_paths) {
             continue;
         }
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::path_resolve::{is_denied, resolve};
+use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -178,7 +178,7 @@ fn find_denied_descendant(root: &Path, deny_paths: &[PathBuf]) -> Option<PathBuf
     for entry in WalkBuilder::new(root).standard_filters(false).build() {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if is_denied(path, deny_paths) {
+        if path_is_denied(path, deny_paths) {
             return Some(path.to_path_buf());
         }
     }

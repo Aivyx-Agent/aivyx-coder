@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::checkpoint::exclude_pathspecs;
-use crate::path_resolve::{is_denied, resolve};
+use crate::path_resolve::resolve;
 use crate::process::run;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
@@ -46,7 +46,7 @@ impl GitCommitTool {
         let mut resolved = Vec::new();
         for path in &args.paths {
             let path = resolve(cwd, path);
-            if is_denied(&path, &self.deny_paths) {
+            if path_is_denied(&path, &self.deny_paths) {
                 return Err(ToolError::ExecutionFailed(format!(
                     "path `{}` is under a configured deny_paths entry",
                     path.display()
