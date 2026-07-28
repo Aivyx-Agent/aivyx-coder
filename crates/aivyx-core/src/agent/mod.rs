@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
-use aivyx_sandbox::{AutonomousMode, InjectionTaint, PlanMode};
+use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
@@ -23,7 +24,10 @@ mod tests;
 mod types;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
-use types::{AgentsFileConfig, EditorContextConfig, VerificationConfig};
+use types::{
+    AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig,
+    VerificationKind,
+};
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from
 /// a misbehaving backend that never stops streaming.
@@ -239,7 +243,7 @@ pub struct Agent {
     /// outcome. In-memory only; never persisted to the session JSON — a
     /// resumed session starts with nothing to compare against, same as
     /// before the first verification call in a fresh session.
-    last_verification_output: Option<String>,
+    last_verification_output: Option<(VerificationKind, String)>,
     /// Resolved paths (relative-to-`cwd` at substitution time, stored
     /// absolute) touched by a mutating file tool while `unverified_edits`
     /// is `true` — accumulated across the *whole* unverified-edits window,
@@ -800,14 +804,82 @@ impl Agent {
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
             if !passed
-                && let Some(previous) = &self.last_verification_output
+                && let Some((VerificationKind::Full, previous)) = &self.last_verification_output
                 && let Some(note) = new_lines_note(previous, &current_text)
             {
                 text.push_str(&note);
             }
-            self.last_verification_output = Some(current_text);
+            self.last_verification_output = Some((VerificationKind::Full, current_text));
         }
 
+        self.record_tool_result(result, &source);
+        passed
+    }
+
+    /// Runs the scoped verification command directly — sandboxed via the
+    /// same `ExecutionConfiner` `run_command` would apply, but without
+    /// going through `ConfirmationGate`/`ToolExecutor::dispatch` at all
+    /// (see docs/superpowers/specs/
+    /// 2026-07-28-verification-test-selection-design.md's Decision 4: its
+    /// args vary every retry, which the gate's exact-`(program, args)`
+    /// Always-Allow cache can't accommodate without defeating the point).
+    /// Recorded into history identically to `run_auto_verification`'s
+    /// full-command path — a synthetic assistant+tool message pair — so
+    /// the model sees it as an ordinary round-trip, and participates in
+    /// the same per-`VerificationKind` output comparison.
+    async fn run_scoped_verification(
+        &mut self,
+        scoped: ScopedVerificationConfig,
+        touched_paths: &[PathBuf],
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let args = substitute_touched_paths(&scoped.spec.args, touched_paths, cwd);
+
+        self.synthetic_seq += 1;
+        let call = ToolCall {
+            id: ToolCallId(format!("auto-verify-scoped-{}", self.synthetic_seq)),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "command": scoped.spec.name, "scoped": true }),
+            source: ToolCallSource::AutoVerification,
+        };
+        self.emit(AgentEvent::ToolCallDetected(call.clone()));
+        self.history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolCall(call.clone())],
+            tool_call_id: None,
+        });
+
+        let mut command = tokio::process::Command::new(&scoped.spec.program);
+        command
+            .args(&args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let command = scoped.confiner.confine(command);
+
+        let output = aivyx_tools::run(command, scoped.spec.timeout, cancellation.clone()).await;
+        let mut result = ToolResult {
+            call_id: call.id.clone(),
+            output: output.unwrap_or_else(|err| ToolOutput::Error(err.to_string())),
+        };
+        let passed =
+            matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+
+        if let ToolOutput::Ok(text) = &mut result.output {
+            let current_text = text.clone();
+            if !passed
+                && let Some((VerificationKind::Scoped, previous)) = &self.last_verification_output
+                && let Some(note) = new_lines_note(previous, &current_text)
+            {
+                text.push_str(&note);
+            }
+            self.last_verification_output = Some((VerificationKind::Scoped, current_text));
+        }
+
+        let source = format!("{} (scoped)", scoped.spec.name);
         self.record_tool_result(result, &source);
         passed
     }
@@ -1741,6 +1813,29 @@ fn touched_path_for(call: &ToolCall, cwd: &Path) -> Option<PathBuf> {
         call.arguments.get("path").and_then(|v| v.as_str())?
     };
     Some(cwd.join(raw))
+}
+
+/// Expands the literal placeholder token `"{touched_paths}"` in `args`
+/// into one argv entry per path in `touched_paths` (relative to `cwd`,
+/// matching how a human would actually write a scoped command's expected
+/// input, e.g. `pytest tests/test_foo.py` not an absolute path) — an
+/// exact, whole-entry match only, never partial-string interpolation
+/// (`--filter={touched_paths}` is left completely unchanged; a user
+/// needing that shape writes a wrapper script instead).
+fn substitute_touched_paths(args: &[String], touched_paths: &[PathBuf], cwd: &Path) -> Vec<String> {
+    let relative: Vec<String> = touched_paths
+        .iter()
+        .map(|p| p.strip_prefix(cwd).unwrap_or(p).display().to_string())
+        .collect();
+    args.iter()
+        .flat_map(|arg| {
+            if arg == "{touched_paths}" {
+                relative.clone()
+            } else {
+                vec![arg.clone()]
+            }
+        })
+        .collect()
 }
 
 /// Bound on the displayed length of the editor-context `file` value injected

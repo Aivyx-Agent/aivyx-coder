@@ -232,6 +232,40 @@ fn touched_path_for_returns_none_for_a_call_with_no_recognized_path_argument() {
 }
 
 #[test]
+fn substitute_touched_paths_expands_the_placeholder_into_multiple_argv_entries() {
+    let args = vec!["test".to_string(), "{touched_paths}".to_string()];
+    let touched = vec![PathBuf::from("/project/a.rs"), PathBuf::from("/project/b.rs")];
+    let result = substitute_touched_paths(&args, &touched, Path::new("/project"));
+    assert_eq!(result, vec!["test", "a.rs", "b.rs"]);
+}
+
+#[test]
+fn substitute_touched_paths_leaves_args_without_the_token_unchanged() {
+    let args = vec!["test".to_string(), "--verbose".to_string()];
+    let touched = vec![PathBuf::from("/project/a.rs")];
+    let result = substitute_touched_paths(&args, &touched, Path::new("/project"));
+    assert_eq!(result, vec!["test", "--verbose"]);
+}
+
+#[test]
+fn substitute_touched_paths_uses_paths_relative_to_cwd() {
+    let args = vec!["{touched_paths}".to_string()];
+    let touched = vec![PathBuf::from("/project/src/foo.rs")];
+    let result = substitute_touched_paths(&args, &touched, Path::new("/project"));
+    assert_eq!(result, vec!["src/foo.rs"]);
+}
+
+#[test]
+fn substitute_touched_paths_does_not_partially_interpolate_a_token_embedded_in_a_larger_string() {
+    let args = vec!["--filter={touched_paths}".to_string()];
+    let touched = vec![PathBuf::from("/project/a.rs")];
+    let result = substitute_touched_paths(&args, &touched, Path::new("/project"));
+    // Exact-whole-entry match only — this arg is left completely unchanged,
+    // not partially substituted.
+    assert_eq!(result, vec!["--filter={touched_paths}"]);
+}
+
+#[test]
 fn restore_turns_plan_mode_on_when_the_resumed_session_had_it_active_but_never_turns_it_off() {
     let (tx, _rx) = unbounded_channel();
     let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
@@ -3137,6 +3171,90 @@ async fn touched_paths_are_cleared_once_verification_passes() {
 }
 
 #[tokio::test]
+async fn run_scoped_verification_reports_pass_and_records_history() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let dir = tempfile::tempdir().unwrap();
+
+    let scoped = ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "fake_scoped".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    };
+
+    let passed = agent
+        .run_scoped_verification(scoped, &[], dir.path(), &CancellationToken::new())
+        .await;
+
+    assert!(passed);
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        1,
+        "the scoped run must be recorded as a synthetic AutoVerification call, same as the full-command path"
+    );
+}
+
+#[tokio::test]
+async fn run_scoped_verification_reports_failure_for_a_nonzero_exit() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let dir = tempfile::tempdir().unwrap();
+
+    let scoped = ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "fake_scoped".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    };
+
+    let passed = agent
+        .run_scoped_verification(scoped, &[], dir.path(), &CancellationToken::new())
+        .await;
+
+    assert!(!passed);
+}
+
+#[tokio::test]
+async fn run_scoped_verification_substitutes_touched_paths_into_argv() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "").unwrap();
+
+    let scoped = ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "fake_scoped".to_string(),
+            program: "sh".to_string(),
+            // Fails unless its first positional arg is a path that exists
+            // relative to cwd — proves the placeholder was substituted
+            // with a real, cwd-relative touched path, not left literal.
+            args: vec![
+                "-c".to_string(),
+                "test -f \"$1\"".to_string(),
+                "sh".to_string(),
+                "{touched_paths}".to_string(),
+            ],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: Arc::new(NoopConfiner),
+    };
+    let touched = vec![dir.path().join("a.rs")];
+
+    let passed = agent
+        .run_scoped_verification(scoped, &touched, dir.path(), &CancellationToken::new())
+        .await;
+
+    assert!(
+        passed,
+        "the substituted path must resolve to a real file relative to cwd"
+    );
+}
+
+#[tokio::test]
 async fn verification_never_fires_when_nothing_was_edited() {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
@@ -3332,7 +3450,7 @@ async fn starts_broken_then_fixed_leaves_the_passing_result_unmodified() {
         results[1]
     );
     assert_eq!(
-        agent.last_verification_output.as_deref(),
+        agent.last_verification_output.as_ref().map(|(_, text)| text.as_str()),
         Some(results[1].as_str()),
         "the stored reference must be the passing run's own text"
     );
@@ -3432,7 +3550,7 @@ async fn last_verification_output_updates_after_every_call_regardless_of_outcome
     // proving it was overwritten again after the first failing call's own
     // update, not left stuck at whatever the first call set.
     assert_eq!(
-        agent.last_verification_output.as_deref(),
+        agent.last_verification_output.as_ref().map(|(_, text)| text.as_str()),
         Some(results[1].as_str())
     );
 }
