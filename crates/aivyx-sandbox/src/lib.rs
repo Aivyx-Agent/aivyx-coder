@@ -265,8 +265,36 @@ pub fn default_confiner(
 /// Shared by `ConfirmationGate::is_denied` and (behind `sandbox-backend`)
 /// `LandlockConfiner`'s path-grant construction — both need the same
 /// "is this path under a denied path" check.
+///
+/// A `deny_paths` entry with a single path component (e.g. `.env`,
+/// `*.pem`) is a basename-glob pattern, matched against `path`'s own file
+/// name wherever it appears — not just at one fixed location. Every
+/// other entry keeps the original exact-prefix `starts_with` check.
+/// Classifying by component count (rather than a config-time flag) means
+/// this function's signature never has to change: an entry only has a
+/// single component in the first place when `aivyx-config`'s
+/// `resolved_deny_paths` deliberately left it unresolved for exactly this
+/// reason (see that function's own doc comment).
 pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
-    deny_paths.iter().any(|denied| path.starts_with(denied))
+    deny_paths.iter().any(|denied| {
+        if denied.parent() == Some(Path::new("")) {
+            is_basename_glob_match(path, denied)
+        } else {
+            path.starts_with(denied)
+        }
+    })
+}
+
+fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(pattern) = pattern.to_str() else {
+        return false;
+    };
+    globset::Glob::new(pattern)
+        .map(|glob| glob.compile_matcher().is_match(name))
+        .unwrap_or(false)
 }
 
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is
@@ -302,5 +330,52 @@ mod tests {
         let clone = mode.clone();
         mode.set_active(true);
         assert!(clone.active(), "clones must observe the same underlying flag");
+    }
+
+    #[test]
+    fn a_bare_basename_matches_the_same_name_under_any_directory() {
+        let deny_paths = vec![PathBuf::from(".env")];
+        assert!(path_is_denied(Path::new("/project-a/.env"), &deny_paths));
+        assert!(path_is_denied(
+            Path::new("/project-b/nested/.env"),
+            &deny_paths
+        ));
+        assert!(!path_is_denied(
+            Path::new("/project-a/.env.example"),
+            &deny_paths
+        ));
+    }
+
+    #[test]
+    fn a_bare_glob_pattern_matches_by_wildcard() {
+        let deny_paths = vec![PathBuf::from("*.pem")];
+        assert!(path_is_denied(Path::new("/any/dir/server.pem"), &deny_paths));
+        assert!(!path_is_denied(Path::new("/any/dir/.env"), &deny_paths));
+    }
+
+    #[test]
+    fn a_bare_pattern_does_not_match_a_substring_of_a_longer_basename() {
+        let deny_paths = vec![PathBuf::from(".env")];
+        // A directory or file merely containing the pattern text is not a
+        // match — glob matching is exact against the whole basename, not
+        // a substring search.
+        assert!(!path_is_denied(
+            Path::new("/project/.env-backup"),
+            &deny_paths
+        ));
+    }
+
+    #[test]
+    fn a_path_separator_entry_keeps_exact_prefix_matching() {
+        let deny_paths = vec![PathBuf::from("/home/user/.ssh")];
+        assert!(path_is_denied(
+            Path::new("/home/user/.ssh/id_rsa"),
+            &deny_paths
+        ));
+        assert!(!path_is_denied(
+            Path::new("/home/user/.ssh-backup/id_rsa"),
+            &deny_paths
+        ));
+        assert!(!path_is_denied(Path::new("/home/user/other"), &deny_paths));
     }
 }
