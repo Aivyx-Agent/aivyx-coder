@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
-use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
+use aivyx_sandbox::{AutonomousMode, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
