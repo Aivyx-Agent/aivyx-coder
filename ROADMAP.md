@@ -243,13 +243,9 @@ test quality, and documentation closed 10 findings directly (argument-blind
 MCP Always-Allow cache, sub-agent injection-taint isolation, thin
 `deny_paths` defaults, five documentation-accuracy fixes, an untested
 injection-scan tie-break rule, unlabeled web_fetch/web_search injection
-sources, and Plan mode not surviving `--resume`). The remaining one is
-sized as its own feature — it needs a real design pass (tool-trait
+sources, and Plan mode not surviving `--resume`). The remaining finding,
+verification test-selection, needed a real design pass of its own (tool-trait
 shape, permission/`ActionKind` wiring, config surface) rather than a
-same-session patch — so it's tracked here instead of built ad hoc:
-
-- **Verification test-selection**: enforced verification always re-runs
-  the entire configured `[verification] command`. There's no mechanism to
-  scope a retry to just the tests relevant to the files touched in that
-  batch of edits, so the auto-fix-and-retry loop pays the full suite's
-  cost on every retry even for a large test suite and a small edit.
+same-session patch; it shipped as `[verification] scoped_command` (see
+"Enforced verification" above). With that done, this audit's backlog is
+now fully resolved.

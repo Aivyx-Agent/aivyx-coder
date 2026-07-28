@@ -138,6 +138,45 @@ re-deriving that context from raw output each time. This is a coarse,
 framework-agnostic line-set comparison, not real test-parsing, and says so
 explicitly in the note itself.
 
+`scoped_command` (optional): another `[[permissions.allowed_commands]]`
+entry name, whose `args` may contain the literal token `"{touched_paths}"`
+— substituted at runtime with the files touched since edits became
+unverified, one argv entry per path (relative to the project root), never
+a joined string. When configured, interim retries in the fix-and-retry
+loop run this faster, scoped command first; one full, unscoped run is
+still required before a batch of edits is finally declared verified —
+scoping speeds up iteration, it never weakens the final guarantee.
+
+Example (works with `pytest`, which accepts file paths as test-selection
+arguments natively):
+
+```toml
+[verification]
+command = "test"
+scoped_command = "test_scoped"
+
+[[permissions.allowed_commands]]
+name = "test_scoped"
+program = "pytest"
+args = ["{touched_paths}"]
+```
+
+Not every test runner supports path-based filtering this directly — `cargo
+test <file-path>` in particular does **not** (verified: it silently
+matches zero tests and reports success). For a `cargo`-based project,
+`scoped_command` needs a small wrapper script that translates a file path
+into an appropriate module-path filter instead of a bare `cargo test`
+invocation.
+
+The scoped run's arguments differ on every retry (different touched
+files), so — unlike every other `run_command` invocation, including the
+full `command` above — it does **not** go through the normal per-exact-
+argument approval cache: it executes directly, sandboxed the same way,
+on the reasoning that the only dynamic input is files the model already
+had gated permission to edit. This is a deliberate, narrow exception to
+this project's "the model never influences a `run_command` invocation's
+arguments" invariant, documented here rather than left implicit.
+
 **Autonomous mode** (`aivyx-coder --auto "<goal>"`): runs unattended — the TUI
 stays up so you can watch (and Ctrl+C at any point), but nothing waits on a
 permission modal. `ConfirmationGate` gains a dedicated autonomous-mode tier
@@ -932,6 +971,12 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 # max_auto_verify_retries = 3 # (edit, re-verify) cycles before giving up
 #                              # on this round of edits — never silently:
 #                              # the turn still ends, with a loud notice.
+# scoped_command = "test_scoped" # optional; another allowed_commands entry
+#                              # whose args may contain "{touched_paths}",
+#                              # run first on interim retries to skip the
+#                              # full suite's cost — see "Enforced
+#                              # verification" above for the substitution
+#                              # semantics and the cargo-specific caveat.
 
 # REPL/interactive-process support (repl_start/repl_send/repl_stop):
 # timing knobs for deciding when a call has "enough" output to return,
