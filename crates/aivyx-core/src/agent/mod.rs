@@ -26,7 +26,6 @@ mod types;
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
 use types::{
     AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig,
-    VerificationKind,
 };
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from
@@ -235,15 +234,20 @@ pub struct Agent {
     /// disables itself for the rest of the session.
     verify_retries: u32,
     /// The raw `run_auto_verification` output text from the immediately
-    /// preceding verification run in this session, *regardless of whether
-    /// that run passed or failed* — `None` until the first verification
-    /// call ever happens, then updated after every subsequent call (pass
-    /// or fail alike). Used to distinguish a genuinely new failure line
-    /// from one that was already present in the last attempt, whatever its
-    /// outcome. In-memory only; never persisted to the session JSON — a
-    /// resumed session starts with nothing to compare against, same as
-    /// before the first verification call in a fresh session.
-    last_verification_output: Option<(VerificationKind, String)>,
+    /// preceding FULL verification run, regardless of outcome. Kept in its
+    /// own slot, separate from `last_scoped_verification_output`, so each
+    /// kind's "what's new since last attempt" comparison is always against
+    /// a run of the *same* kind — a scoped pass is always immediately
+    /// followed by a full run in the same retry iteration, so a single
+    /// shared slot tagged by kind would alternate Scoped/Full every entry,
+    /// meaning a repeatedly-failing full run (in a scoped-pass/full-fail
+    /// loop) would never find a same-kind predecessor to compare against —
+    /// exactly the case where this diagnostic is most valuable (a
+    /// full-suite-only regression outside the touched-files set).
+    last_full_verification_output: Option<String>,
+    /// The scoped counterpart of `last_full_verification_output` — same
+    /// reasoning, its own independent slot.
+    last_scoped_verification_output: Option<String>,
     /// Resolved paths (relative-to-`cwd` at substitution time, stored
     /// absolute) touched by a mutating file tool while `unverified_edits`
     /// is `true` — accumulated across the *whole* unverified-edits window,
@@ -316,7 +320,8 @@ impl Agent {
             verification: None,
             unverified_edits: false,
             verify_retries: 0,
-            last_verification_output: None,
+            last_full_verification_output: None,
+            last_scoped_verification_output: None,
             verification_touched_paths: Vec::new(),
             pre_experiment_ref: None,
             events_tx,
@@ -812,19 +817,20 @@ impl Agent {
         // (clean output vs. lines full of FAILED), and `command_reported_
         // success` already communicates "this passed" plainly — appending
         // a large "what changed" note to already-unambiguous good news
-        // would be pure noise. `last_verification_output` is still updated
-        // unconditionally on both outcomes, though — comparing against
-        // the last run rather than only the last *successful* one is the
-        // whole point of this feature (see the design spec's Decision 2).
+        // would be pure noise. `last_full_verification_output` is still
+        // updated unconditionally on both outcomes, though — comparing
+        // against the last run rather than only the last *successful* one
+        // is the whole point of this feature (see the design spec's
+        // Decision 2).
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
             if !passed
-                && let Some((VerificationKind::Full, previous)) = &self.last_verification_output
+                && let Some(previous) = &self.last_full_verification_output
                 && let Some(note) = new_lines_note(previous, &current_text)
             {
                 text.push_str(&note);
             }
-            self.last_verification_output = Some((VerificationKind::Full, current_text));
+            self.last_full_verification_output = Some(current_text);
         }
 
         self.record_tool_result(result, &source);
@@ -841,7 +847,8 @@ impl Agent {
     /// Recorded into history identically to `run_auto_verification`'s
     /// full-command path — a synthetic assistant+tool message pair — so
     /// the model sees it as an ordinary round-trip, and participates in
-    /// the same per-`VerificationKind` output comparison.
+    /// the same "compare against the last run of this kind" mechanism via
+    /// `last_scoped_verification_output`.
     async fn run_scoped_verification(
         &mut self,
         scoped: ScopedVerificationConfig,
@@ -886,12 +893,12 @@ impl Agent {
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
             if !passed
-                && let Some((VerificationKind::Scoped, previous)) = &self.last_verification_output
+                && let Some(previous) = &self.last_scoped_verification_output
                 && let Some(note) = new_lines_note(previous, &current_text)
             {
                 text.push_str(&note);
             }
-            self.last_verification_output = Some((VerificationKind::Scoped, current_text));
+            self.last_scoped_verification_output = Some(current_text);
         }
 
         let source = format!("{} (scoped)", scoped.spec.name);

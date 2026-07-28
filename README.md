@@ -141,7 +141,7 @@ explicitly in the note itself.
 `scoped_command` (optional): another `[[permissions.allowed_commands]]`
 entry name, whose `args` may contain the literal token `"{touched_paths}"`
 — substituted at runtime with the files touched since edits became
-unverified, one argv entry per path (relative to the project root), never
+unverified, one argv entry per path (relative to `cwd`), never
 a joined string. When configured, interim retries in the fix-and-retry
 loop run this faster, scoped command first; one full, unscoped run is
 still required before a batch of edits is finally declared verified —
@@ -166,7 +166,10 @@ test <file-path>` in particular does **not** (verified: it silently
 matches zero tests and reports success). For a `cargo`-based project,
 `scoped_command` needs a small wrapper script that translates a file path
 into an appropriate module-path filter instead of a bare `cargo test`
-invocation.
+invocation. A misconfigured or unspawnable `scoped_command` degrades
+verification to always-failing for that batch (until retries exhaust)
+rather than silently falling back to the full command — the same fail-safe
+behavior a broken base `command` already has.
 
 The scoped run's arguments differ on every retry (different touched
 files), so — unlike every other `run_command` invocation, including the

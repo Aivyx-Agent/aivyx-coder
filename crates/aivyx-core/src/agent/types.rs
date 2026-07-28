@@ -88,17 +88,6 @@ pub(crate) struct VerificationConfig {
     pub(crate) scoped: Option<ScopedVerificationConfig>,
 }
 
-/// Which command produced a `run_auto_verification`-style result — tags
-/// `Agent::last_verification_output` so the "what's new since last
-/// attempt" comparison never compares a scoped run's (small, targeted)
-/// output against a full run's (large, comprehensive) one, which would
-/// produce a misleading note dominated by irrelevant noise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerificationKind {
-    Full,
-    Scoped,
-}
-
 /// The scoped-verification command and the confiner to sandbox it with —
 /// bundled together since the scoped run bypasses `ToolExecutor::dispatch`
 /// entirely (see the design doc's Decision 4) and must apply the same

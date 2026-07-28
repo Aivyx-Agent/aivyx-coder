@@ -3072,6 +3072,11 @@ async fn move_file_contributes_its_destination_not_its_source_to_touched_paths()
         !agent.verification_touched_paths.contains(&unexpected_source),
         "the source path must not be tracked — it no longer exists after the move"
     );
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        1,
+        "max_retries: 1 means exactly one full-command attempt before exhaustion"
+    );
 }
 
 #[tokio::test]
@@ -3132,6 +3137,11 @@ async fn touched_paths_accumulate_across_multiple_retry_iterations() {
         agent
             .verification_touched_paths
             .contains(&dir.path().join("b.txt"))
+    );
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        2,
+        "max_retries: 2 means exactly two full-command attempts before exhaustion"
     );
 }
 
@@ -3491,7 +3501,7 @@ async fn starts_broken_then_fixed_leaves_the_passing_result_unmodified() {
         results[1]
     );
     assert_eq!(
-        agent.last_verification_output.as_ref().map(|(_, text)| text.as_str()),
+        agent.last_full_verification_output.as_deref(),
         Some(results[1].as_str()),
         "the stored reference must be the passing run's own text"
     );
@@ -3576,7 +3586,7 @@ async fn last_verification_output_updates_after_every_call_regardless_of_outcome
     );
     agent.set_verification("verify".to_string(), 2);
 
-    assert!(agent.last_verification_output.is_none());
+    assert!(agent.last_full_verification_output.is_none());
 
     agent
         .run_turn("go".to_string(), dir.path(), CancellationToken::new())
@@ -3591,7 +3601,7 @@ async fn last_verification_output_updates_after_every_call_regardless_of_outcome
     // proving it was overwritten again after the first failing call's own
     // update, not left stuck at whatever the first call set.
     assert_eq!(
-        agent.last_verification_output.as_ref().map(|(_, text)| text.as_str()),
+        agent.last_full_verification_output.as_deref(),
         Some(results[1].as_str())
     );
 }
