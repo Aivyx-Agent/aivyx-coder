@@ -617,12 +617,27 @@ pub struct AllowedCommand {
 }
 
 impl PermissionSettings {
-    /// Expands a leading `~` (home directory) in each `deny_paths` entry
-    /// into an absolute `PathBuf`. Entries that can't be expanded (no home
-    /// directory found) are skipped rather than left unresolved and
+    /// Expands a leading `~` (home directory) in each path-like
+    /// `deny_paths` entry into an absolute `PathBuf`. A *bare* entry —
+    /// one with no `/` and not starting with `~` (e.g. `.env`, `*.pem`)
+    /// — is left exactly as configured instead: `aivyx_sandbox::path_is_denied`
+    /// treats a single-component entry as a basename-glob pattern matched
+    /// against a path's file name, not a real filesystem location to
+    /// resolve. Running it through tilde-expansion and
+    /// symlink-canonicalization here would tie a "matches anywhere"
+    /// pattern to whatever the process's actual launch directory happens
+    /// to contain instead. Path-like entries that can't be expanded (no
+    /// home directory found) are skipped rather than left unresolved and
     /// silently wrong.
     pub fn resolved_deny_paths(&self) -> Vec<PathBuf> {
-        resolve_tilde_paths(&self.deny_paths)
+        let (bare, path_like): (Vec<String>, Vec<String>) = self
+            .deny_paths
+            .iter()
+            .cloned()
+            .partition(|raw| !raw.starts_with('~') && !raw.contains('/'));
+        let mut resolved = resolve_tilde_paths(&path_like);
+        resolved.extend(bare.into_iter().map(PathBuf::from));
+        resolved
     }
 }
 
@@ -1215,5 +1230,55 @@ mod tests {
         assert_eq!(settings.quiet_window_ms, 300);
         assert_eq!(settings.max_wait_secs, 10);
         assert_eq!(settings.idle_timeout_secs, 600);
+    }
+
+    #[test]
+    fn a_bare_basename_glob_entry_is_left_unresolved() {
+        let settings = PermissionSettings {
+            deny_paths: vec![".env".to_string(), "*.pem".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        let resolved = settings.resolved_deny_paths();
+        assert!(resolved.contains(&PathBuf::from(".env")));
+        assert!(resolved.contains(&PathBuf::from("*.pem")));
+    }
+
+    #[test]
+    fn a_bare_entry_is_unaffected_by_the_process_current_directory() {
+        // Regression test for the bug this fix closes: if a bare entry
+        // were run through tilde/symlink resolution like a real path,
+        // `canonicalize` could silently rewrite it into an absolute path
+        // tied to wherever the process happened to be launched from —
+        // breaking the "matches this basename anywhere" semantic. Proven
+        // here by asserting the entry stays the literal configured
+        // string regardless of what the test process's own cwd contains
+        // (this test does not need to create a real `.env` file or
+        // change directory to prove it — the fix means resolution is
+        // never attempted at all for a bare entry).
+        let settings = PermissionSettings {
+            deny_paths: vec![".env".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert_eq!(settings.resolved_deny_paths(), vec![PathBuf::from(".env")]);
+    }
+
+    #[test]
+    fn a_bare_tilde_alone_still_expands_to_the_home_directory() {
+        // `"~"` contains no `/`, so it must be special-cased in the
+        // bare-pattern classification — otherwise this would regress from
+        // an already-supported case into a literal, wrong pattern.
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .canonicalize()
+            .expect("$HOME must exist");
+        let settings = PermissionSettings {
+            deny_paths: vec!["~".to_string()],
+            ..PermissionSettings::default()
+        };
+
+        assert_eq!(settings.resolved_deny_paths(), vec![home]);
     }
 }
