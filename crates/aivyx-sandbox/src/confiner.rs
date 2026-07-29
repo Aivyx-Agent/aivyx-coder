@@ -136,44 +136,69 @@ impl LandlockConfiner {
             );
         }
 
-        // `grant_paths_excluding` is applied uniformly to every candidate
-        // root, not just `cwd` — any of them could, in principle, contain a
-        // nested `deny_paths` entry (most concretely: `cwd` is very
-        // commonly itself a subdirectory of the system tmp dir, e.g. in
-        // tests or scratch working directories, so the tmp-dir grant below
-        // needs the same treatment or it silently re-grants whatever `cwd`'s
-        // own carve-out just excluded). It's a no-op (returns the root
-        // unchanged) whenever nothing is actually nested underneath, so this
-        // costs nothing extra in the common case.
-        let mut read_candidates: Vec<PathBuf> =
+        // Fixed system/toolchain read paths: never scanned for
+        // basename-glob matches (see `find_basename_glob_matches`'s doc
+        // comment for why — no project secret plausibly lives under
+        // `/usr` etc., and recursively walking them would be substantial,
+        // pointless work). Bare patterns already have zero effect on
+        // `grant_paths_excluding`'s existing absolute-only checks, so
+        // passing the plain `deny_paths` list here is a correctness
+        // no-op, not a special case that needs its own logic.
+        let mut system_read_candidates: Vec<PathBuf> =
             DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
-            read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
+            system_read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        read_candidates.push(cwd.to_path_buf());
-        read_candidates.extend(extra_read_paths.iter().cloned());
-        let mut read_paths: Vec<PathBuf> = read_candidates
+        let mut read_paths: Vec<PathBuf> = system_read_candidates
             .iter()
             .flat_map(|root| grant_paths_excluding(root, deny_paths))
             .collect();
+
+        // `cwd` is project-relevant — its own basename-glob matches are
+        // computed once here and reused for both its read grant (below)
+        // and its write grant (further down), since a project's own
+        // secrets are exactly what this feature exists to protect.
+        let mut cwd_deny_paths = deny_paths.to_vec();
+        cwd_deny_paths.extend(find_basename_glob_matches(cwd, deny_paths));
+        read_paths.extend(grant_paths_excluding(cwd, &cwd_deny_paths));
+
+        // `extra_read_paths` entries are also project-relevant (they're
+        // explicitly configured additional read locations), so each gets
+        // its own basename-glob scan.
+        for extra_root in extra_read_paths {
+            let mut extra_deny_paths = deny_paths.to_vec();
+            extra_deny_paths.extend(find_basename_glob_matches(extra_root, deny_paths));
+            read_paths.extend(grant_paths_excluding(extra_root, &extra_deny_paths));
+        }
         // Read side of the device grants below (read and write rules are
         // separate Landlock rule sets, so both lists need the entries).
         read_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
+        let mut write_paths: Vec<PathBuf> = grant_paths_excluding(cwd, &cwd_deny_paths);
+        // The OS temp directory and `TMPDIR` are not project-relevant —
+        // same reasoning as the system read paths above — but `cwd` is
+        // very commonly itself a subdirectory of the system tmp dir (e.g.
+        // in tests or scratch working directories, as here), so this grant
+        // is still filtered against `cwd_deny_paths`, not the plain
+        // `deny_paths`: otherwise a resolved bare-pattern match like
+        // `.env` would only be excluded from `cwd`'s own grant above,
+        // while this wholesale `AccessFs::from_all` grant over an
+        // ancestor directory would silently re-grant it (from_all
+        // includes read, not just write).
+        let mut system_write_candidates = vec![std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            write_candidates.push(PathBuf::from(tmpdir));
+            system_write_candidates.push(PathBuf::from(tmpdir));
         }
-        let mut write_paths: Vec<PathBuf> = write_candidates
-            .iter()
-            .flat_map(|root| grant_paths_excluding(root, deny_paths))
-            .collect();
+        write_paths.extend(
+            system_write_candidates
+                .iter()
+                .flat_map(|root| grant_paths_excluding(root, &cwd_deny_paths)),
+        );
         // Individual device files, not subject to deny_paths carve-outs
         // (they're fixed, well-known, and content-free); `path_beneath_rules`
         // silently skips any that don't exist.
         write_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
-
         let seccomp_program = build_seccomp_filter();
 
         Self {
@@ -243,6 +268,52 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     grants
+}
+
+/// Recursively finds every path under `root` whose basename matches a
+/// bare (single-component) `deny_paths` pattern — the concrete
+/// file-level exclusions `LandlockConfiner::new` needs before granting
+/// `root`, since `grant_paths_excluding` only understands specific
+/// absolute paths to carve out, not "matches anywhere" patterns. Returns
+/// immediately without touching the filesystem if `deny_paths` has no
+/// bare entries at all.
+fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let bare_patterns: Vec<PathBuf> = deny_paths
+        .iter()
+        .filter(|p| crate::is_bare_pattern(p))
+        .cloned()
+        .collect();
+    if bare_patterns.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    walk_for_basename_matches(root, &bare_patterns, &mut matches);
+    matches
+}
+
+fn walk_for_basename_matches(dir: &Path, bare_patterns: &[PathBuf], matches: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if bare_patterns
+            .iter()
+            .any(|pattern| crate::is_basename_glob_match(&path, pattern))
+        {
+            matches.push(path);
+            continue; // matched — no need to recurse further into it
+        }
+        // `file_type()` reflects the entry itself, not a symlink's
+        // target, so a symlinked directory is never recursed into —
+        // this is what keeps a symlink cycle from causing unbounded
+        // recursion here (unlike `grant_paths_excluding`, this function
+        // recurses into *every* subdirectory by default, so this guard
+        // matters more here).
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            walk_for_basename_matches(&path, bare_patterns, matches);
+        }
+    }
 }
 
 fn build_seccomp_filter() -> BpfProgram {
@@ -486,5 +557,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let grants = grant_paths_excluding(dir.path(), &[dir.path().to_path_buf()]);
         assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn find_basename_glob_matches_finds_a_nested_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/.env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
+
+        let matches = find_basename_glob_matches(dir.path(), &[PathBuf::from(".env")]);
+
+        assert_eq!(matches, vec![dir.path().join("nested/.env")]);
+    }
+
+    #[test]
+    fn find_basename_glob_matches_skips_the_scan_entirely_when_no_bare_patterns_are_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+
+        // Every entry here has a path separator, so `deny_paths` has no
+        // bare patterns at all — the function must return empty without
+        // needing to find (or miss) the very real `.env` file present.
+        let matches = find_basename_glob_matches(dir.path(), &[PathBuf::from("/some/abs/path")]);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_basename_glob_matches_does_not_follow_a_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = tempfile::tempdir().unwrap();
+        std::fs::write(real_target.path().join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(real_target.path(), dir.path().join("link")).unwrap();
+
+        let matches = find_basename_glob_matches(dir.path(), &[PathBuf::from(".env")]);
+
+        assert!(matches.is_empty(), "must not follow symlinked directories");
+    }
+
+    #[tokio::test]
+    async fn a_bare_basename_pattern_nested_inside_cwd_is_excluded_from_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "hello").unwrap();
+
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join(".env"));
+        let command = confiner.confine(command);
+        let (success, output) = run(command).await;
+        assert!(!success, "bare-pattern-matched file should not be readable");
+        assert!(!output.contains("SECRET"));
+
+        let mut command = tokio::process::Command::new("cat");
+        command.arg(dir.path().join("public.txt"));
+        let command = confiner.confine(command);
+        let (success, output) = run(command).await;
+        assert!(success, "non-matching sibling should still be readable");
+        assert!(output.contains("hello"));
     }
 }
