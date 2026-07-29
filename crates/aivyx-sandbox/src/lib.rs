@@ -286,12 +286,22 @@ pub fn default_confiner(
 /// patterns.
 pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     deny_paths.iter().any(|denied| {
-        if denied.parent() == Some(Path::new("")) {
+        if is_bare_pattern(denied) {
             is_basename_glob_match(path, denied)
         } else {
             path.starts_with(denied)
         }
     })
+}
+
+/// A `deny_paths` entry with a single path component (e.g. `.env`,
+/// `*.pem`) is a basename-glob pattern, not a real filesystem location
+/// to resolve — see `path_is_denied`'s own doc comment above for the
+/// full rationale. Extracted so `confiner.rs`'s
+/// `find_basename_glob_matches` classifies entries identically rather
+/// than re-deriving the same check independently.
+fn is_bare_pattern(path: &Path) -> bool {
+    path.parent() == Some(Path::new(""))
 }
 
 fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
@@ -386,5 +396,17 @@ mod tests {
             &deny_paths
         ));
         assert!(!path_is_denied(Path::new("/home/user/other"), &deny_paths));
+    }
+
+    #[test]
+    fn is_bare_pattern_is_true_for_a_single_component_entry() {
+        assert!(is_bare_pattern(Path::new(".env")));
+        assert!(is_bare_pattern(Path::new("*.pem")));
+    }
+
+    #[test]
+    fn is_bare_pattern_is_false_for_a_path_separator_entry() {
+        assert!(!is_bare_pattern(Path::new("/home/user/.ssh")));
+        assert!(!is_bare_pattern(Path::new("relative/two/parts")));
     }
 }
