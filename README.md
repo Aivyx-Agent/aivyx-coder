@@ -843,14 +843,20 @@ pointed at, which a fixed absolute path can't express. This covers:
   `deny_paths` is enforced at the **kernel** level — the Landlock sandbox
   (below) simply never grants access to a denied path, so a shell command
   physically cannot read or write it regardless of how the command is phrased
-  (redirection, env vars, etc.). **Basename-glob entries (no separator, e.g.
-  `.env`, `*.pem`) are not yet enforced at this layer** — Landlock's grant
-  construction (`grant_paths_excluding` in `confiner.rs`) only understands
-  fixed-path carve-outs, so a confined command can still read a file matching
-  a bare pattern. This is a known, tracked gap (see `ROADMAP.md`'s backlog) —
-  the basename-glob feature's primary protection is against the model's own
-  auto-allowed `read_file`/`grep`/`glob` calls (see tier 2 below), which *are*
-  fully covered.
+  (redirection, env vars, etc.). Basename-glob entries (no separator, e.g.
+  `.env`, `*.pem`) are enforced too: `LandlockConfiner` resolves them to
+  concrete file paths once at startup by scanning the working directory and
+  any configured `extra_read_paths` (the roots a project's own secrets could
+  plausibly live under), then excludes those resolved paths from *every*
+  grant — including the fixed system paths (`/usr`, `/lib`, etc.) and the OS
+  temp directory, in case the working directory happens to be nested inside
+  one of them. What's *not* scanned is the system paths' own contents for
+  unrelated matches (recursively walking `/usr` for a project-local pattern
+  would be substantial, pointless work) — only files nested under the
+  working directory or `extra_read_paths` are ever discovered. A file
+  created *after* startup, or matching a bare pattern inside a directory
+  that was granted wholesale because nothing matched yet, also isn't
+  retroactively excluded, since Landlock rulesets are static once built.
 
 ### 2. `ConfirmationGate` — human-in-the-loop, tiered trust
 

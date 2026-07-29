@@ -3181,3 +3181,125 @@ own level rather than at the `agent_builder.rs` call site.
 
 With this shipped, the entire 2026-07-28 capability-audit backlog is
 closed — no tracked items remain.
+
+### Landlock + `aivyx-repomap` basename-glob enforcement — ✅ shipped
+
+The last open item from the `deny_paths` basename-glob feature's own
+final whole-branch review (2026-07-29), closing the entire 2026-07-28
+capability-audit lineage's backlog with nothing left tracked. Design spec
+at
+`docs/superpowers/specs/2026-07-29-landlock-repomap-basename-glob-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-29-landlock-repomap-basename-glob.md`,
+executed via `subagent-driven-development`.
+
+**The problem**: basename-glob `deny_paths` entries were enforced for
+the model's own file/search/git tools via
+`aivyx_sandbox::path_is_denied`, but two other surfaces never got the
+same treatment. (1) Landlock's command-tool grants
+(`grant_paths_excluding` in `crates/aivyx-sandbox/src/confiner.rs`) only
+understood fixed-path carve-outs — a bare pattern like `.env` never
+matches an absolute grant root via `starts_with`, so it was silently
+never carved out, and a confined `run_shell`/`run_command` child could
+still read (or, given this project's unrestricted-network-for-approved-commands
+known limitation, exfiltrate) a file matching one. (2)
+`aivyx-repomap`'s own duplicate `is_denied` — a third copy never
+accounted for during the `deny_paths` feature's own design — had no
+basename-glob awareness either, so a repo-map-parsed source file
+matching a user's bare pattern could still have its symbols/signatures
+reach the system prompt.
+
+**A factual correction made during design, before any code was
+written**: the original backlog entry claimed `aivyx-repomap` "can't add
+`globset`" because it's "deliberately zero-dependency." Checking its
+actual `Cargo.toml` showed this crate already depends on several
+external crates (`ignore`, `tree-sitter` and three per-language
+grammars) — its real, deliberate architectural boundary is zero
+dependency on *other workspace crates* specifically (keeping repo-map
+extraction a pure, independently-testable string-in/string-out
+component, untangled from the security/tools layer), not zero external
+dependencies in general. Adding `globset` — already used at the same
+version elsewhere in the workspace — doesn't touch that boundary at all.
+**General lesson: a "can't do X because of constraint Y" claim made
+during a fast-moving final review is worth re-verifying against the
+actual code before it hardens into the next feature's starting
+assumption** — this one would have sent an entire design down the wrong
+path (hand-rolling a matcher, or debating whether to break the
+boundary) if taken at face value.
+
+**Landlock fix**: rather than modifying the existing, well-tested
+`grant_paths_excluding` recursion at all, a new step
+(`find_basename_glob_matches`) runs before it, recursively walking a
+directory once with `std::fs::read_dir` (no new dependency, matching
+this file's existing hand-rolled-recursion style) to resolve any bare
+pattern into the concrete absolute paths it actually matches there. Bare
+patterns are resolved by scanning only the project-relevant roots — the
+working directory and each configured `extra_read_paths` entry (the
+roots a project's own secrets could plausibly live under, not `/usr`
+etc., which would be substantial, pointless work to scan) — but the
+resulting concrete matches are then merged into **one combined
+`resolved_deny_paths` list applied uniformly to every grant root**,
+including the fixed system paths (`/usr`/`/lib`/`/etc`/home-toolchain
+dirs) and the OS temp directory. `grant_paths_excluding` itself needed
+zero changes, receiving the resolved concrete paths exactly like any
+other denial. Confirmed via `agent_builder.rs`'s single call site that
+`LandlockConfiner::new` is constructed exactly once per session (not per
+command, wrapped in `Arc<dyn ExecutionConfiner>` and reused for every
+subsequent spawn), making the one-time recursive scan a bounded,
+session-startup cost proportional to project size — the same cost
+category `aivyx-repomap`'s own one-time project walk already accepts,
+not a new performance risk.
+
+**Two real bugs found and fixed during this task's own review cycle, not
+at design time**: (1) the implementer's own first draft filtered the
+OS-temp-directory write grant against the plain `deny_paths` list rather
+than the resolved concrete matches — harmless for absolute entries, but
+silently re-granting a bare-pattern match (e.g. `.env`) whenever the
+working directory is nested inside the system temp dir, exactly what
+`tempfile::tempdir()` does in tests and scratch working directories. The
+implementer caught this via the task's own integration test failing,
+fixed it, and flagged the deviation explicitly rather than silently
+patching around it. (2) The task reviewer then independently traced the
+same bug class one step further and found it was only fixed for the temp
+directory, not the fixed system read paths (`/usr`, `/etc`, etc.) —
+meaning a working directory nested inside one of *those* (e.g. a NixOS
+user keeping system config as a project repo at `/etc/nixos`) would
+still leak a denied file via the system path's wholesale grant. The fix
+dispatched in response unified both cases: one combined
+`resolved_deny_paths` list, computed once, applied to every grant root
+without exception — simpler than the two separately-patched cases, and
+verified safe (`grant_paths_excluding` is a no-op for any entry not
+actually nested under the specific root it's given, so passing the full
+resolved list everywhere doesn't over-grant or mis-grant anything).
+**General lesson: the task-review-then-fix loop isn't just for style and
+spec-compliance nits — this cycle caught two real, non-obvious security
+bugs in a security-boundary change that neither the design doc nor the
+plan's own literal code had anticipated, exactly the kind of gap only
+careful, adversarial review (not just "does it match the brief") is
+positioned to find.**
+
+**A new shared predicate, `is_bare_pattern`**, was extracted from
+`path_is_denied`'s previously-inline single-component classification
+check, reused by both `path_is_denied` and the new
+`find_basename_glob_matches` — avoiding two independent call sites that
+must agree on the same classification, the exact duplication shape a
+task reviewer had already flagged as a theoretical risk during the
+original `deny_paths` feature.
+
+**`aivyx-repomap` fix**: added `globset` as a new dependency and gave its
+own `is_denied` the identical classification + basename-glob matching
+logic `path_is_denied` already has — a deliberate, justified duplicate
+this time (see the factual correction above), not an oversight left
+unfixed.
+
+**Deliberately out of scope, documented rather than solved**: a file
+matching a bare pattern created *after* `LandlockConfiner::new` runs,
+inside a directory that was granted wholesale at startup because nothing
+matched yet, isn't retroactively excluded — Landlock rulesets are static
+once built, and closing this would mean rebuilding the ruleset (and
+re-walking the project) on every command spawn, reintroducing the exact
+per-command performance cost the once-per-session design avoids, for a
+narrow race window.
+
+With this shipped, the entire 2026-07-28 capability-audit backlog
+lineage is closed — no tracked items remain in `ROADMAP.md`.

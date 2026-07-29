@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-29_
+_Last updated: 2026-07-30_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -307,6 +307,30 @@ already achieves for its own one-level recursion cap. No new
 composition. Sub-agents keep `run_command`/`run_shell` for one-shot
 needs; only interactive multi-turn REPL sessions are unavailable to them.
 
+**Landlock + `aivyx-repomap` basename-glob enforcement — shipped.** The
+last open item from the `deny_paths` basename-glob feature's own final
+review, closing the entire 2026-07-28 audit lineage's backlog: Landlock's
+command-tool grants (`grant_paths_excluding` in
+`crates/aivyx-sandbox/src/confiner.rs`) and `aivyx-repomap`'s own
+duplicate `is_denied` didn't understand basename-glob `deny_paths`
+entries (`.env`, `*.pem`, etc.), so a confined `run_shell`/`run_command`
+child could still read a matching file, and a repo-map-parsed source file
+matching a user's own bare pattern could still have its symbols reach the
+system prompt. Fixed for Landlock by resolving bare patterns into
+concrete file paths, once at session startup, by scanning the working
+directory and any configured `extra_read_paths` — then applying the
+resolved matches uniformly to *every* grant, including the fixed system
+paths and the OS temp directory, so a working directory nested inside one
+of them (an `/etc/nixos`-style system-config-as-project-repo, or a test's
+scratch directory under the system temp dir) is still fully protected.
+The existing, well-tested carve-out algorithm (`grant_paths_excluding`)
+needed zero changes, receiving the resolved concrete paths exactly like
+any other denial. Fixed for `aivyx-repomap` by adding `globset` as a new
+dependency and mirroring the canonical matcher's logic locally — a
+deliberate, justified duplicate this time, since the crate's real
+architectural boundary (zero dependency on *other workspace crates*, not
+zero external dependencies at all) stays intact.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -339,21 +363,3 @@ security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
 
-**Found at the deny_paths basename-glob feature's final whole-branch
-review (2026-07-29), logged rather than expanding that feature's scope
-mid-review**: basename-glob `deny_paths` entries (`.env`, `*.pem`, etc.)
-are enforced for the model's own file/search/git tools, but not yet for
-two other surfaces. (1) **Landlock command-tool grants**:
-`grant_paths_excluding` (`crates/aivyx-sandbox/src/confiner.rs`) only
-understands fixed-path carve-outs, so a confined `run_shell`/`run_command`
-child can still read a file matching a bare pattern — closing this needs
-real design work (translating a "matches anywhere" pattern into concrete
-filesystem grants at confiner-construction time, e.g. scanning a granted
-root for matching basenames the way nested absolute-path denials are
-already carved out). (2) **`aivyx-repomap`'s own duplicate `is_denied`**
-(a third copy never accounted for during that feature's design, since this
-crate is deliberately zero-dependency on every other workspace crate) has
-no basename-glob awareness either, though no *default* deny_paths entry
-has a repomap-parsed extension, so current impact is nil. Both are
-documented as known limitations in the affected code and in `README.md`
-(the Landlock one) rather than left silently wrong.
