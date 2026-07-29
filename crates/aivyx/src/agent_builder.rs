@@ -392,7 +392,8 @@ pub(crate) async fn build_agent(
     // (recursion is structurally impossible this way, not merely
     // policy-excluded). `delegate_task` is registered onto `registry`
     // (the parent's) below, *after* this clone.
-    let sub_agent_registry = registry.clone();
+    let mut sub_agent_registry = registry.clone();
+    sub_agent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
     // Verification config is threaded through so a sub-agent's own edits
     // get verified before `delegate_task` returns, exactly like the
     // parent's own edits would — mirrors the `agent.set_verification(...)`

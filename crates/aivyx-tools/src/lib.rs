@@ -123,6 +123,14 @@ impl ToolRegistry {
             .map(|tool| tool.definition())
             .collect()
     }
+
+    /// Removes every registered tool whose name matches an entry in
+    /// `names`, in place. Absent names are silently ignored — a caller
+    /// excluding a tool that was never registered (e.g. because a
+    /// feature flag left it out) is not an error condition.
+    pub fn exclude(&mut self, names: &[&str]) {
+        self.tools.retain(|tool| !names.contains(&tool.name()));
+    }
 }
 
 pub struct ToolExecutor {
@@ -453,6 +461,42 @@ mod tests {
 
         assert_eq!(sub_registry.definitions().len(), 1);
         assert_eq!(registry.definitions().len(), 2);
+    }
+
+    #[test]
+    fn exclude_removes_the_named_tool_and_keeps_others() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+
+        registry.exclude(&["write_file"]);
+
+        let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn exclude_is_a_no_op_for_an_unregistered_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+
+        registry.exclude(&["not_a_real_tool"]);
+
+        let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn exclude_removes_multiple_names_in_one_call() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(EditFileTool));
+
+        registry.exclude(&["write_file", "edit_file"]);
+
+        let names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["read_file"]);
     }
 
     struct AllowAllForThisTest;
