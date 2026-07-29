@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-28_
+_Last updated: 2026-07-29_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -290,6 +290,23 @@ the matching logic in `aivyx-tools` (used by `grep`/`glob`/`move_file`/
 a drift risk) was consolidated onto the one canonical
 `aivyx_sandbox::path_is_denied` function as part of this work.
 
+**`delegate_task` REPL isolation — shipped.** The last item in the
+2026-07-28 capability audit's backlog, closing it out entirely.
+`delegate_task` sub-agents previously shared the parent's single global
+REPL session (`ToolRegistry::clone()` clones `Arc` pointers, not
+underlying state, so a sub-agent's registry held the exact same
+`ReplStartTool`/`ReplSendTool`/`ReplStopTool` instances, bound to the
+same session, as the parent) — breaking the "fresh, isolated agent,
+completely separate conversation history" invariant `delegate_task` is
+documented to provide. Fixed with a new `ToolRegistry::exclude` method,
+called once in `agent_builder.rs` right after the parent registry is
+cloned for sub-agent use: REPL tools are simply never offered to a
+sub-agent, the same "just never in the list" outcome `delegate_task`
+already achieves for its own one-level recursion cap. No new
+`ActionKind`, `PermissionTarget`, or gate logic — pure tool-list
+composition. Sub-agents keep `run_command`/`run_shell` for one-shot
+needs; only interactive multi-turn REPL sessions are unavailable to them.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -312,22 +329,10 @@ current codebase found two documentation-accuracy gaps, fixed directly
 (the autonomous-mode paragraph was missing `repl_start`/MCP-tool/
 `remember_preference` denials added since it was written; the TOCTOU
 known-limitation bullet was missing `patch_file`, which has the identical
-resolve-twice exposure), and one genuine new-capability gap, logged here
-rather than patched ad hoc: **`delegate_task` sub-agents share the
-parent's single global REPL session slot**, breaking the "fresh, isolated
-agent, completely separate conversation history" invariant `delegate_task`
-is documented to provide. `crates/aivyx/src/agent_builder.rs` clones the
-same `ToolRegistry` (same underlying `Arc<Mutex<Option<ReplSession>>>`)
-for sub-agents; `sub_agent_registry_never_contains_delegate_task_itself`
-is the only sub-agent tool exclusion that exists today. A sub-agent's
-`repl_start` call is invisible to the parent's own history, yet the
-process it starts outlives the sub-agent and can collide with (or be
-silently reused/blocked by) the parent's own REPL usage. Needs its own
-design pass: exclude REPL tools from the sub-agent registry entirely,
-give each sub-agent a private session slot, or auto-stop any session a
-sub-agent leaves running when it completes. (The `deny_paths` gap
-previously logged alongside this one shipped — see "`deny_paths`
-basename-glob matching" above.)
+resolve-twice exposure), and two genuine new-capability gaps, both since
+shipped: `deny_paths` basename-glob matching and `delegate_task` REPL
+isolation (see "Current status" above for both). With both done, this
+audit's backlog is now fully resolved.
 
 No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see

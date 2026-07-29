@@ -261,7 +261,11 @@ but never join history directly. Bounded by `[sub_agent] max_iterations`
 (default 10); a sub-agent that runs out of budget still returns its
 best-effort partial result rather than failing outright. Delegation is
 capped at one level — a sub-agent's own tool list never includes
-`delegate_task`.
+`delegate_task`. REPL tools (`repl_start`/`repl_send`/`repl_stop`) are
+excluded too — a sub-agent sharing the parent's single REPL session slot
+would break the isolated-conversation-history guarantee this feature is
+built around, so a sub-agent needing to run something falls back to
+`run_command`/`run_shell` instead.
 
 **Architect/editor model-pairing** (`/architect <task>`): a separately
 configured, typically stronger model produces a prose implementation plan

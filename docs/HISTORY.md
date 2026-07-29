@@ -3121,3 +3121,63 @@ review, is what caught both the Landlock gap and the third duplicate,
 because only a review scoped to "does this genuinely hold across the
 *whole* workspace" rather than "does this task's diff do what its brief
 says" would think to check `confiner.rs` and `aivyx-repomap` at all.
+
+### `delegate_task` REPL isolation — ✅ shipped
+
+The last item in the 2026-07-28 capability audit's backlog, closing it
+out entirely. Design spec at
+`docs/superpowers/specs/2026-07-29-delegate-task-repl-isolation-design.md`,
+implementation plan at
+`docs/superpowers/plans/2026-07-29-delegate-task-repl-isolation.md`,
+executed via `subagent-driven-development`.
+
+**The problem**: `delegate_task` sub-agents shared the parent's single
+global REPL session. `crates/aivyx/src/agent_builder.rs` registers
+`ReplStartTool`/`ReplSendTool`/`ReplStopTool` onto the parent's
+`ToolRegistry`, all three bound to the same `SharedReplSession`
+(`Arc<AsyncMutex<Option<ReplSession>>>`), *before* cloning that registry
+into `sub_agent_registry` for `delegate_task`'s use. `ToolRegistry`'s
+`Clone` clones `Arc` pointers, not underlying tool state, so a
+sub-agent's registry held the *exact same* REPL tool instances as the
+parent — a sub-agent's `repl_start` call was invisible to the parent's
+own conversation history, yet the process it started outlived the
+sub-agent and could collide with the parent's own REPL usage (a
+`repl_start` failing with "already running" for a session the other
+side didn't know existed, in either direction).
+
+**What shipped**: a new `ToolRegistry::exclude(&mut self, names:
+&[&str])` method (`crates/aivyx-tools/src/lib.rs`) removes registered
+tools by name, in place — absent names are silently ignored. One new
+line in `agent_builder.rs`, immediately after the existing
+`sub_agent_registry` clone, calls it with the three REPL tool names.
+That is the entire fix: no new `ActionKind`, `PermissionTarget`, or gate
+logic, since this is pure tool-list composition, not a new capability
+needing its own trust tier.
+
+**Three fix shapes were considered during design, resolved with the
+user**: exclude REPL tools from the sub-agent registry entirely
+(chosen — smallest, safest, sub-agent REPL access is a narrow edge case
+`run_command`/`run_shell` mostly covers); give each sub-agent a private
+REPL session (preserves full capability, but needs meaningfully more
+plumbing — a registry-mutation primitive plus threading the REPL tools'
+constructor settings into `DelegateTaskConfig` to rebuild them per call);
+or keep sharing and auto-stop on completion (cheapest, but doesn't fix
+the collision case, only prevents a leaked process). The chosen fix
+means `delegate_task`'s "full tool access" claim in `README.md` needed a
+one-clause correction — updated alongside the code fix.
+
+**A deliberate testing-scope decision, matching this project's
+established convention**: no test was added in `agent_builder.rs`
+itself, which has zero existing tests and remains pure, untested
+integration wiring — the tested logic lives entirely in the new
+`ToolRegistry::exclude` primitive (three unit tests: removes a named
+tool while keeping others, is a no-op for an absent name, removes
+multiple names in one call), and the one-line call site was verified by
+the final whole-branch review reading `agent_builder.rs` directly rather
+than by a dedicated unit test that can't see the real registration
+order anyway. Same pattern this project already used for
+`[verification] scoped_command`'s resolution logic, tested at `Agent`'s
+own level rather than at the `agent_builder.rs` call site.
+
+With this shipped, the entire 2026-07-28 capability-audit backlog is
+closed — no tracked items remain.
