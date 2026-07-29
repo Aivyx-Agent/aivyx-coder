@@ -363,3 +363,16 @@ security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
 
+**Found at the Landlock + `aivyx-repomap` basename-glob enforcement
+feature's own final whole-branch review (2026-07-30), logged rather than
+expanding that feature's scope mid-review**: `aivyx-repomap`'s
+`wiki_pointer_lines` (`crates/aivyx-repomap/src/lib.rs`) reads
+`docs/wiki/*.md` files and injects their path + one-line summary into the
+system prompt every turn, with **no `deny_paths` check at all** — unlike
+`collect_tags`, which the Landlock + `aivyx-repomap` feature just added
+basename-glob matching to. A user who denied a pattern matching a wiki
+page (e.g. `secret*.md`) would still have its summary reach the prompt.
+Low severity (scoped to `.md` files under `docs/wiki/`, and no default
+`deny_paths` entry targets `.md`), but it's the one remaining "content
+reaches the prompt without any deny check" path in this crate.
+

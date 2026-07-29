@@ -3246,9 +3246,15 @@ other denial. Confirmed via `agent_builder.rs`'s single call site that
 `LandlockConfiner::new` is constructed exactly once per session (not per
 command, wrapped in `Arc<dyn ExecutionConfiner>` and reused for every
 subsequent spawn), making the one-time recursive scan a bounded,
-session-startup cost proportional to project size — the same cost
-category `aivyx-repomap`'s own one-time project walk already accepts,
-not a new performance risk.
+session-startup cost proportional to project size. Unlike
+`aivyx-repomap`'s own one-time walk (which uses `ignore::WalkBuilder` and
+respects `.gitignore`/skips `.git`), this scan deliberately does *not*
+filter by gitignore rules — a gitignored `.env` must still be caught, so
+skipping it here would reopen exactly the hole this feature closes — so
+the two walks are not actually the same cost category; this one is
+somewhat more expensive on a large project with a big `.gitignore`'d
+`node_modules`/`target` tree, though `.git` itself is now skipped (see
+below).
 
 **Two real bugs found and fixed during this task's own review cycle, not
 at design time**: (1) the implementer's own first draft filtered the

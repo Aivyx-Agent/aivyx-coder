@@ -156,6 +156,7 @@ dependencies = [
 name = "aivyx-repomap"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "ignore",
  "streaming-iterator",
  "tempfile",

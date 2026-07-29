@@ -275,6 +275,17 @@ fn grant_paths_excluding(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
 /// absolute paths to carve out, not "matches anywhere" patterns. Returns
 /// immediately without touching the filesystem if `deny_paths` has no
 /// bare entries at all.
+///
+/// Each match found here forces `grant_paths_excluding` to enumerate its
+/// containing directory child-by-child instead of granting it wholesale
+/// (see that function's own doc comment) — a project with many matching
+/// files (e.g. a `node_modules` tree containing numerous test `*.pem`
+/// fixtures) will produce a larger Landlock ruleset, rebuilt on every
+/// command spawn via `LandlockConfiner::confine`. This is a real,
+/// match-count-proportional cost, accepted as the price of closing the
+/// security gap this function exists for — not a bug, but worth knowing
+/// if a project's grant construction becomes noticeably slower after
+/// adding a broad bare pattern.
 fn find_basename_glob_matches(root: &Path, deny_paths: &[PathBuf]) -> Vec<PathBuf> {
     let bare_patterns: Vec<PathBuf> = deny_paths
         .iter()
@@ -309,6 +320,14 @@ fn walk_for_basename_matches(dir: &Path, bare_patterns: &[PathBuf], matches: &mu
         // recurses into *every* subdirectory by default, so this guard
         // matters more here).
         if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            // `.git` directories never legitimately hold a project's own
+            // secrets — they hold git's own internal object database and
+            // refs — so skipping them cuts real walk cost (a `.git`
+            // directory can be large) without weakening the security
+            // guarantee this scan exists for.
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
             walk_for_basename_matches(&path, bare_patterns, matches);
         }
     }
@@ -596,6 +615,17 @@ mod tests {
         assert!(matches.is_empty(), "must not follow symlinked directories");
     }
 
+    #[test]
+    fn find_basename_glob_matches_does_not_descend_into_a_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/.env"), "SECRET=1").unwrap();
+
+        let matches = find_basename_glob_matches(dir.path(), &[PathBuf::from(".env")]);
+
+        assert!(matches.is_empty(), "must not descend into .git directories");
+    }
+
     #[tokio::test]
     async fn a_bare_basename_pattern_nested_inside_cwd_is_excluded_from_the_grant() {
         let dir = tempfile::tempdir().unwrap();
@@ -617,5 +647,24 @@ mod tests {
         let (success, output) = run(command).await;
         assert!(success, "non-matching sibling should still be readable");
         assert!(output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn a_bare_basename_pattern_nested_inside_cwd_cannot_be_written_either() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+
+        let confiner = LandlockConfiner::new(dir.path(), &[], &[PathBuf::from(".env")], true);
+
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", &format!("echo overwritten > {}", dir.path().join(".env").display())]);
+        let command = confiner.confine(command);
+        let (success, _output) = run(command).await;
+        assert!(!success, "writing to a bare-pattern-matched file should fail");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+            "SECRET=1",
+            "the original content must be untouched"
+        );
     }
 }
