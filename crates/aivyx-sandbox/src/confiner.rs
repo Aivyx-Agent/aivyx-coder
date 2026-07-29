@@ -136,69 +136,67 @@ impl LandlockConfiner {
             );
         }
 
-        // Fixed system/toolchain read paths: never scanned for
-        // basename-glob matches (see `find_basename_glob_matches`'s doc
-        // comment for why — no project secret plausibly lives under
-        // `/usr` etc., and recursively walking them would be substantial,
-        // pointless work). Bare patterns already have zero effect on
-        // `grant_paths_excluding`'s existing absolute-only checks, so
-        // passing the plain `deny_paths` list here is a correctness
-        // no-op, not a special case that needs its own logic.
-        let mut system_read_candidates: Vec<PathBuf> =
+        // Bare deny_paths patterns (e.g. `.env`) are resolved into
+        // concrete file paths, once, by scanning every project-relevant
+        // root — `cwd` and each `extra_read_paths` entry, the roots a
+        // project's own secrets could plausibly live under. The combined
+        // result is reused for *every* grant computation below,
+        // including the fixed system paths and the OS temp directory:
+        // any of them could, in principle, be an ancestor of a
+        // project-relevant root (an `/etc/nixos`-style system-config-as-
+        // project-repo, or `cwd` nested inside the system temp dir in
+        // tests/scratch directories) and would otherwise silently
+        // re-grant whatever that root's own narrower carve-out just
+        // excluded. Passing the same fully-resolved list to every
+        // `grant_paths_excluding` call is safe, not overly permissive —
+        // that function only ever acts on entries actually nested under
+        // the specific root it's given — and reusing the already-computed
+        // matches this way costs nothing extra; `find_basename_glob_matches`
+        // itself is a no-op whenever `deny_paths` has no bare entries at
+        // all.
+        let mut resolved_deny_paths = deny_paths.to_vec();
+        resolved_deny_paths.extend(find_basename_glob_matches(cwd, deny_paths));
+        for extra_root in extra_read_paths {
+            resolved_deny_paths.extend(find_basename_glob_matches(extra_root, deny_paths));
+        }
+
+        // `grant_paths_excluding` is applied uniformly to every candidate
+        // root — any of them could, in principle, contain a nested
+        // `deny_paths` entry (see the comment above for why the resolved
+        // bare-pattern matches specifically need this uniform treatment,
+        // beyond the original reasoning about absolute nested entries).
+        // It's a no-op (returns the root unchanged) whenever nothing is
+        // actually nested underneath, so this costs nothing extra in the
+        // common case.
+        let mut read_candidates: Vec<PathBuf> =
             DEFAULT_READ_PATHS.iter().map(PathBuf::from).collect();
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
-            system_read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
+            read_candidates.extend(DEFAULT_HOME_READ_PATHS.iter().map(|p| home.join(p)));
         }
-        let mut read_paths: Vec<PathBuf> = system_read_candidates
+        read_candidates.push(cwd.to_path_buf());
+        read_candidates.extend(extra_read_paths.iter().cloned());
+        let mut read_paths: Vec<PathBuf> = read_candidates
             .iter()
-            .flat_map(|root| grant_paths_excluding(root, deny_paths))
+            .flat_map(|root| grant_paths_excluding(root, &resolved_deny_paths))
             .collect();
-
-        // `cwd` is project-relevant — its own basename-glob matches are
-        // computed once here and reused for both its read grant (below)
-        // and its write grant (further down), since a project's own
-        // secrets are exactly what this feature exists to protect.
-        let mut cwd_deny_paths = deny_paths.to_vec();
-        cwd_deny_paths.extend(find_basename_glob_matches(cwd, deny_paths));
-        read_paths.extend(grant_paths_excluding(cwd, &cwd_deny_paths));
-
-        // `extra_read_paths` entries are also project-relevant (they're
-        // explicitly configured additional read locations), so each gets
-        // its own basename-glob scan.
-        for extra_root in extra_read_paths {
-            let mut extra_deny_paths = deny_paths.to_vec();
-            extra_deny_paths.extend(find_basename_glob_matches(extra_root, deny_paths));
-            read_paths.extend(grant_paths_excluding(extra_root, &extra_deny_paths));
-        }
         // Read side of the device grants below (read and write rules are
         // separate Landlock rule sets, so both lists need the entries).
         read_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
 
-        let mut write_paths: Vec<PathBuf> = grant_paths_excluding(cwd, &cwd_deny_paths);
-        // The OS temp directory and `TMPDIR` are not project-relevant —
-        // same reasoning as the system read paths above — but `cwd` is
-        // very commonly itself a subdirectory of the system tmp dir (e.g.
-        // in tests or scratch working directories, as here), so this grant
-        // is still filtered against `cwd_deny_paths`, not the plain
-        // `deny_paths`: otherwise a resolved bare-pattern match like
-        // `.env` would only be excluded from `cwd`'s own grant above,
-        // while this wholesale `AccessFs::from_all` grant over an
-        // ancestor directory would silently re-grant it (from_all
-        // includes read, not just write).
-        let mut system_write_candidates = vec![std::env::temp_dir()];
+        let mut write_candidates = vec![cwd.to_path_buf(), std::env::temp_dir()];
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            system_write_candidates.push(PathBuf::from(tmpdir));
+            write_candidates.push(PathBuf::from(tmpdir));
         }
-        write_paths.extend(
-            system_write_candidates
-                .iter()
-                .flat_map(|root| grant_paths_excluding(root, &cwd_deny_paths)),
-        );
+        let mut write_paths: Vec<PathBuf> = write_candidates
+            .iter()
+            .flat_map(|root| grant_paths_excluding(root, &resolved_deny_paths))
+            .collect();
         // Individual device files, not subject to deny_paths carve-outs
         // (they're fixed, well-known, and content-free); `path_beneath_rules`
         // silently skips any that don't exist.
         write_paths.extend(DEVICE_RW_PATHS.iter().map(PathBuf::from));
+
         let seccomp_program = build_seccomp_filter();
 
         Self {
@@ -572,13 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn find_basename_glob_matches_skips_the_scan_entirely_when_no_bare_patterns_are_configured() {
+    fn a_deny_paths_list_with_no_bare_entries_produces_no_matches() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
 
         // Every entry here has a path separator, so `deny_paths` has no
-        // bare patterns at all — the function must return empty without
-        // needing to find (or miss) the very real `.env` file present.
+        // bare patterns at all — the real `.env` file present must not
+        // be reported as a match, whether or not the fast-path
+        // short-circuit itself is exercised (a separate, harder-to-
+        // black-box-test performance property, not asserted here).
         let matches = find_basename_glob_matches(dir.path(), &[PathBuf::from("/some/abs/path")]);
 
         assert!(matches.is_empty());
