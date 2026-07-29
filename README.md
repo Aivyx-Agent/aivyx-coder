@@ -585,7 +585,7 @@ with running commands).
 ## Serving
 
 aivyx speaks the OpenAI-compatible `/v1` API, so any local server works.
-Two supported setups:
+A few documented options:
 
 **Ollama (quick start).** Zero-setup, and the shipped default. One trap to
 know: Ollama serves its *own* default context window (typically 4096)
