@@ -721,6 +721,52 @@ control (no Ollama-style hidden default), and the Phase 10 acceptance
 benchmark reproduced the native 9/9 / prompted 6/9 result exactly against
 a Lemonade-managed `qwen3.5:9b`.
 
+**Docker Model Runner (Docker Desktop/Engine's built-in local model
+runner).** ⚠️ **Not yet live-verified** — everything in this subsection
+comes from Docker's own documentation and third-party write-ups
+gathered during research, not from a real running instance (unlike
+every other backend above, which was confirmed live before being
+written down). Treat the specifics here as a starting point, not a
+guarantee, until someone runs it.
+
+Docker Model Runner (DMR) serves local models through an
+OpenAI-compatible API, integrated into the normal Docker workflow —
+pull a model with `docker model pull <name>` (model names look like
+`ai/qwen2.5-coder` or `ai/smollm2:360M-Q4_K_M`), then point aivyx at:
+
+```toml
+[backend]
+base_url = "http://localhost:12434/engines/v1"
+model = "ai/qwen2.5-coder"
+```
+
+(An explicit engine can also be named in the path —
+`http://localhost:12434/engines/llama.cpp/v1` — if the plain form
+doesn't resolve on your install.)
+
+**The same hidden-context-window trap as Ollama, reportedly**: DMR's
+underlying llama.cpp engine defaults to a 4096-token context unless
+explicitly configured. Set it with `docker model configure
+--context-size N <model>` (or a `context_size:` key under `models:` in
+a Docker Compose file) before pointing aivyx at it — and note that
+aivyx's own startup probe (which catches this automatically for Ollama)
+does **not** currently detect it for DMR, since DMR's diagnostic
+endpoint shape isn't confirmed yet (see `probe.rs`). Until that's
+extended, confirm your configured context size manually rather than
+relying on a truncation warning. One third-party report (recent, but not
+precisely dated) found a specific Docker CUDA runtime image that
+hard-coded `--ctx-size 4096` regardless of the `configure` setting —
+worth checking for on whatever version you actually install, not
+assumed fixed or still-broken.
+
+Tool/function calling is documented as supported (backed by llama.cpp),
+but hasn't been checked end-to-end through aivyx's own native edit
+format — this project's own experience is that serving configuration,
+not the model, is usually the dominant variable for tool-call
+reliability (see the Ollama-vs-llama-server serving verdict in
+`ROADMAP.md`), so this is worth verifying directly rather than assuming
+Docker's own claim transfers.
+
 ## Editor integration (ACP)
 
 `aivyx-coder --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)

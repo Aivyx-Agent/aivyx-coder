@@ -331,6 +331,17 @@ deliberate, justified duplicate this time, since the crate's real
 architectural boundary (zero dependency on *other workspace crates*, not
 zero external dependencies at all) stays intact.
 
+**Docker Model Runner serving support — documented, pending live
+verification.** A new `README.md` "Serving" subsection covers Docker
+Model Runner (DMR) as another local-LLM backend option — no code
+changes needed, since `base_url` already targets any OpenAI-compatible
+endpoint generically. Unlike every other backend documented in this
+project, none of this subsection's technical claims (the exact `base_url`
+path, the context-window default behavior, whether tool-calling works
+end-to-end through aivyx's native edit format) have been confirmed
+against a real running instance yet — see `docs/HISTORY.md` for the full
+account of what's confirmed vs. still open.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 

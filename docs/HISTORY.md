@@ -3309,3 +3309,72 @@ narrow race window.
 
 With this shipped, the entire 2026-07-28 capability-audit backlog
 lineage is closed — no tracked items remain in `ROADMAP.md`.
+
+### Docker Model Runner serving support — documented, live verification pending
+
+Originally raised as part of a larger idea — packaging aivyx-coder
+itself as a Docker/container-based distribution, with Docker Model
+Runner (DMR) as the bundled LLM backend, to simplify end-user setup.
+That larger question was descoped immediately after research surfaced a
+real, unresolved risk: this project's core security mechanism
+(Landlock) is very likely blocked by Docker's *default* seccomp profile
+— the `landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`
+syscalls are almost certainly not on Docker's default allowlist, based
+on reasonably corroborated (but not empirically confirmed — no Docker
+daemon was accessible in the research session) search findings. A
+containerized aivyx-coder would likely either refuse to run confined
+commands (`sandbox.require_enforcement`'s fail-closed default) or
+silently run them unconfined, undermining the property `CLAUDE.md`
+calls "load-bearing." This is logged as a separate, real, future design
+question — not solved here, not part of this chapter.
+
+**What actually shipped this chapter: a new `README.md` "Serving"
+subsection documenting Docker Model Runner as a supported LLM backend**
+— aivyx-coder itself stays a native binary, distributed exactly as
+today. `aivyx-llm`'s `OpenAiCompatBackend` already treats `base_url` as
+an opaque prefix and appends `/chat/completions` directly, so pointing
+it at DMR needed zero code changes — the same "no new config surface
+needed" shape as the earlier vLLM compat pass.
+
+**Everything in the new subsection is honestly flagged as unverified**,
+a deliberate departure from how every other backend in this project has
+been documented — Ollama, llama-server, Lemonade, and vLLM were each
+confirmed against a real running instance (live E2E tests, acceptance
+benchmarks, or at minimum a manual compat check) before being written
+into `README.md`. For DMR: no running Docker daemon was accessible
+during this chapter's research, so the base URL
+(`http://localhost:12434/engines/v1`), the model-naming convention
+(`namespace/name[:tag]`), the reported hidden-context-window default
+(4096, unless set via `docker model configure --context-size N`), and
+whether tool/function calling actually works end-to-end through aivyx's
+native edit format are all drawn from Docker's own docs and third-party
+write-ups, not confirmed firsthand. One specific claim worth
+double-checking on a real install: a third-party report found a Docker
+CUDA runtime image that hard-coded `--ctx-size 4096` regardless of the
+`configure` setting — possibly since fixed, possibly not.
+
+**`probe.rs`'s automatic context-window detection was deliberately not
+extended for DMR in this chapter.** Its origin-derivation logic
+(`base_url.trim_end_matches('/').trim_end_matches("/v1")`) only strips a
+trailing `/v1`; for DMR's `.../engines/v1` base URL this leaves
+`.../engines` as the computed origin, an assumption not confirmed to
+line up with wherever DMR's actual diagnostic endpoint (if one even
+exists in an Ollama-`/api/show`-compatible shape) actually lives.
+Shipping a guessed implementation would have been shipping unverified
+parsing logic — low-risk, since both existing parsers fail safe to
+`ServedContext::Unknown` on any shape mismatch rather than misreporting
+a wrong number, but still speculative code with no way to confirm it
+helps anyone until tested live. **General lesson, consistent with this
+project's established practice** (see the `diffy` and `cargo test`
+path-filtering findings elsewhere in this history): verify a
+dependency's or service's actual behavior before writing code against
+assumptions about it — documentation with an honest "unverified" label
+is more useful than code that quietly might not work.
+
+**Still open, the actual next step for this chapter**: a live check
+against a real Docker Model Runner instance — confirming the base URL
+and model-naming convention actually work, confirming or correcting the
+context-window default behavior on whatever version is actually
+installed, checking tool-calling end-to-end through aivyx's native edit
+format, and — if a real diagnostic endpoint is found — a follow-up
+`probe.rs` extension using the now-confirmed shape.
