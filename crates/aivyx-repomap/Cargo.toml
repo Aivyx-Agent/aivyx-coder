@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+globset = "0.4.18"
 ignore = "0.4.28"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.26.10"

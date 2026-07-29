@@ -222,30 +222,49 @@ impl RepoMap {
 }
 
 /// Denies a path if it (or a symlink-resolved alias) sits under one of
-/// `deny_paths`' absolute/tilde-prefixed entries.
+/// `deny_paths`' absolute/tilde-prefixed entries, or matches a bare
+/// basename-glob entry (e.g. `.env`, `*.pem`) by file name.
 ///
-/// **Known gap (2026-07-29, found at the deny_paths basename-glob
-/// feature's final review):** this does NOT support the basename-glob
-/// matching `aivyx_sandbox::path_is_denied` added for bare entries like
-/// `.env`/`*.pem` — this crate is deliberately zero-dependency on every
-/// other workspace crate, so it can't call that function or add
-/// `globset`. A bare pattern here is compared via `starts_with` against
-/// an absolute path and will practically never match, so a repo-map-parsed
-/// source file matching a user's own bare `deny_paths` pattern would still
-/// have its symbols/signatures reach the system prompt. Lower severity
-/// than the file-read surface `path_is_denied` protects (only
-/// signatures reach the prompt here, not file content), and no *default*
-/// deny_paths entry has a repomap-parsed extension (`.rs`/`.py`/`.js`/
-/// `.jsx`/`.ts`/`.tsx`), so this wasn't treated as merge-blocking — see
-/// `ROADMAP.md`'s backlog for the tracked follow-up.
+/// **Fixed 2026-07-29** (previously a known gap, found at the
+/// `deny_paths` basename-glob feature's own final review): this crate
+/// has zero dependencies on any *other workspace crate* (deliberately —
+/// keeps repo-map extraction a pure, independently-testable
+/// string-in/string-out component, untangled from the security/tools
+/// layer), which means it cannot call `aivyx_sandbox::path_is_denied`
+/// directly or depend on `aivyx-sandbox`. It can, however, depend on
+/// external crates like any other — `globset` (already used elsewhere
+/// in the workspace) is now one, alongside the `ignore`/`tree-sitter-*`
+/// crates this crate already pulled in. The classification and matching
+/// logic below is therefore a deliberate, justified duplicate of
+/// `path_is_denied`'s, not an oversight.
 fn is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     // Denied entries are canonicalized at config load; canonicalize the
     // candidate too so a symlinked spelling can't slip past the comparison
     // (same convention as the search tools).
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    deny_paths
-        .iter()
-        .any(|denied| canonical.starts_with(denied) || path.starts_with(denied))
+    deny_paths.iter().any(|denied| {
+        if is_bare_pattern(denied) {
+            is_basename_glob_match(&canonical, denied) || is_basename_glob_match(path, denied)
+        } else {
+            canonical.starts_with(denied) || path.starts_with(denied)
+        }
+    })
+}
+
+fn is_bare_pattern(path: &Path) -> bool {
+    path.parent() == Some(Path::new(""))
+}
+
+fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(pattern) = pattern.to_str() else {
+        return false;
+    };
+    globset::Glob::new(pattern)
+        .map(|glob| glob.compile_matcher().is_match(name))
+        .unwrap_or(false)
 }
 
 struct CompiledLanguage {
@@ -608,6 +627,23 @@ fn caller() {
         assert!(
             !rendered.contains("secret_fn"),
             "denied leaked:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_bare_basename_pattern_excludes_a_matching_file_from_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "visible.rs", "pub fn visible_fn() {}\n");
+        write(dir.path(), "secret_config.rs", "pub fn secret_fn() {}\n");
+
+        let deny = vec![PathBuf::from("secret_*.rs")];
+        let map = RepoMap::new(dir.path().to_path_buf(), deny);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(rendered.contains("visible_fn"));
+        assert!(
+            !rendered.contains("secret_fn"),
+            "bare-pattern-matched file leaked:\n{rendered}"
         );
     }
 
