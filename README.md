@@ -250,9 +250,10 @@ first-run, full-skeleton regeneration. See `docs/HISTORY.md`'s Phase 11
 section (the "11b" subsection) for the full design rationale.
 
 **Sub-agent delegation** (`delegate_task`): a tool the model can call
-mid-turn to hand a bounded task to a fresh, isolated agent — full tool
-access, the same `ConfirmationGate`/checkpoint/plan-mode boundary as the
-main session, but a completely separate conversation history, so
+mid-turn to hand a bounded task to a fresh, isolated agent — nearly full
+tool access (see the REPL exception below), the same
+`ConfirmationGate`/checkpoint/plan-mode boundary as the main session, but
+a completely separate conversation history, so
 exploring or working on something unfamiliar doesn't clutter the main
 session's own context window. Only the sub-agent's final text answer
 enters the main session's history; its own tool calls/results/reasoning
