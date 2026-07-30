@@ -3447,3 +3447,50 @@ pattern of briefing a final whole-branch review to explicitly hunt for
 unknown instance in four consecutive features and is considered
 established practice for this project's review dispatches going
 forward.
+
+### 2026-07-30 capability audit — done
+
+A fresh audit against the same four dimensions as 2026-07-22 and
+2026-07-28 (security posture, tool coverage, test quality,
+documentation), scoped to everything shipped since 2026-07-28 closed:
+`deny_paths` basename-glob matching, `delegate_task` REPL isolation,
+Landlock + `aivyx-repomap` basename-glob enforcement, Docker Model
+Runner backend docs, `wiki_pointer_lines` `deny_paths` enforcement, and
+`Agent::refresh_agents_files` `deny_paths` enforcement — plus a general
+sweep for gate-tier-order/Landlock drift and any new tool's
+`ActionKind`/`PermissionTarget` pairing. Every finding was independently
+re-verified by reading the actual code before being logged, matching
+this project's established audit practice.
+
+**Nothing new found in security posture, tool coverage, or test
+quality.** Specifically confirmed: the three independent copies of the
+bare-pattern/basename-glob classifier (`aivyx-sandbox`, `aivyx-config`,
+`aivyx-repomap`) still agree with each other; the unified
+`resolved_deny_paths` Landlock fix still closes both bugs found during
+its own feature (temp-dir-nested-cwd, system-path-nested-cwd), with its
+documented not-recursively-scanned boundary (system paths, temp-dir
+contents outside `cwd`/`extra_read_paths`) being an accurate, deliberate
+design statement rather than a gap; `refresh_agents_files` and
+`wiki_pointer_lines` both check their respective `deny_paths` before
+reading, mirroring `refresh_editor_context` exactly. No new tool was
+registered since 2026-07-28, so no new `ActionKind`/`PermissionTarget`
+pairing existed to under-claim; the one new primitive,
+`ToolRegistry::exclude`, is pure list composition with no new trust
+tier. Every test added by the six audited features was spot-checked and
+found to be real (would fail if the fix were reverted), not vacuous.
+
+**One documentation-accuracy gap, fixed directly in `ROADMAP.md`**: the
+Docker Model Runner chapter above states that whether Docker's default
+seccomp profile blocks the Landlock syscalls `aivyx-coder`'s own sandbox
+needs is "logged as a separate, real, future design question" — but no
+corresponding entry actually existed in `ROADMAP.md`'s Backlog section,
+making a genuinely security-relevant open question invisible to anyone
+consulting ROADMAP as the canonical status tracker (per `CLAUDE.md`).
+Fixed by adding the missing backlog entry, restating the open question
+and its concrete verification path (a real Docker daemon, a
+Landlock-probe binary, checking for `EPERM`/`ENOSYS` on
+`landlock_create_ruleset`).
+
+With this closed, the entire audit lineage (2026-07-22 → 2026-07-28 →
+2026-07-30) remains fully resolved except for that one still-open,
+correctly-tracked design question.

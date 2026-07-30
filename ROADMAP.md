@@ -394,3 +394,30 @@ No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
+
+A follow-up audit (2026-07-30) covering the same four dimensions against
+everything shipped since 2026-07-28 (`deny_paths` basename-glob matching,
+`delegate_task` REPL isolation, Landlock + `aivyx-repomap` basename-glob
+enforcement, Docker Model Runner docs, and the `wiki_pointer_lines`/
+`Agent::refresh_agents_files` `deny_paths` fixes) found nothing new in
+security posture, tool coverage, or test quality. One documentation-only
+gap: this entry itself was missing — `docs/HISTORY.md`'s Docker Model
+Runner chapter states that whether Docker's default seccomp profile
+blocks the Landlock syscalls needed for `aivyx-coder`'s own sandbox is
+"logged as a separate, real, future design question," but no
+corresponding backlog entry existed here. It's a real open question, not
+yet scheduled: **does containerizing `aivyx-coder` itself defeat its own
+Landlock enforcement?** Docker's default seccomp profile likely blocks
+`landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`
+(reasonably corroborated via research, not empirically confirmed — no
+Docker daemon was accessible to test directly). If so, a containerized
+build would either refuse to run confined commands
+(`sandbox.require_enforcement`'s fail-closed default) or need
+`require_enforcement: false` (silently unconfined) unless launched with
+a custom seccomp profile permitting those three syscalls. Verifying this
+needs a real Docker daemon: run a minimal image with a Landlock-probe
+binary and check whether `landlock_create_ruleset` returns success or
+`EPERM`/`ENOSYS`. This is the original, larger "package aivyx-coder as a
+container for end users" idea, still gated on this question — see
+`docs/HISTORY.md`'s "Docker Model Runner serving support" chapter for
+the full descoping story.
