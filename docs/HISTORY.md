@@ -3378,3 +3378,32 @@ context-window default behavior on whatever version is actually
 installed, checking tool-calling end-to-end through aivyx's native edit
 format, and — if a real diagnostic endpoint is found — a follow-up
 `probe.rs` extension using the now-confirmed shape.
+
+### `wiki_pointer_lines` `deny_paths` enforcement — ✅ shipped
+
+Found at the Landlock + `aivyx-repomap` basename-glob enforcement
+feature's own final whole-branch review (2026-07-30) and logged to
+`ROADMAP.md`'s backlog rather than fixed mid-review, since it was out of
+that feature's stated scope: `aivyx-repomap`'s `wiki_pointer_lines`
+(`crates/aivyx-repomap/src/lib.rs`) read `docs/wiki/*.md` files and
+injected each page's path plus a one-line summary into the system prompt
+every turn, with no `deny_paths` check at all — unlike `collect_tags`,
+which the same feature had just given basename-glob-aware `deny_paths`
+matching via `is_denied`. A user who denied a pattern matching a wiki
+page (e.g. `secret*.md`) would still have that page's path and summary
+reach the model's system prompt. Low severity (no default `deny_paths`
+entry targets `.md` files), but it was the one remaining "content
+reaches the prompt without any deny check" path in this crate.
+
+**The fix**: one additional `.filter()` step in `wiki_pointer_lines`'s
+existing iterator chain, reusing the exact same `is_denied` function
+`collect_tags` already calls — no new function, no new dependency, no
+change to `is_denied` itself. `wiki_pointer_lines` still reads via plain
+`std::fs::read_dir` (not `ignore::WalkBuilder`, unlike `collect_tags`'s
+recursive repo walk) — a denied wiki page still needs to physically
+exist in `docs/wiki/` to be excluded, same as before; only whether it's
+now filtered out afterward changes.
+
+With this shipped, the entire 2026-07-28 capability-audit backlog
+lineage remains fully closed — this was a small, separately-logged
+finding from a later feature's own review, not a reopened item.

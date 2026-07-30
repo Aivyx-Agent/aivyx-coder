@@ -342,6 +342,16 @@ end-to-end through aivyx's native edit format) have been confirmed
 against a real running instance yet — see `docs/HISTORY.md` for the full
 account of what's confirmed vs. still open.
 
+**`wiki_pointer_lines` `deny_paths` enforcement — shipped.** Found at the
+Landlock + `aivyx-repomap` basename-glob enforcement feature's own final
+review: `aivyx-repomap`'s `wiki_pointer_lines` read `docs/wiki/*.md`
+files and injected each page's path and summary into the system prompt
+every turn with no `deny_paths` check at all — unlike `collect_tags`,
+which that same feature had just given basename-glob-aware matching to.
+Fixed with a one-line addition to `wiki_pointer_lines`'s existing filter
+chain, reusing the same `is_denied` function verbatim. No new logic, no
+new dependency.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -373,17 +383,3 @@ No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
-
-**Found at the Landlock + `aivyx-repomap` basename-glob enforcement
-feature's own final whole-branch review (2026-07-30), logged rather than
-expanding that feature's scope mid-review**: `aivyx-repomap`'s
-`wiki_pointer_lines` (`crates/aivyx-repomap/src/lib.rs`) reads
-`docs/wiki/*.md` files and injects their path + one-line summary into the
-system prompt every turn, with **no `deny_paths` check at all** — unlike
-`collect_tags`, which the Landlock + `aivyx-repomap` feature just added
-basename-glob matching to. A user who denied a pattern matching a wiki
-page (e.g. `secret*.md`) would still have its summary reach the prompt.
-Low severity (scoped to `.md` files under `docs/wiki/`, and no default
-`deny_paths` entry targets `.md`), but it's the one remaining "content
-reaches the prompt without any deny check" path in this crate.
-
