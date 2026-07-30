@@ -3407,3 +3407,43 @@ now filtered out afterward changes.
 With this shipped, the entire 2026-07-28 capability-audit backlog
 lineage remains fully closed — this was a small, separately-logged
 finding from a later feature's own review, not a reopened item.
+
+### `Agent::refresh_agents_files` `deny_paths` enforcement — ✅ shipped
+
+Found at the `wiki_pointer_lines` `deny_paths` enforcement fix's own final
+whole-branch review (2026-07-30) and logged to `ROADMAP.md`'s backlog
+rather than fixed mid-review, since it was out of that fix's stated
+scope: `Agent::refresh_agents_files`
+(`crates/aivyx-core/src/agent/mod.rs`) read both the global and project
+`AGENTS.md` files and spliced their content into the system prompt every
+turn, with no `deny_paths` check at all — unlike its sibling
+`refresh_editor_context`, which already called
+`aivyx_sandbox::path_is_denied` before surfacing anything.
+`AgentsFileConfig` had no `deny_paths` field at all, so there was no way
+to wire a check in without adding one. Low realistic severity (an
+`AGENTS.md` a user wrote themselves is unlikely to also be a credentials
+file), but it was the same "content reaches the prompt without any deny
+check" shape found in `aivyx-repomap`'s `collect_tags` and
+`wiki_pointer_lines` — now a fourth function with the same gap.
+
+**The fix**: mirrored `EditorContextConfig`/`refresh_editor_context`
+exactly. `AgentsFileConfig` gained a `deny_paths: Vec<PathBuf>` field;
+`Agent::set_agents_file` gained a matching parameter; `agent_builder.rs`
+passes the same global `deny_paths` list already passed to
+`set_editor_context` one line below it — no new settings field, no new
+config surface. `refresh_agents_files` checks both the global and
+project `AGENTS.md` paths against `deny_paths` before reading either,
+silently skipping a denied one exactly like a missing file — no
+user-facing notice, unlike the existing over-budget notice, since
+denying a path is the user's own configuration choice rather than a
+misconfiguration.
+
+With this shipped, this is the fourth and — as far as this audit
+lineage has traced — last instance of the "content reaches the system
+prompt without a `deny_paths` check" gap shape found across
+`aivyx-repomap` and `aivyx-core`'s context-injection sources. The
+pattern of briefing a final whole-branch review to explicitly hunt for
+"the same shape of gap elsewhere" has now found a real, previously
+unknown instance in four consecutive features and is considered
+established practice for this project's review dispatches going
+forward.

@@ -352,6 +352,17 @@ Fixed with a one-line addition to `wiki_pointer_lines`'s existing filter
 chain, reusing the same `is_denied` function verbatim. No new logic, no
 new dependency.
 
+**`Agent::refresh_agents_files` `deny_paths` enforcement — shipped.**
+Found at the `wiki_pointer_lines` fix's own final review: both the
+global and project `AGENTS.md` files were spliced into the system
+prompt every turn with no `deny_paths` check at all — unlike the
+sibling `refresh_editor_context`, which already checked. Fixed by
+adding a `deny_paths` field to `AgentsFileConfig` and checking both
+paths (via the same global `deny_paths` list every other tool already
+reuses) before either file is read; a denied file is silently skipped,
+matching `refresh_editor_context`'s own behavior. No new config
+surface, no new dependency.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -383,19 +394,3 @@ No new capability opportunities were found in test quality or the
 security/gate-tier-order/Landlock dimension this pass — see
 `docs/HISTORY.md`'s "2026-07-28 capability audit" chapter for the full
 account of what was checked.
-
-**Found at the `wiki_pointer_lines` `deny_paths` enforcement fix's own
-final whole-branch review (2026-07-30), logged rather than expanding
-that fix's scope mid-review**: `Agent::refresh_agents_files`
-(`crates/aivyx-core/src/agent/mod.rs`) reads both the global and
-project `AGENTS.md` files and splices their content into the system
-prompt every turn with **no `deny_paths` check at all** — unlike its
-sibling `refresh_editor_context`, which explicitly calls
-`aivyx_sandbox::path_is_denied` before surfacing anything.
-`AgentsFileConfig` (`crates/aivyx-core/src/agent/types.rs`) has no
-`deny_paths` field at all, so there's currently no way to wire a check
-in without adding one. Low realistic severity in practice (an
-`AGENTS.md` a user wrote themselves is unlikely to also be a
-credentials file), but it's the same "content reaches the prompt
-without any deny check" shape this feature just closed for wiki pages,
-in a different function.
