@@ -21,6 +21,7 @@ mod lsp;
 mod mcp;
 mod path_resolve;
 mod process;
+mod pty;
 mod tools;
 pub mod web;
 pub mod wiki;
