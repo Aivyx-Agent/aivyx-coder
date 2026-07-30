@@ -141,6 +141,7 @@ impl RepoMap {
         let mut pages: Vec<(String, Option<String>)> = entries
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .filter(|e| !is_denied(&e.path(), &self.deny_paths))
             .map(|e| {
                 let path = e.path();
                 let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
@@ -644,6 +645,24 @@ fn caller() {
         assert!(
             !rendered.contains("secret_fn"),
             "bare-pattern-matched file leaked:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_denied_wiki_page_is_excluded_from_the_pointer_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "visible.rs", "pub fn visible_fn() {}\n");
+        write(dir.path(), "docs/wiki/public.md", "# Public\nSome notes.\n");
+        write(dir.path(), "docs/wiki/secret.md", "# Secret\nHidden notes.\n");
+
+        let deny = vec![PathBuf::from("secret.md")];
+        let map = RepoMap::new(dir.path().to_path_buf(), deny);
+        let rendered = map.render(10_000).unwrap();
+
+        assert!(rendered.contains("public.md"));
+        assert!(
+            !rendered.contains("secret.md"),
+            "denied wiki page leaked:\n{rendered}"
         );
     }
 
