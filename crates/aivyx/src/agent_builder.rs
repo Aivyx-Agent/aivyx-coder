@@ -470,7 +470,7 @@ pub(crate) async fn build_agent(
     // when the user explicitly disables it via [agents_file] enabled.
     if settings.agents_file.enabled {
         let global_path = aivyx_config::Settings::agents_file_path().ok();
-        agent.set_agents_file(global_path, settings.agents_file.budget_tokens);
+        agent.set_agents_file(global_path, settings.agents_file.budget_tokens, deny_paths.clone());
     }
 
     // Absence of a context file is not an error — the feature is off only

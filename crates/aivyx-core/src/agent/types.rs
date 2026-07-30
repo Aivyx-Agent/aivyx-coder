@@ -150,6 +150,7 @@ pub enum AgentError {
 pub(crate) struct AgentsFileConfig {
     pub(crate) global_path: Option<PathBuf>,
     pub(crate) budget_tokens: u32,
+    pub(crate) deny_paths: Vec<PathBuf>,
 }
 
 /// `deny_paths` needed to check a reported editor-context file path before

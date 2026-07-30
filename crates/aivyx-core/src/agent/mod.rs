@@ -404,11 +404,19 @@ impl Agent {
     /// user-global location (`None` if `Settings::agents_file_path()`
     /// couldn't resolve one), applied identically per turn alongside the
     /// project-level `<cwd>/AGENTS.md`. `budget_tokens` applies to each
-    /// file independently.
-    pub fn set_agents_file(&mut self, global_path: Option<PathBuf>, budget_tokens: u32) {
+    /// file independently. `deny_paths` is checked against both file
+    /// paths before either is ever read, same as every other
+    /// path-reporting source in this project.
+    pub fn set_agents_file(
+        &mut self,
+        global_path: Option<PathBuf>,
+        budget_tokens: u32,
+        deny_paths: Vec<PathBuf>,
+    ) {
         self.agents_file_config = Some(AgentsFileConfig {
             global_path,
             budget_tokens,
+            deny_paths,
         });
     }
 
@@ -516,7 +524,10 @@ impl Agent {
     /// any read error for either file (missing, permission denied, not
     /// valid UTF-8) just means that source contributes nothing — this
     /// never fails the turn. Called once per turn (not once per LLM
-    /// round-trip), mirroring `refresh_repo_map`'s cadence exactly.
+    /// round-trip), mirroring `refresh_repo_map`'s cadence exactly. A
+    /// path denied via `config.deny_paths` is treated identically to a
+    /// missing file — silently skipped, no notice — mirroring
+    /// `refresh_editor_context`'s own denied-path handling.
     async fn refresh_agents_files(&mut self, cwd: &Path) {
         let Some(config) = &self.agents_file_config else {
             return;
@@ -530,6 +541,7 @@ impl Agent {
         let mut over_budget_labels: Vec<&str> = Vec::new();
 
         if let Some(path) = &global_path
+            && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
             && let Ok(content) = tokio::fs::read_to_string(path).await
         {
             let content = content.trim();
@@ -546,7 +558,9 @@ impl Agent {
             }
         }
 
-        if let Ok(content) = tokio::fs::read_to_string(&project_path).await {
+        if !aivyx_sandbox::path_is_denied(&project_path, &config.deny_paths)
+            && let Ok(content) = tokio::fs::read_to_string(&project_path).await
+        {
             let content = content.trim();
             if !content.is_empty() {
                 if content.chars().count() > budget_chars {

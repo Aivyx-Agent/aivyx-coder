@@ -939,7 +939,7 @@ async fn project_only_agents_md_is_injected_with_no_precedence_note() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -968,7 +968,7 @@ async fn global_only_agents_md_is_injected_with_no_precedence_note() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(Some(global_path), 1024);
+    agent.set_agents_file(Some(global_path), 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -996,7 +996,7 @@ async fn neither_file_present_injects_nothing() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(Some(global_path), 1024);
+    agent.set_agents_file(Some(global_path), 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -1007,6 +1007,70 @@ async fn neither_file_present_injects_nothing() {
     let system = received[0].messages[0].text_content();
     assert!(!system.contains("AGENTS.md"));
     assert!(!system.contains("User preferences"));
+}
+
+#[tokio::test]
+async fn a_denied_project_agents_md_is_excluded_but_global_still_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "PROJECT_SECRET_INSTRUCTIONS",
+    )
+    .unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_path = global_dir.path().join("AGENTS.md");
+    std::fs::write(&global_path, "Always write terse commit messages.").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(
+        Some(global_path),
+        1024,
+        vec![dir.path().join("AGENTS.md")],
+    );
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("PROJECT_SECRET_INSTRUCTIONS"));
+    assert!(system.contains("Always write terse commit messages."));
+}
+
+#[tokio::test]
+async fn a_denied_global_agents_md_is_excluded_but_project_still_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "Use tabs, not spaces.").unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let global_path = global_dir.path().join("AGENTS.md");
+    std::fs::write(&global_path, "GLOBAL_SECRET_INSTRUCTIONS").unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(Some(global_path.clone()), 1024, vec![global_path]);
+
+    agent
+        .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(!system.contains("GLOBAL_SECRET_INSTRUCTIONS"));
+    assert!(system.contains("Use tabs, not spaces."));
 }
 
 #[tokio::test]
@@ -1024,7 +1088,7 @@ async fn both_files_present_orders_global_first_with_precedence_note() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(Some(global_path), 1024);
+    agent.set_agents_file(Some(global_path), 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -1059,7 +1123,7 @@ async fn a_file_over_budget_is_included_in_full_and_triggers_one_notice() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 5);
+    agent.set_agents_file(None, 5, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -1091,7 +1155,7 @@ async fn a_file_within_budget_triggers_no_notice() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -1119,7 +1183,7 @@ async fn editing_the_file_between_turns_changes_the_next_turns_prompt() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
 
     agent
         .run_turn("first".to_string(), dir.path(), CancellationToken::new())
@@ -1165,7 +1229,7 @@ async fn agents_files_text_is_counted_by_the_size_estimator() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
     let chars_without_file = agent.prompt_chars();
 
     agent
@@ -1218,7 +1282,7 @@ async fn an_unreadable_project_path_degrades_gracefully() {
         ToolRegistry::new(),
         10,
     );
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
@@ -4473,7 +4537,7 @@ async fn an_agents_md_file_containing_a_trigger_phrase_flags_the_taint() {
     );
     let injection_taint = InjectionTaint::new();
     agent.set_injection_taint(injection_taint.clone());
-    agent.set_agents_file(None, 1024);
+    agent.set_agents_file(None, 1024, vec![]);
 
     agent
         .run_turn("hi".to_string(), dir.path(), CancellationToken::new())
