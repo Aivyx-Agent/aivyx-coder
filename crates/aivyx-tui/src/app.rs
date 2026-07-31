@@ -407,6 +407,21 @@ impl App {
         self.transcript.push(ChatLine::Notice(lines.join("\n")));
     }
 
+    /// Slash-command suggestions for the input box's current
+    /// (uncommitted) content — shown while the user is still composing a
+    /// command name: starts with `/`, no whitespace yet. Empty once a
+    /// space appears or the text doesn't start with `/`.
+    fn command_hint_matches(&self) -> Vec<&'static aivyx_core::commands::CommandInfo> {
+        let text = self.input.lines().join("\n");
+        if !text.starts_with('/') || text.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        aivyx_core::commands::COMMANDS
+            .iter()
+            .filter(|c| c.name.starts_with(text.as_str()))
+            .collect()
+    }
+
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
@@ -542,6 +557,12 @@ impl App {
         }
 
         frame.render_widget(&self.input, input_area);
+
+        let hints = self.command_hint_matches();
+        if !hints.is_empty() {
+            let hint_area = command_hint_rect(input_area, hints.len() as u16);
+            render_command_hint(frame, hint_area, &hints);
+        }
 
         let base = if self.streaming_active {
             "streaming... (Ctrl+C to cancel)"
@@ -826,6 +847,35 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+/// The area for the command-hint popup: anchored directly above
+/// `input_area`, same width, one row per match plus borders — clamped so
+/// it never extends above the top of the frame (`saturating_sub` avoids
+/// an underflow panic when `input_area.y` is small).
+fn command_hint_rect(input_area: Rect, match_count: u16) -> Rect {
+    let height = match_count + 2;
+    let y = input_area.y.saturating_sub(height);
+    Rect {
+        x: input_area.x,
+        y,
+        width: input_area.width,
+        height,
+    }
+}
+
+fn render_command_hint(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    matches: &[&aivyx_core::commands::CommandInfo],
+) {
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line> = matches
+        .iter()
+        .map(|c| Line::from(format!("{} — {}", c.name, c.description)))
+        .collect();
+    let block = Block::default().borders(Borders::ALL).title("Commands");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
@@ -1357,5 +1407,47 @@ mod tests {
                 cmd.name
             );
         }
+    }
+
+    #[test]
+    fn command_hint_matches_narrows_as_the_user_types_and_stops_after_a_space() {
+        let mut app = App::new(None, PlanMode::new());
+        assert!(app.command_hint_matches().is_empty(), "empty input has no hints");
+
+        app.input.insert_str("/");
+        assert_eq!(app.command_hint_matches().len(), aivyx_core::commands::COMMANDS.len());
+
+        app.input.insert_str("cl");
+        let matches = app.command_hint_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "/clear");
+
+        app.input.insert_str(" ");
+        assert!(
+            app.command_hint_matches().is_empty(),
+            "a space means the command name is done being composed"
+        );
+    }
+
+    #[test]
+    fn command_hint_matches_is_empty_for_plain_text() {
+        let mut app = App::new(None, PlanMode::new());
+        app.input.insert_str("fix the bug");
+        assert!(app.command_hint_matches().is_empty());
+    }
+
+    #[test]
+    fn command_hint_rect_sits_directly_above_the_input_area_and_never_goes_negative() {
+        let input_area = Rect { x: 0, y: 10, width: 80, height: 3 };
+        let rect = command_hint_rect(input_area, 2);
+        assert_eq!(rect.height, 4); // 2 matches + 2 borders
+        assert_eq!(rect.y, 6); // 10 - 4
+        assert_eq!(rect.x, input_area.x);
+        assert_eq!(rect.width, input_area.width);
+
+        // Near the top of the frame: must clamp, not underflow/panic.
+        let near_top = Rect { x: 0, y: 1, width: 80, height: 3 };
+        let clamped = command_hint_rect(near_top, 6);
+        assert_eq!(clamped.y, 0);
     }
 }
