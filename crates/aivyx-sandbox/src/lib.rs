@@ -233,6 +233,24 @@ impl ExecutionConfiner for NoopConfiner {
     }
 }
 
+/// Lets a frontend forward a live terminal resize down to whatever
+/// out-of-process session might care (e.g. a running `repl_start`
+/// session's pty) without that frontend crate needing a dependency on
+/// the tool crate that actually owns the session — the same decoupling
+/// `PermissionPrompter` already provides for permission prompts.
+/// `NoopResizeTarget` is the default no-op wherever no such session
+/// exists (e.g. the ACP frontend, which has no real terminal to forward
+/// a resize *from* in the first place).
+pub trait ResizeTarget: Send + Sync {
+    fn resize(&self, cols: u16, rows: u16);
+}
+
+pub struct NoopResizeTarget;
+
+impl ResizeTarget for NoopResizeTarget {
+    fn resize(&self, _cols: u16, _rows: u16) {}
+}
+
 /// Builds the best confiner available for this build: `LandlockConfiner`
 /// when the `sandbox-backend` feature is enabled (the default), otherwise
 /// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
@@ -334,6 +352,13 @@ impl PermissionGate for AlwaysDenyGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noop_resize_target_does_not_panic_on_any_input() {
+        let target = NoopResizeTarget;
+        target.resize(80, 24);
+        target.resize(0, 0);
+    }
 
     #[test]
     fn autonomous_mode_starts_inactive_and_can_be_activated() {

@@ -33,6 +33,35 @@ pub fn new_shared_repl_session() -> SharedReplSession {
     Arc::new(AsyncMutex::new(None))
 }
 
+/// Bridges a frontend's live terminal-resize events down to whatever
+/// `repl_start` session is currently running, via
+/// `aivyx_sandbox::ResizeTarget` — this indirection is what lets
+/// `aivyx-tui` forward `crossterm` resize events without depending on
+/// `aivyx-tools` directly (see the design spec's "Window size" decision).
+pub struct ReplResizeTarget(SharedReplSession);
+
+impl ReplResizeTarget {
+    pub fn new(session: SharedReplSession) -> Self {
+        Self(session)
+    }
+}
+
+impl aivyx_sandbox::ResizeTarget for ReplResizeTarget {
+    /// Fire-and-forget: spawns a task to acquire the session lock and
+    /// apply the resize, rather than blocking the caller (a frontend's
+    /// render loop) on an async mutex for what is, by nature, a
+    /// best-effort operation — if no session is running, this is a
+    /// harmless no-op.
+    fn resize(&self, cols: u16, rows: u16) {
+        let session = Arc::clone(&self.0);
+        tokio::spawn(async move {
+            if let Some(session) = session.lock().await.as_ref() {
+                session.resize(cols, rows);
+            }
+        });
+    }
+}
+
 /// One live, persistent child process and everything needed to interact
 /// with it across multiple tool calls. Never persisted (no `Serialize`) —
 /// a REPL session is process-lifetime-scoped, not conversation-lifetime-
@@ -888,6 +917,42 @@ mod tests {
             .await
             .unwrap();
         (session, start_tool)
+    }
+
+    #[tokio::test]
+    async fn resize_changes_are_reflected_in_the_child_reported_window_size() {
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+        let session = new_shared_repl_session();
+        let start_tool =
+            ReplStartTool::new(Arc::clone(&session), quiet_window, max_wait, idle_timeout);
+        start_tool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "while IFS= read -r line; do stty size; done"]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let resize_target = ReplResizeTarget::new(Arc::clone(&session));
+        aivyx_sandbox::ResizeTarget::resize(&resize_target, 120, 40);
+        // `resize` fires a detached tokio task (see its doc comment) —
+        // give it a moment to acquire the session lock and apply the
+        // ioctl before sending input below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let output = send_tool
+            .execute(serde_json::json!({ "input": "go" }), &ctx())
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        // `stty size` prints "rows cols".
+        assert!(text.contains("40 120"), "expected rows=40 cols=120, got: {text}");
     }
 
     #[tokio::test]
