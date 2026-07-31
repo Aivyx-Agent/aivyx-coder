@@ -4595,3 +4595,35 @@ async fn an_editor_context_file_path_containing_a_trigger_phrase_flags_the_taint
 
     tokio::fs::remove_file(&context_path).await.ok();
 }
+
+#[tokio::test]
+async fn clear_conversation_empties_history_and_tasks_and_emits_one_event() {
+    let (mut agent, mut rx, _mock) = build_agent(
+        vec![vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent
+        .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(!agent.history.is_empty(), "a real turn should have added history");
+    agent.tasks.lock().unwrap().push(Task {
+        id: 1,
+        text: "do the thing".to_string(),
+        status: crate::session::TaskStatus::Pending,
+    });
+    drain(&mut rx); // discard events from the turn and the push above
+
+    agent.clear_conversation();
+
+    assert!(agent.history.is_empty());
+    assert!(agent.tasks.lock().unwrap().is_empty());
+    let events = drain(&mut rx);
+    assert!(
+        matches!(events.as_slice(), [AgentEvent::ConversationCleared]),
+        "expected exactly one ConversationCleared event, got: {events:?}"
+    );
+}

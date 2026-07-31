@@ -343,6 +343,20 @@ impl Agent {
         self.emit(AgentEvent::Error(message.into()));
     }
 
+    /// Starts a fresh conversation: clears `history` and the shared task
+    /// list, persists the now-empty session (so a crash immediately after
+    /// doesn't reload the old conversation via `--resume`), and emits
+    /// `ConversationCleared` so the frontend resets its own display state.
+    /// Never calls the model — this is the `AgentState`-tier `/clear`
+    /// command's entire implementation. `plan_mode` is deliberately
+    /// untouched: it's a mode setting, not conversation content.
+    pub fn clear_conversation(&mut self) {
+        self.history.clear();
+        self.tasks.lock().unwrap().clear();
+        self.emit(AgentEvent::ConversationCleared);
+        self.persist();
+    }
+
     /// Enables `/council` (Phase 11a). The caller builds the seats — each
     /// is any `LlmBackend`, typically Ollama-swapped models alongside the
     /// resident daily driver.

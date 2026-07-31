@@ -95,10 +95,14 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         AgentEvent::SubAgentActivity(inner) => return translate_event(session_id, inner),
         // Turn-terminal (handled by `terminal_stop_reason` instead) or
         // deliberately non-notification events — not surfaced as a
-        // SessionUpdate.
-        AgentEvent::TurnComplete | AgentEvent::TurnPaused(_) | AgentEvent::ContextUsage { .. } => {
-            return None
-        }
+        // SessionUpdate. `ConversationCleared` is only ever emitted by the
+        // TUI's `/clear` interception (see the design spec's scope note —
+        // this frontend doesn't wire that command up), but the match must
+        // still be exhaustive.
+        AgentEvent::TurnComplete
+        | AgentEvent::TurnPaused(_)
+        | AgentEvent::ContextUsage { .. }
+        | AgentEvent::ConversationCleared => return None,
     };
     let _ = session_id; // session_id threading happens at the SessionNotification wrapper in Task 5
     Some(update)

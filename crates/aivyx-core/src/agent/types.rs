@@ -38,6 +38,11 @@ pub enum AgentEvent {
     /// The task list changed during this turn (the model called
     /// `set_tasks`) — carries the full new list for the TUI's task panel.
     TasksUpdated(Vec<Task>),
+    /// `Agent::clear_conversation` ran (the `/clear` command) — the
+    /// frontend should reset whatever display state it owns (transcript,
+    /// task panel, context-usage indicator). Carries no payload: the new
+    /// state is simply "empty" in every dimension.
+    ConversationCleared,
     /// One block of council-mode output (a stage banner, a member's answer
     /// or ranking, the chairman's synthesis, or a failure note) — the whole
     /// deliberation streams through these; see `council::convene`.
