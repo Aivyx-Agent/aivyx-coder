@@ -17,7 +17,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 pub(crate) fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: `posix_openpt` is a standard libc call; a negative return
     // is its documented error signal, checked immediately below.
-    let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    let master_fd =
+        unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
     if master_fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -49,7 +50,12 @@ pub(crate) fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
 
     // SAFETY: `slave_path` is a valid NUL-terminated C string from
     // `ptsname_r` above; `open` returns -1 on error, checked immediately.
-    let slave_fd = unsafe { libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    let slave_fd = unsafe {
+        libc::open(
+            slave_path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
     if slave_fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -94,5 +100,25 @@ mod tests {
         );
         assert_eq!(got.ws_row, 40);
         assert_eq!(got.ws_col, 120);
+    }
+
+    #[test]
+    fn open_pty_marks_both_fds_close_on_exec() {
+        // Regression test: `open_pty()` must not leak the master (or
+        // slave) fd into every child process this program spawns after a
+        // REPL session is opened. Both `posix_openpt` and the slave's
+        // `open` must pass `O_CLOEXEC` so `FD_CLOEXEC` is set from
+        // creation — verified here directly via `fcntl(F_GETFD)` rather
+        // than by spawning a child, since that's the exact property the
+        // kernel guarantees `O_CLOEXEC` provides across `exec`.
+        let (master, slave) = open_pty().unwrap();
+
+        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFD) };
+        assert!(master_flags >= 0);
+        assert_ne!(master_flags & libc::FD_CLOEXEC, 0, "master fd not CLOEXEC");
+
+        let slave_flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFD) };
+        assert!(slave_flags >= 0);
+        assert_ne!(slave_flags & libc::FD_CLOEXEC, 0, "slave fd not CLOEXEC");
     }
 }
