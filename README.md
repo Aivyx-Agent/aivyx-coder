@@ -835,6 +835,28 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 `allowed_commands` below); `run_shell` is always registered but every command
 still needs approval unless it exactly matches a pre-approved entry.
 
+## Slash commands
+
+Typed at the start of a message (with a space or nothing after — see
+below for exact forms):
+
+| Command | Tier | What it does |
+|---|---|---|
+| `/council` | needs the model | Convenes the configured council on a subject, or the last assistant message if bare. See "Council mode" below. |
+| `/wiki` | needs the model | Regenerates stale wiki pages, or `/wiki <page>` forces one named page. |
+| `/architect` | needs the model | Has the configured architect model produce a plan for `/architect <task>`, then hands it to the primary model to execute. |
+| `/clear` | agent state, no model call | Starts a fresh conversation — clears history and the task list, keeps plan mode as-is. |
+| `/help` | frontend only | Lists all of the above. |
+| `/quit` | frontend only | Exits `aivyx-coder` (same as Ctrl+C). |
+
+While composing a command (input starts with `/`, no space yet), the TUI
+shows a small hint listing matching commands and their descriptions —
+purely visual, keep typing and press Enter as normal. `/help`/`/clear`/
+`/quit` and the hint are TUI-only; the ACP editor-integration frontend
+doesn't wire them up (an editor hosting ACP has its own UI for
+equivalent actions), though `/council`/`/wiki`/`/architect` work there
+too since they flow through the same `Agent::run_turn` path either way.
+
 ## Council mode
 
 For hard design decisions, `/council <question>` puts the question to several

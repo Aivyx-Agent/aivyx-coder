@@ -3591,3 +3591,80 @@ basename-glob enforcement feature — the difference here is that both of
 its two hardest technical questions were resolved with a real, throwaway
 empirical test *during planning*, before any implementation code
 depended on the answer, rather than discovered mid-implementation.
+
+### Slash command framework — ✅ shipped
+
+`/council`, `/wiki`, and `/architect` existed as three independently
+implemented ad hoc commands (`council.rs`, `wiki.rs`, `architect.rs`),
+each with its own `parse_command` reimplementing the identical
+strip-prefix-then-check-word-boundary logic, chained together in
+`Agent::run_turn`. There was no generic framework: no shared metadata for
+discoverability, no TUI-side awareness that `/`-prefixed input was
+special (the TUI just sent whatever text the user typed straight
+through), and no built-in utility commands — Ctrl+C was the only way to
+quit, and there was no way to reset a conversation short of restarting
+the binary.
+
+**Three dispatch tiers**, chosen by what a command actually needs: a new
+`aivyx_core::commands` module's `CommandTier` enum distinguishes
+`AgentTurn` (`/council`/`/wiki`/`/architect`, unchanged — still flows
+through `Agent::run_turn`), `AgentState` (`/clear`, touches real `Agent`
+state but never calls the model), and `FrontendOnly` (`/help`/`/quit`,
+need nothing from `Agent` at all). A single static `COMMANDS` table
+(name, description, tier) is the shared source of truth `/help`'s
+listing and the TUI's autocomplete hint both read from — a plain
+compile-time table, not a dynamic registry, matching this project's
+preference for explicit code over unrequested abstraction. The three
+existing commands' triplicated boundary-parsing logic was de-duplicated
+onto one shared `parse_slash_command` helper as a natural side effect,
+with zero change to their own tests (each function's observable
+behavior is unchanged).
+
+**A real architecture wrinkle shaped where each tier gets intercepted**:
+the TUI doesn't hold a direct reference to `Agent` — it runs on a
+background task, driven only by messages received over a channel. This
+is why `/clear` (which needs real `Agent` state: clearing `history` and
+the task list, persisting the now-empty session) is intercepted inside
+that background task's own receive loop, right before `run_turn` would
+otherwise be called — not in the render loop, where `Agent` isn't
+reachable at all. `/help`/`/quit`, needing nothing from `Agent`, are
+intercepted in the render loop itself, before anything is even sent
+through the channel.
+
+**A gap in the original design spec, caught and fixed during planning,
+not left for implementation to improvise**: the spec's
+`Agent::clear_conversation` sketch emitted `AgentEvent::TasksUpdated(Vec::new())`
+alone, which resets the TUI's task panel but does nothing about the
+TUI's own visible transcript — after `/clear`, the chat window would
+still show every prior message, defeating the point of a "fresh
+conversation" command. Fixed by adding a dedicated
+`AgentEvent::ConversationCleared` instead, handled by the TUI to reset
+transcript, task panel, and context-usage indicator together. Because
+`AgentEvent` is matched exhaustively in two other places (`aivyx-tui`'s
+`handle_agent_event` and `aivyx-acp`'s `translate_event`), both needed
+updating for the new variant — `aivyx-acp`'s match routes it to "no
+`SessionUpdate`" (the ACP frontend never triggers `/clear`, since this
+chapter is TUI-only, but the match must still be exhaustive). A third,
+separate exhaustive match over `AgentEvent` turned up during
+implementation — `aivyx-tui`'s own `sub_agent_event_text` (used to
+render a `delegate_task` sub-agent's nested events as plain text) —
+which also needed a `ConversationCleared` arm to compile; it was fixed
+in the same commit by grouping it with that function's existing
+"renders as nothing" arms (`TurnComplete`/`ContextUsage`/`TasksUpdated`/etc.),
+since a sub-agent issuing `/clear` isn't a real scenario worth rendering
+specially.
+
+**Autocomplete hint**: a small popup rendered directly above the input
+box while the user is still composing a command name (starts with `/`,
+no space yet), listing matching commands with their descriptions.
+Deliberately visual-only in this pass — no Tab-complete or arrow-key
+selection, avoiding new keybindings that could conflict with
+`tui-textarea`'s own handling; a richer interactive version is a natural
+future increment.
+
+Scope: TUI-only throughout. `/council`/`/wiki`/`/architect` still work
+identically under the ACP editor-integration frontend (they always
+flowed through `Agent::run_turn` unconditionally, with no
+frontend-specific gating), but `/help`/`/clear`/`/quit` and the
+autocomplete hint were not wired into ACP — an editor hosting ACP has
+its own UI paradigms for equivalent actions.

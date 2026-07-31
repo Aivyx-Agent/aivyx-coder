@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-31_
+_Last updated: 2026-08-01_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -375,6 +375,21 @@ inter-crate dependency between `aivyx-tui` and `aivyx-tools`). Needed no
 Landlock ruleset change at all: both pty fds are opened in the parent
 before `fork`, so the child only ever inherits already-open descriptors
 rather than calling `open()` on any `/dev/pts/*` path itself.
+
+**Slash command framework — shipped.** `/council`/`/wiki`/`/architect`
+existed as three separately-implemented ad hoc commands with no shared
+metadata and no TUI-side awareness that `/`-prefixed input was special.
+Added a shared `aivyx_core::commands` table (name, description, and
+which of three dispatch tiers each belongs to) that both a new `/help`
+listing and a new TUI autocomplete hint read from, plus two new built-in
+commands: `/clear` (starts a fresh conversation, via a new
+`Agent::clear_conversation` that never calls the model) and `/quit`. The
+three existing commands' triplicated word-boundary parsing logic was
+de-duplicated onto one shared helper as a side effect. TUI-only —
+`/council`/`/wiki`/`/architect` still work identically under the ACP
+frontend (unchanged, they already flowed through `Agent::run_turn`
+unconditionally), but `/help`/`/clear`/`/quit` and the autocomplete hint
+are not wired into ACP.
 
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
