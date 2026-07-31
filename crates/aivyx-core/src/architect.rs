@@ -44,13 +44,7 @@ pub struct Architect {
 /// note rather than falling back to reviewing prior conversation the way
 /// `/council`'s bare form does).
 pub fn parse_command(input: &str) -> Option<&str> {
-    let trimmed = input.trim();
-    let rest = trimmed.strip_prefix("/architect")?;
-    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-        Some(rest.trim())
-    } else {
-        None
-    }
+    crate::commands::parse_slash_command(input, "/architect")
 }
 
 /// Makes one no-tools planning call to the architect's backend and returns

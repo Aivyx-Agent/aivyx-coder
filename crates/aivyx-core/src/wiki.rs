@@ -37,22 +37,13 @@ pub enum WikiCommand {
 }
 
 /// Recognizes `/wiki` / `/wiki <page>` (and nothing else — a message merely
-/// starting with those letters is a normal turn), mirroring
-/// `council::parse_command` exactly.
+/// starting with those letters is a normal turn).
 pub fn parse_command(input: &str) -> Option<WikiCommand> {
-    let trimmed = input.trim();
-    let rest = trimmed.strip_prefix("/wiki")?;
-    if rest.is_empty() {
+    let page = crate::commands::parse_slash_command(input, "/wiki")?;
+    if page.is_empty() {
         Some(WikiCommand::Batch)
-    } else if rest.starts_with(char::is_whitespace) {
-        let page = rest.trim();
-        if page.is_empty() {
-            Some(WikiCommand::Batch)
-        } else {
-            Some(WikiCommand::Forced(page.to_string()))
-        }
     } else {
-        None
+        Some(WikiCommand::Forced(page.to_string()))
     }
 }
 

@@ -69,13 +69,7 @@ pub struct Council {
 /// message merely starting with those letters is a normal turn). Returns
 /// the question, empty for the bare form.
 pub fn parse_command(input: &str) -> Option<&str> {
-    let trimmed = input.trim();
-    let rest = trimmed.strip_prefix("/council")?;
-    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-        Some(rest.trim())
-    } else {
-        None
-    }
+    crate::commands::parse_slash_command(input, "/council")
 }
 
 /// The most recent assistant text in history — the subject of a bare
