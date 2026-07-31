@@ -137,6 +137,7 @@ pub async fn run(
     restored: Option<SessionState>,
     plan_mode: PlanMode,
     autonomous: Option<AutonomousRun>,
+    repl_resize: std::sync::Arc<dyn aivyx_sandbox::ResizeTarget>,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
@@ -255,6 +256,10 @@ pub async fn run(
                         }
                         _ => {}
                     }
+                }
+
+                if let CtEvent::Resize(cols, rows) = &event {
+                    repl_resize.resize(*cols, *rows);
                 }
 
                 app.input.input(event);

@@ -41,7 +41,8 @@ pub use patch_file::PatchFileTool;
 pub use read_file::ReadFileTool;
 pub use remember_preference::RememberPreferenceTool;
 pub use repl::{
-    ReplSendTool, ReplStartTool, ReplStopTool, SharedReplSession, new_shared_repl_session,
+    ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool, SharedReplSession,
+    new_shared_repl_session,
 };
 pub use run_command::RunCommandTool;
 pub use run_shell::RunShellTool;

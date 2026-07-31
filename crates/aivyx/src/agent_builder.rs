@@ -26,9 +26,9 @@ use aivyx_tools::{
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
     McpToolAdapter, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
-    RememberPreferenceTool, ReplSendTool, ReplStartTool, ReplStopTool, RunCommandTool,
-    RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool, WebSearchTool,
-    WriteFileTool, new_shared_repl_session,
+    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
+    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -48,6 +48,11 @@ pub(crate) struct BuiltAgent {
     pub(crate) restored: Option<session::SessionState>,
     pub(crate) tasks: Arc<std::sync::Mutex<Vec<session::Task>>>,
     pub(crate) injection_taint: InjectionTaint,
+    /// Lets a frontend forward a live terminal resize down to whatever
+    /// `repl_start` session is currently running. Only the TUI frontend
+    /// uses this (see `main.rs`) — the ACP frontend has no real terminal
+    /// to forward a resize *from*, so it simply never reads this field.
+    pub(crate) repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget>,
 }
 
 /// Builds `Agent` + every collaborator it needs, identically regardless
@@ -245,7 +250,9 @@ pub(crate) async fn build_agent(
         repl_quiet_window,
         repl_max_wait,
     )));
-    registry.register(Arc::new(ReplStopTool::new(repl_session)));
+    registry.register(Arc::new(ReplStopTool::new(Arc::clone(&repl_session))));
+    let repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget> =
+        Arc::new(ReplResizeTarget::new(repl_session));
     registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
@@ -597,5 +604,6 @@ pub(crate) async fn build_agent(
         restored,
         tasks,
         injection_taint,
+        repl_resize,
     })
 }

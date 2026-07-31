@@ -185,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         built.restored,
         built.plan_mode,
         autonomous_run,
+        built.repl_resize,
     )
     .await
 }
