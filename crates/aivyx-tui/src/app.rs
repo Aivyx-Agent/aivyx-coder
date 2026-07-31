@@ -187,6 +187,19 @@ pub async fn run(
             }
         } else {
             while let Some(input) = input_rx.recv().await {
+                if aivyx_core::commands::parse_slash_command(&input, "/clear").is_some() {
+                    // AgentState tier: never touches run_turn, never calls
+                    // the model. Order matters — clear_conversation's own
+                    // ConversationCleared event must be emitted (and thus
+                    // received by the render loop) before this notify's
+                    // Error event, or the confirmation message would be
+                    // wiped by the clear that follows it. mpsc channels
+                    // preserve send order, so calling these sequentially
+                    // here is sufficient.
+                    agent.clear_conversation();
+                    agent.notify("Conversation cleared.");
+                    continue;
+                }
                 let cancellation = CancellationToken::new();
                 *background_cancellation.lock().unwrap() = Some(cancellation.clone());
                 let _ = agent.run_turn(input, &cwd, cancellation).await;
@@ -249,8 +262,15 @@ pub async fn run(
                         (KeyCode::Enter, KeyModifiers::NONE) => {
                             let text = app.take_input();
                             if !text.is_empty() {
-                                app.push_user_message(text.clone());
-                                let _ = input_tx.send(text);
+                                if aivyx_core::commands::parse_slash_command(&text, "/quit").is_some() {
+                                    break;
+                                }
+                                if aivyx_core::commands::parse_slash_command(&text, "/help").is_some() {
+                                    app.show_help();
+                                } else {
+                                    app.push_user_message(text.clone());
+                                    let _ = input_tx.send(text);
+                                }
                             }
                             continue;
                         }
@@ -375,6 +395,18 @@ impl App {
         self.streaming_active = true;
     }
 
+    /// Renders the `/help` command: every known slash command with its
+    /// one-line description, sourced from `aivyx_core::commands::COMMANDS`
+    /// — the same table `/clear`'s and the autocomplete hint's own logic
+    /// reads, so this listing can never drift from what actually exists.
+    fn show_help(&mut self) {
+        let mut lines = vec!["Available commands:".to_string()];
+        for cmd in aivyx_core::commands::COMMANDS {
+            lines.push(format!("  {} — {}", cmd.name, cmd.description));
+        }
+        self.transcript.push(ChatLine::Notice(lines.join("\n")));
+    }
+
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
@@ -423,6 +455,12 @@ impl App {
             }
             AgentEvent::TasksUpdated(tasks) => {
                 self.tasks = tasks;
+            }
+            AgentEvent::ConversationCleared => {
+                self.transcript.clear();
+                self.tasks.clear();
+                self.context_usage = None;
+                self.streaming_active = false;
             }
             AgentEvent::CouncilNote(text) => {
                 self.transcript.push(ChatLine::Council(text));
@@ -624,7 +662,8 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         | AgentEvent::TasksUpdated(_)
         | AgentEvent::CouncilNote(_)
         | AgentEvent::ArchitectNote(_)
-        | AgentEvent::SubAgentActivity(_) => String::new(),
+        | AgentEvent::SubAgentActivity(_)
+        | AgentEvent::ConversationCleared => String::new(),
     }
 }
 
@@ -1279,5 +1318,44 @@ mod tests {
         drop(reply_rx);
 
         assert!(app.pending_permission_is_stale());
+    }
+
+    #[test]
+    fn conversation_cleared_event_resets_transcript_tasks_and_context_usage() {
+        let mut app = App::new(None, PlanMode::new());
+        app.transcript.push(ChatLine::User("hi".to_string()));
+        app.transcript.push(ChatLine::Assistant("hello".to_string()));
+        app.tasks.push(Task {
+            id: 1,
+            text: "a task".to_string(),
+            status: TaskStatus::Pending,
+        });
+        app.context_usage = Some((100, 1000));
+        app.streaming_active = true;
+
+        app.handle_agent_event(AgentEvent::ConversationCleared);
+
+        assert!(app.transcript.is_empty());
+        assert!(app.tasks.is_empty());
+        assert_eq!(app.context_usage, None);
+        assert!(!app.streaming_active);
+    }
+
+    #[test]
+    fn show_help_lists_every_known_command_with_its_description() {
+        let mut app = App::new(None, PlanMode::new());
+        app.show_help();
+
+        assert_eq!(app.transcript.len(), 1);
+        let ChatLine::Notice(text) = &app.transcript[0] else {
+            panic!("expected a Notice line");
+        };
+        for cmd in aivyx_core::commands::COMMANDS {
+            assert!(
+                text.contains(cmd.name) && text.contains(cmd.description),
+                "help text missing {}: {text}",
+                cmd.name
+            );
+        }
     }
 }
