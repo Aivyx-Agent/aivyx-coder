@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-07-30_
+_Last updated: 2026-07-31_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -362,6 +362,19 @@ paths (via the same global `deny_paths` list every other tool already
 reuses) before either file is read; a denied file is silently skipped,
 matching `refresh_editor_context`'s own behavior. No new config
 surface, no new dependency.
+
+**Real PTY for `repl_start`/`repl_send` — shipped.** Replaced the three
+plain OS pipes with a genuine pseudo-terminal, allocated via raw `libc`
+`posix_openpt`/`grantpt`/`unlockpt`/`ptsname_r` calls (consistent with
+this project's existing raw-syscall precedent, no new dependency) — a
+program run via `repl_start` now sees `isatty()` as true, gets working
+readline/color, and can be resized live as `aivyx-coder`'s own terminal
+resizes (a new `aivyx_sandbox::ResizeTarget` trait lets the TUI forward
+`crossterm`'s resize events down to the active session without a new
+inter-crate dependency between `aivyx-tui` and `aivyx-tools`). Needed no
+Landlock ruleset change at all: both pty fds are opened in the parent
+before `fork`, so the child only ever inherits already-open descriptors
+rather than calling `open()` on any `/dev/pts/*` path itself.
 
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.

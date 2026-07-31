@@ -1117,10 +1117,17 @@ Deliberately not (yet) addressed — documented rather than hidden:
   for debugging, it logs the full conversation (including file/command content)
   in plaintext, append-only, forever. The file is `0600` but has no rotation or
   expiry — treat it as sensitive and delete it when done.
-- **`repl_start`/`repl_send` use plain pipes, not a real pseudo-terminal
-  (PTY)**: a program that checks `isatty()` may behave differently than it
-  would in a real terminal — disabled line-editing/readline history, no
-  color, or in the worst case refusing to run non-interactively at all.
+- **`repl_start`/`repl_send` use a real pseudo-terminal (PTY)**, not plain
+  pipes — a program run this way sees `isatty()` as true, so
+  readline/history, color, and window-size-aware output all work as they
+  would at a real terminal, and the pty resizes live as `aivyx-coder`'s
+  own terminal does. Two consequences worth knowing, both deliberate:
+  the pty's default line discipline echoes input back before the
+  program's own response (matching what a human typing at a real
+  terminal would see); and standard control characters in `repl_send`'s
+  `input` (e.g. a literal Ctrl-C byte) are interpreted by the tty driver
+  as signals to the process, not passed through as literal data — again,
+  same as at a real terminal.
 - **`Tool::execute` bypass**: the "all tool calls go through the permission
   gate" property is enforced by convention (the executor is the only caller),
   not by the type system.

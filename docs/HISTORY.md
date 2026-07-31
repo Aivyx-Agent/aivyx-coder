@@ -3494,3 +3494,100 @@ Landlock-probe binary, checking for `EPERM`/`ENOSYS` on
 With this closed, the entire audit lineage (2026-07-22 → 2026-07-28 →
 2026-07-30) remains fully resolved except for that one still-open,
 correctly-tracked design question.
+
+### Real PTY for `repl_start`/`repl_send` — ✅ shipped
+
+`README.md`'s own "Known limitations" documented this gap: `repl_start`/
+`repl_send` (`crates/aivyx-tools/src/tools/repl.rs`) spawned the target
+process with three plain OS pipes (`Stdio::piped()` for stdin, stdout,
+stderr). A program checking `isatty()` saw `false` and could behave very
+differently than at a real terminal — disabled readline/history, no
+color, or in the worst case an outright refusal to run non-interactively
+at all. This feature replaces the pipes with a real pseudo-terminal.
+
+**Allocation**: raw `libc` calls (`posix_openpt`/`grantpt`/`unlockpt`/
+`ptsname_r`, a new `pty.rs` module in `aivyx-tools`), consistent with
+this project's existing raw-syscall precedent (`process.rs`'s
+`kill_process_group` already uses raw `libc::kill` rather than a wrapper
+crate) — no new dependency. Both the master and slave fds are opened in
+the **parent** (`aivyx-coder` itself) before `fork`; the slave becomes
+the child's stdin, stdout, *and* stderr (a real terminal is one merged
+stream, replacing the old two separate reader tasks with one). Because
+the slave fd is already open before fork, the child never calls `open()`
+on any `/dev/pts/*` path itself — it only inherits already-open
+descriptors across `exec`, which Landlock has no opinion on. This needed
+**zero Landlock ruleset changes** — a materially simpler security story
+than a naive "grant `/dev/pts` too" design would have required, and the
+same fd-inheritance principle every existing Landlock test spawning a
+`Stdio::piped()` child already exercises implicitly.
+
+**Two real implementation risks, resolved empirically during planning
+rather than assumed**: (1) whether `std::os::unix::process::CommandExt
+::pre_exec`, called a second time on the same `Command` (the confiner's
+own Landlock/seccomp setup already calls it once), would chain both
+closures or silently replace the first — confirmed with a real spawned
+process that both closures run, in order, so no `ExecutionConfiner`
+trait extension was needed; and (2) whether stdio redirection (the
+dup2-onto-0/1/2 machinery) happens before or after `pre_exec` runs —
+confirmed empirically that redirection happens first, meaning
+`ioctl(0, TIOCSCTTY)` inside the new `pre_exec` closure correctly targets
+the pty slave once it's the child's stdin.
+
+**A real, non-obvious correctness bug avoided rather than shipped**: the
+existing `.process_group(0)` call (used to isolate the child into its
+own process group) had to be **removed**, not kept alongside the new
+`setsid()` call. `setsid()` makes the calling process both a new session
+leader and, atomically, the sole member of a new process group — but
+POSIX `setsid()` fails with `EPERM` if the caller is already a
+process-group leader, which a prior `.process_group(0)` would have just
+made it. Removing it is safe: `setsid()`'s new process group's pgid
+equals the child's own pid, exactly as `.process_group(0)` provided
+before, so `kill_process_group`'s `-(pid)` target needed no change.
+
+**A genuine Critical bug caught by review before merge**: the first cut
+of `open_pty()` opened both the pty master and slave without
+`O_CLOEXEC`, so the pty master fd leaked into *every* child process
+`aivyx-coder` spawned — not just the REPL's own child — for as long as a
+REPL session stayed alive. Any `run_command`/`run_shell`/`git_commit`
+invocation while a `repl_start` session was running would inherit that
+fd, a privilege leak across otherwise-unrelated tool invocations. Fixed
+(commit `6cf71d6`) by adding `O_CLOEXEC` to both `open_pty()` calls,
+relying on `OwnedFd::try_clone()` preserving `FD_CLOEXEC` (so the
+master's own retained clones stay non-inherited) while `dup2()` (used to
+wire the slave onto the child's fds 0/1/2) always clears `FD_CLOEXEC` on
+its target regardless of the source's flag (so the REPL's own child's
+stdio is unaffected). A regression test,
+`open_pty_marks_both_fds_close_on_exec`, was added to lock this in.
+
+**Live resize**: a new `aivyx_sandbox::ResizeTarget` trait (mirroring
+the existing `PermissionPrompter` decoupling pattern) lets `aivyx-tui`
+forward `crossterm`'s already-polled `Event::Resize` events down to
+whatever `repl_start` session is currently running, via
+`aivyx_tools::ReplResizeTarget`, without `aivyx-tui` gaining a new
+dependency on `aivyx-tools`. `BuiltAgent` gained a `repl_resize` field
+threaded from `agent_builder.rs` to `app::run`; the ACP frontend simply
+never reads it, since there's no real terminal there to forward a resize
+*from*. Initial pty sizing needed no cross-crate plumbing at all: a
+direct `ioctl(TIOCGWINSZ)` on `aivyx-coder`'s own fd 1 at `repl_start`
+time works for the TUI (a real terminal) and fails harmlessly
+(`ENOTTY`) under ACP (a pipe to the editor), falling back to a fixed
+80×24 default there. (`ReplResizeTarget` itself was defined in the
+resize-capability task but initially missed from `aivyx-tools`'s public
+re-exports — a small oversight caught and fixed as part of the
+following task's own commit rather than needing a separate one.)
+
+**Echo and control characters, deliberately left as pty defaults**: a
+real pty's cooked-mode line discipline echoes input back before the
+program's own response, and interprets standard control characters
+(Ctrl-C, etc.) as signals rather than literal data — both left
+unsuppressed, since matching a human typing at a real terminal is this
+feature's entire point, and both are now documented in `README.md`'s
+known limitations rather than silently changing behavior underneath the
+model.
+
+This was among the largest single-feature branches this project has
+shipped, comparable in scope to the Landlock + `aivyx-repomap`
+basename-glob enforcement feature — the difference here is that both of
+its two hardest technical questions were resolved with a real, throwaway
+empirical test *during planning*, before any implementation code
+depended on the answer, rather than discovered mid-implementation.
