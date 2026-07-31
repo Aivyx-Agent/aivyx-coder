@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;

@@ -129,6 +129,10 @@ pub struct AutonomousRun {
 /// caller built it with the `LlmBackend` + `ToolExecutor` it wants) and the
 /// receiving half of the channel that `Agent` was constructed with; `run`
 /// drives the agent on a background task and renders its events live.
+/// `repl_resize` (Real PTY feature) tips this over clippy's default
+/// argument-count threshold of 7 — each parameter is a distinct
+/// frontend-level collaborator with no natural grouping.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut agent: Agent,
     mut agent_events_rx: mpsc::UnboundedReceiver<AgentEvent>,
