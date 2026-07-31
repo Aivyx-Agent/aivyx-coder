@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -36,14 +39,25 @@ pub fn new_shared_repl_session() -> SharedReplSession {
 /// scoped, and does not survive `--resume`.
 pub struct ReplSession {
     child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    /// Combined stdout+stderr, continuously appended to by two background
-    /// reader tasks spawned in `ReplStartTool::execute` — this is what
-    /// makes polling a long-running process (no `repl_send` input, just
-    /// checking for new output) work, since output keeps accumulating
-    /// even between calls. A plain `std::sync::Mutex`, not the async one
-    /// above: every touch of this buffer is a short, synchronous
-    /// append-or-drain, never held across an `.await`.
+    /// The pty master — used for both writing input (`repl_send`) and
+    /// resizing (`resize`, Task 3). A `tokio::fs::File` wrapping a raw fd
+    /// gives async read/write via tokio's blocking-pool dispatch (fine
+    /// for this tool's modest I/O volume) while `AsRawFd` stays available
+    /// for the `ioctl(TIOCSWINSZ)` resize call. A separate fd, dup'd from
+    /// the same master, is handed to the background reader task in
+    /// `ReplStartTool::execute` — reading and writing happen from two
+    /// different tasks concurrently, so each needs its own `File` value;
+    /// duplicated fds on a character device like a pty share no file
+    /// offset to worry about (unlike a real file), so this is safe.
+    pty_master: tokio::fs::File,
+    /// Everything the pty master has produced, continuously appended to
+    /// by the single background reader task spawned in
+    /// `ReplStartTool::execute` — this is what makes polling a
+    /// long-running process (no `repl_send` input, just checking for new
+    /// output) work, since output keeps accumulating even between calls.
+    /// A plain `std::sync::Mutex`, not the async one above: every touch
+    /// of this buffer is a short, synchronous append-or-drain, never held
+    /// across an `.await`.
     output: Arc<std::sync::Mutex<VecDeque<u8>>>,
     last_activity: Instant,
     program: String,
@@ -67,6 +81,28 @@ pub struct ReplSession {
 impl Drop for ReplSession {
     fn drop(&mut self) {
         crate::process::kill_process_group(&self.child);
+    }
+}
+
+impl ReplSession {
+    /// Sets the pty's window size — called at `repl_start` time (sized to
+    /// `aivyx-coder`'s own current terminal, or a fixed 80x24 fallback
+    /// under a frontend with no real terminal) and live, whenever the
+    /// TUI's own terminal resizes (see Task 3's `ReplResizeTarget`).
+    pub(crate) fn resize(&self, cols: u16, rows: u16) {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `ioctl(TIOCSWINSZ)` on a valid, still-open pty master
+        // fd is always safe to attempt; a failure here (e.g. the pty was
+        // just torn down) has no observable effect worth surfacing — a
+        // resize is best-effort by nature.
+        unsafe {
+            libc::ioctl(self.pty_master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+        }
     }
 }
 
@@ -148,6 +184,25 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
         .unwrap_or_else(|| "signal".to_string())
 }
 
+/// The size to give a freshly-started pty: `aivyx-coder`'s own current
+/// terminal size (queried directly off fd 1 — works for the TUI
+/// frontend, whose stdout is a real terminal), or a fixed 80x24 fallback
+/// whenever that query fails (e.g. under the ACP frontend, whose stdio is
+/// a pipe to the editor, not a tty — `ioctl(TIOCGWINSZ)` there fails with
+/// `ENOTTY`). Live resizing after this point is handled separately, by
+/// `ReplResizeTarget` (Task 3/4).
+fn current_terminal_size() -> (u16, u16) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `ioctl` with a valid, zeroed buffer on a fixed, well-known
+    // fd is always safe to attempt regardless of what fd 1 actually is.
+    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if ok && ws.ws_col > 0 && ws.ws_row > 0 {
+        (ws.ws_col, ws.ws_row)
+    } else {
+        (80, 24)
+    }
+}
+
 /// Auto-kills a forgotten session — a safety net, not a limit on how long
 /// a legitimate long-running process may stay useful (as long as
 /// `repl_send` is called at least once per `idle_timeout`, this never
@@ -188,9 +243,9 @@ struct ReplStartArgs {
     args: Vec<String>,
 }
 
-/// Starts a persistent, piped-stdin/stdout/stderr child process and
-/// stores it in the shared slot. `ActionKind::Execute` — goes through the
-/// normal gate (prompt / Always-Allow cache / pre-approved
+/// Starts a persistent, interactive process on a real pseudo-terminal,
+/// and stores it in the shared slot. `ActionKind::Execute` — goes through
+/// the normal gate (prompt / Always-Allow cache / pre-approved
 /// `allowed_commands`), gets checkpointed (trait default
 /// `mutates_outside_session() == true`, not overridden), and is hidden
 /// from the model in Plan mode (same mechanism) and Autonomous mode
@@ -282,27 +337,80 @@ impl Tool for ReplStartTool {
             )));
         }
 
+        let (master, slave) = crate::pty::open_pty().map_err(|err| {
+            ToolError::ExecutionFailed(format!("failed to allocate a pty: {err}"))
+        })?;
+        let (cols, rows) = current_terminal_size();
+        let initial_ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `master` was just successfully opened above; setting
+        // its initial size before the child ever writes anything is
+        // always safe to attempt (a failure here just leaves the pty at
+        // its kernel default size, not fatal).
+        unsafe {
+            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &initial_ws);
+        }
+
         let mut command = tokio::process::Command::new(&args.program);
         command
             .args(&args.args)
             .current_dir(&ctx.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stdin(Stdio::from(slave.try_clone().map_err(|err| {
+                ToolError::ExecutionFailed(format!("failed to duplicate the pty slave fd: {err}"))
+            })?))
+            .stdout(Stdio::from(slave.try_clone().map_err(|err| {
+                ToolError::ExecutionFailed(format!("failed to duplicate the pty slave fd: {err}"))
+            })?))
+            .stderr(Stdio::from(slave));
         let mut command = ctx.confiner.confine(command);
-        let mut child = command.spawn().map_err(|err| {
+        // SAFETY: `setsid()`/`ioctl(TIOCSCTTY)` are both async-signal-safe
+        // libc calls. This closure runs after fork, after the Stdio
+        // redirections above have already been applied (dup2'd onto fds
+        // 0/1/2 — confirmed empirically during planning), so fd 0 here is
+        // the pty slave. `setsid()` makes the child both a new session
+        // leader and, atomically, the sole member of a new process group
+        // — this is why `.process_group(0)` (used before this feature)
+        // was removed rather than kept alongside: calling both would make
+        // `setsid()` fail (POSIX: it errors if the caller is already a
+        // process-group leader, which `.process_group(0)` would have just
+        // made it). `kill_process_group`'s `-(pid)` target still works
+        // unchanged, since `setsid()`'s new group's pgid equals the
+        // child's own pid, same as `.process_group(0)` provided before.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(format!("failed to start `{}`: {err}", args.program))
         })?;
 
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
+        // The parent's own fd handling: one clone of the master for the
+        // continuous background reader, one for `ReplSession` itself
+        // (writes + resize). `slave` needs no further handling here —
+        // each of its three dup'd copies was consumed by a `Stdio::from`
+        // above, and std closes the parent's own copy of each after the
+        // corresponding dup2 into the child (the same mechanism already
+        // relied on for `Stdio::from(File)` elsewhere).
+        let reader_fd = master.try_clone().map_err(|err| {
+            ToolError::ExecutionFailed(format!("failed to duplicate the pty master fd: {err}"))
+        })?;
+        let reader_file = tokio::fs::File::from_std(std::fs::File::from(reader_fd));
+        let pty_master = tokio::fs::File::from_std(std::fs::File::from(master));
 
         let output: Arc<std::sync::Mutex<VecDeque<u8>>> =
             Arc::new(std::sync::Mutex::new(VecDeque::new()));
-        spawn_output_reader(stdout, Arc::clone(&output));
-        spawn_output_reader(stderr, Arc::clone(&output));
+        spawn_output_reader(reader_file, Arc::clone(&output));
 
         // Store the session BEFORE the quiet-window wait below (not
         // after): the idle watcher spawned right after this checks the
@@ -312,7 +420,7 @@ impl Tool for ReplStartTool {
         // permanently orphaning idle-timeout protection for this session.
         *guard = Some(ReplSession {
             child,
-            stdin,
+            pty_master,
             output: Arc::clone(&output),
             last_activity: Instant::now(),
             program: args.program.clone(),
@@ -440,7 +548,7 @@ impl Tool for ReplSendTool {
         if let Some(input) = args.input.as_deref().filter(|s| !s.is_empty()) {
             let mut line = input.to_string();
             line.push('\n');
-            if session.stdin.write_all(line.as_bytes()).await.is_err() {
+            if session.pty_master.write_all(line.as_bytes()).await.is_err() {
                 // Most likely a broken pipe in the narrow window since the
                 // try_wait() check above — the process exited right then.
                 let final_output = drain_output(&session.output);
@@ -623,6 +731,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_program_that_requires_a_real_tty_now_runs_successfully() {
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+        let session = new_shared_repl_session();
+        let tool = ReplStartTool::new(session, quiet_window, max_wait, idle_timeout);
+
+        // `test -t 0` is a shell builtin (no external program dependency,
+        // matching this file's existing `fake_repl_args()` philosophy)
+        // reporting whether fd 0 is a real tty — false under the old
+        // plain-pipe design, true now.
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "if [ -t 0 ]; then echo IS_A_TTY; else echo NOT_A_TTY; fi"]
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+
+        let aivyx_types::ToolOutput::Ok(text) = output else {
+            panic!("expected Ok output");
+        };
+        assert!(text.contains("IS_A_TTY"), "got: {text}");
+    }
+
+    #[tokio::test]
     async fn permission_request_is_execute_with_a_command_target() {
         let session = new_shared_repl_session();
         let tool = ReplStartTool::new(
@@ -695,20 +830,31 @@ mod tests {
         // entangled with the shared `Arc` other tool instances also hold
         // a clone of.
         let (program, args) = fake_repl_args();
+        let (master, slave) = crate::pty::open_pty().unwrap();
         let mut command = tokio::process::Command::new(&program);
         command
             .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = command.spawn().unwrap();
-        let stdin = child.stdin.take().unwrap();
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
+        let pty_master = tokio::fs::File::from_std(std::fs::File::from(master));
 
         let session = ReplSession {
             child,
-            stdin,
+            pty_master,
             output: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             last_activity: Instant::now(),
             program,
@@ -758,6 +904,11 @@ mod tests {
         let aivyx_types::ToolOutput::Ok(text) = output else {
             panic!("expected Ok output");
         };
+        // The pty's cooked-mode line discipline echoes the raw input
+        // back first (new, pty-only behavior — this is deliberate, not
+        // suppressed, see the design spec's "Echo behavior" decision)...
+        assert!(text.contains("hello"), "got: {text}");
+        // ...followed by the fake repl's own explicit response.
         assert!(text.contains("echo: hello"), "got: {text}");
     }
 
@@ -905,7 +1056,7 @@ mod tests {
             let mut guard = session.lock().await;
             let s = guard.as_mut().unwrap();
             use tokio::io::AsyncWriteExt;
-            s.stdin.write_all(b"quit\n").await.unwrap();
+            s.pty_master.write_all(b"quit\n").await.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
 
