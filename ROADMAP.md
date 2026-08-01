@@ -449,3 +449,17 @@ binary and check whether `landlock_create_ruleset` returns success or
 container for end users" idea, still gated on this question — see
 `docs/HISTORY.md`'s "Docker Model Runner serving support" chapter for
 the full descoping story.
+
+A follow-up audit (2026-08-01) covering the same four dimensions against
+everything shipped since 2026-07-30 (the real PTY for `repl_start`/
+`repl_send`, and the slash command framework) found nothing new in
+security posture, tool coverage, test quality, or documentation. Two
+risks specific to those features' own history were checked with extra
+scrutiny and confirmed still closed: the `O_CLOEXEC` fix (no raw-fd-open
+site anywhere in the workspace reintroduced a similar leak) and the
+exhaustive `AgentEvent` match count (all three sites — `aivyx-tui`'s
+`handle_agent_event` and `sub_agent_event_text`, and `aivyx-acp`'s
+`translate_event` — still explicitly handle `ConversationCleared`, no
+fourth site and no silent wildcard arm anywhere). See `docs/HISTORY.md`'s
+"2026-08-01 capability audit" chapter for the full account of what was
+checked.

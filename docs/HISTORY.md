@@ -3668,3 +3668,43 @@ flowed through `Agent::run_turn` unconditionally, with no
 frontend-specific gating), but `/help`/`/clear`/`/quit` and the
 autocomplete hint were not wired into ACP — an editor hosting ACP has
 its own UI paradigms for equivalent actions.
+
+### 2026-08-01 capability audit — done
+
+A fresh audit against the same four dimensions as the prior three
+(security posture, tool coverage, test quality, documentation), scoped
+to everything shipped since 2026-07-30 closed: the real PTY for
+`repl_start`/`repl_send` and the slash command framework. Every
+candidate finding was independently re-verified by reading the actual
+code before being accepted or dismissed, matching this project's
+established audit practice.
+
+**Nothing new found in any of the four dimensions.** Specifically
+confirmed: the REPL tools' `ActionKind`/`PermissionTarget` pairings are
+unchanged and still honest after the pty rewrite; the `Interact` tier's
+position in `ConfirmationGate`'s gate order is untouched; the new
+`ResizeTarget` trait carries no trust (a pure `ioctl` forwarder,
+triggered only by the TUI's own terminal-resize events, never by the
+model); no new model-facing tool was registered this window, so no new
+`ActionKind`/`PermissionTarget` pairing existed to under-claim; every
+test added by the two audited features was spot-checked and found to be
+a real regression test (would fail if the fix were reverted), not
+vacuous; and the README/ROADMAP documentation for both features matches
+the shipped code exactly.
+
+Two risks specific to those features' own history got extra scrutiny,
+both confirmed still closed: **(1)** the real PTY feature's own final
+review had found and fixed a missing `O_CLOEXEC` (the pty master fd
+leaking into every spawned child) — a workspace-wide sweep for every
+raw fd-opening syscall found `pty.rs` is still the only such site, and
+the fix (plus its regression test) is intact. **(2)** the slash-command
+branch needed two separate rounds of fixing a missed exhaustive
+`AgentEvent` match for the new `ConversationCleared` variant — a full
+sweep confirmed there are exactly three exhaustive matches over
+`AgentEvent` in the whole workspace, all three explicitly handle
+`ConversationCleared`, and none of them fall back to a silent wildcard
+`_ =>` arm that could mishandle a future variant unnoticed.
+
+With this closed, the audit lineage (2026-07-22 → 2026-07-28 → 2026-07-30
+→ 2026-08-01) remains fully resolved except for the one still-open,
+correctly-tracked Docker/Landlock design question.
