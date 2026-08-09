@@ -194,11 +194,14 @@ invoked anyway (`git_commit`'s target is never cacheable, so it falls out
 of the same cache-miss-denies rule with no special-casing). `repl_send`/
 `repl_stop` are likewise denied outright if a hidden `repl_start` is
 somehow still reached — there is no human to answer a REPL prompt in
-autonomous mode. Every MCP tool call and `remember_preference` are also
-unconditionally denied: there's no way to pre-approve an MCP tool the way
-`allowed_commands` pre-approves a shell command, and `remember_preference`
-edits a file whose effect isn't scoped to the current worktree the normal
-Write/Delete boundary check bounds. A driver loop sends the
+autonomous mode. Every MCP tool call, `remember_preference`, and `memory_write`/
+`memory_forget` are also unconditionally denied: there's no way to
+pre-approve an MCP tool the way `allowed_commands` pre-approves a shell
+command, and `remember_preference`/`memory_write`/`memory_forget` all
+persist state whose effect isn't scoped to the current worktree the
+normal Write/Delete boundary check bounds — unlike an ordinary in-worktree
+edit, there's no checkpoint/rollback safety net to fall back on if an
+unattended run gets it wrong. A driver loop sends the
 goal, continues on `AgentEvent::TurnPaused`, and stops once every task in
 the task list is `Done`, the iteration/wall-clock budget from `[autonomous]`
 is exhausted, or you cancel. If enforced verification (above) exhausts its
@@ -335,7 +338,17 @@ see every change to this file, individually, even if you've approved a
 previous one. Not available in `--auto` (autonomous) mode: there's no
 human to review the change.
 
-This feature also added `~/.config/aivyx-coder` to the *default*
+**Cross-session memory**: beyond global preferences, the agent can save
+smaller, incidental facts via `memory_write` — scoped to this project
+(`project:`) or global (`global:`), recalled only when it explicitly
+calls `memory_read` (never injected automatically). Unlike
+`remember_preference`'s single always-active file, this is many small,
+independently-forgettable notes — see `memory_forget`. Both writing and
+forgetting go through the same review-then-cache flow as any other
+mutating tool, and are unconditionally denied in autonomous mode for the
+same reason `remember_preference` is (see above).
+
+The persona feature also added `~/.config/aivyx-coder` to the *default*
 `deny_paths` list, protecting the config directory (which can hold
 `backend.api_key`) from the generic `write_file`/`edit_file`/`delete_file`/
 `read_file`/`grep` tools. Since it's a default, it only applies to fresh
@@ -830,6 +843,9 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 | `repl_start` | start a persistent process (e.g. a language REPL, `psql`, or a dev server) | prompt (then cacheable) |
 | `repl_send` | send input to / poll output from the running process | none (auto-allowed once started) |
 | `repl_stop` | stop the running process | none (auto-allowed once started) |
+| `memory_read` | recall entries saved under a topic (`global:`/`project:` scoped) | none (auto-allowed) |
+| `memory_write` | persist a fact/note under a topic for future recall | prompt (then cacheable per topic) |
+| `memory_forget` | delete every entry saved under a topic | prompt (then cacheable per topic) |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command

@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-08-01_
+_Last updated: 2026-08-09_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -390,6 +390,23 @@ de-duplicated onto one shared helper as a side effect. TUI-only —
 frontend (unchanged, they already flowed through `Agent::run_turn`
 unconditionally), but `/help`/`/clear`/`/quit` and the autocomplete hint
 are not wired into ACP.
+
+**Cross-session memory (`aivyx-recall`) — shipped.** `memory_write`/
+`memory_read`/`memory_forget` give the agent topic-scoped facts that
+persist across sessions — global (`global:`) or project-scoped
+(`project:`, keyed by the same cwd hash session persistence already
+uses) — recalled only on an explicit `memory_read` call, never injected
+ambiently. Backed by a new standalone crate/repo, `aivyx-recall`
+(`Aivyx-Agent/aivyx-recall`), deliberately factored out so the sibling
+Aivyx Personal Assistant can eventually adopt the same substrate instead
+of reimplementing an equivalent one — see `docs/superpowers/specs/
+2026-08-09-aivyx-recall-design.md`. A new `ActionKind::PersistentMemory`
+backs the write/forget tools' gating: cacheable per exact topic in
+interactive mode (unlike the existing, differently-shaped
+`ActionKind::Memory` behind `remember_preference`), but unconditionally
+denied under `--auto` for the same reason `remember_preference` already
+is — both persist state outside the project working tree with no
+checkpoint/rollback safety net.
 
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
