@@ -480,3 +480,42 @@ exhaustive `AgentEvent` match count (all three sites — `aivyx-tui`'s
 fourth site and no silent wildcard arm anywhere). See `docs/HISTORY.md`'s
 "2026-08-01 capability audit" chapter for the full account of what was
 checked.
+
+The final whole-branch review of cross-session memory (`aivyx-recall`,
+2026-08-09 — see `docs/HISTORY.md`'s own entry for that chapter) found
+and closed a real bug before merge (`memory_write`/`memory_forget`
+sharing one Always-Allow cache key) plus three gaps (a cross-repo
+dependency that would have broken on the next release tag, a missing
+`deny_paths` default, a missing `docs/HISTORY.md` entry). Three smaller
+findings from that same review are logged here rather than fixed ad hoc:
+
+- **`repl_send`/`repl_stop` share the identical `PermissionKey`
+  collision class Fix 1 (above) just closed for `memory_write`/
+  `memory_forget`.** Both use `ActionKind::Interact` +
+  `PermissionTarget::Other("repl session")` — the same fixed string
+  regardless of which of the two tools is calling, so an Always-Allow on
+  one (if either tool's caching path is ever reached — today `Interact`
+  auto-allows unconditionally per `ConfirmationGate::check`, so this is
+  currently latent, not exploitable) would silently satisfy the other.
+  Severity is much lower than the memory case (stopping an
+  already-approved REPL session destroys no user data), but the same
+  `PermissionTarget::Other`-collision sweep that caught this should be
+  done properly: audit every `PermissionTarget::Other` producer in the
+  workspace for tool-qualification, not just the two this chapter
+  touched.
+- **`aivyx-recall` (the new sibling repo) has no `CLAUDE.md`, isn't
+  listed in the root `~/Projects/Rust/CLAUDE.md` workspace table, and
+  its own README doesn't yet document the workspace's conventions
+  (branch naming, commit style, etc.) the way the other four repos'
+  `CLAUDE.md` files do.** Out of this chapter's scope (a design
+  document, not a code gap), but a real loose end now that it's a real,
+  pushed, sixth ecosystem member.
+- **The new `write_approval_does_not_satisfy_a_forget_on_the_same_topic`
+  gate test lives in `aivyx-sandbox`, which has no dependency on
+  `aivyx-tools`** — it proves the cache mechanism directly with
+  hand-built `PermissionRequest`s, but can't itself detect a regression
+  in `memory_write.rs`/`memory_forget.rs`'s actual `permission_request`
+  output (that's covered by each tool's own updated unit test instead,
+  as two decoupled halves rather than one end-to-end proof). An
+  `aivyx-tools`-side test driving both tools' real `permission_request()`
+  through a real `ConfirmationGate` would close the loop properly.
