@@ -19,6 +19,7 @@ mod checkpoint;
 mod diff;
 mod lsp;
 mod mcp;
+mod memory_topic;
 mod path_resolve;
 mod process;
 mod pty;
