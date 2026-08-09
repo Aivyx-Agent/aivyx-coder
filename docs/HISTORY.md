@@ -3807,3 +3807,26 @@ genuine prior memory. Fixed by adding the whole state directory (not
 just `memory/`) to the default deny list, matching the existing
 precedent of protecting all of `~/.config/aivyx-coder` rather than one
 subdirectory within it.
+
+**`aivyx-memory` migration — investigated 2026-08-10, decided against.**
+The chapter's own deferred note above assumed `aivyx-memory`'s `Memory`
+trait was still close to the ~3-method shape its module docs describe as
+substrate-agnostic. Actually reading the current trait in a follow-up
+session found it had grown to 18 methods (`scan_prefix`, `gc_topic`/
+`gc_expired`/`gc_expired_with_rules`, `search`/`lexical_search_scored`,
+`list_topics`, `evict_oldest_unread`, the five vector/ANN methods,
+`promote_recall_helpful` — on top of the 3 `aivyx-recall` covers), and a
+real, tested conflict on the 3 that do overlap: `aivyx-memory`'s sequence
+counter is global across every topic (`RedbMemory`'s own
+`topics_are_isolated_on_disk` test locks this in explicitly), while
+`aivyx-recall`'s is deliberately per-topic. Migrating would mean either
+growing `aivyx-recall` to own retrieval ranking, eviction policy, and
+embeddings — directly against its own founding "no embeddings, no
+ranking" design — or changing `aivyx-memory`'s tested global-seq behavior
+to match a slice covering a sixth of what it actually does. Neither was
+judged worth the risk to a mature, ~8,300-line, security-relevant system
+for sharing three simple methods. `aivyx-memory` stays exactly as it is;
+`aivyx-recall` remains `aivyx-coder`'s own substrate, still genuinely
+reusable by some future consumer, just not this one. See the design
+spec's own "Deferred" section (now retitled to record this) for the full
+account.

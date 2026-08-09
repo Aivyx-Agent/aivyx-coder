@@ -278,22 +278,50 @@ added.
   mirroring the existing gate tests for `write_file`/`read_file`/
   `delete_file`.
 
-## Deferred: `aivyx`'s `aivyx-memory` migration
+## Deferred: `aivyx`'s `aivyx-memory` migration — investigated 2026-08-10, decided against
 
-Not designed or built in this chapter. `aivyx`'s `RedbMemory` would
-become a second `Recall` implementor (wrapping its existing
-`aivyx_storage::DomainHandle` for `KeyDomain::Memory` encryption, same
-as today) alongside `aivyx-recall`'s own `FileRecall`. `aivyx-memory`'s
-`Memory` trait, its `Tool` wrappers, capability scopes, audit hooks,
-BM25/ANN search, and LRU eviction all stay exactly as they are — only
-the lowest storage-substrate layer would eventually point at
-`aivyx-recall` instead of reimplementing an equivalent one. That's a
-real refactor of ~8,300 lines of mature, tested, many-phases-old
-production code, and belongs in its own spec, written and reviewed
-inside the `aivyx` repo against its own real test suite, whenever that
-work is picked up. Nothing in this chapter's design blocks it — the
-`Recall` trait is intentionally the same shape `aivyx-memory`'s own
-docs already describe as the substrate-agnostic part.
+Not designed or built in this chapter, and — after actually investigating
+it in a follow-up session — **not going to happen**, at least not as
+"point `RedbMemory` at `aivyx-recall` instead of reimplementing an
+equivalent substrate." The original framing above assumed `aivyx-memory`'s
+`Memory` trait was still close to the ~3-method shape its own module docs
+describe as substrate-agnostic. Reading the actual current trait found
+otherwise:
+
+- **`Memory` has grown to 18 methods**, not 3: `put`/`get_recent`/`forget`/
+  `delete_entry`, `scan_prefix` (wildcard topic-prefix grouping),
+  `gc_topic`/`gc_expired`/`gc_expired_with_rules` (retention rules),
+  `search`/`lexical_search_scored` (BM25), `list_topics`,
+  `evict_oldest_unread` (LRU), `put_vector`/`load_all_vectors`/
+  `semantic_search`/`semantic_search_scored`/`semantic_search_scored_ann`
+  (embeddings + a hand-rolled ANN index, in a *separately encrypted*
+  `KeyDomain::MemoryVectors`), and `promote_recall_helpful`. `aivyx-recall`'s
+  `Recall` trait covers exactly 3 of those — and every one of the other 15
+  is exactly the kind of thing `aivyx-recall`'s own design explicitly
+  declines to own (search ranking, eviction policy, embeddings).
+- **A real, tested, load-bearing semantic conflict on the 3 methods that
+  do overlap**: `aivyx-memory`'s sequence counter is global across every
+  topic (`RedbMemory`'s own test `topics_are_isolated_on_disk` locks this
+  in explicitly: "the middle seq lands between the two notes seqs...
+  proving the counter is global not per-topic. If this fails, the two
+  impls have diverged"). `aivyx-recall`'s `Recall` trait deliberately made
+  seq **per-topic** (see `RecallEntry::seq`'s own doc comment) — a
+  considered choice for a one-file-per-topic backend, not an oversight,
+  and not reconcilable with `aivyx-memory`'s tested behavior without a
+  real, deliberate behavior change to a mature, security-relevant system.
+
+Given that, migrating would mean either growing `aivyx-recall` into
+something that also owns retrieval ranking, eviction policy, and
+embeddings — directly contradicting its own founding design ("no
+embeddings, no ranking... consumers layer whatever scoping, security, and
+retrieval semantics they need on top") — or changing `aivyx-memory`'s
+tested global-seq behavior to match a 3-method slice that covers barely a
+sixth of what it actually does. Neither is worth the risk to a mature,
+~8,300-line, many-phases-old, security-relevant system for the sake of
+sharing three simple methods. `aivyx-memory` stays exactly as it is,
+unchanged, on its own storage. `aivyx-recall` remains `aivyx-coder`'s own
+substrate — a real, working, shared-*capable* crate that a future
+project could still adopt, just not `aivyx-memory` as it exists today.
 
 ## Why not embeddings/BM25 here
 
