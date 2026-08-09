@@ -135,9 +135,9 @@ shared collaborator — `Arc<dyn LlmProvider>`, `Arc<dyn Storage>`, etc.):
 
 | Tool | Args | `ActionKind` | Gate behavior |
 |---|---|---|---|
-| `memory_write` | `topic`, `body` | `Write` | Confirm on first use per distinct topic; Always-Allow caches on the **topic string** — same exact-target-caching principle `write_file`/`git_commit` already use, so approving `project:flaky-tests` never blesses `project:other-topic`. |
-| `memory_read` | `topic`, `limit` | `Read` | Auto-allow, like `read_file` — recall is never a mutation. |
-| `memory_forget` | `topic` | `Delete` | Confirm, same tier as `delete_file`. |
+| `memory_write` | `topic`, `body` | `PersistentMemory` (new — see addendum) | Confirm on first use per distinct topic; Always-Allow caches on the **topic string** — same exact-target-caching principle `write_file`/`git_commit` already use, so approving `project:flaky-tests` never blesses `project:other-topic`. Unconditionally denied under `--auto`. |
+| `memory_read` | `topic`, `limit` | `Read` | Auto-allow, like `read_file` — recall is never a mutation. Unaffected by `--auto`. |
+| `memory_forget` | `topic` | `PersistentMemory` (new — see addendum) | Confirm, same caching as `memory_write`. Unconditionally denied under `--auto`. |
 
 **Why `memory_write` isn't `Internal` (auto-allow) like `set_tasks`:**
 `set_tasks` is ephemeral, current-session-only bookkeeping — it's
@@ -177,6 +177,60 @@ file/command output.
 **Storage location:** `~/.local/state/aivyx-coder/memory/`, parallel to
 the existing `sessions/` directory (same `directories::ProjectDirs`
 state dir).
+
+### Addendum — relationship to `remember_preference`, and autonomous mode (`--auto`)
+
+Found while writing the implementation plan, not during the original
+brainstorm: `aivyx-coder` already has a cross-session, global memory
+mechanism — `remember_preference`
+(`crates/aivyx-tools/src/tools/remember_preference.rs`,
+`docs/superpowers/specs/2026-07-21-agent-learned-preferences-design.md`),
+which lets the model propose a full rewrite of
+`~/.config/aivyx-coder/AGENTS.md`, a file already ambiently injected
+into every turn's system prompt across every project. This doesn't
+duplicate what this chapter builds: `remember_preference` is *ambient*
+(always injected, no recall call needed) and *whole-document* (propose
+one complete replacement, reviewed as one diff), aimed at "how you like
+me to work" instructions meant to be permanently active. `memory_write`/
+`memory_read`/`memory_forget` are *on-demand* (nothing enters context
+until the model calls `memory_read`) and *topic-scoped* (one small fact
+per entry, no full-document rewrite), aimed at incidental facts that
+don't need to be always-on. Both this chapter's `global:` and `project:`
+namespaces are therefore intentional, not overlapping with
+`remember_preference`'s existing global file.
+
+`remember_preference` also introduced `ActionKind::Memory`
+(`crates/aivyx-sandbox/src/lib.rs`) — relevant precedent, but **not**
+directly reusable here. It's shaped narrowly for `remember_preference`'s
+specific danger: its `PermissionTarget::Other` description is a fixed
+constant string regardless of the content actually being proposed, so
+`ConfirmationGate::check` treats it as *never* Always-Allow-cached (a
+cached approval would silently bless every future, unreviewed rewrite)
+and *unconditionally denied* under `--auto` (the autonomous-mode branch
+checks `action == ActionKind::Memory` directly).
+
+This surfaced a real gap the original design missed: `--auto` was never
+addressed for `memory_write`/`memory_forget`. Both persist content
+outside the project working tree, with no git checkpoint/rollback
+safety net — the same property that motivated `ActionKind::Memory`'s
+unconditional `--auto` denial. Confirmed by reading
+`ConfirmationGate::check`'s autonomous-mode branch: today, a `Write`/
+`Delete` action on a `PermissionTarget::Other` target falls through to
+silent auto-allow unless its `ActionKind` is one of the two kinds
+special-cased for unconditional denial (`McpTool`, `Memory`) — so
+`memory_write`/`memory_forget` as originally specified (plain `Write`/
+`Delete`) would have silently auto-allowed, unattended, under `--auto`.
+
+**Resolution:** a new `ActionKind::PersistentMemory`, used by both
+`memory_write` and `memory_forget` (replacing the plain `Write`/
+`Delete` kinds in the table above). It gets the same unconditional
+`--auto` denial as `McpTool`/`Memory` (add it alongside them in
+`ConfirmationGate::check`'s autonomous-mode branch), but — unlike
+`Memory` — is *not* added to the `never_cached` check, since this
+chapter's targets (topic strings) genuinely vary per call and per-topic
+Always-Allow caching is safe and intended, unlike `remember_preference`'s
+fixed-string case. `memory_read` is unaffected (stays `Read`, always
+auto-allowed, `--auto` included).
 
 **Default posture:** on by default, no new `[memory]` config toggle.
 Consistent with how every other tool in this project ships — the
