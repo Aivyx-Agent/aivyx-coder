@@ -356,6 +356,14 @@ installs — an existing `config.toml` won't pick it up automatically; add
 `"~/.config/aivyx-coder"` to your own `[permissions] deny_paths` list by
 hand to get the same protection.
 
+Cross-session memory added the same default protection for
+`~/.local/state/aivyx-coder` — the state directory `memory/`'s topic files
+(and `sessions/`) live under — so a generic `write_file` can't plant
+content for a later, auto-allowed `memory_read` to surface, bypassing the
+`memory_write` confirmation entirely. Same caveat as above: only fresh
+installs pick this up automatically; add `"~/.local/state/aivyx-coder"` to
+your own `[permissions] deny_paths` list by hand on an existing install.
+
 **Editor context**: an optional per-project JSON file
 (`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
 canonicalized-`cwd` hash as session files) that any editor integration can
