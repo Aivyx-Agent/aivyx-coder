@@ -25,10 +25,10 @@ use aivyx_tools::{
     CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
-    McpToolAdapter, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
-    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
-    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteFileTool, new_shared_repl_session,
+    McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool, MoveFileTool, PatchFileTool,
+    ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplResizeTarget, ReplSendTool,
+    ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -254,6 +254,27 @@ pub(crate) async fn build_agent(
     let repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget> =
         Arc::new(ReplResizeTarget::new(repl_session));
     registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
+
+    // Cross-session memory (memory_write/memory_read/memory_forget),
+    // backed by aivyx-recall's FileRecall — one shared Arc<dyn Recall>
+    // across all three tools. See docs/superpowers/specs/
+    // 2026-08-09-aivyx-recall-design.md. Falls back to an in-memory-only
+    // store (functional for this process, just not persisted) if the
+    // state directory can't be resolved — matching session persistence's
+    // own best-effort, never-block-startup posture immediately below.
+    let recall: Arc<dyn aivyx_recall::Recall> = match session::memory_dir_path() {
+        Some(dir) => Arc::new(aivyx_recall::FileRecall::new(dir)),
+        None => {
+            tracing::warn!(
+                "no state directory available — cross-session memory will not persist across restarts"
+            );
+            Arc::new(aivyx_recall::InMemoryRecall::new())
+        }
+    };
+    registry.register(Arc::new(MemoryReadTool::new(Arc::clone(&recall))));
+    registry.register(Arc::new(MemoryWriteTool::new(Arc::clone(&recall))));
+    registry.register(Arc::new(MemoryForgetTool::new(recall)));
+
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitCommitTool::new(deny_paths.clone())));
     registry.register(Arc::new(GitBranchTool::new()));
