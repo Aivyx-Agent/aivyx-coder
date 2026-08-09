@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aivyx-recall = { path = "../../../aivyx-recall" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 async-trait = "0.1.89"

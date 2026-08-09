@@ -153,6 +153,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivyx-recall"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "aivyx-repomap"
 version = "0.1.0"
 dependencies = [
@@ -189,6 +200,7 @@ dependencies = [
 name = "aivyx-tools"
 version = "0.1.0"
 dependencies = [
+ "aivyx-recall",
  "aivyx-sandbox",
  "aivyx-types",
  "async-trait",
