@@ -43,6 +43,15 @@ const AUTONOMOUS_MCP_TOOL_DENIAL: &str =
 const AUTONOMOUS_MEMORY_DENIAL: &str =
     "remembering preferences requires interactive confirmation and cannot happen in autonomous mode";
 
+/// Told to the model when a `memory_write`/`memory_forget` call reaches
+/// autonomous mode. Same reasoning as `AUTONOMOUS_MEMORY_DENIAL`: the
+/// change persists outside the project working tree, with no
+/// checkpoint/rollback safety net, and there is no human present to
+/// review it.
+const AUTONOMOUS_PERSISTENT_MEMORY_DENIAL: &str =
+    "remembering or forgetting persistent memory requires interactive confirmation and cannot \
+     happen in autonomous mode";
+
 /// Told to the model when a `repl_send`/`repl_stop` call reaches
 /// autonomous mode. `repl_start` (the `Execute`-tier action that would
 /// actually spawn the process) is already hidden from the model in
@@ -302,6 +311,17 @@ impl PermissionGate for ConfirmationGate {
                     "permission denied: remember_preference call in autonomous mode"
                 );
                 return PermissionDecision::Deny(Some(AUTONOMOUS_MEMORY_DENIAL.to_string()));
+            }
+            if request.action == ActionKind::PersistentMemory {
+                tracing::warn!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "permission denied: memory_write/memory_forget call in autonomous mode"
+                );
+                return PermissionDecision::Deny(Some(
+                    AUTONOMOUS_PERSISTENT_MEMORY_DENIAL.to_string(),
+                ));
             }
             if request.action == ActionKind::Interact {
                 tracing::warn!(
@@ -1762,6 +1782,89 @@ mod tests {
         let second = gate.check(&memory_request()).await;
         assert_eq!(second, PermissionDecision::AllowAlways);
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn persistent_memory_request(topic: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "memory_write".to_string(),
+            action: ActionKind::PersistentMemory,
+            target: PermissionTarget::Other(topic.to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomous_mode_denies_persistent_memory_actions_unconditionally() {
+        // Mirrors autonomous_mode_denies_memory_actions_unconditionally
+        // exactly, for the new ActionKind — memory_write/memory_forget
+        // persist outside the project with no checkpoint/rollback net,
+        // same reasoning as remember_preference's ActionKind::Memory.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&persistent_memory_request("project:flaky-tests")).await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never prompt for a PersistentMemory action"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_memory_actions_are_cached_unlike_plain_memory_actions() {
+        // The key difference from ActionKind::Memory: here the target
+        // (topic string) genuinely varies per call, so per-topic
+        // Always-Allow caching is safe and intended.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let first = gate.check(&persistent_memory_request("project:flaky-tests")).await;
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        let second = gate.check(&persistent_memory_request("project:flaky-tests")).await;
+        assert_eq!(second, PermissionDecision::AllowAlways);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            1,
+            "same exact topic should be cached, unlike ActionKind::Memory"
+        );
+
+        let third = gate.check(&persistent_memory_request("project:other-topic")).await;
+        assert_eq!(third, PermissionDecision::AllowAlways);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            2,
+            "a different topic must still prompt"
+        );
     }
 
     #[test]

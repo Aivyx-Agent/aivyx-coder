@@ -107,6 +107,17 @@ pub enum ActionKind {
     /// describe it honestly, the same reasoning `ActionKind::Delete`'s own
     /// doc comment already gives for not folding deletion into `Write`.
     Move,
+    /// The agent persisting a fact under a topic (`memory_write`) or
+    /// deleting one (`memory_forget`) — see `aivyx-tools`'
+    /// `memory_write`/`memory_forget`. Unlike `Memory` (used only by
+    /// `remember_preference`), the target here is the actual topic
+    /// string, which genuinely varies per call — so, unlike `Memory`,
+    /// this kind *does* participate in the Always-Allow cache, keyed on
+    /// that exact topic. It shares `Memory`'s unconditional `--auto`
+    /// denial, though: both persist content outside the project working
+    /// tree, with no git checkpoint/rollback safety net to fall back on
+    /// if an unattended run gets it wrong.
+    PersistentMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

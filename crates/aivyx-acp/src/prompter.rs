@@ -87,7 +87,10 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
         ActionKind::Delete => ToolKind::Delete,
         ActionKind::Execute => ToolKind::Execute,
         ActionKind::Move => ToolKind::Move,
-        ActionKind::McpTool | ActionKind::Memory | ActionKind::Interact => ToolKind::Other,
+        ActionKind::McpTool
+        | ActionKind::Memory
+        | ActionKind::PersistentMemory
+        | ActionKind::Interact => ToolKind::Other,
         ActionKind::Read | ActionKind::Internal => ToolKind::Other,
     };
     let fields = ToolCallUpdateFields::new()
