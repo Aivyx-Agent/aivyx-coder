@@ -73,6 +73,24 @@ pub fn session_file_path(cwd: &Path) -> Option<PathBuf> {
     Some(state_dir.join("sessions").join(format!("{key}.json")))
 }
 
+/// Where cross-session memory (`memory_write`/`memory_read`/
+/// `memory_forget`, via `aivyx-recall`'s `FileRecall`) is persisted: one
+/// shared directory under the platform state dir, parallel to
+/// `sessions/`. Unlike `session_file_path`, this directory isn't itself
+/// project-keyed — `aivyx-tools`' topic-rewriting layer embeds a
+/// project-scoping hash *inside* the topic string for `project:`-prefixed
+/// topics instead (see `crates/aivyx-tools/src/memory_topic.rs`), so all
+/// topics — global and per-project alike — share one directory of
+/// per-topic files.
+pub fn memory_dir_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
+    let state_dir = dirs
+        .state_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    Some(state_dir.join("memory"))
+}
+
 /// FNV-1a, inlined because the session key must be stable across program
 /// versions — `std`'s `DefaultHasher` explicitly does not guarantee that.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -196,6 +214,23 @@ mod tests {
             session_file_path(dir.path()).unwrap(),
             session_file_path(&dotted).unwrap()
         );
+    }
+
+    #[test]
+    fn memory_dir_path_is_a_memory_subdirectory_of_the_state_dir() {
+        let path = memory_dir_path().expect("should resolve on any platform with a home dir");
+        assert_eq!(path.file_name().unwrap(), "memory");
+    }
+
+    #[test]
+    fn memory_dir_path_is_a_sibling_of_the_sessions_dir() {
+        let memory = memory_dir_path().unwrap();
+        let sessions = session_file_path(&std::env::current_dir().unwrap())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(memory.parent(), sessions.parent());
     }
 
     #[cfg(unix)]
