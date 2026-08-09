@@ -64,7 +64,15 @@ impl Tool for MemoryWriteTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::PersistentMemory,
-            target: PermissionTarget::Other(resolved),
+            // Tool-qualified, not the bare resolved topic: `memory_forget`
+            // uses the same ActionKind::PersistentMemory + resolved-topic
+            // shape for the same topic, and PermissionKey::from_request
+            // keys an `Other` target on `{action, description}` only — a
+            // bare topic here would let an Always-Allow granted for a
+            // memory_write on this topic silently satisfy a later
+            // memory_forget on the same topic from the cache, with no
+            // prompt for the irreversible delete.
+            target: PermissionTarget::Other(format!("memory_write {resolved}")),
             arguments_preview: json!({ "topic": args.topic }),
             preview: Some(args.body.clone()),
             diff: None,
@@ -112,7 +120,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(request.action, ActionKind::PersistentMemory);
-        assert_eq!(request.target, PermissionTarget::Other("global:editor".to_string()));
+        assert_eq!(
+            request.target,
+            PermissionTarget::Other("memory_write global:editor".to_string())
+        );
         assert_eq!(request.preview, Some("prefers tabs".to_string()));
     }
 

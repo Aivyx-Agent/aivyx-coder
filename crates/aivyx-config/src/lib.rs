@@ -592,6 +592,15 @@ impl Default for PermissionSettings {
                 "~/.ssh".to_string(),
                 "~/.aws".to_string(),
                 "~/.config/aivyx-coder".to_string(),
+                // Protects the whole control-plane state directory, not
+                // just its `memory/` subdirectory (matching the same
+                // whole-directory reasoning as `~/.config/aivyx-coder`
+                // above) — without this, a generic write_file/edit_file
+                // could plant a crafted memory topic file directly under
+                // `memory/`, bypassing the ActionKind::PersistentMemory
+                // gate entirely; a later memory_read (auto-allowed) would
+                // then return the planted content.
+                "~/.local/state/aivyx-coder".to_string(),
                 "~/.gnupg".to_string(),
                 "~/.netrc".to_string(),
                 "~/.docker/config.json".to_string(),
@@ -837,6 +846,21 @@ mod tests {
             PermissionSettings::default()
                 .deny_paths
                 .contains(&"~/.config/aivyx-coder".to_string())
+        );
+    }
+
+    #[test]
+    fn default_deny_paths_includes_the_state_directory() {
+        // Protects the whole `~/.local/state/aivyx-coder` control-plane
+        // directory (parent of `memory/`), not just the memory
+        // subdirectory — otherwise a generic write_file/edit_file could
+        // plant a crafted memory topic file directly, bypassing the
+        // ActionKind::PersistentMemory gate entirely; a later memory_read
+        // (auto-allowed) would then return the planted content.
+        assert!(
+            PermissionSettings::default()
+                .deny_paths
+                .contains(&"~/.local/state/aivyx-coder".to_string())
         );
     }
 

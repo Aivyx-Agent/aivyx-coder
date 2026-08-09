@@ -904,6 +904,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_approval_does_not_satisfy_a_forget_on_the_same_topic() {
+        // Regression test for the final-review finding: memory_write and
+        // memory_forget both use ActionKind::PersistentMemory with a
+        // PermissionTarget::Other built from the same resolved topic. Before
+        // the tools tool-qualified their target strings (`"memory_write
+        // <topic>"` / `"memory_forget <topic>"`), PermissionKey::from_request
+        // keyed an Other target on {action, description} only — so an
+        // Always-Allow cached for a memory_write on a topic would silently
+        // also satisfy a memory_forget on that same topic, letting an
+        // approval meant for "remember this" authorize an unprompted,
+        // irreversible delete.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let write_request = PermissionRequest {
+            tool_name: "memory_write".to_string(),
+            action: ActionKind::PersistentMemory,
+            target: PermissionTarget::Other("memory_write global:editor".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let forget_request = PermissionRequest {
+            tool_name: "memory_forget".to_string(),
+            action: ActionKind::PersistentMemory,
+            target: PermissionTarget::Other("memory_forget global:editor".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        let write_decision = gate.check(&write_request).await;
+        assert_eq!(write_decision, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // The forget on the same topic must still prompt — the write's
+        // cache entry must not satisfy it.
+        let forget_decision = gate.check(&forget_request).await;
+        assert_eq!(forget_decision, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn deny_paths_wins_over_read_auto_allow() {
         // Locks in the order inside `check`: the deny-list is consulted
         // before the read-auto-allow shortcut, not after. A refactor that

@@ -58,7 +58,11 @@ impl Tool for MemoryForgetTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::PersistentMemory,
-            target: PermissionTarget::Other(resolved),
+            // Tool-qualified, not the bare resolved topic — see the matching
+            // comment in memory_write.rs's permission_request for why: this
+            // keeps a memory_write Always-Allow on this topic from silently
+            // satisfying this forget from the cache.
+            target: PermissionTarget::Other(format!("memory_forget {resolved}")),
             arguments_preview: json!({ "topic": args.topic }),
             preview: None,
             diff: None,
@@ -107,7 +111,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(request.action, ActionKind::PersistentMemory);
-        assert_eq!(request.target, PermissionTarget::Other("global:editor".to_string()));
+        assert_eq!(
+            request.target,
+            PermissionTarget::Other("memory_forget global:editor".to_string())
+        );
     }
 
     #[tokio::test]

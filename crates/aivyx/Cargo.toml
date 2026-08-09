@@ -13,7 +13,7 @@ aivyx-acp = { version = "0.1.0", path = "../aivyx-acp" }
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
-aivyx-recall = { path = "../../../aivyx-recall" }
+aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
 aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }

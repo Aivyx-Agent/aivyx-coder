@@ -156,6 +156,7 @@ dependencies = [
 [[package]]
 name = "aivyx-recall"
 version = "0.1.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-recall?rev=e22e28ac9dbcc051b9564c690d5082f79a51cf03#e22e28ac9dbcc051b9564c690d5082f79a51cf03"
 dependencies = [
  "async-trait",
  "serde",

@@ -3708,3 +3708,102 @@ sweep confirmed there are exactly three exhaustive matches over
 With this closed, the audit lineage (2026-07-22 → 2026-07-28 → 2026-07-30
 → 2026-08-01) remains fully resolved except for the one still-open,
 correctly-tracked Docker/Landlock design question.
+
+### Cross-session memory (`aivyx-recall`) — ✅ shipped
+
+This chapter opened from an ecosystem-level question, not a project-local
+one: the user asked whether "RAG" and "context-memory" were worth
+building as standalone, shared features across the whole Aivyx
+Ecosystem (`aivyx`, the personal assistant, and this project).
+Investigating both terms against the actual state of both repos
+reshaped the question rather than answering it directly. RAG for code
+stayed rejected — this file already documents the evidence (["grep beat
+embeddings"](https://jxnl.co/writing/2025/09/11/why-grep-beat-embeddings-in-our-swe-bench-agent-lessons-from-augment/))
+for why embeddings/vector search on code lose to exact search plus the
+tree-sitter repo map already shipped here, and nothing in this chapter
+revisits that. Cross-session memory, though, was a real gap:
+`aivyx`'s own `crates/aivyx-memory` is a mature ~8,300-line system
+(BM25 lexical search, a hand-rolled ANN vector index, redb-backed
+AEAD-encrypted persistence, capability-scoped and HMAC-audited), but
+`aivyx-coder` had no equivalent at all — session persistence here was
+conversation replay only, no learned state surviving across sessions.
+
+**The decision:** build cross-session memory only, backed by a new
+standalone crate/repo, `aivyx-recall` (`Aivyx-Agent/aivyx-recall`),
+rather than duplicating `aivyx-memory`'s logic a second time or
+attempting to migrate `aivyx-memory` onto a shared substrate in the same
+pass — that migration is real refactor risk against production code
+this repo's own test suite can't verify, and is recorded as deferred
+scope for a future session rooted in the `aivyx` repo itself.
+`aivyx-memory`'s own module docs already describe its `Memory` trait and
+`InMemoryMemory` fake as substrate-agnostic, which is what made
+extracting a clean, genuinely shared `Recall` trait tractable despite
+the surrounding crate being untouched. Full design in
+`docs/superpowers/specs/2026-08-09-aivyx-recall-design.md`.
+
+**The tools:** `memory_write`/`memory_read`/`memory_forget` give the
+agent topic-scoped facts that persist across sessions — `global:` or
+`project:`-prefixed (project topics keyed by the same cwd hash session
+persistence already uses), recalled only on an explicit `memory_read`
+call, never injected ambiently into context. Gated by a new
+`ActionKind::PersistentMemory`, deliberately shaped differently from the
+existing `ActionKind::Memory` behind `remember_preference`: `Memory` is
+never cached (its target description is fixed regardless of proposed
+content, so caching would silently bless every future rewrite), while
+`PersistentMemory` supports normal per-exact-topic Always-Allow caching,
+since a `memory_write`/`memory_forget` target genuinely varies by topic.
+Both share the same unconditional `--auto` denial, though — both persist
+state outside the project working tree with no checkpoint/rollback
+safety net, and autonomous mode has no human to review the change.
+
+**Two real implementation-plan gaps, found and fixed during the build,
+not left for a later audit:**
+
+- Adding `ActionKind::PersistentMemory` broke two exhaustive matches over
+  `ActionKind` the plan's stated file scope had missed:
+  `aivyx-sandbox/src/editor_approval.rs` (grouped into the "no
+  `ApprovalContent` shape yet" terminal-only fallback arm alongside
+  `Memory`/`Interact`) and `aivyx-acp/src/prompter.rs` (grouped under
+  `ToolKind::Other` alongside `McpTool`/`Memory`/`Interact`). Caught by
+  the compiler immediately, not by a later review — the same pattern
+  `ActionKind::Interact`'s own addition hit earlier in this project's
+  history.
+- `agent_builder.rs`'s Task 9 imported `MemoryReadTool`/`MemoryWriteTool`/
+  `MemoryForgetTool` from `aivyx-tools`'s crate root, but Tasks 5-7 (which
+  added the tools themselves) had only `pub use`d them from `tools::mod`,
+  not re-exported from `aivyx-tools/src/lib.rs` — a build break fixed in
+  the same commit that wired the tools into `agent_builder.rs`.
+
+**Final-review findings, closed in the same pass that produced this
+entry:** a whole-branch review of both `aivyx-recall` and this
+integration found three real issues beyond the build itself, all fixed
+together. **(1)** `memory_write` and `memory_forget` both used
+`ActionKind::PersistentMemory` with a `PermissionTarget::Other` built
+from the *same* resolved topic string — since `PermissionKey::from_request`
+keys an `Other` target on `{action, description}` only, an Always-Allow
+cached for a `memory_write` on a topic would silently also satisfy a
+`memory_forget` on that same topic, letting an approval meant for
+"remember this" authorize an unprompted, irreversible delete. Fixed by
+tool-qualifying each target string (`"memory_write <topic>"` /
+`"memory_forget <topic>"`), which keeps each tool's own per-topic caching
+intact while making the two tools' cache keys distinct; locked in with a
+new `confirmation.rs` regression test,
+`write_approval_does_not_satisfy_a_forget_on_the_same_topic`. **(2)**
+`aivyx-tools`/`aivyx`'s `Cargo.toml`s depended on `aivyx-recall` via a
+local `path`, unbuildable off this machine and certain to break
+`release.yml`'s tag-triggered build the first time a `v*` tag was
+pushed; switched to a pinned `git` dependency (`https://` form, so CI can
+clone anonymously) against the exact `aivyx-recall` commit that closed
+that repo's own final-review finding (an `FileRecall::load` topic
+re-filter, defending against an FNV-1a filename-hash collision letting
+one topic's file silently serve another topic's entries). **(3)**
+`PermissionSettings::default`'s `deny_paths` didn't cover
+`~/.local/state/aivyx-coder` (the parent of the new `memory/`
+subdirectory), which meant a generic `write_file`/`edit_file` could
+plant a crafted memory topic file directly on disk, bypassing the
+`ActionKind::PersistentMemory` gate entirely — a later, auto-allowed
+`memory_read` would then return the planted content as if it were a
+genuine prior memory. Fixed by adding the whole state directory (not
+just `memory/`) to the default deny list, matching the existing
+precedent of protecting all of `~/.config/aivyx-coder` rather than one
+subdirectory within it.
