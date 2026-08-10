@@ -533,7 +533,7 @@ impl Tool for ReplSendTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::Interact,
-            target: PermissionTarget::Other("repl session".to_string()),
+            target: PermissionTarget::Other("repl_send session".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
             diff: None,
@@ -635,7 +635,7 @@ impl Tool for ReplStopTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::Interact,
-            target: PermissionTarget::Other("repl session".to_string()),
+            target: PermissionTarget::Other("repl_stop session".to_string()),
             arguments_preview: serde_json::json!({}),
             preview: None,
             diff: None,
@@ -1142,6 +1142,42 @@ mod tests {
             .permission_request(&serde_json::json!({}), std::path::Path::new("."))
             .unwrap();
         assert_eq!(request.action, ActionKind::Interact);
+    }
+
+    #[test]
+    fn repl_send_and_repl_stop_use_distinct_permission_targets() {
+        // Defense-in-depth regression test: repl_send and repl_stop both
+        // used PermissionTarget::Other("repl session") — the identical
+        // string regardless of which tool was calling. ActionKind::Interact
+        // currently short-circuits to Allow before ever reaching
+        // ConfirmationGate's Always-Allow cache (confirmed by reading
+        // confirmation.rs directly, and see
+        // `interact_actions_never_touch_the_always_allow_cache` in
+        // aivyx-sandbox for the gate-level proof), so this collision is not
+        // exploitable today. But identical targets for two different tools
+        // is the same shape that was a real, live bug for
+        // memory_write/memory_forget (ActionKind::PersistentMemory) before
+        // being tool-qualified — this locks in the same fix here so a
+        // future refactor that starts caching Interact doesn't silently
+        // inherit the collision.
+        let send_tool = ReplSendTool::new(
+            new_shared_repl_session(),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let stop_tool = ReplStopTool::new(new_shared_repl_session());
+
+        let send_request = send_tool
+            .permission_request(&serde_json::json!({ "input": "x" }), std::path::Path::new("."))
+            .unwrap();
+        let stop_request = stop_tool
+            .permission_request(&serde_json::json!({}), std::path::Path::new("."))
+            .unwrap();
+
+        assert_ne!(
+            send_request.target, stop_request.target,
+            "repl_send and repl_stop must not share an identical PermissionTarget"
+        );
     }
 
     #[test]

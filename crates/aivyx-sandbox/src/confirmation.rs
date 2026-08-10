@@ -958,6 +958,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interact_actions_never_touch_the_always_allow_cache() {
+        // repl_send and repl_stop both use ActionKind::Interact with a
+        // PermissionTarget::Other("repl_send session" / "repl_stop
+        // session") — until they were tool-qualified, both used the
+        // identical "repl session" string, the same collision shape that
+        // was a real, live bug for memory_write/memory_forget. Unlike that
+        // case, this one was never exploitable: `check`'s Interact arm
+        // (crates/aivyx-sandbox/src/confirmation.rs) returns
+        // `PermissionDecision::Allow` unconditionally, before the function
+        // ever reaches the Always-Allow cache lookup/insert — so an
+        // Interact request never even calls the prompter, let alone reads
+        // or writes `self.always_allow`. This test proves that directly:
+        // the prompter is configured to return `AllowAlways` (which would
+        // populate the cache if it were ever consulted), but the call
+        // count stays at zero and the decision is plain `Allow`, not
+        // `AllowAlways`.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let send_request = PermissionRequest {
+            tool_name: "repl_send".to_string(),
+            action: ActionKind::Interact,
+            target: PermissionTarget::Other("repl_send session".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let stop_request = PermissionRequest {
+            tool_name: "repl_stop".to_string(),
+            action: ActionKind::Interact,
+            target: PermissionTarget::Other("repl_stop session".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        let send_decision = gate.check(&send_request).await;
+        assert_eq!(send_decision, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "Interact must never reach the prompter, let alone the cache"
+        );
+
+        let stop_decision = gate.check(&stop_request).await;
+        assert_eq!(stop_decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn deny_paths_wins_over_read_auto_allow() {
         // Locks in the order inside `check`: the deny-list is consulted
         // before the read-auto-allow shortcut, not after. A refactor that
