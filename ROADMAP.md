@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-08-09_
+_Last updated: 2026-08-10_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -489,27 +489,28 @@ dependency that would have broken on the next release tag, a missing
 `deny_paths` default, a missing `docs/HISTORY.md` entry). Three smaller
 findings from that same review are logged here rather than fixed ad hoc:
 
-- **`repl_send`/`repl_stop` share the identical `PermissionKey`
+- ~~`repl_send`/`repl_stop` share the identical `PermissionKey`
   collision class Fix 1 (above) just closed for `memory_write`/
-  `memory_forget`.** Both use `ActionKind::Interact` +
-  `PermissionTarget::Other("repl session")` — the same fixed string
-  regardless of which of the two tools is calling, so an Always-Allow on
-  one (if either tool's caching path is ever reached — today `Interact`
-  auto-allows unconditionally per `ConfirmationGate::check`, so this is
-  currently latent, not exploitable) would silently satisfy the other.
-  Severity is much lower than the memory case (stopping an
-  already-approved REPL session destroys no user data), but the same
-  `PermissionTarget::Other`-collision sweep that caught this should be
-  done properly: audit every `PermissionTarget::Other` producer in the
-  workspace for tool-qualification, not just the two this chapter
-  touched.
-- **`aivyx-recall` (the new sibling repo) has no `CLAUDE.md`, isn't
-  listed in the root `~/Projects/Rust/CLAUDE.md` workspace table, and
-  its own README doesn't yet document the workspace's conventions
-  (branch naming, commit style, etc.) the way the other four repos'
-  `CLAUDE.md` files do.** Out of this chapter's scope (a design
-  document, not a code gap), but a real loose end now that it's a real,
-  pushed, sixth ecosystem member.
+  `memory_forget`.~~ **Fixed 2026-08-10.** Confirmed by reading
+  `confirmation.rs` directly that this one was never actually
+  exploitable — `ActionKind::Interact` returns `Allow` unconditionally
+  before the function ever reaches the Always-Allow cache, so it never
+  touched `self.always_allow` in either direction. Both tools'
+  `PermissionTarget::Other` strings are now tool-qualified
+  (`"repl_send session"`/`"repl_stop session"`) as defense-in-depth
+  against a future refactor that starts caching `Interact`, backed by a
+  new gate-level test proving the prompter is never even called for an
+  Interact request, plus a tool-level test proving the two targets now
+  differ. The broader "audit every `PermissionTarget::Other` producer in
+  the workspace" sweep this bullet also called for was not done —
+  `repl_send`/`repl_stop` were the only other pair found, not a
+  full audit.
+- ~~`aivyx-recall` (the new sibling repo) has no `CLAUDE.md`, isn't
+  listed in the root `~/Projects/Rust/CLAUDE.md` workspace table~~
+  **Resolved.** `aivyx-recall` has its own `CLAUDE.md`; root `CLAUDE.md`
+  now points at the new `aivyx-ecosystem` repo (`README.md`/`ROADMAP.md`/
+  `GLOSSARY.md`), which lists it and keeps the table current going
+  forward instead of duplicating it here.
 - **The new `write_approval_does_not_satisfy_a_forget_on_the_same_topic`
   gate test lives in `aivyx-sandbox`, which has no dependency on
   `aivyx-tools`** — it proves the cache mechanism directly with
