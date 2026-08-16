@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use aivyx_confine::{is_bare_pattern, is_basename_glob_match};
 
 mod confirmation;
 mod editor_approval;
@@ -246,9 +247,14 @@ impl ResizeTarget for NoopResizeTarget {
     fn resize(&self, _cols: u16, _rows: u16) {}
 }
 
-/// Shared by `ConfirmationGate::is_denied` and (behind `sandbox-backend`)
-/// `LandlockConfiner`'s path-grant construction — both need the same
-/// "is this path under a denied path" check.
+/// This crate's own use of the shared `is_bare_pattern`/
+/// `is_basename_glob_match` classification (see their doc comments in the
+/// `aivyx-confine` crate) — needs the same "is this path under a denied
+/// path" check `LandlockConfiner`'s own path-grant construction does,
+/// which is why those two helpers are `pub` there rather than private to
+/// its `confiner.rs`. This function itself, `path_is_denied`, is specific
+/// to `ConfirmationGate::is_denied`'s permission-gate use and doesn't
+/// exist in `aivyx-confine` — only the two helpers it calls are shared.
 ///
 /// A `deny_paths` entry with a single path component (e.g. `.env`,
 /// `*.pem`) is a basename-glob pattern, matched against `path`'s own file
@@ -277,8 +283,6 @@ pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
         }
     })
 }
-
-use aivyx_confine::{is_bare_pattern, is_basename_glob_match};
 
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is
 /// required but no real one (e.g. `ConfirmationGate`) has been wired up

@@ -55,7 +55,7 @@ Workspace crates (`crates/*`), roughly bottom-up:
 |---|---|
 | `aivyx-types` | Shared wire/domain types (`Role`, message shapes) with no logic |
 | `aivyx-llm` | `LlmBackend` trait + `OpenAiCompatBackend`, streaming, context-window probing (`probe.rs` — detects Ollama's hidden default window) |
-| `aivyx-sandbox` | The security boundary: `PermissionGate`/`ConfirmationGate` (`confirmation.rs` — decision point every tool call passes through before `Tool::execute`), `ExecutionConfiner` (`confiner.rs` — Landlock/seccomp process confinement, behind the default-on `sandbox-backend` feature) |
+| `aivyx-sandbox` | The security boundary: `PermissionGate`/`ConfirmationGate` (`confirmation.rs` — decision point every tool call passes through before `Tool::execute`); `ExecutionConfiner`/`NoopConfiner`/`LandlockConfiner`/`default_confiner` (Landlock/seccomp process confinement, behind the default-on `sandbox-backend` feature) are re-exported from the `aivyx-confine` crate (a pinned `git` dependency, extracted 2026-08-16 so `aivyx` could share the same primitive — see that repo's own `CLAUDE.md`), not implemented here |
 | `aivyx-tools` | `Tool` trait + `ToolExecutor::dispatch`, which centralizes the permission check so individual tools can't forget to gate a dangerous action; concrete tools under `tools/*.rs` (`read_file`, `write_file`, `edit_file`, `grep`, `glob`, `run_command`, `run_shell`, `git_read`, `git_commit`, `set_tasks`); `checkpoint.rs` owns the git snapshot mechanism |
 | `aivyx-repomap` | Aider-style repo map: tree-sitter symbol extraction + PageRank over the cross-file reference graph, token-budgeted and appended to the system prompt each turn (Rust, Python, JavaScript/JSX, and TypeScript/TSX today; other languages degrade gracefully to no map). Deliberately zero-dependency on any other workspace crate (pure filesystem-in/string-out) |
 | `aivyx-config` | `Settings` — XDG config loading, defaults, `0600` writing |
@@ -118,9 +118,15 @@ running (the TUI, the only writer via Ctrl+P; or `aivyx-acp`, via ACP's
 `session/set_mode`) and the gate (a reader) — the model has no path to it
 at all, not just no incentive to flip it.
 
-## Sandbox internals (`aivyx-sandbox/src/confiner.rs`)
+## Sandbox internals (now in the `aivyx-confine` crate)
 
-Worth knowing before touching `ExecutionConfiner` or its call sites:
+This confinement logic used to live in `aivyx-sandbox/src/confiner.rs`;
+as of 2026-08-16 it's in the standalone `aivyx-confine` repo (a pinned
+`git` dependency of `aivyx-sandbox`, re-exported so every call site here
+is unchanged — see `aivyx-sandbox/src/lib.rs`'s own doc comment). The
+policy summary below is still accurate and worth knowing before touching
+`ExecutionConfiner` or its call sites, but the actual source — and its
+own more detailed doc comments — now lives in that other repo, not here.
 
 - **Landlock** (ABI V7): write grants are `cwd` + the system temp dir(s);
   read grants are `cwd` + a fixed system/toolchain list (`/usr`, `/lib`,
