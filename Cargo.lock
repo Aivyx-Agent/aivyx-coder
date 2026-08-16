@@ -116,6 +116,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivyx-confine"
+version = "0.1.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-confine?rev=9a9ea5b96e6f97bc196722ebae4c46f61b4750a4#9a9ea5b96e6f97bc196722ebae4c46f61b4750a4"
+dependencies = [
+ "globset",
+ "landlock",
+ "libc",
+ "seccompiler",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aivyx-core"
 version = "0.1.0"
 dependencies = [
@@ -184,12 +197,9 @@ dependencies = [
 name = "aivyx-sandbox"
 version = "0.1.0"
 dependencies = [
+ "aivyx-confine",
  "async-trait",
  "directories",
- "globset",
- "landlock",
- "libc",
- "seccompiler",
  "serde",
  "serde_json",
  "tempfile",

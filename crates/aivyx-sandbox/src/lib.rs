@@ -2,11 +2,12 @@
 //!
 //! `PermissionGate` is the decision point every tool call must pass through
 //! before `Tool::execute` runs; `ConfirmationGate` is the real (prompting)
-//! implementation. `ExecutionConfiner` is the (currently no-op) hook for
-//! OS-level process confinement (Linux landlock/bubblewrap), kept as a
-//! separate trait so non-process tools (e.g. file read) never need a
-//! confiner at all — a concrete `LandlockConfiner` is deliberately deferred
-//! to a later pass.
+//! implementation. `ExecutionConfiner` is the hook for OS-level process
+//! confinement (Landlock + seccomp-bpf) — its real implementation,
+//! `LandlockConfiner`, and `NoopConfiner` (its no-op fallback) both live
+//! in the `aivyx-confine` crate now, re-exported here so every existing
+//! call site in this workspace keeps working unchanged. See that crate's
+//! own README for the confinement contract itself.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,13 +15,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-#[cfg(feature = "sandbox-backend")]
-mod confiner;
 mod confirmation;
 mod editor_approval;
 mod injection_scan;
+pub use aivyx_confine::{ExecutionConfiner, NoopConfiner, default_confiner};
 #[cfg(feature = "sandbox-backend")]
-pub use confiner::LandlockConfiner;
+pub use aivyx_confine::LandlockConfiner;
 pub use confirmation::ConfirmationGate;
 pub use injection_scan::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 
@@ -228,22 +228,6 @@ pub trait PermissionPrompter: Send + Sync {
     async fn prompt(&self, request: &PermissionRequest) -> UserResponse;
 }
 
-/// Wraps/restricts an about-to-spawn process. `NoopConfiner` is the
-/// identity fallback; `LandlockConfiner` (behind the `sandbox-backend`
-/// feature, on by default) is the real Landlock + seccomp-bpf backend —
-/// swapping between them never touches any tool implementation.
-pub trait ExecutionConfiner: Send + Sync {
-    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command;
-}
-
-pub struct NoopConfiner;
-
-impl ExecutionConfiner for NoopConfiner {
-    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
-        command
-    }
-}
-
 /// Lets a frontend forward a live terminal resize down to whatever
 /// out-of-process session might care (e.g. a running `repl_start`
 /// session's pty) without that frontend crate needing a dependency on
@@ -260,35 +244,6 @@ pub struct NoopResizeTarget;
 
 impl ResizeTarget for NoopResizeTarget {
     fn resize(&self, _cols: u16, _rows: u16) {}
-}
-
-/// Builds the best confiner available for this build: `LandlockConfiner`
-/// when the `sandbox-backend` feature is enabled (the default), otherwise
-/// `NoopConfiner` — keeps the `#[cfg]` branching in one place rather than
-/// in every caller.
-#[cfg(feature = "sandbox-backend")]
-pub fn default_confiner(
-    cwd: &Path,
-    extra_read_paths: &[PathBuf],
-    deny_paths: &[PathBuf],
-    require_enforcement: bool,
-) -> Arc<dyn ExecutionConfiner> {
-    Arc::new(LandlockConfiner::new(
-        cwd,
-        extra_read_paths,
-        deny_paths,
-        require_enforcement,
-    ))
-}
-
-#[cfg(not(feature = "sandbox-backend"))]
-pub fn default_confiner(
-    _cwd: &Path,
-    _extra_read_paths: &[PathBuf],
-    _deny_paths: &[PathBuf],
-    _require_enforcement: bool,
-) -> Arc<dyn ExecutionConfiner> {
-    Arc::new(NoopConfiner)
 }
 
 /// Shared by `ConfirmationGate::is_denied` and (behind `sandbox-backend`)
@@ -323,27 +278,7 @@ pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     })
 }
 
-/// A `deny_paths` entry with a single path component (e.g. `.env`,
-/// `*.pem`) is a basename-glob pattern, not a real filesystem location
-/// to resolve — see `path_is_denied`'s own doc comment above for the
-/// full rationale. Extracted so `confiner.rs`'s
-/// `find_basename_glob_matches` classifies entries identically rather
-/// than re-deriving the same check independently.
-fn is_bare_pattern(path: &Path) -> bool {
-    path.parent() == Some(Path::new(""))
-}
-
-fn is_basename_glob_match(path: &Path, pattern: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let Some(pattern) = pattern.to_str() else {
-        return false;
-    };
-    globset::Glob::new(pattern)
-        .map(|glob| glob.compile_matcher().is_match(name))
-        .unwrap_or(false)
-}
+use aivyx_confine::{is_bare_pattern, is_basename_glob_match};
 
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is
 /// required but no real one (e.g. `ConfirmationGate`) has been wired up
@@ -432,17 +367,5 @@ mod tests {
             &deny_paths
         ));
         assert!(!path_is_denied(Path::new("/home/user/other"), &deny_paths));
-    }
-
-    #[test]
-    fn is_bare_pattern_is_true_for_a_single_component_entry() {
-        assert!(is_bare_pattern(Path::new(".env")));
-        assert!(is_bare_pattern(Path::new("*.pem")));
-    }
-
-    #[test]
-    fn is_bare_pattern_is_false_for_a_path_separator_entry() {
-        assert!(!is_bare_pattern(Path::new("/home/user/.ssh")));
-        assert!(!is_bare_pattern(Path::new("relative/two/parts")));
     }
 }
