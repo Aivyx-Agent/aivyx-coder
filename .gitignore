@@ -7,3 +7,4 @@
 
 # Local model weights parked in-repo (never committed)
 /models/
+.worktrees/
