@@ -222,7 +222,7 @@ fn check_gh_authenticated(gh_program: &str, cwd: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::test_support::{git, init_repo};
+    use aivyx_checkpoint::test_support::{git, init_repo};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 

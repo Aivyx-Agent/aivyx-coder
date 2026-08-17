@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-mod checkpoint;
 mod diff;
 mod lsp;
 mod mcp;
@@ -27,7 +26,7 @@ mod tools;
 pub mod web;
 pub mod wiki;
 
-pub use checkpoint::GitCheckpointer;
+pub use aivyx_checkpoint::GitCheckpointer;
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use process::{CommandSpec, run};
@@ -310,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_checkpoints_before_mutating_tools_only() {
-        use crate::checkpoint::test_support::{git, init_repo};
+        use aivyx_checkpoint::test_support::{git, init_repo};
         use aivyx_sandbox::{NoopConfiner, PermissionDecision};
         use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
 
@@ -395,7 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_checkpoint_ref_and_restore_delegate_to_the_checkpointer() {
-        use crate::checkpoint::test_support::init_repo;
+        use aivyx_checkpoint::test_support::init_repo;
         use aivyx_sandbox::NoopConfiner;
 
         let dir = tempfile::tempdir().unwrap();

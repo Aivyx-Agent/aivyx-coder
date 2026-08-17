@@ -171,7 +171,7 @@ fn current_branch(cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::test_support::{git, init_repo};
+    use aivyx_checkpoint::test_support::{git, init_repo};
     use serde_json::json;
 
     fn ctx(dir: &Path) -> ToolExecutionContext {

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::checkpoint::exclude_pathspecs;
+use aivyx_checkpoint::exclude_pathspecs;
 use crate::path_resolve::resolve;
 use crate::process::run;
 use crate::{Tool, ToolError, ToolExecutionContext};
@@ -219,7 +219,7 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::test_support::{git, init_repo};
+    use aivyx_checkpoint::test_support::{git, init_repo};
     use serde_json::json;
 
     fn ctx(dir: &Path) -> ToolExecutionContext {

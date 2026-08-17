@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::run_git;
+use aivyx_checkpoint::run_git;
 
 /// One page this project's wiki could have: its name (file stem under
 /// `docs/wiki/`) and the path prefixes its content is staked against for
