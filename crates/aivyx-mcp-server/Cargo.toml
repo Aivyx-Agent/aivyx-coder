@@ -1,0 +1,32 @@
+[package]
+name = "aivyx-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rmcp = { version = "0.11.0", features = ["transport-io"] }
+aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
+aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
+aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
+aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7.18"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Only used by test-only LlmBackend mocks (BoxStream, StreamExt,
+# executor::block_on) -- mirrors aivyx-core's own delegate.rs test module,
+# which uses the same crate the same way.
+futures = "0.3"
+# Only used by the cutoff-notice test's scripted ToolCallComplete event
+# (ToolCall/ToolCallId/ToolCallSource) -- Cargo requires this be a direct
+# dependency of this crate even though aivyx-core already depends on it;
+# a transitive dependency's types are not importable without it.
+aivyx-types = { version = "0.1.0", path = "../aivyx-types" }

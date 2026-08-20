@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 aivyx-acp = { path = "crates/aivyx-acp" }
 aivyx-types = { path = "crates/aivyx-types" }
 aivyx-llm = { path = "crates/aivyx-llm" }
+aivyx-mcp-server = { path = "crates/aivyx-mcp-server" }
 aivyx-sandbox = { path = "crates/aivyx-sandbox" }
 aivyx-tools = { path = "crates/aivyx-tools" }
 aivyx-repomap = { path = "crates/aivyx-repomap" }
