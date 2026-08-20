@@ -88,13 +88,25 @@ impl SessionMap {
         self.sessions.insert(id, StoredSession { agent, events_rx, last_active: Instant::now() });
     }
 
-    fn touch_and_borrow(
-        &mut self,
-        id: &str,
-    ) -> Option<(&mut Agent, &mut tokio::sync::mpsc::UnboundedReceiver<aivyx_core::AgentEvent>)> {
-        let session = self.sessions.get_mut(id)?;
+    /// Removes and returns the session, so its turn can run WITHOUT
+    /// holding the map's lock -- the whole point of this method existing
+    /// instead of a borrow-returning accessor. Returns None if the id
+    /// doesn't exist, has expired, OR is already checked out by another
+    /// in-flight code_reply call (this last case is intentional: two
+    /// concurrent code_reply calls for the SAME session_id must not both
+    /// get a copy of the same Agent).
+    fn take(&mut self, id: &str) -> Option<StoredSession> {
+        self.sessions.remove(id)
+    }
+
+    /// Re-inserts a session after its turn completes, refreshing
+    /// last_active to now (not whenever it was originally checked out) --
+    /// called regardless of whether the turn itself succeeded or errored,
+    /// since a turn-level error (e.g. a backend network failure) does not
+    /// mean the Agent's own internal state is unusable for a future retry.
+    fn put_back(&mut self, id: String, mut session: StoredSession) {
         session.last_active = Instant::now();
-        Some((&mut session.agent, &mut session.events_rx))
+        self.sessions.insert(id, session);
     }
 }
 
@@ -160,9 +172,9 @@ mod session_map_tests {
         let (c, c_rx) = fake_session().await;
         map.insert("c".to_string(), c, c_rx);
 
-        assert!(map.touch_and_borrow("a").is_none(), "a was the oldest, must be evicted");
-        assert!(map.touch_and_borrow("b").is_some());
-        assert!(map.touch_and_borrow("c").is_some());
+        assert!(map.take("a").is_none(), "a was the oldest, must be evicted");
+        assert!(map.take("b").is_some());
+        assert!(map.take("c").is_some());
     }
 
     #[tokio::test]
@@ -176,22 +188,42 @@ mod session_map_tests {
 
         map.evict_stale();
 
-        assert!(map.touch_and_borrow("stale").is_none());
-        assert!(map.touch_and_borrow("fresh").is_some());
+        assert!(map.take("stale").is_none());
+        assert!(map.take("fresh").is_some());
     }
 
     #[tokio::test]
-    async fn touch_and_borrow_refreshes_last_active_so_evict_stale_spares_it() {
+    async fn take_then_put_back_refreshes_last_active_so_evict_stale_spares_it() {
         let mut map = SessionMap::new(Duration::from_millis(15), 8);
         let (s, s_rx) = fake_session().await;
         map.insert("s".to_string(), s, s_rx);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(map.touch_and_borrow("s").is_some(), "touched before its TTL expires");
+        // "touch" by taking it out and immediately putting it back --
+        // put_back refreshes last_active, exactly like the old
+        // touch_and_borrow did.
+        let session = map.take("s").expect("touched before its TTL expires");
+        map.put_back("s".to_string(), session);
         tokio::time::sleep(Duration::from_millis(10)).await;
         // 10ms since the touch above -- still under the 15ms TTL relative
         // to that touch, even though 20ms have passed since insertion.
         map.evict_stale();
-        assert!(map.touch_and_borrow("s").is_some(), "the touch above must have reset the TTL clock");
+        assert!(map.take("s").is_some(), "the touch above must have reset the TTL clock");
+    }
+
+    #[tokio::test]
+    async fn take_makes_a_session_unavailable_until_put_back() {
+        let mut map = SessionMap::new(Duration::from_secs(3600), 8);
+        let (s, s_rx) = fake_session().await;
+        map.insert("s".to_string(), s, s_rx);
+
+        let checked_out = map.take("s").expect("session exists");
+        assert!(
+            map.take("s").is_none(),
+            "a session already checked out must not be handed to a second concurrent caller"
+        );
+
+        map.put_back("s".to_string(), checked_out);
+        assert!(map.take("s").is_some(), "put_back must make the session available again");
     }
 }
 
@@ -290,32 +322,39 @@ impl AivyxCoderMcpServer {
         &self,
         Parameters(params): Parameters<CodeReplyParams>,
     ) -> Result<CallToolResult, McpError> {
-        let text = {
+        let mut session = {
             let mut sessions = self.sessions.lock().await;
             sessions.evict_stale();
-            // Reuses the SAME events_rx `code` first created (stored
-            // alongside the Agent in StoredSession) -- Agent::run_turn
-            // sends to whatever channel it was constructed with, baked in
-            // once at build_session_agent time, so a fresh, disconnected
-            // channel here would drain nothing and always return empty text.
-            let Some((agent, events_rx)) = sessions.touch_and_borrow(&params.session_id) else {
-                return Err(mcp_error(format!(
-                    "no session {:?} -- it may have expired (idle past the configured TTL)",
+            sessions.take(&params.session_id).ok_or_else(|| {
+                mcp_error(format!(
+                    "no session {:?} -- it may have expired (idle past the configured TTL) or \
+                     is already processing another request",
                     params.session_id
-                )));
-            };
-            let (result, text) = run_bounded_turn(
-                agent,
-                events_rx,
-                params.message,
-                &self.session_config.cwd,
-                self.max_iterations,
-                CancellationToken::new(),
-            )
-            .await;
-            result.map_err(|e| mcp_error(e.to_string()))?;
-            text
-        };
+                ))
+            })?
+        }; // lock released here -- the turn below runs with no lock held
+
+        // Reuses the SAME events_rx `code` first created (stored alongside
+        // the Agent in StoredSession) -- Agent::run_turn sends to whatever
+        // channel it was constructed with, baked in once at
+        // build_session_agent time, so a fresh, disconnected channel here
+        // would drain nothing and always return empty text.
+        let (result, text) = run_bounded_turn(
+            &mut session.agent,
+            &mut session.events_rx,
+            params.message,
+            &self.session_config.cwd,
+            self.max_iterations,
+            CancellationToken::new(),
+        )
+        .await;
+
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.put_back(params.session_id.clone(), session);
+        }
+
+        result.map_err(|e| mcp_error(e.to_string()))?;
         let content = Content::json(CodeOutcome { session_id: params.session_id, result: text })
             .map_err(|e| mcp_error(format!("failed to encode result: {e}")))?;
         Ok(CallToolResult::success(vec![content]))
