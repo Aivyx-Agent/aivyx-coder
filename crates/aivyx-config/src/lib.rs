@@ -42,6 +42,7 @@ pub struct Settings {
     pub verification: VerificationSettings,
     pub autonomous: AutonomousSettings,
     pub sub_agent: SubAgentSettings,
+    pub mcp_server: McpServerSettings,
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
     pub editor_context: EditorContextSettings,
@@ -150,6 +151,42 @@ pub struct SubAgentSettings {
 impl Default for SubAgentSettings {
     fn default() -> Self {
         Self { max_iterations: 10 }
+    }
+}
+
+/// `--mcp-server`: exposes `aivyx-coder` as an MCP server. `max_access_level`
+/// has no working default — the operator must set it explicitly, or the
+/// server refuses to start (same "refuse to start rather than run
+/// degraded" posture `--auto` already uses for its own required
+/// `[verification].command`). Sessions live in-memory only, TTL-evicted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerSettings {
+    /// "plan" | "edit" | "execute" — the ceiling. A `code` call requesting
+    /// a level above this is rejected, never silently downgraded. `None`
+    /// (the default) means the server has not been configured at all and
+    /// must refuse to start.
+    pub max_access_level: Option<String>,
+    /// An idle MCP session (no `code_reply` call) is evicted after this
+    /// long.
+    pub session_ttl_secs: u64,
+    /// Bounded in-memory session map; the oldest idle session is evicted
+    /// if a new session would exceed this.
+    pub max_concurrent_sessions: u32,
+    /// A single `code` or `code_reply` call's own round-trip budget —
+    /// mirrors `[sub_agent].max_iterations`'s shape exactly (an outer
+    /// "continue" loop, not `AgentConfig.max_tool_iterations`).
+    pub max_iterations: u32,
+}
+
+impl Default for McpServerSettings {
+    fn default() -> Self {
+        Self {
+            max_access_level: None,
+            session_ttl_secs: 1800,
+            max_concurrent_sessions: 8,
+            max_iterations: 10,
+        }
     }
 }
 
@@ -1044,6 +1081,31 @@ mod tests {
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.autonomous.max_iterations, 5);
         assert_eq!(settings.autonomous.max_duration_secs, 600);
+    }
+
+    #[test]
+    fn mcp_server_settings_have_conservative_defaults_and_no_access_level() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.mcp_server.max_access_level, None);
+        assert_eq!(settings.mcp_server.session_ttl_secs, 1800);
+        assert_eq!(settings.mcp_server.max_concurrent_sessions, 8);
+        assert_eq!(settings.mcp_server.max_iterations, 10);
+    }
+
+    #[test]
+    fn mcp_server_settings_parse_from_config() {
+        let raw = r#"
+            [mcp_server]
+            max_access_level = "edit"
+            session_ttl_secs = 600
+            max_concurrent_sessions = 4
+            max_iterations = 5
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.mcp_server.max_access_level.as_deref(), Some("edit"));
+        assert_eq!(settings.mcp_server.session_ttl_secs, 600);
+        assert_eq!(settings.mcp_server.max_concurrent_sessions, 4);
+        assert_eq!(settings.mcp_server.max_iterations, 5);
     }
 
     #[test]
