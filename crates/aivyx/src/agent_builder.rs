@@ -63,10 +63,22 @@ pub(crate) struct BuiltAgent {
     /// The full tool registry, minus `delegate_task` (not yet registered
     /// at the point this is cloned from), minus `repl_start`/`repl_send`/
     /// `repl_stop` (unreachable after an ephemeral session ends), minus
-    /// every dynamically-bridged `mcp__<server>__<tool>` adapter
-    /// (confused-deputy risk for a remote MCP caller) — the base every
-    /// MCP-server session's own tier-filtered registry is built from.
+    /// every dynamically-bridged `mcp__<server>__<tool>` adapter and minus
+    /// the four mcp_meta tools (`list_mcp_resources`/`read_mcp_resource`/
+    /// `list_mcp_prompts`/`get_mcp_prompt`) — all excluded for the same
+    /// confused-deputy reason: a remote MCP caller must not transitively
+    /// reach a third-party MCP server the operator configured for a
+    /// different purpose, whether via a bridged tool call or via reading
+    /// that server's resources/prompts — the base every MCP-server
+    /// session's own tier-filtered registry is built from.
     pub(crate) mcp_registry: ToolRegistry,
+    /// The resolved `deny_paths` this function computed and used
+    /// throughout its own body (sandbox confiner, checkpointer, repo map,
+    /// tool constructors) — exposed so a frontend never has to recompute
+    /// `settings.permissions.resolved_deny_paths()` a second time
+    /// independently, which could silently diverge if this function's own
+    /// local `deny_paths` is ever augmented further.
+    pub(crate) deny_paths: Vec<PathBuf>,
 }
 
 /// Builds `Agent` + every collaborator it needs, identically regardless
@@ -447,7 +459,15 @@ pub(crate) async fn build_agent(
     // sub-agent runs in the same trust boundary as its parent; an MCP-
     // server session's caller is a different process/product entirely).
     let mut mcp_registry = registry.clone();
-    mcp_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
+    mcp_registry.exclude(&[
+        "repl_start",
+        "repl_send",
+        "repl_stop",
+        "list_mcp_resources",
+        "read_mcp_resource",
+        "list_mcp_prompts",
+        "get_mcp_prompt",
+    ]);
     let bridged_names: Vec<&str> = mcp_bridged_tool_names.iter().map(|s| s.as_str()).collect();
     mcp_registry.exclude(&bridged_names);
     // Verification config is threaded through so a sub-agent's own edits
@@ -659,5 +679,6 @@ pub(crate) async fn build_agent(
         checkpointer,
         repo_map,
         mcp_registry,
+        deny_paths: deny_paths.clone(),
     })
 }

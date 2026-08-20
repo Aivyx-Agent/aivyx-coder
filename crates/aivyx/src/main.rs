@@ -139,6 +139,15 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Checked here, before either --acp's or --mcp-server's own branch can
+    // early-return, because --acp's branch returns unconditionally and
+    // runs first in source order — a check for this same combination
+    // inside --mcp-server's own later block was unreachable dead code.
+    if cli.acp && cli.mcp_server {
+        anyhow::bail!("--acp and --mcp-server cannot be used together");
+    }
+
     let _tracing_guard = init_tracing()?;
 
     let mut settings = Settings::load()?;
@@ -182,9 +191,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cli.mcp_server {
-        if cli.acp {
-            anyhow::bail!("--mcp-server and --acp cannot be used together");
-        }
         if cli.plan {
             anyhow::bail!("--mcp-server and --plan cannot be used together");
         }
@@ -212,8 +218,6 @@ async fn main() -> anyhow::Result<()> {
                 aivyx_config::EditFormat::Prompted => aivyx_core::EditFormat::Prompted,
             },
         };
-        let deny_paths = settings.permissions.resolved_deny_paths();
-
         return aivyx_mcp_server::run(aivyx_mcp_server::McpServerRunConfig {
             session_config: aivyx_mcp_server::SessionConfig {
                 llm: built.llm,
@@ -221,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 checkpointer: built.checkpointer,
                 repo_map: built.repo_map,
                 base_registry: built.mcp_registry,
-                deny_paths,
+                deny_paths: built.deny_paths,
                 cwd: built.cwd,
                 context_tokens: settings.backend.context_tokens,
                 edit_format,

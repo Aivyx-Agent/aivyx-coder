@@ -71,6 +71,17 @@ another agent over MCP. Work the task to completion within your granted access l
 a clear, complete final answer describing what you found or did -- this is the only part of your \
 work the caller sees directly.";
 
+/// Filters `base` down to exactly `level`'s tier -- the one line that
+/// actually enforces tier boundaries. Extracted so it's independently
+/// testable against a realistic registry (see the module tests), not
+/// just provable-in-isolation via `AccessLevel::excluded_tool_names`'s
+/// own tests in `tiers.rs`.
+fn tier_registry(base: &ToolRegistry, level: AccessLevel) -> ToolRegistry {
+    let mut registry = base.clone();
+    registry.exclude(&level.excluded_tool_names());
+    registry
+}
+
 /// Builds a fresh, isolated `Agent` for one MCP session at `level` --
 /// no turn run yet. A fresh `PlanMode`/`AutonomousMode`/`ConfirmationGate`
 /// per session (never shared, never the outer `BuiltAgent`'s own) since
@@ -90,8 +101,7 @@ pub async fn build_session_agent(
     level: AccessLevel,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> Agent {
-    let mut registry = config.base_registry.clone();
-    registry.exclude(&level.excluded_tool_names());
+    let registry = tier_registry(&config.base_registry, level);
 
     let allowed_names: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
     let prompter: Arc<dyn PermissionPrompter> = Arc::new(TieredPrompter::new(allowed_names));
@@ -214,7 +224,7 @@ mod tests {
     use super::*;
     use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent};
     use aivyx_sandbox::NoopConfiner;
-    use aivyx_tools::{ReadFileTool, RunCommandTool, WriteFileTool};
+    use aivyx_tools::{ReadFileTool, RunCommandTool, RunShellTool, WriteFileTool};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use futures::StreamExt;
@@ -276,18 +286,29 @@ mod tests {
         registry
     }
 
-    #[tokio::test]
-    async fn plan_tier_session_has_no_mutating_tools_in_its_registry() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let agent = build_session_agent(&config(full_registry()), AccessLevel::Plan, tx).await;
-        // No public accessor for the registry directly -- proven instead
-        // via the tier's own excluded_tool_names, which is what
-        // build_session_agent actually applies (a unit-level proof this
-        // wiring uses that exact list, not a copy that could drift).
-        let excluded = AccessLevel::Plan.excluded_tool_names();
-        assert!(excluded.contains(&"write_file") && excluded.contains(&"run_command"));
-        drop(agent);
-        drop(rx);
+    #[test]
+    fn tier_registry_actually_filters_a_realistic_base_registry() {
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(ReadFileTool));
+        base.register(Arc::new(WriteFileTool));
+        base.register(Arc::new(RunShellTool));
+
+        let names = |level: AccessLevel| -> Vec<String> {
+            tier_registry(&base, level).definitions().into_iter().map(|d| d.name).collect()
+        };
+
+        let plan_names = names(AccessLevel::Plan);
+        assert!(plan_names.contains(&"read_file".to_string()), "plan must include read_file");
+        assert!(!plan_names.contains(&"write_file".to_string()), "plan must exclude write_file");
+        assert!(!plan_names.contains(&"run_shell".to_string()), "plan must exclude run_shell");
+
+        let edit_names = names(AccessLevel::Edit);
+        assert!(edit_names.contains(&"write_file".to_string()), "edit must include write_file");
+        assert!(!edit_names.contains(&"run_shell".to_string()), "edit must exclude run_shell");
+
+        let execute_names = names(AccessLevel::Execute);
+        assert!(execute_names.contains(&"write_file".to_string()), "execute must include write_file");
+        assert!(execute_names.contains(&"run_shell".to_string()), "execute must include run_shell");
     }
 
     #[tokio::test]

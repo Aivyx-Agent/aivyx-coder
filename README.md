@@ -820,6 +820,56 @@ startup), mid-turn cancellation (`session/cancel`), and non-text prompt
 content (images, embedded resources) — see `docs/superpowers/specs/
 2026-07-20-acp-editor-integration-design.md` for the full scope.
 
+## MCP server integration
+
+`aivyx-coder --mcp-server` runs as a third frontend: a [Model Context
+Protocol](https://modelcontextprotocol.io) server over stdin/stdout,
+exposing aivyx-coder as `code`/`code_reply` tools for delegation from
+another local MCP client (for example, `aivyx` invoking aivyx-coder as a
+sub-agent for a bounded coding task). Each MCP call runs in its own fresh,
+isolated session — there's no shared conversation state or persistence
+across calls beyond a session's own TTL.
+
+This frontend requires `[mcp_server].max_access_level` to be set in
+`config.toml` first — there is no default, and the server refuses to start
+without it configured:
+
+```toml
+[mcp_server]
+max_access_level = "edit"   # "plan" | "edit" | "execute" -- no default, required
+session_ttl_secs = 1800      # idle sessions are evicted after this long
+max_concurrent_sessions = 8
+max_iterations = 10          # outer round-trip budget per code/code_reply session
+```
+
+Every session runs at a *requested* access level no higher than this
+configured ceiling — three tiers, each additive over the previous:
+
+- **`plan`** — read-only: the session can read, search, and build a task
+  list, but every mutating tool is excluded from its registry (the same
+  mechanism plan mode uses elsewhere in this project).
+- **`edit`** — adds file mutation: `write_file`/`edit_file`/`patch_file`/
+  `delete_file`/`move_file` become available, but commands and git-mutating
+  tools stay excluded.
+- **`execute`** — full access: adds `run_command`/`run_shell`/`git_commit`/
+  `git_branch`/`git_push`/`git_pr`/`memory_write`/`memory_forget`. Nothing
+  is excluded beyond the tools every MCP-server tier always excludes
+  regardless of level (`repl_start`/`repl_send`/`repl_stop`, the dynamically
+  bridged `mcp__<server>__<tool>` adapters, and the `list_mcp_resources`/
+  `read_mcp_resource`/`list_mcp_prompts`/`get_mcp_prompt` mcp_meta tools —
+  a remote MCP caller must not transitively reach a third-party MCP server
+  the operator configured for a different purpose).
+
+**Security note:** unlike the TUI and ACP frontends, an MCP-server session
+has no human to show a permission prompt to — every tool call within the
+session's granted tier auto-resolves. In particular, **`max_access_level =
+"execute"` means any process able to spawn this binary gets `run_shell`
+auto-approved with no human in the loop.** Landlock/seccomp confinement
+still applies to whatever the session runs, but the interactive permission
+gate this project's security model otherwise relies on does not, for
+MCP-server sessions. Set `max_access_level` no higher than the calling
+client actually needs.
+
 ## Tools
 
 | Tool | Action | Confirmation |
