@@ -53,6 +53,20 @@ pub(crate) struct BuiltAgent {
     /// uses this (see `main.rs`) — the ACP frontend has no real terminal
     /// to forward a resize *from*, so it simply never reads this field.
     pub(crate) repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget>,
+    /// The shared LLM backend — cheap `Arc` clone, reused by the MCP-server
+    /// frontend to build a fresh `Agent` per session rather than sharing
+    /// this struct's own (unused, for that frontend) `agent` field.
+    pub(crate) llm: Arc<dyn LlmBackend>,
+    pub(crate) confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
+    pub(crate) checkpointer: Option<Arc<GitCheckpointer>>,
+    pub(crate) repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)>,
+    /// The full tool registry, minus `delegate_task` (not yet registered
+    /// at the point this is cloned from), minus `repl_start`/`repl_send`/
+    /// `repl_stop` (unreachable after an ephemeral session ends), minus
+    /// every dynamically-bridged `mcp__<server>__<tool>` adapter
+    /// (confused-deputy risk for a remote MCP caller) — the base every
+    /// MCP-server session's own tier-filtered registry is built from.
+    pub(crate) mcp_registry: ToolRegistry,
 }
 
 /// Builds `Agent` + every collaborator it needs, identically regardless
@@ -328,6 +342,10 @@ pub(crate) async fn build_agent(
     // context-window mismatch is reported above) rather than aborting the
     // whole session.
     let mut mcp_discovery = tokio::task::JoinSet::new();
+    // Collected as each bridged tool is discovered, so mcp_registry (built
+    // below, after this loop) can exclude them by their real registered
+    // name — dynamically server-defined, so no static list would work.
+    let mut mcp_bridged_tool_names: Vec<String> = Vec::new();
     for server in settings.mcp.servers.clone() {
         let confiner = Arc::clone(&confiner);
         let cwd = cwd.clone();
@@ -367,6 +385,7 @@ pub(crate) async fn build_agent(
         match outcome {
             Ok(Ok(tools)) => {
                 for tool_info in tools {
+                    mcp_bridged_tool_names.push(format!("mcp__{server_name}__{}", tool_info.name));
                     registry.register(Arc::new(McpToolAdapter::new(
                         Arc::clone(&client),
                         &server_name,
@@ -422,6 +441,15 @@ pub(crate) async fn build_agent(
     // (the parent's) below, *after* this clone.
     let mut sub_agent_registry = registry.clone();
     sub_agent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
+    // Same clone point as sub_agent_registry (before delegate_task is
+    // registered below) — additionally excludes dynamically-bridged MCP
+    // tools, which sub_agent_registry does not need to (a delegate_task
+    // sub-agent runs in the same trust boundary as its parent; an MCP-
+    // server session's caller is a different process/product entirely).
+    let mut mcp_registry = registry.clone();
+    mcp_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
+    let bridged_names: Vec<&str> = mcp_bridged_tool_names.iter().map(|s| s.as_str()).collect();
+    mcp_registry.exclude(&bridged_names);
     // Verification config is threaded through so a sub-agent's own edits
     // get verified before `delegate_task` returns, exactly like the
     // parent's own edits would — mirrors the `agent.set_verification(...)`
@@ -475,7 +503,7 @@ pub(crate) async fn build_agent(
     }
 
     let mut agent = Agent::new(
-        llm,
+        Arc::clone(&llm),
         executor,
         system_prompt,
         AgentConfig {
@@ -626,5 +654,10 @@ pub(crate) async fn build_agent(
         tasks,
         injection_taint,
         repl_resize,
+        llm,
+        confiner,
+        checkpointer,
+        repo_map,
+        mcp_registry,
     })
 }
