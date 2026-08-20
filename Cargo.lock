@@ -70,6 +70,7 @@ dependencies = [
  "aivyx-config",
  "aivyx-core",
  "aivyx-llm",
+ "aivyx-mcp-server",
  "aivyx-recall",
  "aivyx-repomap",
  "aivyx-sandbox",

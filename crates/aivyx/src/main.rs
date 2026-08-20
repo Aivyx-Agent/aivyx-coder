@@ -122,6 +122,18 @@ struct Cli {
     /// resumed history would be invisible to it).
     #[arg(long)]
     acp: bool,
+
+    /// Run as an MCP (Model Context Protocol) server over stdin/stdout,
+    /// for delegation from another local MCP client (e.g. aivyx). Requires
+    /// [mcp_server].max_access_level to be configured in config.toml first
+    /// -- refuses to start otherwise, matching --auto's own posture for
+    /// its required [verification].command. Mutually exclusive with
+    /// --acp/--plan/--auto/--resume: this frontend has no human to show a
+    /// modal to, no editor session to embed in, and no unattended-goal
+    /// concept of its own (each MCP call is its own bounded, isolated
+    /// session).
+    #[arg(long)]
+    mcp_server: bool,
 }
 
 #[tokio::main]
@@ -167,6 +179,59 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
+
+    if cli.mcp_server {
+        if cli.acp {
+            anyhow::bail!("--mcp-server and --acp cannot be used together");
+        }
+        if cli.plan {
+            anyhow::bail!("--mcp-server and --plan cannot be used together");
+        }
+        if cli.auto.is_some() {
+            anyhow::bail!("--mcp-server and --auto cannot be used together");
+        }
+        if cli.resume {
+            anyhow::bail!("--mcp-server and --resume cannot be used together");
+        }
+        let Some(max_access_level_str) = settings.mcp_server.max_access_level.as_deref() else {
+            anyhow::bail!(
+                "--mcp-server requires [mcp_server].max_access_level to be set in config.toml \
+                 (\"plan\", \"edit\", or \"execute\") -- refusing to start with no configured \
+                 ceiling"
+            );
+        };
+        let max_access_level = aivyx_mcp_server::AccessLevel::parse(max_access_level_str)
+            .map_err(|e| anyhow::anyhow!("[mcp_server].max_access_level: {e}"))?;
+
+        let edit_format = match cli.edit_format.as_deref() {
+            Some("native") => aivyx_core::EditFormat::Native,
+            Some("prompted") => aivyx_core::EditFormat::Prompted,
+            _ => match settings.backend.edit_format {
+                aivyx_config::EditFormat::Native => aivyx_core::EditFormat::Native,
+                aivyx_config::EditFormat::Prompted => aivyx_core::EditFormat::Prompted,
+            },
+        };
+        let deny_paths = settings.permissions.resolved_deny_paths();
+
+        return aivyx_mcp_server::run(aivyx_mcp_server::McpServerRunConfig {
+            session_config: aivyx_mcp_server::SessionConfig {
+                llm: built.llm,
+                confiner: built.confiner,
+                checkpointer: built.checkpointer,
+                repo_map: built.repo_map,
+                base_registry: built.mcp_registry,
+                deny_paths,
+                cwd: built.cwd,
+                context_tokens: settings.backend.context_tokens,
+                edit_format,
+            },
+            max_access_level,
+            session_ttl: Duration::from_secs(settings.mcp_server.session_ttl_secs),
+            max_concurrent_sessions: settings.mcp_server.max_concurrent_sessions as usize,
+            max_iterations: settings.mcp_server.max_iterations,
+        })
+        .await;
     }
 
     let permission_rx = tui_permission_rx.expect("TUI path always sets this");
