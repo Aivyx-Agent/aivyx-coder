@@ -408,6 +408,47 @@ denied under `--auto` for the same reason `remember_preference` already
 is — both persist state outside the project working tree with no
 checkpoint/rollback safety net.
 
+**MCP-server frontend — shipped.** `aivyx --mcp-server` is a fourth
+frontend — a new `aivyx-mcp-server` crate exposing `aivyx-coder` as an
+MCP (Model Context Protocol) server over stdio (via the official `rmcp`
+SDK), so another local MCP client can delegate a bounded coding task to
+it, without needing shared code or conventions between the two products.
+Each session runs at one of three access tiers (`plan`/`edit`/`execute`),
+each an explicit tool-name allowlist filtered via `ToolRegistry::exclude`
+from a delegate-shaped base registry (mirrors `agent_builder.rs`'s
+existing `sub_agent_registry` precedent, plus two MCP-specific
+exclusions: dynamically-bridged third-party MCP tools, and the
+resource/prompt "meta" tools that read from those same servers — both
+excluded for the same confused-deputy reason). A new `PermissionPrompter`
+(`TieredPrompter`) auto-resolves any call the tier's own registry
+already permits — belt-and-braces, since an excluded tool was never
+registered to begin with. `[mcp_server].max_access_level` has no working
+default; the server refuses to start unconfigured, mirroring `--auto`'s
+existing posture for its own required `[verification].command`. Sessions
+are in-memory only, TTL-evicted, deliberately separate from the on-disk
+`--resume` store. `AutonomousMode` is never reused for this frontend — a
+deliberate architectural choice to keep the two unattended-execution
+mechanisms independently tunable.
+
+The final whole-branch review caught two real gaps neither task-scoped
+review could see: `--mcp-server --acp` silently started an ACP server
+instead of erroring, because `--acp`'s own unconditional early return in
+`main.rs` made a later `--mcp-server`-side mutual-exclusion check
+unreachable dead code (fixed by hoisting the check above both branches);
+and the single line that actually enforces the `edit`/`execute` tier
+boundary (`registry.exclude(...)`) had zero real test coverage — deleting
+it left all 63 then-existing tests passing. Fixed by extracting a
+`tier_registry` helper and a test that filters a realistic registry
+across all three tiers, verified to genuinely discriminate by deliberately
+breaking the exclusion and watching it fail before restoring the fix. The
+review also found a real architecture question, resolved by explicit
+decision rather than silently either way: `code_reply` originally held
+the session-map lock for an entire agentic turn, serializing every
+session's turns system-wide despite `max_concurrent_sessions` implying
+real concurrency — fixed with a check-out (`take`)/run-lock-free/check-in
+(`put_back`) pattern, independently re-reviewed via hand-traced control
+flow.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -520,3 +561,45 @@ findings from that same review are logged here rather than fixed ad hoc:
   as two decoupled halves rather than one end-to-end proof). An
   `aivyx-tools`-side test driving both tools' real `permission_request()`
   through a real `ConfirmationGate` would close the loop properly.
+
+**New backlog, from the MCP-server frontend's own final review** (see
+"MCP-server frontend — shipped" above for the two Important findings
+that WERE fixed before merge; these Minor ones were deliberately
+deferred, not overlooked):
+- `code`/`code_reply` construct a fresh `CancellationToken::new()` per
+  call that nothing ever cancels — an MCP `notifications/cancelled` or a
+  client disconnect currently cannot stop a runaway turn early;
+  `max_iterations` is the only real bound. A per-session token, wired to
+  `rmcp`'s own cancellation surface, would close this. Related: if a
+  `code_reply` future is dropped mid-turn (e.g. the same disconnect),
+  the session was already checked out via `take()` and `put_back` never
+  runs — graceful (the session is simply gone, the next call gets a
+  clear "no session" error) but silent.
+- `run_bounded_turn`'s `cap_hit` (`session.rs`) is `result.is_ok() &&
+  agent.last_turn_paused()`, which is also true if a turn stopped via
+  cancellation rather than genuinely exhausting `max_iterations` — today
+  unreachable (see above), but would mislabel a cancelled turn as
+  "reached its iteration budget" the moment real cancellation is wired
+  in. Distinguish via `iterations_used >= max_iterations` instead.
+- `[mcp_server].session_ttl_secs`/`max_concurrent_sessions` accept `0`
+  with no startup validation — `0` sessions degenerates to a
+  perpetually-thrashing one-session map, `0` TTL makes every session
+  unreachable on its very next call. `run_bounded_turn` already clamps
+  `max_iterations` to a floor of 1; the same defensiveness (or a loud
+  startup rejection alongside the existing `max_access_level` check)
+  would be consistent.
+- The three tier tool-name lists in `tiers.rs` are string denylists
+  against `ToolRegistry::exclude`, which is a documented no-op for an
+  unregistered name — correct today (every name independently verified
+  against real registered tools during the final review), but a future
+  tool rename in `aivyx-tools` would silently widen a tier with no test
+  failure. A test asserting every listed name is actually present in a
+  full registry would make a rename loud instead of silent.
+- `code`'s turn-error path discards both the `Agent` and any
+  accumulated partial text (the session never reaches `insert`), while
+  `code_reply`'s turn-error path keeps the session alive via `put_back`
+  regardless of outcome — a transient backend failure on a session's
+  first turn loses everything; the identical failure on its second
+  doesn't. Defensible (a `code` failure never had a session identity to
+  preserve in the first place), but undocumented as an intentional
+  asymmetry.
