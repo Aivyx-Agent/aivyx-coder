@@ -23,6 +23,14 @@ pub struct ChatRequest {
     pub tool_choice: ToolChoice,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    /// llama-server-only: pins this request to a specific `/slots` id
+    /// (an extension beyond the OpenAI spec, but honored by llama-server
+    /// on `/v1/chat/completions` — verified empirically against a real
+    /// server, not documented in llama-server's own API reference). Only
+    /// ever set when `[backend] kind = "llama_server"` and a slot has
+    /// been checked out (see `aivyx-core::Agent`); `None` for every other
+    /// backend and every llama-server request before checkout.
+    pub id_slot: Option<u32>,
 }
 
 impl ChatRequest {
@@ -33,6 +41,7 @@ impl ChatRequest {
             tool_choice: ToolChoice::Auto,
             temperature: None,
             max_tokens: None,
+            id_slot: None,
         }
     }
 }

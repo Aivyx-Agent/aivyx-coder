@@ -320,6 +320,8 @@ struct WireRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_slot: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -350,6 +352,7 @@ impl WireRequest {
             tool_choice,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            id_slot: request.id_slot,
         }
     }
 }
@@ -657,5 +660,23 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(text)) if text == "answer"));
         assert!(matches!(&events[1], Ok(StreamEvent::ReasoningDelta(text)) if text == "thought"));
+    }
+
+    #[test]
+    fn wire_request_omits_id_slot_when_none() {
+        let mut request = ChatRequest::new(vec![]);
+        request.id_slot = None;
+        let wire = WireRequest::from_chat_request("test-model", &request);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("id_slot").is_none(), "id_slot must be omitted entirely when None");
+    }
+
+    #[test]
+    fn wire_request_includes_id_slot_when_set() {
+        let mut request = ChatRequest::new(vec![]);
+        request.id_slot = Some(2);
+        let wire = WireRequest::from_chat_request("test-model", &request);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json.get("id_slot"), Some(&serde_json::json!(2)));
     }
 }

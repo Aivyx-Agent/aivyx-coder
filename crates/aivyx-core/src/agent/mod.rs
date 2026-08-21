@@ -1328,6 +1328,7 @@ impl Agent {
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
                 max_tokens: None,
+                id_slot: None,
             };
 
             let mut stream = match self.llm.stream_chat(request).await {
