@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServedContext {

@@ -542,14 +542,28 @@ pub(crate) async fn build_agent(
     let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
         let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
         let props_url = format!("{origin}/props");
-        match reqwest::Client::new().get(&props_url).send().await {
+        let props_client = reqwest::Client::builder()
+            .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
+            .build()
+            .unwrap_or_default();
+        match props_client.get(&props_url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
                 Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
                     Some(info) => {
-                        let store_path = dirs::data_local_dir()
-                            .unwrap_or_else(std::env::temp_dir)
-                            .join("aivyx-coder")
-                            .join("kvcache");
+                        // Same `directories::ProjectDirs` construction every
+                        // other XDG-path resolution in this codebase uses
+                        // (see `aivyx-core::session`, `aivyx-config`,
+                        // `aivyx-sandbox::editor_approval`) rather than a
+                        // second, redundant `dirs` crate dependency.
+                        // `data_local_dir()` already resolves to
+                        // `~/.local/share/aivyx-coder` on Linux (the app
+                        // name is baked in by `ProjectDirs::from`), so only
+                        // `kvcache` is joined on top.
+                        let store_path = match directories::ProjectDirs::from("", "", "aivyx-coder")
+                        {
+                            Some(dirs) => dirs.data_local_dir().join("kvcache"),
+                            None => std::env::temp_dir().join("aivyx-coder").join("kvcache"),
+                        };
                         match aivyx_kvcache::LlamaServerSlotStore::open(
                             &store_path,
                             origin, // NOT settings.backend.base_url -- /slots is a native
@@ -557,7 +571,7 @@ pub(crate) async fn build_agent(
                                     // (confirmed live: a /v1-prefixed base_url 404s on
                                     // /v1/slots/{id}?action=save, since the real path is
                                     // just /slots/{id}?action=save)
-                            10 * 1024 * 1024 * 1024, // 10 GiB default budget
+                            settings.backend.kvcache_max_bytes,
                         ) {
                             Ok(store) => Some((
                                 Arc::new(aivyx_llm::KvSlotPool::new(info.total_slots)),

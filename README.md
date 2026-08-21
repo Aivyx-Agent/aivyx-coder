@@ -788,6 +788,68 @@ reliability (see the Ollama-vs-llama-server serving verdict in
 `ROADMAP.md`), so this is worth verifying directly rather than assuming
 Docker's own claim transfers.
 
+## KV-cache persistence
+
+For a `llama-server` backend, aivyx can persist the model's KV-cache state
+to disk across process restarts, via the standalone
+[aivyx-kvcache](https://github.com/Aivyx-Agent/aivyx-kvcache) library. When
+it engages, a fresh `aivyx-coder` process's first turn on a repo it has
+seen before can skip re-prefilling the stable system prompt + tool
+definitions + repo map, instead of paying that cost cold every time the
+process restarts.
+
+**Enable it**: set `kind = "llama_server"` under `[backend]`:
+
+```toml
+[backend]
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen3.5:9b"
+kind = "llama_server"
+```
+
+**The one load-bearing operational requirement**: `llama-server` itself
+must be started with `--slot-save-path` pointed at *exactly*
+`~/.local/share/aivyx-coder/kvcache/slots` — on Linux, this is
+`directories::ProjectDirs`-resolved (the same XDG-path mechanism every
+other data/state directory in this project uses), so the exact path
+varies by platform (see the `directories` crate's own docs for the
+macOS/Windows equivalents). If `--slot-save-path` doesn't match this exact
+path, saves and restores silently fall back to no-op behavior: no error is
+surfaced, there's just no benefit — and, less happily, real slot files may
+accumulate on disk in the wrong directory instead of ever being found
+again by a later session.
+
+```
+llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
+  -c 16384 -ngl 99 --jinja --cache-reuse 256 \
+  --slot-save-path ~/.local/share/aivyx-coder/kvcache/slots \
+  --host 127.0.0.1 --port 8080
+```
+
+**Disk budget**: the on-disk store evicts its least-recently-used entry
+once it would exceed `kvcache_max_bytes` under `[backend]` (default 10
+GiB):
+
+```toml
+[backend]
+kvcache_max_bytes = 10737418240  # 10 GiB, the default; bytes, not GiB
+```
+
+**What this does and doesn't help.** The cached key covers the *stable
+prefix* only — system prompt, tool definitions, and repo map — never
+conversation history. That means it helps a **fresh process's first turn**
+on a repo it's cached before; it does *not* help turn-to-turn reuse within
+one already-running session, since `llama-server`'s own automatic prefix
+caching (`--cache-reuse`) already handles that case on its own. Any change
+to the repo map, the enabled tool set, or the system prompt mints a new
+cache entry — a project whose repo map or tool config changes often will
+see correspondingly lower hit rates.
+
+If the `/props` probe at startup can't confirm a real `llama-server`
+instance, or the store fails to open, KV-cache persistence is silently
+disabled for that run (a `warn`-level log line, nothing else) — aivyx
+never fails to start because of it.
+
 ## Editor integration (ACP)
 
 `aivyx-coder --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)

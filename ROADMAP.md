@@ -449,6 +449,27 @@ real concurrency — fixed with a check-out (`take`)/run-lock-free/check-in
 (`put_back`) pattern, independently re-reviewed via hand-traced control
 flow.
 
+**KV-cache persistence (`aivyx-kvcache`) — shipped.** For a `llama-server`
+backend (`[backend] kind = "llama_server"`), `aivyx-coder` now persists
+each session's stable-prefix KV-cache (system prompt + tool defs + repo
+map) to disk via the standalone `aivyx-kvcache` crate/repo, so a fresh
+process's first turn on a previously-seen repo can restore rather than
+re-prefill that prefix — a new `KvSlotPool` (`aivyx-llm`) checks out a
+numeric llama-server slot per session, `Agent::ensure_kv_slot_checked_out`
+warms/restores/saves it against a `LlamaServerSlotStore`, gated end-to-end
+on a best-effort `/props` probe so every failure mode is fail-open (never
+blocks startup, never surfaces as an error). New `kvcache_max_bytes`
+config knob (default 10 GiB) and a `deny_paths` default protecting the
+store directory. See `README.md`'s "KV-cache persistence" section for
+setup, including the one load-bearing requirement (`llama-server`'s own
+`--slot-save-path` must match exactly). The final whole-branch review
+caught and fixed three real issues before merge: an unbounded `/props`
+probe client that could hang startup indefinitely against a slow-loading
+model, a failed `restore_into_slot` (`Ok(false)`, not `Err`) being
+silently discarded instead of falling through to re-warm (leaving a key
+stuck cold forever), and a slot-pool leak if the warm-up future was
+dropped mid-flight before the checked-out id was recorded.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -603,3 +624,29 @@ deferred, not overlooked):
   doesn't. Defensible (a `code` failure never had a session identity to
   preserve in the first place), but undocumented as an intentional
   asymmetry.
+
+**New backlog, from KV-cache persistence's (`aivyx-kvcache`) task and
+final reviews** (see "KV-cache persistence — shipped" above for the three
+Important findings that WERE fixed before merge; these were deliberately
+deferred, not overlooked):
+- `KvSlotPool` has no concurrent-checkout stress test — a nice-to-have
+  regression guard for its `Mutex<HashSet<u32>>` checkout logic, not a
+  known bug.
+- The warm-up request sends the *unfiltered* tool list, while real turns
+  filter it by plan-mode/prompted-edit/autonomous-mode — this narrows
+  cache reuse in those modes (a plan-mode turn's real tool list won't
+  match the warmed prefix hash), but is not a correctness risk.
+- No `info`-level observability for kvcache hit/miss/save — only `warn`
+  on failure, so an operator can't easily tell from normal logs whether
+  the feature is silently never engaging.
+- Multi-process contention: `KvSlotPool`'s deterministic lowest-first
+  checkout means two concurrent `aivyx-coder` processes against one
+  shared `llama-server` both check out slot 0 first, pinning both
+  sessions to the same physical slot and mutually invalidating each
+  other's cache. A lock file or a per-process pool-index offset would
+  fix this.
+- Cache-key volatility: any repo-map/tool-set/system-prompt change mints
+  a new, potentially hundreds-of-MB cache entry, so real-world hit rates
+  depend heavily on how stable a given project's own context is — a
+  known, plan-mandated trade-off (see README's "KV-cache persistence"
+  section), not a bug.

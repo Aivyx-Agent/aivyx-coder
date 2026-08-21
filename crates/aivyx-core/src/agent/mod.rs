@@ -476,6 +476,12 @@ impl Agent {
             tracing::warn!("kvcache: no free slot in the pool; this session runs unpinned");
             return;
         };
+        // Recorded immediately, before any `.await` point below: this field
+        // represents "checked out from the pool," not "fully warmed/
+        // restored" -- if the enclosing future is dropped mid-warm-up (a
+        // cancelled turn), `Drop`'s only job is returning this numeric id to
+        // the pool, which requires the id to already be recorded here.
+        self.kv_slot_id = Some(slot_id);
 
         let system_text = self.system_prompt_text();
         let tools = self.executor.definitions();
@@ -494,12 +500,24 @@ impl Agent {
             }
         };
 
-        if hit {
-            match kv.store.restore_into_slot(&key, slot_id).await {
-                Ok(_) => {}
-                Err(err) => tracing::warn!(error = %err, "kvcache: restore_into_slot failed"),
-            }
-        } else {
+        // "Needs warm-up" is `!hit || the hit's restore came back false or
+        // errored` -- `restore_into_slot` returning `Ok(false)` (llama-server
+        // rejected the restore, e.g. the manifest row survived but the real
+        // file didn't) must be treated the same as a miss, not silently
+        // discarded, or a key in this state is stuck cold forever with no
+        // repair path. Falling through to warm-up also corrects the stale
+        // manifest row via `Manifest::insert`'s own upsert semantics.
+        let restored = hit
+            && match kv.store.restore_into_slot(&key, slot_id).await {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(err) => {
+                    tracing::warn!(error = %err, "kvcache: restore_into_slot failed");
+                    false
+                }
+            };
+
+        if !restored {
             // Cold: warm the slot with exactly the stable prefix, save it
             // once, then proceed. The warm-up goes through the *same*
             // `self.llm.stream_chat` path real turns use (not a raw
@@ -557,8 +575,6 @@ impl Agent {
                 }
             }
         }
-
-        self.kv_slot_id = Some(slot_id);
     }
 
     /// Enables `AGENTS.md` support: `global_path` is the resolved

@@ -560,6 +560,10 @@ pub struct BackendSettings {
     /// own doc comment. Default `Generic`: no behavior change for
     /// existing configs.
     pub kind: BackendKind,
+    /// Maximum bytes the kvcache store (docs/README's KV-cache persistence
+    /// section) will hold on disk before evicting the least-recently-used
+    /// entry. Only meaningful when `kind = "llama_server"`. Default 10 GiB.
+    pub kvcache_max_bytes: u64,
 }
 
 /// Phase kvcache-adoption — which local-LLM backend server this config
@@ -597,6 +601,7 @@ impl Default for BackendSettings {
             // genuinely mangle tool-call JSON.
             edit_format: EditFormat::Native,
             kind: BackendKind::Generic,
+            kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -656,6 +661,13 @@ impl Default for PermissionSettings {
                 // gate entirely; a later memory_read (auto-allowed) would
                 // then return the planted content.
                 "~/.local/state/aivyx-coder".to_string(),
+                // Same rationale as ~/.local/state/aivyx-coder above, for
+                // the kvcache store: a restored `.slot` file IS the
+                // model's context re-entering a future session invisibly
+                // — without this, a generic write_file/edit_file could
+                // plant or corrupt cache state a later session's kvcache
+                // restore would silently trust.
+                "~/.local/share/aivyx-coder/kvcache".to_string(),
                 "~/.gnupg".to_string(),
                 "~/.netrc".to_string(),
                 "~/.docker/config.json".to_string(),
@@ -916,6 +928,20 @@ mod tests {
             PermissionSettings::default()
                 .deny_paths
                 .contains(&"~/.local/state/aivyx-coder".to_string())
+        );
+    }
+
+    #[test]
+    fn default_deny_paths_includes_the_kvcache_directory() {
+        let settings = Settings::default();
+        assert!(
+            settings
+                .permissions
+                .resolved_deny_paths()
+                .iter()
+                .any(|p| p.to_string_lossy().contains(".local/share/aivyx-coder/kvcache")),
+            "kvcache store directory must be in default deny_paths, same rationale as the \
+             state directory"
         );
     }
 
@@ -1453,5 +1479,23 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.backend.kind, BackendKind::LlamaServer);
+    }
+
+    #[test]
+    fn kvcache_max_bytes_defaults_to_ten_gib() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.backend.kvcache_max_bytes, 10 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kvcache_max_bytes_is_configurable() {
+        let raw = r#"
+            [backend]
+            base_url = "http://127.0.0.1:8080/v1"
+            model = "test-model"
+            kvcache_max_bytes = 5000000000
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.backend.kvcache_max_bytes, 5_000_000_000);
     }
 }

@@ -26,12 +26,7 @@ impl KvSlotPool {
     /// is required for correctness.
     pub fn checkout(&self) -> Option<u32> {
         let mut checked_out = self.checked_out.lock().unwrap();
-        for id in 0..self.total_slots {
-            if checked_out.insert(id) {
-                return Some(id);
-            }
-        }
-        None
+        (0..self.total_slots).find(|id| checked_out.insert(*id))
     }
 
     /// Returns `slot_id` to the pool. A `slot_id` that was never checked
