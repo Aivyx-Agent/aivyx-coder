@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, StreamEvent, ToolChoice};
+use aivyx_kvcache::{CacheKey, CacheMeta, KvCacheStore, LlamaServerSlotStore};
+use aivyx_llm::{ChatRequest, FinishReason, KvSlotPool, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
@@ -141,6 +142,18 @@ it fails, fix the issue based on the output fed back to you. Use set_tasks to tr
 marking every task done is how you signal the goal is achieved and this session should stop. \
 Leaving tasks incomplete means you will be prompted to continue working toward the goal.";
 
+/// Collaborators `set_kv_cache` bundles together — kept as one `Option`
+/// field on `Agent` (rather than several individually-`Option` fields) so
+/// there's exactly one place that means "kvcache is configured for this
+/// session" to check.
+struct KvCacheConfig {
+    pool: Arc<KvSlotPool>,
+    store: Arc<LlamaServerSlotStore>,
+    backend_id: String,
+    model_id: String,
+    build_hash: String,
+}
+
 pub struct Agent {
     llm: std::sync::Arc<dyn LlmBackend>,
     executor: ToolExecutor,
@@ -191,6 +204,17 @@ pub struct Agent {
     /// once per turn (cheap after the first pass — only changed files
     /// re-parse) into `repo_map_text`.
     repo_map: Option<(Arc<RepoMap>, u32)>,
+    /// `None` unless `set_kv_cache` was called (only ever true when
+    /// `[backend] kind = "llama_server"`) -- every other code path this
+    /// task adds is a complete no-op when this is `None`.
+    kv_cache: Option<KvCacheConfig>,
+    /// The slot id checked out from `kv_cache`'s pool, once
+    /// `ensure_kv_slot_checked_out` has run at least once successfully
+    /// (or attempted to -- `None` also covers "the pool was full" and
+    /// "no kv_cache configured", both of which mean every subsequent
+    /// `ChatRequest.id_slot` for this session stays `None`, i.e. today's
+    /// unpinned behavior).
+    kv_slot_id: Option<u32>,
     /// `AGENTS.md` support when configured (`set_agents_file`); `None`
     /// disables the feature entirely (both files).
     agents_file_config: Option<AgentsFileConfig>,
@@ -309,6 +333,8 @@ impl Agent {
             injection_taint: InjectionTaint::new(),
             last_turn_paused: false,
             repo_map: None,
+            kv_cache: None,
+            kv_slot_id: None,
             agents_file_config: None,
             editor_context_config: None,
             repo_map_text: None,
@@ -413,6 +439,99 @@ impl Agent {
     /// system prompt within `budget_tokens`.
     pub fn set_repo_map(&mut self, map: Arc<RepoMap>, budget_tokens: u32) {
         self.repo_map = Some((map, budget_tokens));
+    }
+
+    /// Opts this `Agent` into KV-cache persistence against a llama-server
+    /// backend. Only ever called by `agent_builder.rs` when `[backend]
+    /// kind = "llama_server"` -- every other backend never calls this,
+    /// and every code path this enables is a complete no-op otherwise.
+    pub fn set_kv_cache(
+        &mut self,
+        pool: Arc<KvSlotPool>,
+        store: Arc<LlamaServerSlotStore>,
+        backend_id: String,
+        model_id: String,
+        build_hash: String,
+    ) {
+        self.kv_cache = Some(KvCacheConfig { pool, store, backend_id, model_id, build_hash });
+    }
+
+    /// Checks out a slot (once per `Agent` lifetime -- idempotent, a
+    /// no-op on the second and later calls within the same session) and
+    /// either restores a previously-saved matching prefix into it, or
+    /// warms it fresh with exactly this session's stable prefix (system
+    /// prompt + tool defs + repo map -- via `system_prompt_text()`,
+    /// never `self.history`) and saves it for future sessions. Every
+    /// failure mode here is fail-open: logged at `warn`, `kv_slot_id`
+    /// stays `None`, the turn proceeds exactly as if kvcache weren't
+    /// configured at all.
+    async fn ensure_kv_slot_checked_out(&mut self) {
+        if self.kv_slot_id.is_some() {
+            return; // already checked out earlier this session
+        }
+        let Some(kv) = &self.kv_cache else {
+            return; // kvcache not configured for this Agent
+        };
+        let Some(slot_id) = kv.pool.checkout() else {
+            tracing::warn!("kvcache: no free slot in the pool; this session runs unpinned");
+            return;
+        };
+
+        let system_text = self.system_prompt_text();
+        let tools = self.executor.definitions();
+        let key = CacheKey {
+            backend_id: kv.backend_id.clone(),
+            model_id: kv.model_id.clone(),
+            build_hash: kv.build_hash.clone(),
+            prefix_hash: compute_prefix_hash(&system_text, &tools),
+        };
+
+        let hit = match kv.store.find(&key).await {
+            Ok(handle) => handle.is_some(),
+            Err(err) => {
+                tracing::warn!(error = %err, "kvcache: find() failed; treating as a miss");
+                false
+            }
+        };
+
+        if hit {
+            match kv.store.restore_into_slot(&key, slot_id).await {
+                Ok(_) => {}
+                Err(err) => tracing::warn!(error = %err, "kvcache: restore_into_slot failed"),
+            }
+        } else {
+            // Cold: warm the slot with exactly the stable prefix, save it
+            // once, then proceed. The warm-up goes through the *same*
+            // `self.llm.stream_chat` path real turns use (not a raw
+            // /completion call) so its tokenization matches exactly --
+            // a mismatch here is what silently defeats automatic reuse.
+            let warm_up_request = ChatRequest {
+                messages: vec![Message::text(Role::System, system_text)],
+                tools: Vec::new(),
+                tool_choice: ToolChoice::Auto,
+                temperature: None,
+                max_tokens: Some(1),
+                id_slot: Some(slot_id),
+            };
+            match self.llm.stream_chat(warm_up_request).await {
+                Ok(mut stream) => {
+                    use futures::StreamExt;
+                    while stream.next().await.is_some() {
+                        // Drain silently -- this call exists only to
+                        // populate the slot, never shown to the user.
+                    }
+                    let meta = CacheMeta { size_bytes: 1, token_count: 1 };
+                    if let Err(err) = kv.store.save_from_slot(&key, slot_id, meta).await {
+                        tracing::warn!(error = %err, "kvcache: save_from_slot failed");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "kvcache: warm-up request failed");
+                }
+            }
+        }
+
+        self.kv_slot_id = Some(slot_id);
     }
 
     /// Enables `AGENTS.md` support: `global_path` is the resolved
@@ -1308,6 +1427,7 @@ impl Agent {
         self.refresh_repo_map().await;
         self.refresh_agents_files(cwd).await;
         self.refresh_editor_context(cwd).await;
+        self.ensure_kv_slot_checked_out().await;
 
         for iteration in 1..=self.max_tool_iterations {
             if cancellation.is_cancelled() {
@@ -1340,7 +1460,7 @@ impl Agent {
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
                 max_tokens: None,
-                id_slot: None,
+                id_slot: self.kv_slot_id,
             };
 
             let mut stream = match self.llm.stream_chat(request).await {
@@ -1788,6 +1908,17 @@ impl Agent {
 
         self.emit(AgentEvent::TurnComplete);
         Ok(())
+    }
+}
+
+impl Drop for Agent {
+    /// Releases this session's checked-out kvcache slot, if any. Pure,
+    /// synchronous, infallible -- `KvSlotPool::release` does no I/O, so
+    /// this is safe to run from `Drop` (which cannot be async).
+    fn drop(&mut self) {
+        if let (Some(slot_id), Some(kv)) = (self.kv_slot_id, &self.kv_cache) {
+            kv.pool.release(slot_id);
+        }
     }
 }
 
