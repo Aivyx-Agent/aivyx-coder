@@ -556,6 +556,23 @@ pub struct BackendSettings {
     /// models — see ROADMAP.md Phase 2 for the A/B evidence behind the
     /// default.
     pub edit_format: EditFormat,
+    /// Which backend server this config talks to — see `BackendKind`'s
+    /// own doc comment. Default `Generic`: no behavior change for
+    /// existing configs.
+    pub kind: BackendKind,
+}
+
+/// Phase kvcache-adoption — which local-LLM backend server this config
+/// talks to. `Generic` (the default) is today's fully backend-agnostic
+/// behavior; `LlamaServer` opts a config into llama-server-specific
+/// features (currently: KV-cache persistence via `aivyx-kvcache`, gated
+/// on this exact variant so no other backend is ever affected).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    #[default]
+    Generic,
+    LlamaServer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +596,7 @@ impl Default for BackendSettings {
             // ~45% faster, prompted stays available for models that
             // genuinely mangle tool-call JSON.
             edit_format: EditFormat::Native,
+            kind: BackendKind::Generic,
         }
     }
 }
@@ -1417,5 +1435,23 @@ mod tests {
         };
 
         assert_eq!(settings.resolved_deny_paths(), vec![home]);
+    }
+
+    #[test]
+    fn backend_kind_defaults_to_generic_when_absent() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.backend.kind, BackendKind::Generic);
+    }
+
+    #[test]
+    fn backend_kind_parses_llama_server() {
+        let raw = r#"
+            [backend]
+            base_url = "http://127.0.0.1:8080/v1"
+            model = "test-model"
+            kind = "llama_server"
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.backend.kind, BackendKind::LlamaServer);
     }
 }
