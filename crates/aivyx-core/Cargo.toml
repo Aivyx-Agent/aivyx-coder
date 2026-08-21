@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "ee69d531c1e72dd6ea455c6554f37b010d69e981" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e1b06c9960ee98841d9b91978a11dd99ed388490" }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }

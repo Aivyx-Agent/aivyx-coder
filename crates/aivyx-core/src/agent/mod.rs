@@ -507,7 +507,7 @@ impl Agent {
             // a mismatch here is what silently defeats automatic reuse.
             let warm_up_request = ChatRequest {
                 messages: vec![Message::text(Role::System, system_text)],
-                tools: Vec::new(),
+                tools: tools.clone(),
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
                 max_tokens: Some(1),
@@ -516,13 +516,25 @@ impl Agent {
             match self.llm.stream_chat(warm_up_request).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
-                    while stream.next().await.is_some() {
-                        // Drain silently -- this call exists only to
-                        // populate the slot, never shown to the user.
+                    let mut warm_up_failed = false;
+                    while let Some(event) = stream.next().await {
+                        if event.is_err() {
+                            warm_up_failed = true;
+                        }
+                        // Drain silently either way -- this call exists
+                        // only to populate the slot, never shown to the
+                        // user.
                     }
-                    let meta = CacheMeta { size_bytes: 1, token_count: 1 };
-                    if let Err(err) = kv.store.save_from_slot(&key, slot_id, meta).await {
-                        tracing::warn!(error = %err, "kvcache: save_from_slot failed");
+                    if warm_up_failed {
+                        tracing::warn!(
+                            "kvcache: warm-up stream errored mid-response; skipping save so a \
+                             partial/corrupt slot is never recorded as a valid cache entry"
+                        );
+                    } else {
+                        let meta = CacheMeta { size_bytes: 1, token_count: 1 };
+                        if let Err(err) = kv.store.save_from_slot(&key, slot_id, meta).await {
+                            tracing::warn!(error = %err, "kvcache: save_from_slot failed");
+                        }
                     }
                 }
                 Err(err) => {
