@@ -60,6 +60,17 @@ pub(crate) struct BuiltAgent {
     pub(crate) confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
     pub(crate) checkpointer: Option<Arc<GitCheckpointer>>,
     pub(crate) repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)>,
+    /// The shared KV-cache pool + store, when `[backend] kind =
+    /// "llama_server"` and the `/props` probe (Step 1 above) succeeded --
+    /// reused by the MCP-server frontend so every session's `Agent`
+    /// shares the *same* pool/store instances instead of each opening its
+    /// own (see `SessionConfig::kv_cache_handles` in `aivyx-mcp-server`).
+    /// The `String` is `build_info`, the served binary's build hash.
+    pub(crate) kv_cache_handles: Option<(
+        Arc<aivyx_llm::KvSlotPool>,
+        Arc<aivyx_kvcache::LlamaServerSlotStore>,
+        String,
+    )>,
     /// The full tool registry, minus `delegate_task` (not yet registered
     /// at the point this is cloned from), minus `repl_start`/`repl_send`/
     /// `repl_stop` (unreachable after an ephemeral session ends), minus
@@ -522,6 +533,58 @@ pub(crate) async fn build_agent(
         }
     }
 
+    // KV-cache persistence/sharing (aivyx-kvcache): only ever attempted
+    // against a real llama-server backend, whose `/props` response both
+    // `probe_served_context` above and `parse_llama_slots_info` here parse
+    // from the same endpoint shape. Every failure mode here is fail-open --
+    // logged at `warn`, `kv_cache_handles` stays `None`, the agent runs
+    // exactly as if kvcache weren't configured at all.
+    let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
+        let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let props_url = format!("{origin}/props");
+        match reqwest::Client::new().get(&props_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+                Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
+                    Some(info) => {
+                        let store_path = dirs::data_local_dir()
+                            .unwrap_or_else(std::env::temp_dir)
+                            .join("aivyx-coder")
+                            .join("kvcache");
+                        match aivyx_kvcache::LlamaServerSlotStore::open(
+                            &store_path,
+                            &settings.backend.base_url,
+                            10 * 1024 * 1024 * 1024, // 10 GiB default budget
+                        ) {
+                            Ok(store) => Some((
+                                Arc::new(aivyx_llm::KvSlotPool::new(info.total_slots)),
+                                Arc::new(store),
+                                info.build_info,
+                            )),
+                            Err(err) => {
+                                tracing::warn!(error = %err, "kvcache: failed to open store; disabled for this run");
+                                None
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "kvcache: [backend] kind = \"llama_server\" but /props didn't look like a real \
+                             llama-server response; disabled for this run"
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            },
+            _ => {
+                tracing::warn!("kvcache: /props probe failed; disabled for this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut agent = Agent::new(
         Arc::clone(&llm),
         executor,
@@ -537,6 +600,16 @@ pub(crate) async fn build_agent(
         events_tx,
     );
     agent.set_injection_taint(injection_taint.clone());
+
+    if let Some((pool, store, build_hash)) = &kv_cache_handles {
+        agent.set_kv_cache(
+            Arc::clone(pool),
+            Arc::clone(store),
+            "llama-server".to_string(),
+            settings.backend.model.clone(),
+            build_hash.clone(),
+        );
+    }
 
     if let Some((map, budget)) = &repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
@@ -678,6 +751,7 @@ pub(crate) async fn build_agent(
         confiner,
         checkpointer,
         repo_map,
+        kv_cache_handles,
         mcp_registry,
         deny_paths: deny_paths.clone(),
     })

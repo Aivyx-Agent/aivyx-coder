@@ -12,6 +12,7 @@ path = "src/main.rs"
 aivyx-acp = { version = "0.1.0", path = "../aivyx-acp" }
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e1b06c9960ee98841d9b91978a11dd99ed388490" }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-mcp-server = { version = "0.1.0", path = "../aivyx-mcp-server" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
@@ -21,6 +22,9 @@ aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
 aivyx-tui = { version = "0.1.0", path = "../aivyx-tui" }
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
+dirs = "6.0.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+serde_json = "1.0.150"
 shell-escape = "0.1.5"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1.44"

@@ -224,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 confiner: built.confiner,
                 checkpointer: built.checkpointer,
                 repo_map: built.repo_map,
+                kv_cache_handles: built.kv_cache_handles,
                 base_registry: built.mcp_registry,
                 deny_paths: built.deny_paths,
                 cwd: built.cwd,

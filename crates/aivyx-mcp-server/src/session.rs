@@ -57,6 +57,15 @@ pub struct SessionConfig {
     pub confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
     pub checkpointer: Option<Arc<GitCheckpointer>>,
     pub repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)>,
+    /// `BuiltAgent::kv_cache_handles` -- the same shared pool/store every
+    /// other `Agent` in this process uses, so every MCP session's own
+    /// checkout draws from one `total_slots`-sized pool rather than each
+    /// session getting its own (see `agent_builder.rs`'s own doc comment).
+    pub kv_cache_handles: Option<(
+        Arc<aivyx_llm::KvSlotPool>,
+        Arc<aivyx_kvcache::LlamaServerSlotStore>,
+        String,
+    )>,
     /// Task 2's `mcp_registry` -- the delegate-shaped base set every
     /// session's own tier-filtered registry is cloned and excluded from.
     pub base_registry: ToolRegistry,
@@ -149,6 +158,15 @@ pub async fn build_session_agent(
     );
     if let Some((map, budget)) = &config.repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
+    }
+    if let Some((pool, store, build_hash)) = &config.kv_cache_handles {
+        agent.set_kv_cache(
+            Arc::clone(pool),
+            Arc::clone(store),
+            "llama-server".to_string(),
+            config.llm.model_id().to_string(),
+            build_hash.clone(),
+        );
     }
     agent
 }
@@ -270,6 +288,7 @@ mod tests {
             confiner: Arc::new(NoopConfiner),
             checkpointer: None,
             repo_map: None,
+            kv_cache_handles: None,
             base_registry,
             deny_paths: Vec::new(),
             cwd: std::env::temp_dir(),
