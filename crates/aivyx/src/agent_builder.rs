@@ -552,7 +552,11 @@ pub(crate) async fn build_agent(
                             .join("kvcache");
                         match aivyx_kvcache::LlamaServerSlotStore::open(
                             &store_path,
-                            &settings.backend.base_url,
+                            origin, // NOT settings.backend.base_url -- /slots is a native
+                                    // llama-server endpoint at the origin, not under /v1
+                                    // (confirmed live: a /v1-prefixed base_url 404s on
+                                    // /v1/slots/{id}?action=save, since the real path is
+                                    // just /slots/{id}?action=save)
                             10 * 1024 * 1024 * 1024, // 10 GiB default budget
                         ) {
                             Ok(store) => Some((
