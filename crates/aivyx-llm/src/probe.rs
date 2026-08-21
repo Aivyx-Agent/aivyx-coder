@@ -70,6 +70,23 @@ fn parse_llama_props(json: &serde_json::Value) -> Option<u32> {
         .map(|n| n as u32)
 }
 
+/// `total_slots` + `build_info` from a real llama-server `/props`
+/// response -- the same JSON body `probe_served_context` already fetches
+/// for context-window detection, so a caller wanting both should parse
+/// the one response with both this function and `parse_llama_props`
+/// rather than fetching `/props` twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlamaSlotsInfo {
+    pub total_slots: u32,
+    pub build_info: String,
+}
+
+pub fn parse_llama_slots_info(json: &serde_json::Value) -> Option<LlamaSlotsInfo> {
+    let total_slots = json.get("total_slots")?.as_u64()? as u32;
+    let build_info = json.get("build_info")?.as_str()?.to_string();
+    Some(LlamaSlotsInfo { total_slots, build_info })
+}
+
 /// The `parameters` field is the Modelfile parameter block as plain text,
 /// one `key value` pair per line.
 fn parse_ollama_show(json: &serde_json::Value) -> Option<u32> {
@@ -138,5 +155,27 @@ mod tests {
         let ollama = context_warning(8192, &ServedContext::OllamaDefaultUnknown);
         assert!(ollama.is_some_and(|w| w.contains("num_ctx")));
         assert!(context_warning(8192, &ServedContext::Unknown).is_none());
+    }
+
+    #[test]
+    fn parses_llama_slots_info_from_real_props_shape() {
+        // Real /props response shape, confirmed against a live llama-server
+        // on the GPU test rig (2026-08-21) -- trimmed to the fields this
+        // parser reads plus enough surrounding structure to be realistic.
+        let json = serde_json::json!({
+            "default_generation_settings": {"params": {}},
+            "total_slots": 4,
+            "model_path": "/home/julian/models/Qwen3.5-9B-Q4_K_M.gguf",
+            "build_info": "b10107-3121043"
+        });
+        let info = parse_llama_slots_info(&json).expect("must parse a real llama-server /props body");
+        assert_eq!(info.total_slots, 4);
+        assert_eq!(info.build_info, "b10107-3121043");
+    }
+
+    #[test]
+    fn parse_llama_slots_info_returns_none_when_fields_are_absent() {
+        let json = serde_json::json!({"some_other_server": true});
+        assert!(parse_llama_slots_info(&json).is_none());
     }
 }
