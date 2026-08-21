@@ -505,8 +505,23 @@ impl Agent {
             // `self.llm.stream_chat` path real turns use (not a raw
             // /completion call) so its tokenization matches exactly --
             // a mismatch here is what silently defeats automatic reuse.
+            //
+            // The trailing empty User message is required, not decorative:
+            // confirmed live against a real llama-server (Qwen3.5's chat
+            // template) that a system-message-only request is REJECTED
+            // outright (400, "No user query found in messages") -- the
+            // template's own Jinja logic walks messages looking for the
+            // last real user turn and raises if none exists. An empty
+            // string satisfies that structural requirement without
+            // introducing any real per-session content into what gets
+            // cached; every real session's first turn diverges from this
+            // placeholder at exactly the same point automatic prefix
+            // matching would diverge from any other turn's own content.
             let warm_up_request = ChatRequest {
-                messages: vec![Message::text(Role::System, system_text)],
+                messages: vec![
+                    Message::text(Role::System, system_text),
+                    Message::text(Role::User, String::new()),
+                ],
                 tools: tools.clone(),
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
