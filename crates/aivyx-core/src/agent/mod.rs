@@ -462,9 +462,13 @@ impl Agent {
     /// warms it fresh with exactly this session's stable prefix (system
     /// prompt + tool defs + repo map -- via `system_prompt_text()`,
     /// never `self.history`) and saves it for future sessions. Every
-    /// failure mode here is fail-open: logged at `warn`, `kv_slot_id`
-    /// stays `None`, the turn proceeds exactly as if kvcache weren't
-    /// configured at all.
+    /// failure mode past the pool-checkout itself is fail-open: logged at
+    /// `warn`, the session simply runs with an un-warmed (but still
+    /// correctly pool-owned) slot -- `kv_slot_id` is set as soon as
+    /// `checkout()` succeeds (see the comment below), not only on a fully
+    /// successful warm-up/restore, specifically so `Drop` can always
+    /// release it. A `None` `kv_slot_id` only ever means "kvcache isn't
+    /// configured" or "the pool was full," never "warm-up failed."
     async fn ensure_kv_slot_checked_out(&mut self) {
         if self.kv_slot_id.is_some() {
             return; // already checked out earlier this session

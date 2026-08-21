@@ -542,11 +542,22 @@ pub(crate) async fn build_agent(
     let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
         let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
         let props_url = format!("{origin}/props");
-        let props_client = reqwest::Client::builder()
+        // `.build()` only fails on TLS/resolver init issues -- `unwrap_or_default()`
+        // would silently re-run the identical builder and panic on the same
+        // failure (`Client::default()` is `Client::new()`, which itself
+        // `.expect()`s), contradicting this whole block's fail-open posture.
+        // Matching `aivyx_llm::probe::probe_served_context`'s own handling
+        // of the identical failure (probe.rs:33-36): treat it as "kvcache
+        // unavailable this run", not a startup panic.
+        let built_client = reqwest::Client::builder()
             .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
-            .build()
-            .unwrap_or_default();
-        match props_client.get(&props_url).send().await {
+            .build();
+        if let Err(err) = &built_client {
+            tracing::warn!(error = %err, "kvcache: failed to build HTTP client; disabled for this run");
+        }
+        match built_client.ok() {
+            None => None,
+            Some(props_client) => match props_client.get(&props_url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
                 Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
                     Some(info) => {
@@ -594,10 +605,11 @@ pub(crate) async fn build_agent(
                 },
                 Err(_) => None,
             },
-            _ => {
-                tracing::warn!("kvcache: /props probe failed; disabled for this run");
-                None
-            }
+                _ => {
+                    tracing::warn!("kvcache: /props probe failed; disabled for this run");
+                    None
+                }
+            },
         }
     } else {
         None

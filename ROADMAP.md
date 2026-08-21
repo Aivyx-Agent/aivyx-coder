@@ -650,3 +650,22 @@ deferred, not overlooked):
   depend heavily on how stable a given project's own context is — a
   known, plan-mandated trade-off (see README's "KV-cache persistence"
   section), not a bug.
+- `LlamaServerSlotStore`'s own HTTP client (`aivyx-kvcache`, not this
+  repo) has no per-request timeout on `restore_into_slot`/`save_from_slot`
+  — the same unbounded-hang class the `/props` probe fix closed here, but
+  on the *per-turn* path (`ensure_kv_slot_checked_out` runs at the top of
+  every `run_turn`, before the cancellation check). A hung llama-server on
+  a slot restore/save stalls the turn indefinitely and un-cancellably.
+  Needs an upstream `aivyx-kvcache` fix, out of this repo's own scope.
+- The `hit` pre-check in `ensure_kv_slot_checked_out` (a `store.find()`
+  call) is now fully redundant with `restore_into_slot`'s own internal
+  `find()` — collapsing to one lookup is a clean simplification, not
+  urgent.
+- No regression test exercises the three behavioral fixes from the final
+  review (`Ok(false)` reaching the warm-up path, the `/props` probe
+  client carrying a timeout, `kv_slot_id` being set before the first
+  `.await`) — verified by code reading at review time, not by an
+  automated test. `agent_builder.rs`'s kvcache-construction block also has
+  zero test coverage of its own, since it's inline in `build_agent` —
+  same structural gap shape as the MCP-server tier-boundary finding from
+  the previous chapter.

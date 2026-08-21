@@ -364,6 +364,14 @@ content for a later, auto-allowed `memory_read` to surface, bypassing the
 installs pick this up automatically; add `"~/.local/state/aivyx-coder"` to
 your own `[permissions] deny_paths` list by hand on an existing install.
 
+KV-cache persistence (see below) added the same default protection for
+`~/.local/share/aivyx-coder/kvcache` — a restored `.slot` file *is* the
+model's context, re-entering a future session invisibly, so a generic
+`write_file` planting or corrupting one there is the same class of gap as
+the two above. Same caveat: only fresh installs pick this up
+automatically; add `"~/.local/share/aivyx-coder/kvcache"` to your own
+`[permissions] deny_paths` list by hand on an existing install.
+
 **Editor context**: an optional per-project JSON file
 (`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
 canonicalized-`cwd` hash as session files) that any editor integration can
@@ -814,10 +822,13 @@ must be started with `--slot-save-path` pointed at *exactly*
 other data/state directory in this project uses), so the exact path
 varies by platform (see the `directories` crate's own docs for the
 macOS/Windows equivalents). If `--slot-save-path` doesn't match this exact
-path, saves and restores silently fall back to no-op behavior: no error is
-surfaced, there's just no benefit — and, less happily, real slot files may
-accumulate on disk in the wrong directory instead of ever being found
-again by a later session.
+path, saves and restores still succeed against llama-server's own
+`--slot-save-path` directory — no error is surfaced — but the store's own
+`fs::metadata` stat on *its* expected path (`.../kvcache/slots`) misses,
+so every entry silently falls back to a 1-byte placeholder size instead of
+the real (often hundreds-of-MB) file size. That defeats
+`kvcache_max_bytes` below: nothing ever looks big enough to evict, so real
+slot files accumulate on disk without limit until the mismatch is fixed.
 
 ```
 llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
@@ -1166,6 +1177,12 @@ model = "qwen3.5:9b"
 # consumes the remainder. Cheap fix without touching the service:
 #   printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 8192\n' | ollama create qwen35-8k -f -
 context_tokens = 8192
+# "generic" (default) | "llama_server" -- opts into llama-server-specific
+# features (currently: KV-cache persistence). See "KV-cache persistence"
+# above. No effect on any other backend.
+# kind = "llama_server"
+# Only meaningful when kind = "llama_server". Bytes, not GiB; default 10 GiB.
+# kvcache_max_bytes = 10737418240
 
 [permissions]
 # A path-separator entry (or a bare "~") is an exact absolute location,
