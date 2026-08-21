@@ -4627,3 +4627,62 @@ async fn clear_conversation_empties_history_and_tasks_and_emits_one_event() {
         "expected exactly one ConversationCleared event, got: {events:?}"
     );
 }
+
+#[test]
+fn system_prompt_text_excludes_history() {
+    // build_agent (this file's real test constructor, see build_agent/
+    // build_agent_with_config above) needs no scripted responses for
+    // these two tests -- they only construct an Agent and inspect its
+    // own fields, never call run_turn.
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.history.push(Message::text(Role::User, "a real user message"));
+    let text = agent.system_prompt_text();
+    assert!(
+        !text.contains("a real user message"),
+        "system_prompt_text must never include conversation history"
+    );
+}
+
+#[test]
+fn system_prompt_text_includes_repo_map_when_set() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.repo_map_text = Some("## Repo Map\nfoo.rs: fn bar()".to_string());
+    let text = agent.system_prompt_text();
+    assert!(text.contains("## Repo Map"));
+}
+
+#[test]
+fn compute_prefix_hash_is_stable_for_identical_inputs() {
+    let tools = vec![ToolDefinition {
+        name: "read_file".to_string(),
+        description: "reads a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+    }];
+    let h1 = compute_prefix_hash("system prompt text", &tools);
+    let h2 = compute_prefix_hash("system prompt text", &tools);
+    assert_eq!(h1, h2);
+}
+
+#[test]
+fn compute_prefix_hash_differs_when_system_text_differs() {
+    let tools: Vec<ToolDefinition> = vec![];
+    let h1 = compute_prefix_hash("prompt A", &tools);
+    let h2 = compute_prefix_hash("prompt B", &tools);
+    assert_ne!(h1, h2);
+}
+
+#[test]
+fn compute_prefix_hash_differs_when_tools_differ() {
+    let system = "same system text";
+    let tools_a = vec![ToolDefinition {
+        name: "read_file".to_string(),
+        description: "reads".to_string(),
+        parameters_schema: serde_json::json!({}),
+    }];
+    let tools_b = vec![ToolDefinition {
+        name: "write_file".to_string(),
+        description: "writes".to_string(),
+        parameters_schema: serde_json::json!({}),
+    }];
+    assert_ne!(compute_prefix_hash(system, &tools_a), compute_prefix_hash(system, &tools_b));
+}

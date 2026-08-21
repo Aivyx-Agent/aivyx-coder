@@ -8,7 +8,8 @@ use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode}
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
-    ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolOutput, ToolResult,
+    ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition, ToolOutput,
+    ToolResult,
 };
 use futures::StreamExt;
 use time::OffsetDateTime;
@@ -642,7 +643,14 @@ impl Agent {
         }
     }
 
-    fn assemble_messages(&self) -> Vec<Message> {
+    /// The history-free portion of request assembly: system prompt +
+    /// mode/format notes + AGENTS.md + repo map + editor context. Extracted
+    /// out of `assemble_messages` (Task 5) specifically so the kvcache
+    /// warm-up path can build exactly this "stable prefix" text without
+    /// ever touching `self.history` — see `ensure_kv_slot_checked_out`'s
+    /// own doc comment for why reusing `assemble_messages` as-is would be
+    /// fragile (it includes the current turn's just-pushed user message).
+    fn system_prompt_text(&self) -> String {
         let mut system = self.system_prompt.clone();
         if self.history_truncated {
             system.push_str(
@@ -682,8 +690,12 @@ impl Agent {
             system.push_str("\n\n");
             system.push_str(text);
         }
+        system
+    }
+
+    fn assemble_messages(&self) -> Vec<Message> {
         let mut messages = Vec::with_capacity(self.history.len() + 1);
-        messages.push(Message::text(Role::System, system));
+        messages.push(Message::text(Role::System, self.system_prompt_text()));
         messages.extend(self.history.iter().cloned());
         messages
     }
@@ -1777,6 +1789,24 @@ impl Agent {
         self.emit(AgentEvent::TurnComplete);
         Ok(())
     }
+}
+
+/// A stable-within-one-process-run hash of the stable prefix (system
+/// prompt text + tool definitions) -- used as `CacheKey.prefix_hash`.
+/// Deliberately NOT guaranteed stable across Rust versions/compilations:
+/// a rebuild changing the hash algorithm just means old kvcache entries
+/// silently miss instead of hit (fail-open, matching every other kvcache
+/// operation in this integration), never a correctness problem.
+fn compute_prefix_hash(system_text: &str, tools: &[ToolDefinition]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    system_text.hash(&mut hasher);
+    for tool in tools {
+        tool.name.hash(&mut hasher);
+        tool.description.hash(&mut hasher);
+        tool.parameters_schema.to_string().hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Total character count of the system prompt plus all message content —
