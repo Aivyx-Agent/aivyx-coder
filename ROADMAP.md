@@ -573,15 +573,21 @@ findings from that same review are logged here rather than fixed ad hoc:
   now points at the new `aivyx-ecosystem` repo (`README.md`/`ROADMAP.md`/
   `GLOSSARY.md`), which lists it and keeps the table current going
   forward instead of duplicating it here.
-- **The new `write_approval_does_not_satisfy_a_forget_on_the_same_topic`
+- ~~The new `write_approval_does_not_satisfy_a_forget_on_the_same_topic`
   gate test lives in `aivyx-sandbox`, which has no dependency on
-  `aivyx-tools`** — it proves the cache mechanism directly with
+  `aivyx-tools`~~ — it proves the cache mechanism directly with
   hand-built `PermissionRequest`s, but can't itself detect a regression
   in `memory_write.rs`/`memory_forget.rs`'s actual `permission_request`
   output (that's covered by each tool's own updated unit test instead,
-  as two decoupled halves rather than one end-to-end proof). An
+  as two decoupled halves rather than one end-to-end proof). ~~An
   `aivyx-tools`-side test driving both tools' real `permission_request()`
-  through a real `ConfirmationGate` would close the loop properly.
+  through a real `ConfirmationGate` would close the loop properly.~~
+  **Fixed 2026-08-26.** Added
+  `write_approval_does_not_satisfy_a_forget_via_real_tool_output` in
+  `aivyx-tools/src/lib.rs`, driving both tools' real `permission_request()`
+  output through a real `ConfirmationGate::check()`. Mutation-proofed: made
+  `memory_forget.rs`'s target collide with `memory_write.rs`'s, confirmed
+  the test failed (1 prompt instead of 2), restored.
 
 **New backlog, from the MCP-server frontend's own final review** (see
 "MCP-server frontend — shipped" above for the two Important findings
@@ -602,28 +608,34 @@ deferred, not overlooked):
   unreachable (see above), but would mislabel a cancelled turn as
   "reached its iteration budget" the moment real cancellation is wired
   in. Distinguish via `iterations_used >= max_iterations` instead.
-- `[mcp_server].session_ttl_secs`/`max_concurrent_sessions` accept `0`
-  with no startup validation — `0` sessions degenerates to a
-  perpetually-thrashing one-session map, `0` TTL makes every session
-  unreachable on its very next call. `run_bounded_turn` already clamps
-  `max_iterations` to a floor of 1; the same defensiveness (or a loud
-  startup rejection alongside the existing `max_access_level` check)
-  would be consistent.
-- The three tier tool-name lists in `tiers.rs` are string denylists
+- ~~`[mcp_server].session_ttl_secs`/`max_concurrent_sessions` accept `0`
+  with no startup validation~~ — **Fixed 2026-08-26.**
+  `validate_mcp_server_session_limits` in `crates/aivyx/src/main.rs` now
+  rejects both at startup (matching the existing `max_access_level`
+  rejection), called right after the `--mcp-server` flag's config is
+  parsed. Mutation-proofed: temporarily short-circuited the `ttl_secs ==
+  0` check, confirmed the rejection test failed, restored.
+- ~~The three tier tool-name lists in `tiers.rs` are string denylists
   against `ToolRegistry::exclude`, which is a documented no-op for an
-  unregistered name — correct today (every name independently verified
+  unregistered name~~ — correct today (every name independently verified
   against real registered tools during the final review), but a future
   tool rename in `aivyx-tools` would silently widen a tier with no test
-  failure. A test asserting every listed name is actually present in a
-  full registry would make a rename loud instead of silent.
-- `code`'s turn-error path discards both the `Agent` and any
+  failure. ~~A test asserting every listed name is actually present in a
+  full registry would make a rename loud instead of silent.~~ **Fixed
+  2026-08-26.** Added `every_excluded_tool_name_matches_a_real_registered_tool`
+  in `tiers.rs`, constructing all 14 real tools and asserting each's
+  `Tool::name()` matches. Mutation-proofed: corrupted one `EDIT_ONLY`
+  entry, confirmed the test failed, restored.
+- ~~`code`'s turn-error path discards both the `Agent` and any
   accumulated partial text (the session never reaches `insert`), while
   `code_reply`'s turn-error path keeps the session alive via `put_back`
-  regardless of outcome — a transient backend failure on a session's
+  regardless of outcome~~ — a transient backend failure on a session's
   first turn loses everything; the identical failure on its second
   doesn't. Defensible (a `code` failure never had a session identity to
-  preserve in the first place), but undocumented as an intentional
-  asymmetry.
+  preserve in the first place), ~~but undocumented as an intentional
+  asymmetry.~~ **Fixed 2026-08-26.** Documented at both call sites in
+  `server.rs`, cross-referencing each other — no behavior change, this
+  was always the intended shape.
 
 **New backlog, from KV-cache persistence's (`aivyx-kvcache`) task and
 final reviews** (see "KV-cache persistence — shipped" above for the three
@@ -636,9 +648,11 @@ deferred, not overlooked):
   filter it by plan-mode/prompted-edit/autonomous-mode — this narrows
   cache reuse in those modes (a plan-mode turn's real tool list won't
   match the warmed prefix hash), but is not a correctness risk.
-- No `info`-level observability for kvcache hit/miss/save — only `warn`
-  on failure, so an operator can't easily tell from normal logs whether
-  the feature is silently never engaging.
+- ~~No `info`-level observability for kvcache hit/miss/save~~ — only `warn`
+  on failure previously, so an operator couldn't easily tell from normal
+  logs whether the feature was silently never engaging. **Fixed
+  2026-08-26.** `ensure_kv_slot_checked_out` now logs `info` on hit, miss,
+  and successful save, each carrying `prefix_hash`/`slot_id`.
 - Multi-process contention: `KvSlotPool`'s deterministic lowest-first
   checkout means two concurrent `aivyx-coder` processes against one
   shared `llama-server` both check out slot 0 first, pinning both
@@ -650,22 +664,37 @@ deferred, not overlooked):
   depend heavily on how stable a given project's own context is — a
   known, plan-mandated trade-off (see README's "KV-cache persistence"
   section), not a bug.
-- `LlamaServerSlotStore`'s own HTTP client (`aivyx-kvcache`, not this
-  repo) has no per-request timeout on `restore_into_slot`/`save_from_slot`
+- ~~`LlamaServerSlotStore`'s own HTTP client (`aivyx-kvcache`, not this
+  repo) has no per-request timeout on `restore_into_slot`/`save_from_slot`~~
   — the same unbounded-hang class the `/props` probe fix closed here, but
   on the *per-turn* path (`ensure_kv_slot_checked_out` runs at the top of
   every `run_turn`, before the cancellation check). A hung llama-server on
-  a slot restore/save stalls the turn indefinitely and un-cancellably.
-  Needs an upstream `aivyx-kvcache` fix, out of this repo's own scope.
-- The `hit` pre-check in `ensure_kv_slot_checked_out` (a `store.find()`
+  a slot restore/save stalled the turn indefinitely and un-cancellably.
+  **Fixed 2026-08-26** upstream in `aivyx-kvcache` (`src/llama_server.rs`,
+  commit `59631f5`): added `SLOT_HTTP_TIMEOUT` (60s -- generous for
+  multi-GB transfers, but finite) to the client `open()` builds.
+  Mutation-proofed with a short-timeout test variant, not the real 60s
+  value. `aivyx-coder`'s own pinned rev is unchanged by this entry --
+  bumping it to pick up the fix is separate follow-on work.
+- ~~The `hit` pre-check in `ensure_kv_slot_checked_out` (a `store.find()`
   call) is now fully redundant with `restore_into_slot`'s own internal
-  `find()` — collapsing to one lookup is a clean simplification, not
-  urgent.
-- No regression test exercises the three behavioral fixes from the final
+  `find()`~~ — **Fixed 2026-08-26.** Collapsed to one lookup; `Ok(true)`/
+  `Ok(false)`/`Err` from `restore_into_slot` alone now drives the
+  warm-up decision. No behavior change, one fewer HTTP request per
+  session start.
+- ~~No regression test exercises the three behavioral fixes from the final
   review (`Ok(false)` reaching the warm-up path, the `/props` probe
   client carrying a timeout, `kv_slot_id` being set before the first
   `.await`) — verified by code reading at review time, not by an
   automated test. `agent_builder.rs`'s kvcache-construction block also has
-  zero test coverage of its own, since it's inline in `build_agent` —
+  zero test coverage of its own, since it's inline in `build_agent`~~ —
   same structural gap shape as the MCP-server tier-boundary finding from
-  the previous chapter.
+  the previous chapter. **Fixed 2026-08-26.** Added two wiremock-driven
+  regression tests in `aivyx-core/src/agent/tests.rs` (restore Ok(false)
+  → warm-up; kv_slot_id recorded before the first await, no leak on
+  cancellation) and extracted+tested `kv_cache_props_client()` in
+  `agent_builder.rs`. `parse_llama_slots_info` (the JSON half of the
+  block) already had its own tests in `aivyx-llm`; a full wiremock-driven
+  end-to-end test of `build_agent`'s entire block would need a complete
+  `Settings`/`Cli` fixture this crate has no harness for, left as a
+  heavier follow-up. All three new tests mutation-proofed.
