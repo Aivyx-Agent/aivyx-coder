@@ -302,6 +302,14 @@ impl AivyxCoderMcpServer {
             CancellationToken::new(),
         )
         .await;
+        // Intentional asymmetry with code_reply below: a turn failure here
+        // discards `agent` (and any partial `text`) entirely -- no
+        // session_id has been minted yet, so there is no session identity
+        // to preserve. A transient backend failure on a brand-new session
+        // loses everything and the caller must retry `code` from scratch.
+        // code_reply's own turn failure, by contrast, still put_backs the
+        // session (see below) because by then a real session_id already
+        // exists for the caller to retry against.
         result.map_err(|e| mcp_error(e.to_string()))?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -350,6 +358,13 @@ impl AivyxCoderMcpServer {
         )
         .await;
 
+        // Unlike code above, this session is put back regardless of the
+        // turn's outcome -- session_id already exists and was handed to
+        // the caller by a prior code/code_reply call, so a transient
+        // backend failure here should leave that identity retryable
+        // rather than silently deleting the conversation. See the
+        // matching comment on code's own turn-error path for the
+        // reasoning on why that path behaves differently.
         {
             let mut sessions = self.sessions.lock().await;
             sessions.put_back(params.session_id.clone(), session);
