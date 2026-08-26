@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use aivyx_kvcache::{CacheKey, CacheMeta, KvCacheStore, LlamaServerSlotStore};
+use aivyx_kvcache::{CacheKey, CacheMeta, LlamaServerSlotStore};
 use aivyx_llm::{ChatRequest, FinishReason, KvSlotPool, LlmBackend, StreamEvent, ToolChoice};
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
@@ -496,30 +496,25 @@ impl Agent {
             prefix_hash: compute_prefix_hash(&system_text, &tools),
         };
 
-        let hit = match kv.store.find(&key).await {
-            Ok(handle) => handle.is_some(),
-            Err(err) => {
-                tracing::warn!(error = %err, "kvcache: find() failed; treating as a miss");
-                false
-            }
-        };
-
-        // "Needs warm-up" is `!hit || the hit's restore came back false or
-        // errored` -- `restore_into_slot` returning `Ok(false)` (llama-server
-        // rejected the restore, e.g. the manifest row survived but the real
-        // file didn't) must be treated the same as a miss, not silently
+        // "Needs warm-up" is "restore_into_slot didn't confirm a hit" --
+        // `restore_into_slot` already does its own `find()` internally (a
+        // miss there, or any find() error, surfaces as `Ok(false)`/`Err`
+        // respectively -- see its own doc comment), so a separate
+        // pre-check `find()` call here would just be a second, wasted
+        // lookup for the same key. `Ok(false)` (llama-server rejected the
+        // restore, e.g. the manifest row survived but the real file
+        // didn't) must be treated the same as a miss, not silently
         // discarded, or a key in this state is stuck cold forever with no
         // repair path. Falling through to warm-up also corrects the stale
         // manifest row via `Manifest::insert`'s own upsert semantics.
-        let restored = hit
-            && match kv.store.restore_into_slot(&key, slot_id).await {
-                Ok(true) => true,
-                Ok(false) => false,
-                Err(err) => {
-                    tracing::warn!(error = %err, "kvcache: restore_into_slot failed");
-                    false
-                }
-            };
+        let restored = match kv.store.restore_into_slot(&key, slot_id).await {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(err) => {
+                tracing::warn!(error = %err, "kvcache: restore_into_slot failed");
+                false
+            }
+        };
 
         if !restored {
             // Cold: warm the slot with exactly the stable prefix, save it
