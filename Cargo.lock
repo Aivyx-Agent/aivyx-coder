@@ -204,6 +204,7 @@ dependencies = [
  "aivyx-core",
  "aivyx-kvcache",
  "aivyx-llm",
+ "aivyx-recall",
  "aivyx-repomap",
  "aivyx-sandbox",
  "aivyx-tools",

@@ -27,6 +27,11 @@ uuid = { version = "1", features = ["v4"] }
 # executor::block_on) -- mirrors aivyx-core's own delegate.rs test module,
 # which uses the same crate the same way.
 futures = "0.3"
+# Only used by tiers.rs's own real-tool-name test (constructs a real
+# MemoryWriteTool/MemoryForgetTool via InMemoryRecall to assert their
+# Tool::name() matches the tier's hardcoded exclusion strings) -- same
+# pinned rev aivyx-tools itself depends on.
+aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
 # Only used by the cutoff-notice test's scripted ToolCallComplete event
 # (ToolCall/ToolCallId/ToolCallSource) -- Cargo requires this be a direct
 # dependency of this crate even though aivyx-core already depends on it;

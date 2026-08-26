@@ -106,4 +106,66 @@ mod tests {
     fn execute_excludes_nothing_tier_specific() {
         assert!(AccessLevel::Execute.excluded_tool_names().is_empty());
     }
+
+    /// The 14 names in `EDIT_ONLY`/`EXECUTE_ONLY` are string literals, not
+    /// derived from any real `Tool::name()` -- a future rename in
+    /// `aivyx-tools` would silently widen whichever tier used to exclude
+    /// the renamed tool, with no test failure (`ToolRegistry::exclude`
+    /// is a documented no-op for an unregistered name). This test
+    /// constructs every real tool the two lists name and asserts each
+    /// string is exactly that tool's own `Tool::name()`, so a rename
+    /// breaks this test loudly instead of silently widening a tier.
+    #[test]
+    fn every_excluded_tool_name_matches_a_real_registered_tool() {
+        use aivyx_tools::{
+            DeleteFileTool, EditFileTool, GitBranchTool, GitCommitTool, GitPrTool, GitPushTool,
+            MemoryForgetTool, MemoryWriteTool, MoveFileTool, PatchFileTool, RememberPreferenceTool,
+            RunCommandTool, RunShellTool, WriteFileTool,
+        };
+        use aivyx_tools::Tool as _;
+        use std::sync::Arc;
+
+        let real_names: Vec<String> = vec![
+            WriteFileTool.name().to_string(),
+            EditFileTool.name().to_string(),
+            DeleteFileTool.name().to_string(),
+            MoveFileTool::new(vec![]).name().to_string(),
+            PatchFileTool.name().to_string(),
+            RunCommandTool::new(vec![]).name().to_string(),
+            RunShellTool.name().to_string(),
+            GitCommitTool::new(vec![]).name().to_string(),
+            GitBranchTool::new().name().to_string(),
+            GitPushTool::new().name().to_string(),
+            GitPrTool::new().name().to_string(),
+            MemoryWriteTool::new(Arc::new(aivyx_recall::InMemoryRecall::new()))
+                .name()
+                .to_string(),
+            MemoryForgetTool::new(Arc::new(aivyx_recall::InMemoryRecall::new()))
+                .name()
+                .to_string(),
+            RememberPreferenceTool::new(std::path::PathBuf::from("/irrelevant"))
+                .name()
+                .to_string(),
+        ];
+
+        // Both directions: every excluded-list entry is a real tool name
+        // (a rename in aivyx-tools would break this), and the real-tool
+        // set above has exactly the 14 names this file's own two lists
+        // expect (a tool added to one of those consts without a matching
+        // real tool here would also break this).
+        let excluded = AccessLevel::Plan.excluded_tool_names();
+        assert_eq!(excluded.len(), 14);
+        for name in &excluded {
+            assert!(
+                real_names.iter().any(|n| n == name),
+                "{name:?} is listed as excluded but no real tool constructed here has that name \
+                 -- either the list is stale or this test's own tool set needs updating"
+            );
+        }
+        assert_eq!(
+            real_names.len(),
+            excluded.len(),
+            "this test's own real-tool set and the excluded lists have drifted apart in size"
+        );
+    }
 }
