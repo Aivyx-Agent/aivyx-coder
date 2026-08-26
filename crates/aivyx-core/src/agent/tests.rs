@@ -4686,3 +4686,189 @@ fn compute_prefix_hash_differs_when_tools_differ() {
     }];
     assert_ne!(compute_prefix_hash(system, &tools_a), compute_prefix_hash(system, &tools_b));
 }
+
+// --- ensure_kv_slot_checked_out regression tests -----------------------
+//
+// Two of the final-review fixes on the kvcache-persistence branch have no
+// automated coverage of their own -- verified only by code reading at
+// review time. Both are genuinely testable end-to-end against a fake
+// llama-server (wiremock) without a real one, so cover them here rather
+// than leaving them as "reviewed once, never re-checked."
+
+mod kv_cache_regressions {
+    use super::*;
+    use aivyx_kvcache::CacheMeta;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Builds an Agent with kvcache configured against `store`/`pool`, and
+    /// returns the exact `CacheKey` `ensure_kv_slot_checked_out` will
+    /// compute for it -- same backend_id/model_id/build_hash passed to
+    /// `set_kv_cache`, same `system_prompt_text()`/`executor.definitions()`
+    /// the constructed Agent will use -- so a test can pre-seed the
+    /// store's manifest under the identical key the real flow looks up.
+    fn build_agent_with_kv_cache(
+        responses: Vec<Vec<StreamEvent>>,
+        pool: Arc<KvSlotPool>,
+        store: Arc<LlamaServerSlotStore>,
+    ) -> (Agent, CacheKey, Arc<MockBackend>) {
+        let (tx, _rx) = unbounded_channel();
+        let mock = Arc::new(MockBackend::new(responses));
+        let llm: std::sync::Arc<dyn LlmBackend> = mock.clone();
+        let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let executor = ToolExecutor::new(ToolRegistry::new(), gate, confiner);
+        let mut agent = Agent::new(
+            llm,
+            executor,
+            "system prompt text",
+            AgentConfig::default(),
+            Arc::default(),
+            PlanMode::new(),
+            AutonomousMode::new(),
+            tx,
+        );
+        let key = CacheKey {
+            backend_id: "llama-server".to_string(),
+            model_id: "test-model".to_string(),
+            build_hash: "build-abc".to_string(),
+            prefix_hash: compute_prefix_hash(
+                &agent.system_prompt_text(),
+                &agent.executor.definitions(),
+            ),
+        };
+        agent.set_kv_cache(
+            pool,
+            store,
+            "llama-server".to_string(),
+            "test-model".to_string(),
+            "build-abc".to_string(),
+        );
+        (agent, key, mock)
+    }
+
+    /// Regression test for the final-review fix that made a rejected
+    /// restore (`restore_into_slot` returning `Ok(false)` despite a
+    /// manifest hit -- e.g. the manifest row survived but the real file
+    /// didn't) fall through to warm-up instead of being silently treated
+    /// as a good restore. Seeds a real manifest hit via a successful
+    /// save, then mocks the restore call to fail, and asserts the agent
+    /// still warms the slot (a chat request reaches the backend) rather
+    /// than skipping straight to using an unwarmed slot.
+    #[tokio::test]
+    async fn restore_into_slot_returning_ok_false_still_falls_through_to_warm_up() {
+        let mock_server = MockServer::start().await;
+        // save succeeds (used below to seed a real manifest hit); restore
+        // is rejected -- the exact "manifest row survived but the real
+        // file didn't" shape the fixed bug needed to fall through on.
+        Mock::given(method("POST"))
+            .and(path("/slots/0"))
+            .and(query_param("action", "save"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/slots/0"))
+            .and(query_param("action", "restore"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            LlamaServerSlotStore::open(store_dir.path(), mock_server.uri(), u64::MAX).unwrap(),
+        );
+        let pool = Arc::new(KvSlotPool::new(1));
+
+        let (mut agent, key, mock_backend) = build_agent_with_kv_cache(
+            vec![vec![StreamEvent::Done { finish_reason: FinishReason::Stop }]],
+            Arc::clone(&pool),
+            Arc::clone(&store),
+        );
+
+        // Seed a real manifest hit for `key` via the store's own public
+        // save path (going through the mocked "save" endpoint above), so
+        // `find()` inside `restore_into_slot` genuinely locates a row --
+        // the mocked "restore" endpoint's 500 is what actually gets
+        // exercised next.
+        store
+            .save_from_slot(&key, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .await
+            .unwrap();
+
+        agent.ensure_kv_slot_checked_out().await;
+
+        assert_eq!(agent.kv_slot_id, Some(0));
+        assert_eq!(
+            mock_backend.received.lock().unwrap().len(),
+            1,
+            "a rejected restore must still warm the slot -- the agent should have sent \
+             exactly one chat request (the warm-up) instead of treating the manifest hit \
+             as a good restore"
+        );
+    }
+
+    /// Regression test for the final-review fix that moved
+    /// `self.kv_slot_id = Some(slot_id)` to run *before* the first
+    /// `.await` in `ensure_kv_slot_checked_out`, specifically so a
+    /// cancelled/dropped warm-up (e.g. a cancelled turn) still leaves the
+    /// checked-out slot recorded for `Drop` to release. Drives the restore
+    /// call into an artificially slow response, cancels the call via
+    /// `tokio::time::timeout`, and asserts the slot id was already
+    /// recorded (and is released, not leaked, once the Agent drops).
+    #[tokio::test]
+    async fn kv_slot_id_is_recorded_before_the_first_await_so_a_cancelled_warm_up_does_not_leak_the_slot()
+     {
+        let mock_server = MockServer::start().await;
+        // save succeeds (used below to seed a real manifest hit, so
+        // restore_into_slot's own internal find() actually proceeds to
+        // the HTTP restore call below rather than short-circuiting on a
+        // miss); restore hangs well past this test's own cancellation
+        // deadline.
+        Mock::given(method("POST"))
+            .and(path("/slots/0"))
+            .and(query_param("action", "save"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/slots/0"))
+            .and(query_param("action", "restore"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&mock_server)
+            .await;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            LlamaServerSlotStore::open(store_dir.path(), mock_server.uri(), u64::MAX).unwrap(),
+        );
+        let pool = Arc::new(KvSlotPool::new(1));
+
+        let (mut agent, key, _mock_backend) =
+            build_agent_with_kv_cache(vec![], Arc::clone(&pool), Arc::clone(&store));
+        store
+            .save_from_slot(&key, 0, CacheMeta { size_bytes: 1, token_count: 1 })
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(200), agent.ensure_kv_slot_checked_out())
+                .await;
+        assert!(outcome.is_err(), "the mocked restore call should still be pending at 200ms");
+
+        assert_eq!(
+            agent.kv_slot_id,
+            Some(0),
+            "the slot id must already be recorded on the Agent even though the future that \
+             would have finished checking it out was cancelled mid-flight"
+        );
+
+        drop(agent);
+        assert_eq!(
+            pool.checkout(),
+            Some(0),
+            "Drop must have released the slot back to the pool -- a leaked slot would leave \
+             the pool of size 1 permanently exhausted"
+        );
+    }
+}

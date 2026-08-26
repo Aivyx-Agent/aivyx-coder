@@ -25,3 +25,8 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Only used by the kvcache regression tests in agent/tests.rs -- fakes
+# llama-server's /slots HTTP endpoints so ensure_kv_slot_checked_out's
+# restore/warm-up/save flow can be driven end-to-end without a real
+# server. Same version aivyx-kvcache's own test suite already pins.
+wiremock = "0.6.5"

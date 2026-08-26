@@ -542,16 +542,7 @@ pub(crate) async fn build_agent(
     let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
         let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
         let props_url = format!("{origin}/props");
-        // `.build()` only fails on TLS/resolver init issues -- `unwrap_or_default()`
-        // would silently re-run the identical builder and panic on the same
-        // failure (`Client::default()` is `Client::new()`, which itself
-        // `.expect()`s), contradicting this whole block's fail-open posture.
-        // Matching `aivyx_llm::probe::probe_served_context`'s own handling
-        // of the identical failure (probe.rs:33-36): treat it as "kvcache
-        // unavailable this run", not a startup panic.
-        let built_client = reqwest::Client::builder()
-            .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
-            .build();
+        let built_client = kv_cache_props_client();
         if let Err(err) = &built_client {
             tracing::warn!(error = %err, "kvcache: failed to build HTTP client; disabled for this run");
         }
@@ -785,4 +776,79 @@ pub(crate) async fn build_agent(
         mcp_registry,
         deny_paths: deny_paths.clone(),
     })
+}
+
+/// Builds the HTTP client used to probe llama-server's `/props` endpoint
+/// for kvcache configuration -- pulled out into its own function so the
+/// timeout it carries is independently testable rather than buried inline
+/// in `build_agent`. `.build()` only fails on TLS/resolver init issues --
+/// `unwrap_or_default()` would silently re-run the identical builder and
+/// panic on the same failure (`Client::default()` is `Client::new()`,
+/// which itself `.expect()`s), contradicting the caller's fail-open
+/// posture, so this returns the `Result` untouched for the caller to
+/// handle. Matching `aivyx_llm::probe::probe_served_context`'s own
+/// handling of the identical failure (probe.rs:33-36): treat it as
+/// "kvcache unavailable this run", not a startup panic.
+fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the final-review fix that gave the `/props`
+    /// probe client an explicit timeout (previously it could hang the
+    /// whole startup sequence indefinitely against an unresponsive
+    /// server). A bare `TcpListener` here accepts the connection but
+    /// never writes a response, so a client with no timeout of its own
+    /// would hang forever; the outer `tokio::time::timeout` exists only
+    /// as a safety bound so a regression here fails this test loudly
+    /// (well within a normal test run) instead of hanging the suite.
+    #[tokio::test]
+    async fn kv_cache_props_client_does_not_hang_against_an_unresponsive_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Accept the connection and hold the *stream* open (not just
+            // the accept() result -- dropping the returned TcpStream
+            // immediately closes the connection, which reqwest surfaces
+            // as an instant error rather than a hang), replying to
+            // nothing. The client has no response to read until this
+            // stream drops (thread exit or test process exit).
+            if let Ok((stream, _addr)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+
+        let client = kv_cache_props_client().expect("client should build");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(8),
+            client.get(format!("http://{addr}/props")).send(),
+        )
+        .await;
+
+        match outcome {
+            Ok(request_result) => {
+                assert!(
+                    request_result.is_err(),
+                    "an unresponsive server must eventually error, not succeed"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(6),
+                    "the client's own configured timeout (PROBE_TIMEOUT = 3s) should have \
+                     fired well before this outer safety bound; took {:?}",
+                    started.elapsed()
+                );
+            }
+            Err(_) => panic!(
+                "the client had no working timeout of its own -- the outer 8s safety bound \
+                 fired instead of PROBE_TIMEOUT"
+            ),
+        }
+    }
 }
