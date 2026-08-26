@@ -308,6 +308,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_approval_does_not_satisfy_a_forget_via_real_tool_output() {
+        // aivyx-sandbox's own confirmation.rs has a regression test for this
+        // exact finding (memory_write and memory_forget must not share an
+        // Always-Allow cache entry on the same topic), but it drives the gate
+        // with hand-built PermissionRequests, not the tools' own real
+        // permission_request() output. This is the aivyx-tools-side half the
+        // backlog asked for: both tools' REAL permission_request() calls,
+        // through a REAL ConfirmationGate, closing the loop end-to-end so a
+        // future change to either tool's target-string format can't silently
+        // reopen the same hole without a test noticing.
+        use aivyx_sandbox::{
+            AutonomousMode, ConfirmationGate, PermissionDecision, PermissionPrompter, PlanMode,
+            UserResponse,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakePrompter {
+            response: UserResponse,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl PermissionPrompter for FakePrompter {
+            async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.response
+            }
+        }
+
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/irrelevant"),
+            false,
+        );
+
+        let write_tool = MemoryWriteTool::new(Arc::new(aivyx_recall::InMemoryRecall::new()));
+        let write_request = write_tool
+            .permission_request(
+                &serde_json::json!({"topic": "global:editor", "body": "prefers tabs"}),
+                Path::new("/irrelevant"),
+            )
+            .unwrap();
+        let decision = gate.check(&write_request).await;
+        assert_eq!(decision, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        let forget_tool = MemoryForgetTool::new(Arc::new(aivyx_recall::InMemoryRecall::new()));
+        let forget_request = forget_tool
+            .permission_request(
+                &serde_json::json!({"topic": "global:editor"}),
+                Path::new("/irrelevant"),
+            )
+            .unwrap();
+        let decision = gate.check(&forget_request).await;
+        assert_eq!(decision, PermissionDecision::AllowAlways);
+        // The approval for memory_write must NOT satisfy memory_forget on
+        // the same topic -- the gate must prompt again.
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn dispatch_checkpoints_before_mutating_tools_only() {
         use aivyx_checkpoint::test_support::{git, init_repo};
         use aivyx_sandbox::{NoopConfiner, PermissionDecision};
