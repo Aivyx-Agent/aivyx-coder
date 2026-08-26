@@ -515,6 +515,17 @@ impl Agent {
                 false
             }
         };
+        // info-level, not warn: this is the normal-operation signal an
+        // operator needs to tell "the feature is silently never engaging"
+        // apart from "everything is warming and reusing exactly as
+        // expected" -- previously only failures logged at all, so a
+        // 100%-cold-miss session looked identical in the logs to a
+        // 100%-hit one.
+        if restored {
+            tracing::info!(prefix_hash = %key.prefix_hash, slot_id, "kvcache hit; slot restored");
+        } else {
+            tracing::info!(prefix_hash = %key.prefix_hash, slot_id, "kvcache miss; warming slot");
+        }
 
         if !restored {
             // Cold: warm the slot with exactly the stable prefix, save it
@@ -564,8 +575,17 @@ impl Agent {
                         );
                     } else {
                         let meta = CacheMeta { size_bytes: 1, token_count: 1 };
-                        if let Err(err) = kv.store.save_from_slot(&key, slot_id, meta).await {
-                            tracing::warn!(error = %err, "kvcache: save_from_slot failed");
+                        match kv.store.save_from_slot(&key, slot_id, meta).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    prefix_hash = %key.prefix_hash,
+                                    slot_id,
+                                    "kvcache: slot saved"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "kvcache: save_from_slot failed");
+                            }
                         }
                     }
                 }
