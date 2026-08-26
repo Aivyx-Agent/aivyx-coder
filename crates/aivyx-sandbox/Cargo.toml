@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "9a9ea5b96e6f97bc196722ebae4c46f61b4750a4", default-features = false }
+aivyx-confine = { workspace = true }
 async-trait = "0.1.89"
 directories = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }

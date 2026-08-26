@@ -18,6 +18,15 @@ aivyx-repomap = { path = "crates/aivyx-repomap" }
 aivyx-core = { path = "crates/aivyx-core" }
 aivyx-config = { path = "crates/aivyx-config" }
 aivyx-tui = { path = "crates/aivyx-tui" }
+# Not on crates.io -- pinned by commit SHA (see each repo's own README).
+# Centralized here (rather than repeated per-crate) so each pin has
+# exactly one place to bump: aivyx-kvcache and aivyx-recall previously
+# had the identical git/rev pair duplicated across 3 Cargo.tomls each,
+# which a partial bump could silently desync.
+aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "9a9ea5b96e6f97bc196722ebae4c46f61b4750a4", default-features = false }
+aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "37b0ebf200eaf5b31bcb795dfb1beb3356cd12a3" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e1b06c9960ee98841d9b91978a11dd99ed388490" }
+aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
 
 [profile.release]
 strip = true
