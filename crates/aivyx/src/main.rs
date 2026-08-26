@@ -11,6 +11,50 @@ use tracing_subscriber::EnvFilter;
 
 mod agent_builder;
 
+/// `[mcp_server].session_ttl_secs`/`.max_concurrent_sessions` accepting `0`
+/// silently degenerates the session map to unusable: a 0-second TTL evicts
+/// every session before its next call could ever see it, and a 0-session
+/// limit means no session can ever be held. Same defensiveness as the
+/// `[mcp_server].max_access_level` check next to its call site — pure so
+/// it's testable without a full CLI run.
+fn validate_mcp_server_session_limits(ttl_secs: u64, max_concurrent: u32) -> anyhow::Result<()> {
+    if ttl_secs == 0 {
+        anyhow::bail!(
+            "[mcp_server].session_ttl_secs must be greater than 0 -- a 0-second TTL would evict \
+             every session before its next call could ever see it"
+        );
+    }
+    if max_concurrent == 0 {
+        anyhow::bail!(
+            "[mcp_server].max_concurrent_sessions must be greater than 0 -- a 0-session limit \
+             would degenerate to a perpetually-thrashing session map that can never hold one"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_mcp_server_session_limits_rejects_zero_ttl() {
+        let err = validate_mcp_server_session_limits(0, 8).unwrap_err();
+        assert!(err.to_string().contains("session_ttl_secs"));
+    }
+
+    #[test]
+    fn validate_mcp_server_session_limits_rejects_zero_max_concurrent() {
+        let err = validate_mcp_server_session_limits(1800, 0).unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_sessions"));
+    }
+
+    #[test]
+    fn validate_mcp_server_session_limits_accepts_real_defaults() {
+        assert!(validate_mcp_server_session_limits(1800, 8).is_ok());
+    }
+}
+
 /// Applied when an `allowed_commands` entry doesn't set its own
 /// `timeout_secs`.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
@@ -209,6 +253,10 @@ async fn main() -> anyhow::Result<()> {
         };
         let max_access_level = aivyx_mcp_server::AccessLevel::parse(max_access_level_str)
             .map_err(|e| anyhow::anyhow!("[mcp_server].max_access_level: {e}"))?;
+        validate_mcp_server_session_limits(
+            settings.mcp_server.session_ttl_secs,
+            settings.mcp_server.max_concurrent_sessions,
+        )?;
 
         let edit_format = match cli.edit_format.as_deref() {
             Some("native") => aivyx_core::EditFormat::Native,
