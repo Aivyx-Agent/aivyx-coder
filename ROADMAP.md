@@ -1,6 +1,9 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-08-10_
+_Last updated: 2026-09-03 (the header date had drifted — the file's own
+git history shows real edits through 2026-08-26; the stretch-goal/status
+prose below is otherwise still current, only the stamp and the test
+count were stale)_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -27,8 +30,9 @@ project instructions, `web_fetch`/`web_search`, full MCP client support, a
 startup probe of the *served* context window, goal-bounded turn pausing
 instead of a hard iteration-cap failure, enforced post-edit verification
 with automatic fix-and-retry, and an ACP editor-integration frontend
-(see below). 473 workspace tests; every security-critical behavior also
-proven by live E2E against real serving.
+(see below). 682 workspace tests (freshly re-run 2026-09-03; up from
+473 as of this doc's own last content update); every security-critical
+behavior also proven by live E2E against real serving.
 
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
