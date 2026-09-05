@@ -168,10 +168,14 @@ config field.
 ## Known, deliberately-undefended limitations
 
 Documented in `README.md` "Known limitations" — worth checking before
-assuming a gap is a bug: indirect prompt injection (file/command content
-re-enters context untagged), network is unrestricted for approved commands,
-env vars are inherited by spawned commands, TOCTOU windows on path
-resolution, and `git_commit` (re)stages full paths rather than partial hunks.
+assuming a gap is a bug: indirect prompt injection (a heuristic
+scan-and-pause guard exists in autonomous mode — see `aivyx-sandbox`'s
+`InjectionTaint`/`scan_for_injection_markers`, now sourced from the
+`aivyx-injection-guard` crate — but it's pattern-based, not structural,
+and doesn't run in interactive mode at all), network is unrestricted for
+approved commands, env vars are inherited by spawned commands, TOCTOU
+windows on path resolution, and `git_commit` (re)stages full paths rather
+than partial hunks.
 
 ## Where to look next
 
