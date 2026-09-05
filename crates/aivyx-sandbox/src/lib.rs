@@ -7,7 +7,11 @@
 //! `LandlockConfiner`, and `NoopConfiner` (its no-op fallback) both live
 //! in the `aivyx-confine` crate now, re-exported here so every existing
 //! call site in this workspace keeps working unchanged. See that crate's
-//! own README for the confinement contract itself.
+//! own README for the confinement contract itself. The prompt-injection
+//! phrase-list tripwire (`scan_for_injection_markers`, `InjectionFinding`,
+//! `InjectionTaint`) similarly now lives in the `aivyx-injection-guard`
+//! crate, re-exported here the same way — extracted 2026-09-05 so `aivyx`
+//! (the flagship Personal Assistant) can share the same primitive.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,12 +22,11 @@ use aivyx_confine::{is_bare_pattern, is_basename_glob_match};
 
 mod confirmation;
 mod editor_approval;
-mod injection_scan;
 pub use aivyx_confine::{ExecutionConfiner, NoopConfiner, default_confiner};
 #[cfg(feature = "sandbox-backend")]
 pub use aivyx_confine::LandlockConfiner;
+pub use aivyx_injection_guard::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 pub use confirmation::ConfirmationGate;
-pub use injection_scan::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 
 /// What a tool is asking to do, described *before* any side effect happens.
 #[derive(Debug, Clone)]

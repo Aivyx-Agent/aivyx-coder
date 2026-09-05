@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aivyx-confine = { workspace = true }
+aivyx-injection-guard = { workspace = true }
 async-trait = "0.1.89"
 directories = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
