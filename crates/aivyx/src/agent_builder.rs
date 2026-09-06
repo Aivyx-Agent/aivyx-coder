@@ -86,9 +86,9 @@ pub(crate) struct BuiltAgent {
     /// The resolved `deny_paths` this function computed and used
     /// throughout its own body (sandbox confiner, checkpointer, repo map,
     /// tool constructors) — exposed so a frontend never has to recompute
-    /// `settings.permissions.resolved_deny_paths()` a second time
-    /// independently, which could silently diverge if this function's own
-    /// local `deny_paths` is ever augmented further.
+    /// `settings.effective_deny_paths()` a second time independently,
+    /// which could silently diverge if this function's own local
+    /// `deny_paths` is ever augmented further.
     pub(crate) deny_paths: Vec<PathBuf>,
 }
 
@@ -552,15 +552,12 @@ pub(crate) async fn build_agent(
             Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
                 Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
                     Some(info) => {
-                        // Same `directories::ProjectDirs` construction every
-                        // other XDG-path resolution in this codebase uses
-                        // (see `aivyx-core::session`, `aivyx-config`,
-                        // `aivyx-sandbox::editor_approval`) rather than a
-                        // second, redundant `dirs` crate dependency.
-                        // `data_local_dir()` already resolves to
-                        // `~/.local/share/aivyx-coder` on Linux (the app
-                        // name is baked in by `ProjectDirs::from`), so only
-                        // `kvcache` is joined on top.
+                        // Single source of truth for the effective path
+                        // (configured override, or the historical
+                        // ProjectDirs-derived default) — see
+                        // BackendSettings::resolved_kvcache_store_path in
+                        // aivyx-config, also reused by Settings::effective_deny_paths
+                        // below so the two can never silently diverge.
                         let store_path = settings.backend.resolved_kvcache_store_path();
                         match aivyx_kvcache::LlamaServerSlotStore::open(
                             &store_path,
