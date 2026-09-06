@@ -171,7 +171,7 @@ dependencies = [
 [[package]]
 name = "aivyx-injection-guard"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-injection-guard?rev=8d8583f9cd63dd48b72ffea9455f98f5a9405ffc#8d8583f9cd63dd48b72ffea9455f98f5a9405ffc"
+source = "git+https://github.com/Aivyx-Agent/aivyx-injection-guard?rev=ad9141c6ca242532db7b8e34eff423084e1eba4d#ad9141c6ca242532db7b8e34eff423084e1eba4d"
 
 [[package]]
 name = "aivyx-kvcache"
