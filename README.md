@@ -364,13 +364,16 @@ content for a later, auto-allowed `memory_read` to surface, bypassing the
 installs pick this up automatically; add `"~/.local/state/aivyx-coder"` to
 your own `[permissions] deny_paths` list by hand on an existing install.
 
-KV-cache persistence (see below) added the same default protection for
-`~/.local/share/aivyx-coder/kvcache` — a restored `.slot` file *is* the
-model's context, re-entering a future session invisibly, so a generic
-`write_file` planting or corrupting one there is the same class of gap as
-the two above. Same caveat: only fresh installs pick this up
-automatically; add `"~/.local/share/aivyx-coder/kvcache"` to your own
-`[permissions] deny_paths` list by hand on an existing install.
+KV-cache persistence (see below) gets the same protection for whatever
+directory it actually uses — a restored `.slot` file *is* the model's
+context, re-entering a future session invisibly, so a generic
+`write_file` planting or corrupting one there is the same class of gap
+as the two above. Unlike the two entries above, this one needs no
+manual `deny_paths` edit on existing installs: `effective_deny_paths()`
+recomputes and protects the *current* kvcache directory (the default,
+or your own `[backend] kvcache_store_path` override — see "KV-cache
+persistence" below) every time the agent starts, so it can never go
+stale the way a static list entry would.
 
 **Editor context**: an optional per-project JSON file
 (`~/.local/state/aivyx-coder/editor-context/<hash>.json`, keyed by the same
@@ -816,12 +819,15 @@ kind = "llama_server"
 ```
 
 **The one load-bearing operational requirement**: `llama-server` itself
-must be started with `--slot-save-path` pointed at *exactly*
-`~/.local/share/aivyx-coder/kvcache/slots` — on Linux, this is
-`directories::ProjectDirs`-resolved (the same XDG-path mechanism every
-other data/state directory in this project uses), so the exact path
-varies by platform (see the `directories` crate's own docs for the
-macOS/Windows equivalents). If `--slot-save-path` doesn't match this exact
+must be started with `--slot-save-path` pointed at *exactly* the
+directory this config actually uses — by default
+`~/.local/share/aivyx-coder/kvcache/slots` (on Linux; the exact default
+path is platform-specific, resolved via the `directories` crate — see
+its own docs for the macOS/Windows equivalents), or your own `[backend]
+kvcache_store_path`'s `slots` subdirectory if you've set one (see
+below — in particular, to share this store with a locally
+delegated-from `aivyx` process pointed at the same `llama-server`, see
+`aivyx`'s own `docs/MCP_RECIPES.md`). If `--slot-save-path` doesn't match this exact
 path, saves and restores still succeed against llama-server's own
 `--slot-save-path` directory — no error is surfaced — but the store's own
 `fs::metadata` stat on *its* expected path (`.../kvcache/slots`) misses,
@@ -1183,6 +1189,12 @@ context_tokens = 8192
 # kind = "llama_server"
 # Only meaningful when kind = "llama_server". Bytes, not GiB; default 10 GiB.
 # kvcache_max_bytes = 10737418240
+# Overrides where the kvcache store directory lives (default:
+# ~/.local/share/aivyx-coder/kvcache). Supports a leading `~`. Set this
+# to the same directory as a locally delegated-from `aivyx` process's
+# own kvcache_store_path (and point both at the same llama-server) to
+# share one store -- see aivyx's own docs/MCP_RECIPES.md.
+# kvcache_store_path = "~/.local/share/shared-kvcache"
 
 [permissions]
 # A path-separator entry (or a bare "~") is an exact absolute location,
