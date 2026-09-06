@@ -121,7 +121,7 @@ pub(crate) async fn build_agent(
         settings.backend.api_key.clone(),
     ));
 
-    let deny_paths = settings.permissions.resolved_deny_paths();
+    let deny_paths = settings.effective_deny_paths();
     // Canonicalized once and reused everywhere `cwd` is needed (sandbox
     // confiner, checkpointer, repo map, session path, and — critically —
     // `ConfirmationGate`'s cwd-boundary check below): `current_dir()` does
@@ -561,11 +561,7 @@ pub(crate) async fn build_agent(
                         // `~/.local/share/aivyx-coder` on Linux (the app
                         // name is baked in by `ProjectDirs::from`), so only
                         // `kvcache` is joined on top.
-                        let store_path = match directories::ProjectDirs::from("", "", "aivyx-coder")
-                        {
-                            Some(dirs) => dirs.data_local_dir().join("kvcache"),
-                            None => std::env::temp_dir().join("aivyx-coder").join("kvcache"),
-                        };
+                        let store_path = settings.backend.resolved_kvcache_store_path();
                         match aivyx_kvcache::LlamaServerSlotStore::open(
                             &store_path,
                             origin, // NOT settings.backend.base_url -- /slots is a native

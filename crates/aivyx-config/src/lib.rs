@@ -532,6 +532,28 @@ impl SandboxSettings {
     }
 }
 
+impl BackendSettings {
+    /// The kvcache store directory this run actually uses: the
+    /// configured override (tilde-expanded, same convention as
+    /// `PermissionSettings::resolved_deny_paths`), or the historical
+    /// `ProjectDirs`-derived default when unset. Single source of truth
+    /// reused by both the real kvcache construction in `agent_builder.rs`
+    /// and `Settings::effective_deny_paths` below -- the two can never
+    /// silently diverge.
+    pub fn resolved_kvcache_store_path(&self) -> PathBuf {
+        match &self.kvcache_store_path {
+            Some(raw) => resolve_tilde_paths(std::slice::from_ref(raw))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| PathBuf::from(raw)),
+            None => match directories::ProjectDirs::from("", "", "aivyx-coder") {
+                Some(dirs) => dirs.data_local_dir().join("kvcache"),
+                None => std::env::temp_dir().join("aivyx-coder").join("kvcache"),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BackendSettings {
@@ -564,6 +586,15 @@ pub struct BackendSettings {
     /// section) will hold on disk before evicting the least-recently-used
     /// entry. Only meaningful when `kind = "llama_server"`. Default 10 GiB.
     pub kvcache_max_bytes: u64,
+    /// Overrides where the kvcache store directory lives. `None`
+    /// (default) preserves the historical per-app `ProjectDirs`-derived
+    /// path. Set this to the *same* directory as `aivyx`'s own
+    /// `kvcache_store_path` (and point both configs' backends at the
+    /// same `llama-server`) to share prefill work across the two
+    /// processes — see `docs/MCP_RECIPES.md`'s `aivyx-coder` recipe in
+    /// the `aivyx` repo for the full pairing guidance. Supports a
+    /// leading `~`, same convention as `deny_paths`.
+    pub kvcache_store_path: Option<String>,
 }
 
 /// Phase kvcache-adoption — which local-LLM backend server this config
@@ -602,6 +633,7 @@ impl Default for BackendSettings {
             edit_format: EditFormat::Native,
             kind: BackendKind::Generic,
             kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
+            kvcache_store_path: None,
         }
     }
 }
@@ -661,13 +693,6 @@ impl Default for PermissionSettings {
                 // gate entirely; a later memory_read (auto-allowed) would
                 // then return the planted content.
                 "~/.local/state/aivyx-coder".to_string(),
-                // Same rationale as ~/.local/state/aivyx-coder above, for
-                // the kvcache store: a restored `.slot` file IS the
-                // model's context re-entering a future session invisibly
-                // — without this, a generic write_file/edit_file could
-                // plant or corrupt cache state a later session's kvcache
-                // restore would silently trust.
-                "~/.local/share/aivyx-coder/kvcache".to_string(),
                 "~/.gnupg".to_string(),
                 "~/.netrc".to_string(),
                 "~/.docker/config.json".to_string(),
@@ -736,6 +761,20 @@ impl PermissionSettings {
         let mut resolved = resolve_tilde_paths(&path_like);
         resolved.extend(bare.into_iter().map(PathBuf::from));
         resolved
+    }
+}
+
+impl Settings {
+    /// The complete, resolved deny_paths list this run actually uses:
+    /// `permissions.resolved_deny_paths()` plus the effective kvcache
+    /// store path (default or overridden), which must always be
+    /// protected regardless of whether kvcache is enabled for this
+    /// particular run -- a previous run may have left slot files behind
+    /// under a path this run's `backend.kind` no longer even selects.
+    pub fn effective_deny_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.permissions.resolved_deny_paths();
+        paths.push(self.backend.resolved_kvcache_store_path());
+        paths
     }
 }
 
@@ -932,16 +971,57 @@ mod tests {
     }
 
     #[test]
-    fn default_deny_paths_includes_the_kvcache_directory() {
+    fn resolved_kvcache_store_path_matches_the_historical_default_when_unset() {
+        let settings = Settings::default();
+        let path = settings.backend.resolved_kvcache_store_path();
+        assert!(
+            path.to_string_lossy().contains(".local/share/aivyx-coder/kvcache"),
+            "default kvcache path must be unchanged when no override is configured, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_kvcache_store_path_uses_the_configured_override() {
+        let mut settings = Settings::default();
+        settings.backend.kvcache_store_path = Some("~/shared-kvcache".to_string());
+        let path = settings.backend.resolved_kvcache_store_path();
+        assert!(
+            path.ends_with("shared-kvcache"),
+            "overridden kvcache path must be used verbatim (tilde-expanded), got {path:?}"
+        );
+        assert!(
+            !path.to_string_lossy().contains("aivyx-coder/kvcache"),
+            "overridden path must replace the default, not sit alongside it, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn default_effective_deny_paths_includes_the_kvcache_directory() {
         let settings = Settings::default();
         assert!(
             settings
-                .permissions
-                .resolved_deny_paths()
+                .effective_deny_paths()
                 .iter()
                 .any(|p| p.to_string_lossy().contains(".local/share/aivyx-coder/kvcache")),
-            "kvcache store directory must be in default deny_paths, same rationale as the \
+            "kvcache store directory must be in effective deny_paths, same rationale as the \
              state directory"
+        );
+    }
+
+    #[test]
+    fn effective_deny_paths_tracks_an_overridden_kvcache_path_not_the_old_default() {
+        let mut settings = Settings::default();
+        settings.backend.kvcache_store_path = Some("~/shared-kvcache".to_string());
+        let paths = settings.effective_deny_paths();
+        assert!(
+            paths.iter().any(|p| p.ends_with("shared-kvcache")),
+            "the overridden path must be protected"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("aivyx-coder/kvcache")),
+            "the stale default path must not remain protected once overridden away from it"
         );
     }
 
