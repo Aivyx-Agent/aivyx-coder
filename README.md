@@ -867,6 +867,44 @@ instance, or the store fails to open, KV-cache persistence is silently
 disabled for that run (a `warn`-level log line, nothing else) — aivyx
 never fails to start because of it.
 
+## Multi-process GPU sharing (`aivyx-broker`)
+
+A single `llama-server` process only ever serves one GPU-resident model at
+a time, and its `/slots` KV-cache mechanism (see "KV-cache persistence"
+above) assumes one process is deciding which slot to use. If you run more
+than one local process against the same `llama-server` at once (multiple
+`aivyx-coder` sessions, or `aivyx-coder` alongside `aivyx`), they'll fight
+over slots without coordination.
+
+[`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker) is a
+standalone daemon that sits in front of a single shared `llama-server` and
+coordinates GPU-slot access across every local process pointed at it — it
+owns slot admission and the full restore/warm/save lifecycle itself, so no
+individual client (this one included) does its own local slot-picking or
+its own `aivyx-kvcache` restore/save calls on this path. See
+`aivyx-broker`'s own README for how to install and run it — it's a
+separate process from `aivyx-coder`, started independently.
+
+**Enable it**: set `kind = "llama_server_broker"` and point
+`broker_base_url` at your running `aivyx-broker` instance instead of at
+`llama-server` directly:
+
+```toml
+[backend]
+model = "qwen3.5:9b"
+kind = "llama_server_broker"
+broker_base_url = "http://127.0.0.1:8899"
+```
+
+`base_url` is no longer contacted directly by this process on this path —
+`broker_base_url` is. `aivyx-broker` exposes the same
+`/v1/chat/completions` shape as a plain OpenAI-compatible server, so this
+is otherwise a drop-in swap; this repo's own contribution is just an
+additive `aivyx_slot_hint` field (a prefix hash, plus a preferred slot once
+the broker has told it one) attached to each outgoing request as a hint —
+the broker's own occupancy tracking, not this client, is what makes
+same-session requests keep landing on a fast, already-warmed slot.
+
 ## Embedded Rust-native inference
 
 `aivyx-coder` can run a local LLM **inside its own process** by linking
@@ -1276,9 +1314,11 @@ model = "qwen3.5:9b"
 # consumes the remainder. Cheap fix without touching the service:
 #   printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 8192\n' | ollama create qwen35-8k -f -
 context_tokens = 8192
-# "generic" (default) | "llama_server" -- opts into llama-server-specific
-# features (currently: KV-cache persistence). See "KV-cache persistence"
-# above. No effect on any other backend.
+# "generic" (default) | "llama_server" | "llama_server_broker" -- opts into
+# backend-specific features. "llama_server": KV-cache persistence, see
+# "KV-cache persistence" above. "llama_server_broker": multi-process GPU
+# sharing via aivyx-broker, see "Multi-process GPU sharing (aivyx-broker)"
+# above -- requires broker_base_url below. No effect on any other backend.
 # kind = "llama_server"
 # Only meaningful when kind = "llama_server". Bytes, not GiB; default 10 GiB.
 # kvcache_max_bytes = 10737418240
@@ -1288,6 +1328,10 @@ context_tokens = 8192
 # own kvcache_store_path (and point both at the same llama-server) to
 # share one store -- see aivyx's own docs/MCP_RECIPES.md.
 # kvcache_store_path = "~/.local/share/shared-kvcache"
+# REQUIRED when kind = "llama_server_broker" -- address of a running
+# aivyx-broker instance. Replaces base_url as the address this process
+# actually connects to on that path.
+# broker_base_url = "http://127.0.0.1:8899"
 
 [permissions]
 # A path-separator entry (or a bare "~") is an exact absolute location,

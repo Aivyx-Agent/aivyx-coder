@@ -595,6 +595,21 @@ pub struct BackendSettings {
     /// the `aivyx` repo for the full pairing guidance. Supports a
     /// leading `~`, same convention as `deny_paths`.
     pub kvcache_store_path: Option<String>,
+    /// Address of a running `aivyx-broker` instance (e.g.
+    /// `http://127.0.0.1:8899`). Required when `kind =
+    /// "llama_server_broker"` -- checked at backend-construction time
+    /// (agent_builder.rs), not at config-load time, matching how
+    /// llama-server's own reachability isn't checked at load time either.
+    /// When set and `kind = "llama_server_broker"`, this -- not
+    /// `base_url` -- is the address `OpenAiCompatBackend` actually
+    /// connects to: `aivyx-broker` sits in front of a single shared
+    /// `llama-server` and coordinates GPU-slot access across multiple
+    /// local processes, so this process no longer contacts llama-server
+    /// directly on this path, and must not perform its own local
+    /// slot-picking or its own `aivyx-kvcache` restore/save calls -- the
+    /// broker owns that lifecycle now. See `aivyx-broker`'s own README
+    /// for the full rationale and wire contract.
+    pub broker_base_url: Option<String>,
     /// Absolute path to a local GGUF file or a directory containing GGUF
     /// files. Required when `kind = "mistral_rs"` -- checked at
     /// backend-construction time (agent_builder.rs), not at config-load
@@ -632,6 +647,18 @@ pub enum BackendKind {
     #[default]
     Generic,
     LlamaServer,
+    /// Points `OpenAiCompatBackend` at a running `aivyx-broker` instead
+    /// of at llama-server directly -- still a plain `OpenAiCompatBackend`
+    /// under the hood (like `LlamaServer`), just aimed at
+    /// `broker_base_url` instead of `base_url`. `aivyx-broker` is a
+    /// standalone daemon that coordinates GPU-slot access across
+    /// multiple local processes sharing one `llama-server`; it owns KV-
+    /// cache slot admission and the full restore/warm/save lifecycle on
+    /// this path, so this process must not also do its own local
+    /// slot-picking or its own `aivyx-kvcache` restore/save calls -- see
+    /// `agent_builder.rs`'s dispatch on this enum, which deliberately
+    /// leaves `kv_cache_handles` unset (`None`) for this variant.
+    LlamaServerBroker,
     /// A genuinely different backend implementation
     /// (`MistralRsBackend`, `crates/aivyx-llm/src/mistral_rs/`) is
     /// constructed for this variant -- unlike `LlamaServer`, which only
@@ -664,6 +691,7 @@ impl Default for BackendSettings {
             kind: BackendKind::Generic,
             kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
             kvcache_store_path: None,
+            broker_base_url: None,
             mistralrs_model_path: None,
             mistralrs_model_file: None,
             mistralrs_chat_template_path: None,
@@ -1611,6 +1639,41 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.backend.kvcache_max_bytes, 5_000_000_000);
+    }
+
+    #[test]
+    fn backend_kind_parses_llama_server_broker() {
+        let raw = r#"
+            [backend]
+            base_url = "http://127.0.0.1:8080/v1"
+            model = "test-model"
+            kind = "llama_server_broker"
+            broker_base_url = "http://127.0.0.1:8899"
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.backend.kind, BackendKind::LlamaServerBroker);
+        assert_eq!(settings.backend.broker_base_url.as_deref(), Some("http://127.0.0.1:8899"));
+    }
+
+    #[test]
+    fn backend_kind_llama_server_broker_parsing_does_not_require_broker_base_url() {
+        // Parsing itself must never fail just because broker_base_url is
+        // absent -- that's a dispatch-time (agent_builder.rs) validation
+        // error, not a config-load-time one, matching how the mistral_rs
+        // variant's own required field is handled.
+        let raw = r#"
+            [backend]
+            kind = "llama_server_broker"
+        "#;
+        let settings: Settings = toml::from_str(raw).expect("parse must succeed");
+        assert_eq!(settings.backend.kind, BackendKind::LlamaServerBroker);
+        assert!(settings.backend.broker_base_url.is_none());
+    }
+
+    #[test]
+    fn backend_settings_default_has_no_broker_base_url_set() {
+        let settings = Settings::default();
+        assert!(settings.backend.broker_base_url.is_none());
     }
 
     #[test]

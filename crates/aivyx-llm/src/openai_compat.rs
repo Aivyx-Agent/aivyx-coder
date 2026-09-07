@@ -11,7 +11,9 @@ use eventsource_stream::Eventsource;
 use futures::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
+use crate::backend::{
+    ChatRequest, FinishReason, LlmBackend, LlmError, SlotHint, StreamEvent, ToolChoice,
+};
 
 /// How long to wait for a TCP+TLS handshake before giving up — this is
 /// deliberately NOT a whole-request timeout, since a legitimately long
@@ -322,11 +324,26 @@ struct WireRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     id_slot: Option<u32>,
+    #[serde(rename = "aivyx_slot_hint", skip_serializing_if = "Option::is_none")]
+    slot_hint: Option<WireSlotHint>,
 }
 
 #[derive(Serialize)]
 struct WireStreamOptions {
     include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct WireSlotHint {
+    prefix_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_slot: Option<u32>,
+}
+
+impl From<&SlotHint> for WireSlotHint {
+    fn from(hint: &SlotHint) -> Self {
+        Self { prefix_hash: hint.prefix_hash.clone(), preferred_slot: hint.preferred_slot }
+    }
 }
 
 impl WireRequest {
@@ -353,6 +370,7 @@ impl WireRequest {
             temperature: request.temperature,
             max_tokens: request.max_tokens,
             id_slot: request.id_slot,
+            slot_hint: request.slot_hint.as_ref().map(WireSlotHint::from),
         }
     }
 }
@@ -678,5 +696,47 @@ mod tests {
         let wire = WireRequest::from_chat_request("test-model", &request);
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json.get("id_slot"), Some(&serde_json::json!(2)));
+    }
+
+    #[test]
+    fn wire_request_omits_aivyx_slot_hint_when_none() {
+        let mut request = ChatRequest::new(vec![]);
+        request.slot_hint = None;
+        let wire = WireRequest::from_chat_request("test-model", &request);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(
+            json.get("aivyx_slot_hint").is_none(),
+            "aivyx_slot_hint must be omitted entirely when None"
+        );
+    }
+
+    #[test]
+    fn wire_request_includes_aivyx_slot_hint_when_set() {
+        let mut request = ChatRequest::new(vec![]);
+        request.slot_hint =
+            Some(SlotHint { prefix_hash: "abc123".to_string(), preferred_slot: Some(2) });
+        let wire = WireRequest::from_chat_request("test-model", &request);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json.get("aivyx_slot_hint"),
+            Some(&serde_json::json!({"prefix_hash": "abc123", "preferred_slot": 2}))
+        );
+    }
+
+    #[test]
+    fn wire_request_aivyx_slot_hint_omits_preferred_slot_when_none() {
+        // A session's first request has no preferred slot yet -- the
+        // broker's own occupancy tracking is what makes subsequent
+        // same-session requests fast, not this client remembering a slot
+        // id (see BackendKind::LlamaServerBroker's doc comment).
+        let mut request = ChatRequest::new(vec![]);
+        request.slot_hint =
+            Some(SlotHint { prefix_hash: "abc123".to_string(), preferred_slot: None });
+        let wire = WireRequest::from_chat_request("test-model", &request);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            json.get("aivyx_slot_hint"),
+            Some(&serde_json::json!({"prefix_hash": "abc123"}))
+        );
     }
 }

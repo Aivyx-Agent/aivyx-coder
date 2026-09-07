@@ -3,7 +3,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use aivyx_kvcache::{CacheKey, CacheMeta, LlamaServerSlotStore};
-use aivyx_llm::{ChatRequest, FinishReason, KvSlotPool, LlmBackend, StreamEvent, ToolChoice};
+use aivyx_llm::{
+    ChatRequest, FinishReason, KvSlotPool, LlmBackend, SlotHint, StreamEvent, ToolChoice,
+};
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode};
 use aivyx_tools::ToolExecutor;
@@ -215,6 +217,17 @@ pub struct Agent {
     /// `ChatRequest.id_slot` for this session stays `None`, i.e. today's
     /// unpinned behavior).
     kv_slot_id: Option<u32>,
+    /// Set by `set_broker_mode` (only ever called by `agent_builder.rs`
+    /// when `[backend] kind = "llama_server_broker"`) -- when `true`,
+    /// every outgoing `ChatRequest` carries a `slot_hint` (prefix hash +
+    /// `kv_slot_id`) for `aivyx-broker`'s own slot admission/restore/
+    /// warm/save lifecycle. `kv_cache` is always `None` on this path
+    /// (`agent_builder.rs` never calls `set_kv_cache` for this backend
+    /// kind), so `ensure_kv_slot_checked_out` already no-ops and
+    /// `kv_slot_id` stays `None` for a session's first request -- the
+    /// broker's own occupancy tracking, not this client, is what makes
+    /// subsequent same-session requests fast.
+    broker_mode: bool,
     /// `AGENTS.md` support when configured (`set_agents_file`); `None`
     /// disables the feature entirely (both files).
     agents_file_config: Option<AgentsFileConfig>,
@@ -335,6 +348,7 @@ impl Agent {
             repo_map: None,
             kv_cache: None,
             kv_slot_id: None,
+            broker_mode: false,
             agents_file_config: None,
             editor_context_config: None,
             repo_map_text: None,
@@ -456,6 +470,17 @@ impl Agent {
         self.kv_cache = Some(KvCacheConfig { pool, store, backend_id, model_id, build_hash });
     }
 
+    /// Opts this `Agent` into attaching a `slot_hint` to every outgoing
+    /// `ChatRequest`, for `aivyx-broker`'s own slot admission/restore/
+    /// warm/save lifecycle. Only ever called by `agent_builder.rs` when
+    /// `[backend] kind = "llama_server_broker"` -- every other backend
+    /// never calls this, and it is independent of (and mutually
+    /// exclusive in practice with) `set_kv_cache`: the broker owns the
+    /// slot lifecycle on this path, so this process must not also try.
+    pub fn set_broker_mode(&mut self, enabled: bool) {
+        self.broker_mode = enabled;
+    }
+
     /// Checks out a slot (once per `Agent` lifetime -- idempotent, a
     /// no-op on the second and later calls within the same session) and
     /// either restores a previously-saved matching prefix into it, or
@@ -555,6 +580,10 @@ impl Agent {
                 temperature: None,
                 max_tokens: Some(1),
                 id_slot: Some(slot_id),
+                // Unreachable in broker mode: `kv_cache` is always `None`
+                // on that path (see `broker_mode`'s doc comment), so this
+                // function already returned above before reaching here.
+                slot_hint: None,
             };
             match self.llm.stream_chat(warm_up_request).await {
                 Ok(mut stream) => {
@@ -1501,28 +1530,39 @@ impl Agent {
             // the estimator's own char-count for a consistent calibration.
             self.last_request_chars = Some(self.prompt_chars());
 
+            // Re-evaluated every iteration, not once per turn, so a
+            // mid-turn toggle takes effect on the very next request.
+            let tools = {
+                let mut tools = if self.plan_mode.active() {
+                    self.executor.plan_definitions()
+                } else {
+                    self.executor.definitions()
+                };
+                if self.edit_format == EditFormat::Prompted {
+                    tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
+                }
+                if self.autonomous_mode.active() {
+                    tools.retain(|d| !AUTONOMOUS_HIDDEN_TOOLS.contains(&d.name.as_str()));
+                }
+                tools
+            };
+            // `kv_slot_id` is always `None` here in broker mode (see
+            // `broker_mode`'s own doc comment) -- the broker's own
+            // occupancy tracking, not this client, is what makes
+            // subsequent same-session requests land on the same slot.
+            let slot_hint = self.broker_mode.then(|| SlotHint {
+                prefix_hash: compute_prefix_hash(&self.system_prompt_text(), &tools),
+                preferred_slot: self.kv_slot_id,
+            });
+
             let request = ChatRequest {
                 messages: self.assemble_messages(),
-                // Re-evaluated every iteration, not once per turn, so a
-                // mid-turn toggle takes effect on the very next request.
-                tools: {
-                    let mut tools = if self.plan_mode.active() {
-                        self.executor.plan_definitions()
-                    } else {
-                        self.executor.definitions()
-                    };
-                    if self.edit_format == EditFormat::Prompted {
-                        tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
-                    }
-                    if self.autonomous_mode.active() {
-                        tools.retain(|d| !AUTONOMOUS_HIDDEN_TOOLS.contains(&d.name.as_str()));
-                    }
-                    tools
-                },
+                tools,
                 tool_choice: ToolChoice::Auto,
                 temperature: None,
                 max_tokens: None,
                 id_slot: self.kv_slot_id,
+                slot_hint,
             };
 
             let mut stream = match self.llm.stream_chat(request).await {

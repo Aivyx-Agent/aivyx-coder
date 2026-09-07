@@ -4872,3 +4872,83 @@ mod kv_cache_regressions {
         );
     }
 }
+
+// --- BackendKind::LlamaServerBroker regression tests --------------------
+//
+// `set_broker_mode` is only ever called by `agent_builder.rs` for
+// `[backend] kind = "llama_server_broker"`, and (per that call site's own
+// guard) `set_kv_cache` is never also called for that backend kind -- so
+// `ensure_kv_slot_checked_out` must still no-op purely because `kv_cache`
+// is `None`, and `slot_hint` population must be independently gated on
+// `broker_mode`, not on kv_cache being configured.
+mod broker_mode_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_kv_slot_checked_out_still_no_ops_in_broker_mode_with_no_kv_cache() {
+        let (mut agent, _rx, mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 10);
+        agent.set_broker_mode(true);
+
+        agent.ensure_kv_slot_checked_out().await;
+
+        assert_eq!(
+            agent.kv_slot_id, None,
+            "broker mode must not make ensure_kv_slot_checked_out do local slot-picking -- \
+             kv_cache is None on this path, and that alone must still be sufficient to no-op"
+        );
+        assert_eq!(
+            mock.received.lock().unwrap().len(),
+            0,
+            "ensure_kv_slot_checked_out must not have sent any request (no warm-up) when \
+             kv_cache isn't configured, regardless of broker_mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_attaches_slot_hint_when_broker_mode_is_enabled() {
+        let (mut agent, _rx, mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 10);
+        agent.set_broker_mode(true);
+
+        agent
+            .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("a request must have been sent");
+        let hint = request
+            .slot_hint
+            .as_ref()
+            .expect("slot_hint must be attached in broker mode");
+        assert_eq!(
+            hint.preferred_slot, None,
+            "kv_slot_id is always None on the broker path (this client never picks a slot \
+             itself), so preferred_slot must start None on a session's first request"
+        );
+        assert!(!hint.prefix_hash.is_empty());
+        assert_eq!(
+            request.id_slot, None,
+            "id_slot (the local llama-server-only pinning mechanism) must stay unset in \
+             broker mode -- slot_hint is the broker-facing channel instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_omits_slot_hint_when_broker_mode_is_disabled() {
+        // Default Agent -- set_broker_mode was never called.
+        let (mut agent, _rx, mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 10);
+
+        agent
+            .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("a request must have been sent");
+        assert!(
+            request.slot_hint.is_none(),
+            "slot_hint must stay None for every backend that never opted into broker mode -- \
+             this is the additive-change guarantee: zero behavior change for existing configs"
+        );
+    }
+}

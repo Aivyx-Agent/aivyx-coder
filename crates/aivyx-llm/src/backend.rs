@@ -31,6 +31,21 @@ pub struct ChatRequest {
     /// been checked out (see `aivyx-core::Agent`); `None` for every other
     /// backend and every llama-server request before checkout.
     pub id_slot: Option<u32>,
+    /// `aivyx-broker`-only: an additive hint the broker uses for its own
+    /// slot admission/restore/warm/save lifecycle -- serialized under the
+    /// `aivyx_slot_hint` key, a field a plain OpenAI-compatible server
+    /// simply ignores. Only ever set when `[backend] kind =
+    /// "llama_server_broker"` (see `aivyx-core::Agent`); `None` for every
+    /// other backend. Unlike `id_slot`, this process never picks the
+    /// slot itself -- the broker, not this client, owns that decision.
+    pub slot_hint: Option<SlotHint>,
+}
+
+/// See `ChatRequest::slot_hint`'s doc comment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlotHint {
+    pub prefix_hash: String,
+    pub preferred_slot: Option<u32>,
 }
 
 impl ChatRequest {
@@ -42,6 +57,7 @@ impl ChatRequest {
             temperature: None,
             max_tokens: None,
             id_slot: None,
+            slot_hint: None,
         }
     }
 }

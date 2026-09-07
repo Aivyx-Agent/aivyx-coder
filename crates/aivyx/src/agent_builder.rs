@@ -103,6 +103,20 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             settings.backend.model.clone(),
             settings.backend.api_key.clone(),
         ))),
+        BackendKind::LlamaServerBroker => {
+            let broker_url = settings.backend.broker_base_url.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "backend.kind = \"llama_server_broker\" but backend.broker_base_url is \
+                     missing. Set it to your running aivyx-broker's address, e.g. \
+                     http://127.0.0.1:8899"
+                )
+            })?;
+            Ok(Arc::new(OpenAiCompatBackend::new(
+                broker_url,
+                settings.backend.model.clone(),
+                settings.backend.api_key.clone(),
+            )))
+        }
         #[cfg(feature = "provider-mistral-rs")]
         BackendKind::MistralRs => {
             let model_path = settings.backend.mistralrs_model_path.clone().ok_or_else(|| {
@@ -574,7 +588,12 @@ pub(crate) async fn build_agent(
     // `probe_served_context` above and `parse_llama_slots_info` here parse
     // from the same endpoint shape. Every failure mode here is fail-open --
     // logged at `warn`, `kv_cache_handles` stays `None`, the agent runs
-    // exactly as if kvcache weren't configured at all.
+    // exactly as if kvcache weren't configured at all. This equality check
+    // (rather than a broader match) deliberately excludes
+    // `BackendKind::LlamaServerBroker` too, not just every other variant:
+    // aivyx-broker owns KV-cache slot admission and the full restore/warm/
+    // save lifecycle for that backend kind, so this process must not also
+    // attempt its own.
     let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
         let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
         let props_url = format!("{origin}/props");
@@ -660,6 +679,12 @@ pub(crate) async fn build_agent(
             build_hash.clone(),
         );
     }
+    // aivyx-broker owns KV-cache slot admission and the full restore/warm/
+    // save lifecycle on this path -- this process must not also do its
+    // own local slot-picking or its own aivyx-kvcache restore/save calls
+    // (kv_cache_handles is unconditionally None for this backend kind,
+    // above), it only attaches a slot_hint to each outgoing request.
+    agent.set_broker_mode(settings.backend.kind == aivyx_config::BackendKind::LlamaServerBroker);
 
     if let Some((map, budget)) = &repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
@@ -879,6 +904,31 @@ mod tests {
                  fired instead of PROBE_TIMEOUT"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn llama_server_broker_backend_construction_fails_clearly_without_broker_base_url() {
+        let mut settings = Settings::default();
+        settings.backend.kind = BackendKind::LlamaServerBroker;
+        // broker_base_url deliberately left None.
+        let result = build_llm_backend(&settings).await;
+        let err = match result {
+            Ok(_) => panic!("must fail without a broker_base_url"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("broker_base_url"),
+            "error should name the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_server_broker_backend_construction_succeeds_with_broker_base_url() {
+        let mut settings = Settings::default();
+        settings.backend.kind = BackendKind::LlamaServerBroker;
+        settings.backend.broker_base_url = Some("http://127.0.0.1:8899".to_string());
+        let result = build_llm_backend(&settings).await;
+        assert!(result.is_ok(), "should construct successfully once broker_base_url is set");
     }
 
     #[tokio::test]
