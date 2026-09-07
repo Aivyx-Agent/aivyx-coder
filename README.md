@@ -867,6 +867,96 @@ instance, or the store fails to open, KV-cache persistence is silently
 disabled for that run (a `warn`-level log line, nothing else) — aivyx
 never fails to start because of it.
 
+### Embedded Rust-native inference
+
+`aivyx-coder` can run a local LLM **inside its own process** by linking
+against the `mistralrs` crate — the same capability `aivyx` (the sibling
+Personal Assistant product) shipped in its own Phase 134, ported here
+with real token streaming from the start. Zero outbound network calls
+during inference; no separate runtime server to install.
+
+#### Building with the embedded provider
+
+```bash
+# Lean build (default) — no mistralrs dependency, fast compile, small binary:
+$ cargo install aivyx
+
+# Embedded provider, CPU only — no C compiler, no CUDA toolkit, no Metal SDK required:
+$ cargo install --features provider-mistral-rs aivyx
+
+# Embedded provider with platform GPU acceleration — pick exactly one:
+$ cargo install --features provider-mistral-rs-cuda aivyx       # NVIDIA
+$ cargo install --features provider-mistral-rs-metal aivyx      # Apple Silicon
+$ cargo install --features provider-mistral-rs-accelerate aivyx # Apple CPU
+```
+
+| Backend | Feature | Build prerequisite | Runtime |
+|---|---|---|---|
+| CPU | `provider-mistral-rs` | None | Any platform |
+| CUDA | `provider-mistral-rs-cuda` | CUDA toolkit (>= 11.8) | NVIDIA GPU with CC >= 8.0 |
+| Metal | `provider-mistral-rs-metal` | macOS + Xcode | Apple Silicon |
+| Accelerate | `provider-mistral-rs-accelerate` | macOS + Xcode | Apple CPU |
+
+#### `config.toml` snippet
+
+```toml
+[backend]
+kind = "mistral_rs"
+model = "qwen3-4b"  # display name; arbitrary string
+
+# REQUIRED — absolute path to a GGUF file or a directory containing GGUF files.
+mistralrs_model_path = "/home/you/models/Qwen3-4B-Q4_K_M.gguf"
+
+# Optional — when mistralrs_model_path is a directory, names the specific file.
+# mistralrs_model_file = "qwen3-4b-q4_k_m.gguf"
+
+# Optional — chat template path. Omit to use the template embedded in the GGUF.
+# mistralrs_chat_template_path = "/home/you/templates/qwen3.json"
+
+# Optional — maximum sequence length. Omit to defer to the model's own default.
+# mistralrs_max_seq_len = 32768
+```
+
+#### Recommended GGUF models
+
+`aivyx-coder` doesn't bundle any model — download the GGUF yourself and
+point `mistralrs_model_path` at it:
+
+| Model | Size (Q4_K_M) | Min RAM | Use case | Download |
+|---|---|---|---|---|
+| **Qwen3-4B** | ~2.5GB | 6GB | Best general agent; strong tool calling | [HF: Qwen/Qwen3-4B-Instruct-GGUF](https://huggingface.co/Qwen) |
+| **Llama-3.2-3B-Instruct** | ~2.0GB | 5GB | Conservative default; well-tested | [HF: bartowski/Llama-3.2-3B-Instruct-GGUF](https://huggingface.co/bartowski) |
+| **Phi-4-mini-instruct** | ~2.4GB | 5GB | Microsoft tooling; XML tool-call format | [HF: microsoft/Phi-4-mini-instruct-gguf](https://huggingface.co/microsoft) |
+| **SmolLM2-1.7B-Instruct** | ~1.1GB | 3GB | Smallest practical agent; CPU-friendly | [HF: HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF](https://huggingface.co/HuggingFaceTB) |
+
+#### When to pick embedded vs. Ollama/llama-server
+
+- **Pick embedded** for a single-binary install with no separate runtime
+  to manage, for zero outbound network calls during inference, or when
+  recommending `aivyx-coder` to an operator who'd otherwise stall at
+  "install Ollama first."
+- **Stick with Ollama/llama-server** if you want `ollama pull <model>`
+  as your download UX, or you already have one running and aren't
+  motivated to rebuild.
+
+#### Honest tradeoffs
+
+- **Build cost.** First build with `--features provider-mistral-rs`:
+  ~5-10 minutes (mistralrs is a substantial crate; incremental builds
+  after that are fast).
+- **Binary size.** Release binary adds ~100-200MB on the CPU variant.
+- **mistralrs is pre-1.0.** Pinned to `=0.8.*`; upgrades happen
+  explicitly, matching aivyx's own upgrade-by-version contract.
+- **TLS stack.** mistralrs's transitive dependencies pull in
+  `aws-lc-rs` alongside this project's otherwise-`rustls`-only
+  `reqwest` configuration. Both stacks coexist in an opt-in build; the
+  default (no feature) build stays rustls-only.
+- **Per-model tool-call format quirks are unverified.** Models with
+  non-standard tool-call formats may behave differently through
+  mistral.rs's own extraction than through Ollama — not yet empirically
+  validated against a real model in this environment (which has neither
+  a GPU nor a downloaded GGUF file to test against).
+
 ## Editor integration (ACP)
 
 `aivyx-coder --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)
