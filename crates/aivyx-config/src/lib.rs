@@ -607,9 +607,6 @@ pub struct BackendSettings {
     /// Overrides the chat template mistral.rs would otherwise infer
     /// from the model's own metadata.
     pub mistralrs_chat_template_path: Option<String>,
-    /// Maximum sequence length mistral.rs allocates KV-cache space for.
-    /// `None` lets mistral.rs pick its own default.
-    pub mistralrs_max_seq_len: Option<usize>,
     /// Reserved for grammar-constrained tool-calling via mistral.rs's
     /// own JSON-Schema constraint support (mirroring aivyx's own
     /// Chapter Stencil). Accepted and stored today, but **not yet wired
@@ -670,7 +667,6 @@ impl Default for BackendSettings {
             mistralrs_model_path: None,
             mistralrs_model_file: None,
             mistralrs_chat_template_path: None,
-            mistralrs_max_seq_len: None,
             mistralrs_constrain_tool_calls: false,
         }
     }
@@ -1633,7 +1629,6 @@ mod tests {
         assert!(settings.backend.mistralrs_model_path.is_none());
         assert!(settings.backend.mistralrs_model_file.is_none());
         assert!(settings.backend.mistralrs_chat_template_path.is_none());
-        assert!(settings.backend.mistralrs_max_seq_len.is_none());
         assert!(!settings.backend.mistralrs_constrain_tool_calls);
     }
 
@@ -1645,7 +1640,6 @@ mod tests {
             mistralrs_model_path = "/models/qwen3-4b.gguf"
             mistralrs_model_file = "qwen3-4b-q4_k_m.gguf"
             mistralrs_chat_template_path = "/templates/qwen3.json"
-            mistralrs_max_seq_len = 8192
             mistralrs_constrain_tool_calls = true
         "#;
         let settings: Settings = toml::from_str(toml_str).expect("parse");
@@ -1661,7 +1655,6 @@ mod tests {
             settings.backend.mistralrs_chat_template_path.as_deref(),
             Some("/templates/qwen3.json")
         );
-        assert_eq!(settings.backend.mistralrs_max_seq_len, Some(8192));
         assert!(settings.backend.mistralrs_constrain_tool_calls);
     }
 

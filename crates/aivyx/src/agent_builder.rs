@@ -116,8 +116,8 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
                 PathBuf::from(model_path),
                 settings.backend.mistralrs_model_file.clone(),
                 settings.backend.mistralrs_chat_template_path.clone().map(PathBuf::from),
-                settings.backend.mistralrs_max_seq_len,
                 settings.backend.mistralrs_constrain_tool_calls,
+                settings.backend.model.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to build mistralrs backend: {e}"))?;
@@ -126,8 +126,8 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
         #[cfg(not(feature = "provider-mistral-rs"))]
         BackendKind::MistralRs => Err(anyhow::anyhow!(
             "backend.kind = \"mistral_rs\" but this binary was built without the \
-             `provider-mistral-rs` feature. Rebuild with `cargo install --features \
-             provider-mistral-rs aivyx-coder` to enable embedded inference."
+             `provider-mistral-rs` feature. Rebuild with `cargo build -p aivyx --features \
+             provider-mistral-rs` to enable embedded inference."
         )),
     }
 }
@@ -558,7 +558,7 @@ pub(crate) async fn build_agent(
     // silent mid-response truncation, the exact failure the Phase 2 A/B
     // spent a round diagnosing. Advisory only: the warning lands in the
     // transcript as a notice; an unreachable/unknown server stays silent.
-    {
+    if settings.backend.kind != aivyx_config::BackendKind::MistralRs {
         let served =
             aivyx_llm::probe_served_context(&settings.backend.base_url, &settings.backend.model)
                 .await;
@@ -898,6 +898,22 @@ mod tests {
         assert!(
             err.to_string().contains("mistralrs_model_path"),
             "error should name the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "provider-mistral-rs"))]
+    async fn mistral_rs_backend_construction_fails_clearly_without_the_feature() {
+        let mut settings = Settings::default();
+        settings.backend.kind = BackendKind::MistralRs;
+        let result = build_llm_backend(&settings).await;
+        let err = match result {
+            Ok(_) => panic!("must fail when built without the provider-mistral-rs feature"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("provider-mistral-rs"),
+            "error should name the missing feature, got: {err}"
         );
     }
 }

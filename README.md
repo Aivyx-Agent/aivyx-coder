@@ -879,15 +879,15 @@ during inference; no separate runtime server to install.
 
 ```bash
 # Lean build (default) — no mistralrs dependency, fast compile, small binary:
-$ cargo install aivyx
+$ cargo build -p aivyx
 
 # Embedded provider, CPU only — no C compiler, no CUDA toolkit, no Metal SDK required:
-$ cargo install --features provider-mistral-rs aivyx
+$ cargo build -p aivyx --features provider-mistral-rs
 
 # Embedded provider with platform GPU acceleration — pick exactly one:
-$ cargo install --features provider-mistral-rs-cuda aivyx       # NVIDIA
-$ cargo install --features provider-mistral-rs-metal aivyx      # Apple Silicon
-$ cargo install --features provider-mistral-rs-accelerate aivyx # Apple CPU
+$ cargo build -p aivyx --features provider-mistral-rs-cuda       # NVIDIA
+$ cargo build -p aivyx --features provider-mistral-rs-metal      # Apple Silicon
+$ cargo build -p aivyx --features provider-mistral-rs-accelerate # Apple CPU
 ```
 
 | Backend | Feature | Build prerequisite | Runtime |
@@ -912,9 +912,6 @@ mistralrs_model_path = "/home/you/models/Qwen3-4B-Q4_K_M.gguf"
 
 # Optional — chat template path. Omit to use the template embedded in the GGUF.
 # mistralrs_chat_template_path = "/home/you/templates/qwen3.json"
-
-# Optional — maximum sequence length. Omit to defer to the model's own default.
-# mistralrs_max_seq_len = 32768
 ```
 
 ### Recommended GGUF models
@@ -947,10 +944,16 @@ point `mistralrs_model_path` at it:
 - **Binary size.** Release binary adds ~100-200MB on the CPU variant.
 - **mistralrs is pre-1.0.** Pinned to `=0.8.*`; upgrades happen
   explicitly, matching aivyx's own upgrade-by-version contract.
-- **TLS stack.** mistralrs's transitive dependencies pull in
-  `aws-lc-rs` alongside this project's otherwise-`rustls`-only
-  `reqwest` configuration. Both stacks coexist in an opt-in build; the
-  default (no feature) build stays rustls-only.
+- **Shared-lockfile cost, even for the default build.** Adding
+  `mistralrs` as an optional dependency at all pins the whole
+  workspace's `Cargo.lock` to `regex` 1.12.4 instead of 1.13.0 (via
+  `mistralrs-core`'s own transitive `serde-saphyr` dependency, which
+  requires `regex < 1.13`) — this applies even to a default (no
+  `provider-mistral-rs`) build, since the lockfile is shared. `cargo
+  tree -p aivyx-llm` confirms `mistralrs` itself contributes zero
+  compiled code to a default build either way. (`aws-lc-rs` is *not* a
+  new cost of this branch — it's already present in the default
+  dependency graph via `rustls` 0.23's own default crypto provider.)
 - **Per-model tool-call format quirks are unverified.** Models with
   non-standard tool-call formats may behave differently through
   mistral.rs's own extraction than through Ollama — not yet empirically
