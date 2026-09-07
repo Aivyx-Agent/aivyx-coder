@@ -900,10 +900,12 @@ broker_base_url = "http://127.0.0.1:8899"
 `broker_base_url` is. `aivyx-broker` exposes the same
 `/v1/chat/completions` shape as a plain OpenAI-compatible server, so this
 is otherwise a drop-in swap; this repo's own contribution is just an
-additive `aivyx_slot_hint` field (a prefix hash, plus a preferred slot once
-the broker has told it one) attached to each outgoing request as a hint —
-the broker's own occupancy tracking, not this client, is what makes
-same-session requests keep landing on a fast, already-warmed slot.
+additive `aivyx_slot_hint` field (a prefix hash, plus an always-omitted
+preferred-slot field — this client never picks or tracks a slot id itself)
+attached to each outgoing request as a hint. The broker infers locality
+purely from the prefix hash and performs its own slot assignment entirely
+on its own side — its own occupancy tracking, not this client, is what
+makes same-session requests keep landing on a fast, already-warmed slot.
 
 ## Embedded Rust-native inference
 

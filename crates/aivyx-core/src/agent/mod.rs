@@ -220,13 +220,17 @@ pub struct Agent {
     /// Set by `set_broker_mode` (only ever called by `agent_builder.rs`
     /// when `[backend] kind = "llama_server_broker"`) -- when `true`,
     /// every outgoing `ChatRequest` carries a `slot_hint` (prefix hash +
-    /// `kv_slot_id`) for `aivyx-broker`'s own slot admission/restore/
+    /// `preferred_slot`) for `aivyx-broker`'s own slot admission/restore/
     /// warm/save lifecycle. `kv_cache` is always `None` on this path
     /// (`agent_builder.rs` never calls `set_kv_cache` for this backend
     /// kind), so `ensure_kv_slot_checked_out` already no-ops and
-    /// `kv_slot_id` stays `None` for a session's first request -- the
-    /// broker's own occupancy tracking, not this client, is what makes
-    /// subsequent same-session requests fast.
+    /// `kv_slot_id` — and therefore `slot_hint.preferred_slot` — stays
+    /// permanently `None` for every request in the session, by design:
+    /// there is no path by which a broker response ever writes a slot id
+    /// back into this client. The broker infers locality purely from
+    /// `prefix_hash`, performing its own slot assignment entirely on its
+    /// own side; `preferred_slot` is not a partially-implemented
+    /// feedback loop, it is simply never populated by this client.
     broker_mode: bool,
     /// `AGENTS.md` support when configured (`set_agents_file`); `None`
     /// disables the feature entirely (both files).

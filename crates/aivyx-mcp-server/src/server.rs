@@ -154,6 +154,7 @@ mod session_map_tests {
             cwd: std::env::temp_dir(),
             context_tokens: 8192,
             edit_format: aivyx_core::EditFormat::Native,
+            broker_mode: false,
         };
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let agent = build_session_agent(&config, AccessLevel::Plan, tx).await;
@@ -454,6 +455,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             context_tokens: 8192,
             edit_format: aivyx_core::EditFormat::Native,
+            broker_mode: false,
         };
         AivyxCoderMcpServer::new(McpServerRunConfig {
             session_config,

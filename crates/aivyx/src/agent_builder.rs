@@ -542,6 +542,17 @@ pub(crate) async fn build_agent(
         .as_ref()
         .filter(|command| command_specs.iter().any(|spec| &spec.name == *command))
         .map(|command| (command.clone(), settings.verification.max_auto_verify_retries));
+    // Computed once and reused for both the `delegate_task` sub-agent
+    // (below) and the top-level `agent.set_broker_mode` call further down
+    // — both must agree on whether this process is talking to
+    // aivyx-broker, since a delegated sub-agent shares the *same*
+    // `Arc<dyn LlmBackend>` (the same broker URL) as the parent. A
+    // hint-less request from a sub-agent that never got `set_broker_mode`
+    // would otherwise land on the broker with no `aivyx_slot_hint`, which
+    // the broker treats as "clear whatever prefix this slot was tracking"
+    // — silently corrupting the cache-locality bookkeeping the parent's
+    // own hinted requests built up.
+    let broker_mode = settings.backend.kind == aivyx_config::BackendKind::LlamaServerBroker;
     registry.register(Arc::new(aivyx_core::DelegateTaskTool::new(
         aivyx_core::DelegateTaskConfig {
             llm: Arc::clone(&llm),
@@ -558,6 +569,7 @@ pub(crate) async fn build_agent(
             edit_format,
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
+            broker_mode,
         },
     )));
 
@@ -572,7 +584,14 @@ pub(crate) async fn build_agent(
     // silent mid-response truncation, the exact failure the Phase 2 A/B
     // spent a round diagnosing. Advisory only: the warning lands in the
     // transcript as a notice; an unreachable/unknown server stays silent.
-    if settings.backend.kind != aivyx_config::BackendKind::MistralRs {
+    // Skipped for MistralRs (embedded inference, no served endpoint to
+    // probe at all) and for LlamaServerBroker (the real request path goes
+    // through `broker_base_url`, not `settings.backend.base_url` — which
+    // broker-mode users often leave at its default — so probing the latter
+    // would just fire against the wrong address).
+    if settings.backend.kind != aivyx_config::BackendKind::MistralRs
+        && settings.backend.kind != aivyx_config::BackendKind::LlamaServerBroker
+    {
         let served =
             aivyx_llm::probe_served_context(&settings.backend.base_url, &settings.backend.model)
                 .await;
@@ -684,7 +703,7 @@ pub(crate) async fn build_agent(
     // own local slot-picking or its own aivyx-kvcache restore/save calls
     // (kv_cache_handles is unconditionally None for this backend kind,
     // above), it only attaches a slot_hint to each outgoing request.
-    agent.set_broker_mode(settings.backend.kind == aivyx_config::BackendKind::LlamaServerBroker);
+    agent.set_broker_mode(broker_mode);
 
     if let Some((map, budget)) = &repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);

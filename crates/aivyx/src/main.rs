@@ -278,6 +278,12 @@ async fn main() -> anyhow::Result<()> {
                 cwd: built.cwd,
                 context_tokens: settings.backend.context_tokens,
                 edit_format,
+                // Same boolean `agent_builder.rs` computes for its own
+                // top-level `agent.set_broker_mode` call -- every MCP
+                // session's `Agent` shares the same `Arc<dyn LlmBackend>`
+                // (the same broker URL) as the top-level agent, so it must
+                // also attach a `slot_hint` to its own outgoing requests.
+                broker_mode: settings.backend.kind == aivyx_config::BackendKind::LlamaServerBroker,
             },
             max_access_level,
             session_ttl: Duration::from_secs(settings.mcp_server.session_ttl_secs),

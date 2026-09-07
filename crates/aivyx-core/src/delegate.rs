@@ -96,6 +96,19 @@ pub struct DelegateTaskConfig {
     /// `run_turn`/"continue" cycle here accounts for exactly one round
     /// trip). Clamped to a minimum of 1.
     pub max_iterations: u32,
+    /// Mirrors the top-level `Agent`'s own `set_broker_mode` call — the
+    /// sub-agent constructed here shares the parent's *same*
+    /// `Arc<dyn LlmBackend>` (the same aivyx-broker URL, when
+    /// `[backend] kind = "llama_server_broker"`), so it must also attach a
+    /// `slot_hint` to its own outgoing requests. Without this, a
+    /// hint-less request from the sub-agent would land on the broker with
+    /// no `aivyx_slot_hint`, which the broker treats as "clear whatever
+    /// prefix this slot was tracking" — silently corrupting the
+    /// cache-locality bookkeeping the parent's own hinted requests built
+    /// up. See `agent_builder.rs`'s own `broker_mode` local, computed once
+    /// and passed to both this field and the top-level `set_broker_mode`
+    /// call.
+    pub broker_mode: bool,
 }
 
 pub struct DelegateTaskTool {
@@ -244,6 +257,11 @@ impl Tool for DelegateTaskTool {
         // let a sub-agent's own ingested content poison autonomous mode
         // with the guard never seeing it.
         sub_agent.set_injection_taint(self.config.injection_taint.clone());
+        // See `DelegateTaskConfig::broker_mode`'s doc comment — without
+        // this, the sub-agent's own requests to a shared aivyx-broker
+        // would omit `aivyx_slot_hint` entirely, which the broker
+        // interprets as "clear this slot's tracked prefix."
+        sub_agent.set_broker_mode(self.config.broker_mode);
 
         let max_iterations = self.config.max_iterations.max(1);
         let mut result = sub_agent
@@ -299,12 +317,18 @@ mod tests {
 
     struct MockBackend {
         responses: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        // Every `ChatRequest` this backend has been sent, in order -- used
+        // by the broker_mode propagation test below to inspect the
+        // sub-agent's own outgoing requests without needing a real
+        // network-facing backend.
+        received: Mutex<Vec<ChatRequest>>,
     }
 
     impl MockBackend {
         fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
+                received: Mutex::new(Vec::new()),
             }
         }
     }
@@ -317,8 +341,9 @@ mod tests {
 
         async fn stream_chat(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+            self.received.lock().unwrap().push(request);
             let events = self.responses.lock().unwrap().pop_front().unwrap_or_default();
             Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
         }
@@ -362,6 +387,7 @@ mod tests {
             edit_format: EditFormat::Native,
             verification: None,
             max_iterations,
+            broker_mode: false,
         }
     }
 
@@ -618,6 +644,57 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let tool = DelegateTaskTool::new(base_config(mock, tx, ToolRegistry::new(), 10));
         assert!(!tool.mutates_outside_session());
+    }
+
+    #[tokio::test]
+    async fn broker_mode_propagates_to_the_delegated_sub_agent() {
+        // Regression test for the finding that `set_broker_mode` was only
+        // ever called on the top-level `Agent` -- a sub-agent sharing the
+        // same `Arc<dyn LlmBackend>` (the same broker URL) would otherwise
+        // send hint-less requests, which the real aivyx-broker treats as
+        // "clear whatever prefix this slot was tracking," corrupting the
+        // cache-locality bookkeeping the parent's own hinted requests
+        // built up. Mirrors `aivyx-core/src/agent/tests.rs`'s own
+        // `run_turn_attaches_slot_hint_when_broker_mode_is_enabled` --
+        // proof is that the sub-agent's own outgoing `ChatRequest` carries
+        // a `slot_hint`, not merely that `DelegateTaskConfig` has the
+        // field set.
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockBackend::new(vec![text_response("done")]));
+        let llm: Arc<dyn LlmBackend> = Arc::clone(&mock) as Arc<dyn LlmBackend>;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = base_config(llm, tx, ToolRegistry::new(), 10);
+        config.broker_mode = true;
+        let tool = DelegateTaskTool::new(config);
+
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await.unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("the sub-agent must have sent a request");
+        assert!(
+            request.slot_hint.is_some(),
+            "the delegated sub-agent must attach a slot_hint when the parent is in broker mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_mode_disabled_by_default_omits_slot_hint_on_the_sub_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockBackend::new(vec![text_response("done")]));
+        let llm: Arc<dyn LlmBackend> = Arc::clone(&mock) as Arc<dyn LlmBackend>;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // base_config's broker_mode defaults to false -- left untouched.
+        let tool = DelegateTaskTool::new(base_config(llm, tx, ToolRegistry::new(), 10));
+
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await.unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("the sub-agent must have sent a request");
+        assert!(
+            request.slot_hint.is_none(),
+            "the delegated sub-agent must not attach a slot_hint when the parent never opted \
+             into broker mode -- zero behavior change for existing configs"
+        );
     }
 
     #[test]

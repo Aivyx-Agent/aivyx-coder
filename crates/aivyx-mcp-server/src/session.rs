@@ -73,6 +73,16 @@ pub struct SessionConfig {
     pub cwd: std::path::PathBuf,
     pub context_tokens: u32,
     pub edit_format: EditFormat,
+    /// Mirrors the top-level `Agent`'s own `set_broker_mode` call
+    /// (`agent_builder.rs`) -- every MCP session's own `Agent` shares the
+    /// *same* `Arc<dyn LlmBackend>` (the same aivyx-broker URL, when
+    /// `[backend] kind = "llama_server_broker"`), so it must also attach a
+    /// `slot_hint` to its own outgoing requests. Without this, a
+    /// hint-less request from a session would land on the broker with no
+    /// `aivyx_slot_hint`, which the broker treats as "clear whatever
+    /// prefix this slot was tracking" -- silently corrupting the
+    /// cache-locality bookkeeping every other hinted request built up.
+    pub broker_mode: bool,
 }
 
 const SESSION_SYSTEM_PROMPT: &str = "You are aivyx-coder, delegated a bounded coding task by \
@@ -168,6 +178,11 @@ pub async fn build_session_agent(
             build_hash.clone(),
         );
     }
+    // See `SessionConfig::broker_mode`'s doc comment -- without this, this
+    // session's own requests to a shared aivyx-broker would omit
+    // `aivyx_slot_hint` entirely, which the broker interprets as "clear
+    // this slot's tracked prefix."
+    agent.set_broker_mode(config.broker_mode);
     agent
 }
 
@@ -250,6 +265,12 @@ mod tests {
 
     struct MockBackend {
         responses: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        // Every `ChatRequest` this backend has been sent, in order -- used
+        // by the broker_mode propagation test below to inspect the
+        // session's own outgoing requests without needing a real
+        // network-facing backend. Mirrors `aivyx-core/src/delegate.rs`'s
+        // own `MockBackend::received`.
+        received: Mutex<Vec<ChatRequest>>,
     }
     impl MockBackend {
         fn says(text: &str) -> Arc<Self> {
@@ -265,6 +286,7 @@ mod tests {
                     // dropped to match the real type.
                     StreamEvent::Done { finish_reason: FinishReason::Stop },
                 ]])),
+                received: Mutex::new(Vec::new()),
             })
         }
     }
@@ -275,8 +297,9 @@ mod tests {
         }
         async fn stream_chat(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+            self.received.lock().unwrap().push(request);
             let events = self.responses.lock().unwrap().pop_front().unwrap_or_default();
             Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
         }
@@ -294,6 +317,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             context_tokens: 8192,
             edit_format: EditFormat::Native,
+            broker_mode: false,
         }
     }
 
@@ -345,6 +369,72 @@ mod tests {
         .await;
         assert!(result.is_ok());
         assert_eq!(text, "done");
+    }
+
+    #[tokio::test]
+    async fn broker_mode_propagates_to_the_session_agent() {
+        // Regression test for the finding that `set_broker_mode` was only
+        // ever called on the top-level `Agent` -- an MCP session's own
+        // `Agent` shares the same `Arc<dyn LlmBackend>` (the same broker
+        // URL) as the top-level agent, so it must also attach a
+        // `slot_hint` to its own outgoing requests, or the real
+        // aivyx-broker treats a hint-less request as "clear whatever
+        // prefix this slot was tracking." Mirrors
+        // `aivyx-core/src/delegate.rs`'s own
+        // `broker_mode_propagates_to_the_delegated_sub_agent` -- proof is
+        // that the session's own outgoing `ChatRequest` carries a
+        // `slot_hint`.
+        let mock = MockBackend::says("done");
+        let mut cfg = config(full_registry());
+        cfg.llm = Arc::clone(&mock) as Arc<dyn LlmBackend>;
+        cfg.broker_mode = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Plan, tx).await;
+        let (result, _text) = run_bounded_turn(
+            &mut agent,
+            &mut rx,
+            "say hello".to_string(),
+            &std::env::temp_dir(),
+            10,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("the session must have sent a request");
+        assert!(
+            request.slot_hint.is_some(),
+            "the session's Agent must attach a slot_hint when SessionConfig.broker_mode is true"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_mode_disabled_by_default_omits_slot_hint_on_the_session_agent() {
+        let mock = MockBackend::says("done");
+        let mut cfg = config(full_registry());
+        cfg.llm = Arc::clone(&mock) as Arc<dyn LlmBackend>;
+        // cfg.broker_mode defaults to false -- left untouched.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Plan, tx).await;
+        let (result, _text) = run_bounded_turn(
+            &mut agent,
+            &mut rx,
+            "say hello".to_string(),
+            &std::env::temp_dir(),
+            10,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("the session must have sent a request");
+        assert!(
+            request.slot_hint.is_none(),
+            "the session's Agent must not attach a slot_hint when SessionConfig.broker_mode is \
+             false -- zero behavior change for existing configs"
+        );
     }
 
     #[test]
