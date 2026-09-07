@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aivyx_config::Settings;
+use aivyx_config::{BackendKind, Settings};
 // Identical to main.rs's own top-of-file import list (main.rs:5-15) —
 // copy it verbatim rather than retyping, so nothing is silently dropped.
 // `DelegateTaskTool`/`DelegateTaskConfig` are deliberately absent here,
@@ -92,6 +92,46 @@ pub(crate) struct BuiltAgent {
     pub(crate) deny_paths: Vec<PathBuf>,
 }
 
+/// Constructs the configured `LlmBackend`. Extracted from `build_agent`
+/// so the dispatch itself -- including its error path when a required
+/// mistral.rs config field is missing -- is directly testable without
+/// building a full `BuiltAgent`.
+async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBackend>> {
+    match settings.backend.kind {
+        BackendKind::Generic | BackendKind::LlamaServer => Ok(Arc::new(OpenAiCompatBackend::new(
+            settings.backend.base_url.clone(),
+            settings.backend.model.clone(),
+            settings.backend.api_key.clone(),
+        ))),
+        #[cfg(feature = "provider-mistral-rs")]
+        BackendKind::MistralRs => {
+            let model_path = settings.backend.mistralrs_model_path.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "backend.kind = \"mistral_rs\" but backend.mistralrs_model_path is missing. \
+                     Set `mistralrs_model_path = \"/abs/path/to/model.gguf\"` under [backend] in \
+                     your config."
+                )
+            })?;
+            let backend = aivyx_llm::mistral_rs::MistralRsBackend::new(
+                PathBuf::from(model_path),
+                settings.backend.mistralrs_model_file.clone(),
+                settings.backend.mistralrs_chat_template_path.clone().map(PathBuf::from),
+                settings.backend.mistralrs_max_seq_len,
+                settings.backend.mistralrs_constrain_tool_calls,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to build mistralrs backend: {e}"))?;
+            Ok(Arc::new(backend))
+        }
+        #[cfg(not(feature = "provider-mistral-rs"))]
+        BackendKind::MistralRs => Err(anyhow::anyhow!(
+            "backend.kind = \"mistral_rs\" but this binary was built without the \
+             `provider-mistral-rs` feature. Rebuild with `cargo install --features \
+             provider-mistral-rs aivyx-coder` to enable embedded inference."
+        )),
+    }
+}
+
 /// Builds `Agent` + every collaborator it needs, identically regardless
 /// of which frontend is asking — only `prompter` differs between the TUI
 /// (`TuiPrompter`) and ACP (`AcpPrompter`) call sites.
@@ -115,11 +155,7 @@ pub(crate) async fn build_agent(
         );
     }
 
-    let llm: Arc<dyn LlmBackend> = Arc::new(OpenAiCompatBackend::new(
-        settings.backend.base_url.clone(),
-        settings.backend.model.clone(),
-        settings.backend.api_key.clone(),
-    ));
+    let llm: Arc<dyn LlmBackend> = build_llm_backend(settings).await?;
 
     let deny_paths = settings.effective_deny_paths();
     // Canonicalized once and reused everywhere `cwd` is needed (sandbox
@@ -843,5 +879,25 @@ mod tests {
                  fired instead of PROBE_TIMEOUT"
             ),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "provider-mistral-rs")]
+    async fn mistral_rs_backend_construction_fails_clearly_without_model_path() {
+        let mut settings = Settings::default();
+        settings.backend.kind = BackendKind::MistralRs;
+        // mistralrs_model_path deliberately left None.
+        let result = build_llm_backend(&settings).await;
+        // `.expect_err()`/`.unwrap_err()` both require the `Ok` type to
+        // impl `Debug`, which `Arc<dyn LlmBackend>` does not -- match
+        // manually instead.
+        let err = match result {
+            Ok(_) => panic!("must fail without a model path"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("mistralrs_model_path"),
+            "error should name the missing field, got: {err}"
+        );
     }
 }

@@ -32,6 +32,12 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
+[features]
+provider-mistral-rs = ["aivyx-llm/provider-mistral-rs"]
+provider-mistral-rs-cuda = ["aivyx-llm/provider-mistral-rs-cuda"]
+provider-mistral-rs-metal = ["aivyx-llm/provider-mistral-rs-metal"]
+provider-mistral-rs-accelerate = ["aivyx-llm/provider-mistral-rs-accelerate"]
+
 [dev-dependencies]
 agent-client-protocol = "2.0.0"
 tempfile = "3.27.0"
