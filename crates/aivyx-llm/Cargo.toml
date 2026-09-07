@@ -9,8 +9,15 @@ aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 async-trait = "0.1.89"
 eventsource-stream = "0.2.3"
 futures = "0.3.32"
+mistralrs = { version = "=0.8.*", default-features = false, optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio-stream = "0.1.18"
+
+[features]
+provider-mistral-rs = ["dep:mistralrs"]
+provider-mistral-rs-cuda = ["provider-mistral-rs", "mistralrs?/cuda"]
+provider-mistral-rs-metal = ["provider-mistral-rs", "mistralrs?/metal"]
+provider-mistral-rs-accelerate = ["provider-mistral-rs", "mistralrs?/accelerate"]
