@@ -3,9 +3,7 @@ pub mod openai_compat;
 pub mod probe;
 mod kv_slot_pool;
 #[cfg(feature = "provider-mistral-rs")]
-mod mistral_rs {
-    pub mod convert;
-}
+pub mod mistral_rs;
 
 pub use backend::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent, ToolChoice};
 pub use openai_compat::OpenAiCompatBackend;
