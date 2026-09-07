@@ -4,7 +4,7 @@
 //! a bare `RequestBuilder::new()` and call the conversion functions
 //! against it directly).
 
-use aivyx_types::{ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition, ToolOutput, ToolResult};
+use aivyx_types::{ContentBlock, Message, Role, ToolDefinition, ToolOutput};
 use mistralrs::{RequestBuilder, TextMessageRole, ToolChoice as MistralRsToolChoice};
 
 /// Add a single aivyx-coder `Message` to a mistral.rs `RequestBuilder`.
@@ -140,6 +140,7 @@ pub fn apply_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivyx_types::{ToolCall, ToolCallId, ToolCallSource, ToolResult};
     use serde_json::json;
 
     #[test]
