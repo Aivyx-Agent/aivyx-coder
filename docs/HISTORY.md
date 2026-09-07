@@ -3908,3 +3908,88 @@ real vendored `mistralrs` source and fresh `cargo test`/`clippy` runs in
 all 4 relevant configurations (with/without `provider-mistral-rs`, for
 both the library crates and the `aivyx` binary crate), not trusted from
 any subagent's own report.
+
+### Multi-process GPU-slot coordination (`aivyx-broker`) — ✅ shipped
+
+**What shipped**: `aivyx-coder` gained a new opt-in backend mode,
+`backend.kind = "llama_server_broker"`, that routes requests through a
+brand-new companion daemon — `aivyx-broker`, its own standalone repo —
+instead of talking to `llama-server` directly. The motivation: `aivyx`
+(the sibling product) and `aivyx-coder` can both be pointed at the same
+`llama-server` since the earlier kvcache-store-path-sharing work, but
+each picks its own physical KV-cache slot via a private, in-process
+tracker with zero awareness of the other process. Grounded directly
+against real code before any design work began, to separate confirmed
+fact from assumption: the client-side race is real (both trackers hand
+out the lowest free slot id first, with no coordination), but the
+server-side consequence is narrower than the originating audit assumed
+— verified against llama.cpp's own `server-context.cpp` that a same-slot
+collision is already deferred safely by `llama-server` itself rather
+than corrupting shared state. So the real cost is silent head-of-line
+blocking and KV-cache-locality thrash, not data corruption — informed of
+this, the operator chose to build the full coordination layer anyway
+rather than a narrower collision-avoidance patch.
+
+`aivyx-broker` is a standalone loopback-only Axum daemon (no auth, same
+trust model as `llama-server` itself) sitting fully in the request path:
+it exposes an OpenAI-compatible `POST /v1/chat/completions` (so pointing
+a client at it is a `base_url` config change, zero `LlmBackend` code
+changes) plus an additive `aivyx_slot_hint` field
+(`{prefix_hash, preferred_slot}`) carrying the same prefix-hash identity
+this repo already computes today for its own `CacheKey`. The broker owns
+cache-locality-aware slot admission *and* the full `aivyx-kvcache`
+restore/warm/save lifecycle — a late but real design correction made
+during implementation planning, once it became clear a client can no
+longer restore its own slot first when it doesn't learn the slot number
+until the broker's single admission call returns. `aivyx-coder`'s own
+`ensure_kv_slot_checked_out`-equivalent logic is skipped entirely on
+this path; the client only ever sends the hint.
+
+Threading broker mode through every place this process can construct an
+`Agent` — not just the main one — was a real gap caught during Task 7's
+own code review, not something the plan anticipated: `delegate_task`'s
+sub-agent and `aivyx-mcp-server`'s per-session agent both share the same
+broker-pointed `Arc<dyn LlmBackend>` as the top-level agent, and the
+real `aivyx-broker` daemon treats a hint-less request as "clear whatever
+prefix this slot was tracking" — so an un-wired sub-agent or MCP-session
+request would have silently destroyed the cache-locality bookkeeping
+the main agent's own hinted requests had just built up, actively
+defeating the feature rather than merely not benefiting from it. Fixed
+by threading a `broker_mode: bool` through `DelegateTaskConfig` and
+`aivyx-mcp-server`'s `SessionConfig`, sourced from the same
+`settings.backend.kind` check in exactly one place so the three call
+sites can't diverge.
+
+**The `aivyx-broker` daemon itself — a brand-new repo, built as part of
+this same project — went through three full whole-branch review rounds
+before merge, the most of any single piece of work this project has
+produced.** The first found two design-level gaps invisible to any
+single task's own diff: seeded-busy slots (from a broker restart mid-
+generation) could never be released, permanently losing capacity, since
+nothing polled `llama-server`'s own `/slots` again after startup; and
+the slot-allocation fallback picked the lowest-numbered *free* slot
+rather than the least-recently-used one — the literal opposite of cache
+locality, measured at 0/8 cache hits on a realistic two-client
+ping-pong scenario across 4 slots, meaning the broker as first built
+would have made cache locality *worse* than not running it at all. Both
+fixed (a periodic reconciliation poll; a real LRU clock) and
+independently re-verified with concurrency stress tests (a 960-admission
+multi-threaded churn probe, zero double-bookings). A second review round
+found a residual gap in the same reconciliation fix — freed seeded slots
+weren't waking any queued waiter — and an outbound HTTP timeout so
+aggressive it would abort legitimate long-running prompt processing, not
+just genuinely wedged connections; both fixed and re-verified. A third,
+narrower round confirmed the final state clean. Every fix at every task
+and branch level was independently re-verified by direct code reading
+and fresh test runs, never trusted from a subagent's own report —
+several review rounds included the controller reverting a fix in place
+to confirm the new regression test actually failed against the old
+code, not just passed against the new one.
+
+**Cross-repo scope**: this was a 7-task, 3-repo project (`aivyx-broker`
+itself, then a client-integration task each in `aivyx` and
+`aivyx-coder`), the first piece of work in this ecosystem to span three
+independent repos in one continuous session. Each repo got its own
+branch, its own review cycle, and its own merge — no shared commit
+history, per this workspace's own top-level `CLAUDE.md` convention that
+each repo is fully independent.

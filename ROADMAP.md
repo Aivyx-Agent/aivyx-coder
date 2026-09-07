@@ -48,6 +48,35 @@ never read at all, and a bad model path could have silently triggered
 an outbound Hugging Face download) both fixed and independently
 re-verified before merge.
 
+**Multi-process GPU-slot coordination via `aivyx-broker` (2026-09-07)**:
+`aivyx-coder` can now share a single `llama-server`'s finite KV-cache
+slots safely with other local processes (e.g. `aivyx`'s own daemon
+pointed at the same server) via a new `backend.kind =
+"llama_server_broker"` mode, routing requests through `aivyx-broker` — a
+new standalone repo/daemon built as a companion to this work — instead
+of talking to `llama-server` directly. Confirmed via direct source
+grounding (this project's own `KvSlotPool`-equivalent tracker, and
+llama.cpp's own `server-context.cpp`) that two independent local
+processes really do race for the same physical slot with zero
+coordination today, though llama-server's own server-side handling
+already prevents actual data corruption — the real cost is silent
+head-of-line blocking and KV-cache-locality thrash, not corrupted
+output. `aivyx-broker` closes that gap: cache-locality-aware slot
+admission plus the full restore/warm/save lifecycle now live in the
+broker itself rather than duplicated per-client, and this repo's own
+local slot-picking/kvcache logic is skipped entirely on this path — an
+additive `aivyx_slot_hint` field is all that's sent. Broker mode is
+threaded through every place this process can construct an `Agent`
+against a shared broker (the top-level agent, delegated sub-agents, and
+MCP-server sessions), not just the main one — a real gap caught and
+fixed during review, since a hint-less request from any of those other
+paths would otherwise have silently wiped the broker's own
+cache-locality bookkeeping. See `docs/HISTORY.md`'s own entry, and
+`aivyx-broker`'s own repo (`docs/superpowers/specs/2026-09-07-aivyx-broker-design.md`)
+for the full cross-repo design and review history — the broker daemon
+itself went through three whole-branch review rounds before merge,
+the most of any single piece of work this project has produced.
+
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
 Correctly-configured llama-server (explicit 16k window, thinking
