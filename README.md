@@ -867,7 +867,7 @@ instance, or the store fails to open, KV-cache persistence is silently
 disabled for that run (a `warn`-level log line, nothing else) — aivyx
 never fails to start because of it.
 
-### Embedded Rust-native inference
+## Embedded Rust-native inference
 
 `aivyx-coder` can run a local LLM **inside its own process** by linking
 against the `mistralrs` crate — the same capability `aivyx` (the sibling
@@ -875,7 +875,7 @@ Personal Assistant product) shipped in its own Phase 134, ported here
 with real token streaming from the start. Zero outbound network calls
 during inference; no separate runtime server to install.
 
-#### Building with the embedded provider
+### Building with the embedded provider
 
 ```bash
 # Lean build (default) — no mistralrs dependency, fast compile, small binary:
@@ -897,7 +897,7 @@ $ cargo install --features provider-mistral-rs-accelerate aivyx # Apple CPU
 | Metal | `provider-mistral-rs-metal` | macOS + Xcode | Apple Silicon |
 | Accelerate | `provider-mistral-rs-accelerate` | macOS + Xcode | Apple CPU |
 
-#### `config.toml` snippet
+### `config.toml` snippet
 
 ```toml
 [backend]
@@ -917,7 +917,7 @@ mistralrs_model_path = "/home/you/models/Qwen3-4B-Q4_K_M.gguf"
 # mistralrs_max_seq_len = 32768
 ```
 
-#### Recommended GGUF models
+### Recommended GGUF models
 
 `aivyx-coder` doesn't bundle any model — download the GGUF yourself and
 point `mistralrs_model_path` at it:
@@ -929,7 +929,7 @@ point `mistralrs_model_path` at it:
 | **Phi-4-mini-instruct** | ~2.4GB | 5GB | Microsoft tooling; XML tool-call format | [HF: microsoft/Phi-4-mini-instruct-gguf](https://huggingface.co/microsoft) |
 | **SmolLM2-1.7B-Instruct** | ~1.1GB | 3GB | Smallest practical agent; CPU-friendly | [HF: HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF](https://huggingface.co/HuggingFaceTB) |
 
-#### When to pick embedded vs. Ollama/llama-server
+### When to pick embedded vs. Ollama/llama-server
 
 - **Pick embedded** for a single-binary install with no separate runtime
   to manage, for zero outbound network calls during inference, or when
@@ -939,7 +939,7 @@ point `mistralrs_model_path` at it:
   as your download UX, or you already have one running and aren't
   motivated to rebuild.
 
-#### Honest tradeoffs
+### Honest tradeoffs
 
 - **Build cost.** First build with `--features provider-mistral-rs`:
   ~5-10 minutes (mistralrs is a substantial crate; incremental builds
