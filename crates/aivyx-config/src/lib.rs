@@ -595,6 +595,26 @@ pub struct BackendSettings {
     /// the `aivyx` repo for the full pairing guidance. Supports a
     /// leading `~`, same convention as `deny_paths`.
     pub kvcache_store_path: Option<String>,
+    /// Absolute path to a local GGUF file or a directory containing GGUF
+    /// files. Required when `kind = "mistral_rs"` -- checked at
+    /// backend-construction time (agent_builder.rs), not at config-load
+    /// time, matching how llama-server's own reachability isn't checked
+    /// at load time either.
+    pub mistralrs_model_path: Option<String>,
+    /// Selects a specific `.gguf` file inside `mistralrs_model_path`
+    /// when it's a directory containing more than one candidate.
+    pub mistralrs_model_file: Option<String>,
+    /// Overrides the chat template mistral.rs would otherwise infer
+    /// from the model's own metadata.
+    pub mistralrs_chat_template_path: Option<String>,
+    /// Maximum sequence length mistral.rs allocates KV-cache space for.
+    /// `None` lets mistral.rs pick its own default.
+    pub mistralrs_max_seq_len: Option<usize>,
+    /// Grammar-constrained tool-calling via mistral.rs's own JSON-Schema
+    /// constraint support, mirroring aivyx's own Chapter Stencil
+    /// equivalent. Default off.
+    #[serde(default)]
+    pub mistralrs_constrain_tool_calls: bool,
 }
 
 /// Phase kvcache-adoption — which local-LLM backend server this config
@@ -608,6 +628,12 @@ pub enum BackendKind {
     #[default]
     Generic,
     LlamaServer,
+    /// A genuinely different backend implementation
+    /// (`MistralRsBackend`, `crates/aivyx-llm/src/mistral_rs/`) is
+    /// constructed for this variant -- unlike `LlamaServer`, which only
+    /// toggles extra features on the same `OpenAiCompatBackend`. See
+    /// `agent_builder.rs`'s dispatch on this enum.
+    MistralRs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +660,11 @@ impl Default for BackendSettings {
             kind: BackendKind::Generic,
             kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
             kvcache_store_path: None,
+            mistralrs_model_path: None,
+            mistralrs_model_file: None,
+            mistralrs_chat_template_path: None,
+            mistralrs_max_seq_len: None,
+            mistralrs_constrain_tool_calls: false,
         }
     }
 }
@@ -1577,5 +1608,68 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.backend.kvcache_max_bytes, 5_000_000_000);
+    }
+
+    #[test]
+    fn backend_kind_parses_mistral_rs() {
+        let toml_str = r#"
+            [backend]
+            kind = "mistral_rs"
+        "#;
+        let settings: Settings = toml::from_str(toml_str).expect("parse");
+        assert_eq!(settings.backend.kind, BackendKind::MistralRs);
+    }
+
+    #[test]
+    fn backend_settings_default_has_no_mistralrs_fields_set() {
+        let settings = Settings::default();
+        assert!(settings.backend.mistralrs_model_path.is_none());
+        assert!(settings.backend.mistralrs_model_file.is_none());
+        assert!(settings.backend.mistralrs_chat_template_path.is_none());
+        assert!(settings.backend.mistralrs_max_seq_len.is_none());
+        assert!(!settings.backend.mistralrs_constrain_tool_calls);
+    }
+
+    #[test]
+    fn backend_settings_mistralrs_fields_round_trip_through_toml() {
+        let toml_str = r#"
+            [backend]
+            kind = "mistral_rs"
+            mistralrs_model_path = "/models/qwen3-4b.gguf"
+            mistralrs_model_file = "qwen3-4b-q4_k_m.gguf"
+            mistralrs_chat_template_path = "/templates/qwen3.json"
+            mistralrs_max_seq_len = 8192
+            mistralrs_constrain_tool_calls = true
+        "#;
+        let settings: Settings = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            settings.backend.mistralrs_model_path.as_deref(),
+            Some("/models/qwen3-4b.gguf")
+        );
+        assert_eq!(
+            settings.backend.mistralrs_model_file.as_deref(),
+            Some("qwen3-4b-q4_k_m.gguf")
+        );
+        assert_eq!(
+            settings.backend.mistralrs_chat_template_path.as_deref(),
+            Some("/templates/qwen3.json")
+        );
+        assert_eq!(settings.backend.mistralrs_max_seq_len, Some(8192));
+        assert!(settings.backend.mistralrs_constrain_tool_calls);
+    }
+
+    #[test]
+    fn backend_kind_mistral_rs_parsing_does_not_require_the_new_fields() {
+        // Parsing itself must never fail just because the model path is
+        // absent -- that's a dispatch-time (Task 5) validation error, not
+        // a config-load-time one, matching how llama-server's own
+        // reachability isn't checked at load time either.
+        let toml_str = r#"
+            [backend]
+            kind = "mistral_rs"
+        "#;
+        let settings: Settings = toml::from_str(toml_str).expect("parse must succeed");
+        assert_eq!(settings.backend.kind, BackendKind::MistralRs);
+        assert!(settings.backend.mistralrs_model_path.is_none());
     }
 }
