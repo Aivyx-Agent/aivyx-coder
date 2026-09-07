@@ -610,9 +610,16 @@ pub struct BackendSettings {
     /// Maximum sequence length mistral.rs allocates KV-cache space for.
     /// `None` lets mistral.rs pick its own default.
     pub mistralrs_max_seq_len: Option<usize>,
-    /// Grammar-constrained tool-calling via mistral.rs's own JSON-Schema
-    /// constraint support, mirroring aivyx's own Chapter Stencil
-    /// equivalent. Default off.
+    /// Reserved for grammar-constrained tool-calling via mistral.rs's
+    /// own JSON-Schema constraint support (mirroring aivyx's own
+    /// Chapter Stencil). Accepted and stored today, but **not yet wired
+    /// into request construction** -- `MistralRsBackend::stream_chat`
+    /// (`crates/aivyx-llm/src/mistral_rs/provider.rs`) currently ignores
+    /// this flag. Real grammar-constrained tool-calling needs
+    /// infrastructure this repo doesn't have yet (a `tool_call_grammar`
+    /// JSON-Schema builder, a constrained-output parser, prompt
+    /// augmentation) -- setting this to `true` has no effect until that
+    /// lands. Default off.
     #[serde(default)]
     pub mistralrs_constrain_tool_calls: bool,
 }

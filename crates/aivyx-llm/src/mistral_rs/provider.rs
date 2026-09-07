@@ -244,10 +244,11 @@ mod forwarding_tests {
     }
 
     #[tokio::test]
-    async fn stops_driving_the_source_once_the_receiver_is_dropped() {
+    async fn stops_driving_the_source_once_the_receiver_is_dropped_mid_stream() {
         // A stream that counts how many times it's been polled, and
-        // never ends -- if `forward_stream_via_mpsc` doesn't stop on
-        // receiver-drop, this test would hang forever.
+        // never ends -- if `forward_stream_via_mpsc` doesn't stop once
+        // the receiver is dropped, this task would spin forever (the
+        // test's own timeout below is what actually catches that).
         struct CountingInfiniteStream {
             polls: Arc<AtomicUsize>,
         }
@@ -263,21 +264,41 @@ mod forwarding_tests {
         }
 
         let polls = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel(1);
+        // Unbuffered-ish: a small bounded channel so the producer task
+        // genuinely blocks on `tx.send` waiting for items to be read,
+        // keeping it alive and running concurrently with this test
+        // rather than racing to completion before we can drop `rx`.
+        let (tx, mut rx) = mpsc::channel(1);
         let source = CountingInfiniteStream { polls: Arc::clone(&polls) };
 
-        // Drop the receiver immediately -- the very next `tx.send` must fail.
+        let forwarding_task = tokio::spawn(async move {
+            forward_stream_via_mpsc(source, tx, |n: i32| Ok(StreamEvent::TextDelta(n.to_string())))
+                .await;
+        });
+
+        // Read exactly 2 real items while the forwarding task is
+        // genuinely running concurrently in the background.
+        for _ in 0..2 {
+            let item = rx.recv().await.expect("forwarding task must still be alive");
+            assert!(matches!(item, Ok(StreamEvent::TextDelta(_))));
+        }
+
+        // Now drop the receiver *while the producer is still running*
+        // (it's blocked on the next `tx.send`, waiting for a reader).
         drop(rx);
 
-        forward_stream_via_mpsc(source, tx, |n: i32| Ok(StreamEvent::TextDelta(n.to_string())))
-            .await;
+        // The forwarding task must notice the closed channel and finish
+        // promptly -- bound the wait so a real regression (spinning
+        // forever) fails this test instead of hanging the suite.
+        tokio::time::timeout(std::time::Duration::from_secs(5), forwarding_task)
+            .await
+            .expect("forwarding task must stop shortly after the receiver is dropped mid-stream")
+            .expect("forwarding task must not panic");
 
-        // Must have stopped after (at most) the first failed send -- not
-        // spun forever driving an infinite source with nowhere to send.
         assert!(
-            polls.load(Ordering::SeqCst) <= 1,
-            "expected the forwarding loop to stop almost immediately after the \
-             receiver was dropped, but the source was polled {} times",
+            polls.load(Ordering::SeqCst) <= 4,
+            "expected the forwarding loop to stop shortly after the receiver was \
+             dropped mid-stream, but the source was polled {} times",
             polls.load(Ordering::SeqCst)
         );
     }
