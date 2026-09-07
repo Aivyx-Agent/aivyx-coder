@@ -3830,3 +3830,81 @@ for sharing three simple methods. `aivyx-memory` stays exactly as it is;
 reusable by some future consumer, just not this one. See the design
 spec's own "Deferred" section (now retitled to record this) for the full
 account.
+
+### Embedded Rust-native inference (`mistral.rs`) — ✅ shipped
+
+**What shipped**: `aivyx-coder` gained an embedded, in-process GGUF
+inference backend by linking against the `mistralrs` crate — the same
+capability `aivyx` (the sibling Personal Assistant product) shipped in
+its own Phase 134, ported here after a direct-code audit confirmed the
+two products can already interact via a real MCP bridge and found this
+specific gap. Opt-in via new `provider-mistral-rs`/`-cuda`/`-metal`/
+`-accelerate` Cargo features (the first Cargo feature flags this
+workspace has ever had) and a new `BackendKind::MistralRs` config
+variant (the first time this codebase has ever dispatched between two
+different `LlmBackend` implementations — every prior backend went
+through the single `OpenAiCompatBackend`). Zero outbound network calls
+during inference, no separate runtime server, single-binary install.
+
+Unlike `aivyx`'s own Phase 134 (which shipped non-streaming — mistral.rs
+0.8's `Stream<'_>` borrows from the model with a lifetime that doesn't
+satisfy Rust's `'static` bound, and the fix was logged as deferred work
+that was never picked up), this port builds real token streaming from
+day one: the borrowed stream is driven entirely inside a spawned task
+holding its own `Arc<Model>` clone, forwarding converted events out
+through an `mpsc` channel wrapped as `ReceiverStream` — genuinely
+`'static`, no `ouroboros` or self-referential-struct dependency needed.
+
+**The final whole-branch review found the most severe issues of any
+review in this project run** — 2 Critical, independently verified
+directly against the real vendored `mistralrs-0.8.1` source before
+either was fixed:
+- The response-conversion function read only `delta.content`, never
+  `delta.tool_calls` — the embedded backend could stream text but could
+  not execute a single tool call, since `aivyx-core`'s own turn loop
+  accepts tool calls exclusively via `StreamEvent::ToolCallComplete`
+  with no text-fallback path. A tool-calling coding agent that
+  structurally cannot call tools defeats the entire point of this work.
+  Fixed by converting one mistral.rs `Response` item into zero-or-more
+  `StreamEvent`s instead of assuming exactly one — confirmed via the
+  real source that mistral.rs sends each tool call fully-formed on one
+  delta (never incrementally fragmented), so no cross-chunk argument
+  accumulation was needed.
+- A nonexistent or mistyped `mistralrs_model_path` silently fell through
+  to mistral.rs's own Hugging Face Hub download fallback — confirmed
+  directly against the vendored source
+  (`if model_id.exists() {...} else { api.get(file) }`) — a real
+  violation of this project's own advertised "never calls a cloud API"
+  guarantee. Fixed with an explicit existence check that fails loudly,
+  naming the path, before any model load is attempted.
+
+Also found and fixed in the same pass: a config field
+(`mistralrs_max_seq_len`) that could never actually be wired at all
+(confirmed `GgufModelBuilder` has no corresponding setter, unlike the
+merely-not-yet-wired `mistralrs_constrain_tool_calls`) — removed rather
+than left as permanently-dead config surface; the context-window probe
+still fired an HTTP call for the in-process backend, contradicting its
+own zero-network-calls claim — guarded to skip; both documented rebuild
+commands referenced `cargo install`, which doesn't work for this
+project (not published to crates.io, wrong package name either way) —
+corrected to the real `cargo build -p aivyx --features ...` convention;
+and a real, unavoidable `regex` 1.13→1.12 workspace-wide `Cargo.lock`
+downgrade caused by `mistralrs`'s own transitive dependencies (present
+even in default, no-feature builds, since the lockfile is shared) —
+documented honestly in `README.md`'s tradeoffs section rather than left
+silent.
+
+Two earlier, smaller review findings within the same branch, also
+fixed: a config doc comment that overstated `mistralrs_constrain_tool_calls`'s
+current functionality (the flag is accepted but not yet wired into
+request construction); and the new `README.md` section initially
+landing at the wrong heading depth (`###`, nesting it as a subsection of
+an unrelated sibling section, when every other major README topic is
+`##`).
+
+Every fix — the two smaller task-review findings and the large
+final-review wave — was independently re-verified directly against the
+real vendored `mistralrs` source and fresh `cargo test`/`clippy` runs in
+all 4 relevant configurations (with/without `provider-mistral-rs`, for
+both the library crates and the `aivyx` binary crate), not trusted from
+any subagent's own report.

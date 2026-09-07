@@ -34,6 +34,20 @@ with automatic fix-and-retry, and an ACP editor-integration frontend
 473 as of this doc's own last content update); every security-critical
 behavior also proven by live E2E against real serving.
 
+**Embedded Rust-native inference (2026-09-07)**: `aivyx-coder` can now
+run a local GGUF model **inside its own process** via the `mistralrs`
+crate, opt-in via new `provider-mistral-rs`/`-cuda`/`-metal`/
+`-accelerate` Cargo features — the same capability the sibling `aivyx`
+product shipped in its own Phase 134, ported here with real token
+streaming from day one (an mpsc-forwarding shim around mistral.rs's
+lifetime-bound stream) rather than the non-streaming compromise
+`aivyx`'s own version shipped and never followed up on. See
+`docs/HISTORY.md`'s own entry for the full account, including two
+Critical final-review findings (streamed tool calls were initially
+never read at all, and a bad model path could have silently triggered
+an outbound Hugging Face download) both fixed and independently
+re-verified before merge.
+
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
 Correctly-configured llama-server (explicit 16k window, thinking
