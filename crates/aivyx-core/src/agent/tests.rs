@@ -4875,9 +4875,10 @@ mod kv_cache_regressions {
 
 // --- BackendKind::LlamaServerBroker regression tests --------------------
 //
-// `set_broker_mode` is only ever called by `agent_builder.rs` for
-// `[backend] kind = "llama_server_broker"`, and (per that call site's own
-// guard) `set_kv_cache` is never also called for that backend kind -- so
+// `set_broker_mode` is called (from `agent_builder.rs`, `delegate.rs`, and
+// `aivyx-mcp-server/session.rs`) only for `[backend] kind =
+// "llama_server_broker"`, and (per those call sites' own guards)
+// `set_kv_cache` is never also called for that backend kind -- so
 // `ensure_kv_slot_checked_out` must still no-op purely because `kv_cache`
 // is `None`, and `slot_hint` population must be independently gated on
 // `broker_mode`, not on kv_cache being configured.
@@ -4923,7 +4924,7 @@ mod broker_mode_regressions {
         assert_eq!(
             hint.preferred_slot, None,
             "kv_slot_id is always None on the broker path (this client never picks a slot \
-             itself), so preferred_slot must start None on a session's first request"
+             itself), so preferred_slot stays None on every request, not just the first"
         );
         assert!(!hint.prefix_hash.is_empty());
         assert_eq!(

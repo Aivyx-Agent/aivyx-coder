@@ -217,8 +217,11 @@ pub struct Agent {
     /// `ChatRequest.id_slot` for this session stays `None`, i.e. today's
     /// unpinned behavior).
     kv_slot_id: Option<u32>,
-    /// Set by `set_broker_mode` (only ever called by `agent_builder.rs`
-    /// when `[backend] kind = "llama_server_broker"`) -- when `true`,
+    /// Set by `set_broker_mode`, called by `agent_builder.rs` for the
+    /// top-level agent, `delegate.rs` for delegated sub-agents, and
+    /// `aivyx-mcp-server/session.rs` for MCP sessions -- all three
+    /// sourced from the same `[backend] kind = "llama_server_broker"`
+    /// check, so they can't diverge. When `true`,
     /// every outgoing `ChatRequest` carries a `slot_hint` (prefix hash +
     /// `preferred_slot`) for `aivyx-broker`'s own slot admission/restore/
     /// warm/save lifecycle. `kv_cache` is always `None` on this path
