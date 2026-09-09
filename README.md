@@ -34,8 +34,8 @@ The installed executable is named `aivyx-coder`, not `aivyx` — the
 crate's package name is still `aivyx` (so `cargo run -p aivyx` above
 works), but the produced binary is renamed via `[[bin]]` in
 `crates/aivyx/Cargo.toml` so it can't collide on `PATH` with the
-unrelated `Rust/aivyx` Personal Assistant project, which also ships a
-binary literally named `aivyx`.
+unrelated `Rust/aivyx-pa` Personal Assistant project, which also ships a
+binary literally named `aivyx-pa`.
 
 Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
@@ -826,8 +826,8 @@ path is platform-specific, resolved via the `directories` crate — see
 its own docs for the macOS/Windows equivalents), or your own `[backend]
 kvcache_store_path`'s `slots` subdirectory if you've set one (see
 below — in particular, to share this store with a locally
-delegated-from `aivyx` process pointed at the same `llama-server`, see
-`aivyx`'s own `docs/MCP_RECIPES.md`). If `--slot-save-path` doesn't match this exact
+delegated-from `aivyx-pa` process pointed at the same `llama-server`, see
+`aivyx-pa`'s own `docs/MCP_RECIPES.md`). If `--slot-save-path` doesn't match this exact
 path, saves and restores still succeed against llama-server's own
 `--slot-save-path` directory — no error is surfaced — but the store's own
 `fs::metadata` stat on *its* expected path (`.../kvcache/slots`) misses,
@@ -873,7 +873,7 @@ A single `llama-server` process only ever serves one GPU-resident model at
 a time, and its `/slots` KV-cache mechanism (see "KV-cache persistence"
 above) assumes one process is deciding which slot to use. If you run more
 than one local process against the same `llama-server` at once (multiple
-`aivyx-coder` sessions, or `aivyx-coder` alongside `aivyx`), they'll fight
+`aivyx-coder` sessions, or `aivyx-coder` alongside `aivyx-pa`), they'll fight
 over slots without coordination.
 
 [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker) is a
@@ -910,7 +910,7 @@ makes same-session requests keep landing on a fast, already-warmed slot.
 ## Embedded Rust-native inference
 
 `aivyx-coder` can run a local LLM **inside its own process** by linking
-against the `mistralrs` crate — the same capability `aivyx` (the sibling
+against the `mistralrs` crate — the same capability `aivyx-pa` (the sibling
 Personal Assistant product) shipped in its own Phase 134, ported here
 with real token streaming from the start. Zero outbound network calls
 during inference; no separate runtime server to install.
@@ -1037,7 +1037,7 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 `aivyx-coder --mcp-server` runs as a third frontend: a [Model Context
 Protocol](https://modelcontextprotocol.io) server over stdin/stdout,
 exposing aivyx-coder as `code`/`code_reply` tools for delegation from
-another local MCP client (for example, `aivyx` invoking aivyx-coder as a
+another local MCP client (for example, `aivyx-pa` invoking aivyx-coder as a
 sub-agent for a bounded coding task). Each MCP call runs in its own fresh,
 isolated session — there's no shared conversation state or persistence
 across calls beyond a session's own TTL.
@@ -1326,9 +1326,9 @@ context_tokens = 8192
 # kvcache_max_bytes = 10737418240
 # Overrides where the kvcache store directory lives (default:
 # ~/.local/share/aivyx-coder/kvcache). Supports a leading `~`. Set this
-# to the same directory as a locally delegated-from `aivyx` process's
+# to the same directory as a locally delegated-from `aivyx-pa` process's
 # own kvcache_store_path (and point both at the same llama-server) to
-# share one store -- see aivyx's own docs/MCP_RECIPES.md.
+# share one store -- see aivyx-pa's own docs/MCP_RECIPES.md.
 # kvcache_store_path = "~/.local/share/shared-kvcache"
 # REQUIRED when kind = "llama_server_broker" -- address of a running
 # aivyx-broker instance. Replaces base_url as the address this process
