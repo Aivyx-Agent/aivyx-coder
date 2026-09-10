@@ -32,7 +32,8 @@ binary instead of building from source:
 ```sh
 curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.1.0-x86_64-linux-musl.tar.gz \
   | tar xz
-./aivyx-coder --version
+cd aivyx-coder-v0.1.0-x86_64-linux-musl
+./aivyx-coder --help
 ```
 
 (Replace `v0.1.0` with whatever the actual latest tag is if you're
