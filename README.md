@@ -25,10 +25,19 @@ scripts/build-release.sh
 ```
 
 Produces `dist/aivyx-coder-v<version>-x86_64-linux-musl.tar.gz` plus a
-`.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are also
-built and published automatically via GitHub Actions once this
-repository is pushed to GitHub — check the repository's Releases page
-for pre-built downloads at that point.
+`.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are built
+and published automatically via GitHub Actions — grab a pre-built
+binary instead of building from source:
+
+```sh
+curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.1.0-x86_64-linux-musl.tar.gz \
+  | tar xz
+./aivyx-coder --version
+```
+
+(Replace `v0.1.0` with whatever the actual latest tag is if you're
+reading this later — check the
+[Releases page](https://github.com/Aivyx-Agent/aivyx-coder/releases).)
 
 The installed executable is named `aivyx-coder`, not `aivyx` — the
 crate's package name is still `aivyx` (so `cargo run -p aivyx` above
