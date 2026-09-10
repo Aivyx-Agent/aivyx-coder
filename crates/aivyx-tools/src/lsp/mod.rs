@@ -113,7 +113,7 @@ impl LspClient {
         let stdout = child.stdout.take().expect("stdout was piped");
         let connection = Connection::new(stdout, stdin);
 
-        initialize(&connection, cwd).await?;
+        initialize(&connection, cwd, self.timeout).await?;
         // rust-analyzer answers requests immediately even while its
         // initial workspace load/index is still running, silently
         // returning empty results rather than blocking — found via live
@@ -274,7 +274,14 @@ fn path_to_uri(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
-async fn initialize(connection: &Connection, cwd: &Path) -> Result<(), ToolError> {
+/// `timeout` bounds the `initialize` round trip the same way
+/// `LspClient::request` bounds every later query — without this, a
+/// server that never answers the handshake hangs `ensure_started`
+/// forever while holding `self.state`'s lock, which then blocks every
+/// subsequent `go_to_definition`/`find_references` call too (found via a
+/// real CI hang: this call site was the one path in the whole module
+/// with no timeout at all).
+async fn initialize(connection: &Connection, cwd: &Path, timeout: Duration) -> Result<(), ToolError> {
     let root_uri = path_to_uri(cwd);
     let params = serde_json::json!({
         "processId": std::process::id(),
@@ -282,7 +289,14 @@ async fn initialize(connection: &Connection, cwd: &Path) -> Result<(), ToolError
         "capabilities": {},
         "workspaceFolders": [{ "uri": root_uri, "name": "workspace" }],
     });
-    connection.request("initialize", params).await?;
+    tokio::time::timeout(timeout, connection.request("initialize", params))
+        .await
+        .map_err(|_| {
+            ToolError::ExecutionFailed(format!(
+                "rust-analyzer did not respond to the initialize handshake within {}s",
+                timeout.as_secs()
+            ))
+        })??;
     connection.notify("initialized", serde_json::json!({})).await?;
     Ok(())
 }
