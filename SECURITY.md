@@ -20,11 +20,13 @@ This is not a bug bounty program.
 
 ## Reporting a vulnerability
 
-Email **jccorbett67@gmail.com** with details. This repo is currently
-private, so GitHub Security Advisories' private vulnerability
-reporting isn't available yet (GitHub only offers it on public
-repositories) — it will be added as a second channel if this repo
-goes public. This is a small, solo-maintained project: reports will be
+Two channels:
+- **GitHub Security Advisories** — use the "Report a vulnerability"
+  button under this repo's Security tab (private by default, visible
+  only to maintainers until you choose to publish).
+- **Email** — **jccorbett67@gmail.com** with details.
+
+This is a small, solo-maintained project: reports will be
 read and acknowledged, and we aim to resolve or provide a remediation
 plan for a confirmed vulnerability within 90 days of the report, or
 coordinate a later disclosure date directly with the reporter if a fix
