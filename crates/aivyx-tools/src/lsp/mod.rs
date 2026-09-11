@@ -281,7 +281,11 @@ fn path_to_uri(path: &Path) -> String {
 /// subsequent `go_to_definition`/`find_references` call too (found via a
 /// real CI hang: this call site was the one path in the whole module
 /// with no timeout at all).
-async fn initialize(connection: &Connection, cwd: &Path, timeout: Duration) -> Result<(), ToolError> {
+async fn initialize(
+    connection: &Connection,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<(), ToolError> {
     let root_uri = path_to_uri(cwd);
     let params = serde_json::json!({
         "processId": std::process::id(),
