@@ -1,5 +1,8 @@
 # aivyx-coder
 
+[![CI](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+
 A terminal (TUI) coding agent for **local** LLMs only — Ollama, vLLM, or
 llama.cpp over their OpenAI-compatible `/chat/completions` endpoints. It never
 talks to a cloud API. An LLM drives tool calls (read/write/edit files, search,
