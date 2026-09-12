@@ -125,6 +125,77 @@ pub struct AutonomousRun {
     pub injection_taint: InjectionTaint,
 }
 
+/// A brief startup banner, printed to plain stdout before the TUI takes
+/// over the screen via the alternate-screen buffer (see
+/// `TerminalGuard::init` in `terminal.rs`). Colors match the Wick &
+/// Compass identity's real brass/rust/slate token values exactly
+/// (`aivyx-brand/design-tokens.md`) -- no new palette invented. Box
+/// width is computed from the real content, not hardcoded, so a longer
+/// future version string can't misalign the border.
+///
+/// Uses `crossterm::style::Color` fully-qualified throughout, not the
+/// bare `Color` this file already imports from `ratatui::style` at file
+/// scope -- the two types share a name but not a shape
+/// (`ratatui::style::Color::Rgb` is a tuple variant, `Rgb(u8, u8, u8)`;
+/// `crossterm::style::Color::Rgb` is a struct variant, `Rgb { r, g, b }`)
+/// and a bare reference here would silently resolve to the wrong one and
+/// fail to compile.
+fn startup_banner() -> String {
+    use crossterm::style::Stylize;
+
+    let brass = crossterm::style::Color::Rgb {
+        r: 0xc9,
+        g: 0xa2,
+        b: 0x4b,
+    };
+    let rust = crossterm::style::Color::Rgb {
+        r: 0xb5,
+        g: 0x43,
+        b: 0x2b,
+    };
+    let slate = crossterm::style::Color::Rgb {
+        r: 0x8a,
+        g: 0x95,
+        b: 0xa1,
+    };
+
+    let title = "aivyx-coder";
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let line1_plain = format!("{title}  {version}");
+    let line2_plain = "\u{25cf} local models only".to_string();
+
+    let interior_width = line1_plain
+        .chars()
+        .count()
+        .max(line2_plain.chars().count());
+    let line1_pad = " ".repeat(interior_width - line1_plain.chars().count());
+    let line2_pad = " ".repeat(interior_width - line2_plain.chars().count());
+    let border = "\u{2500}".repeat(interior_width + 4);
+
+    format!(
+        "{tl}{border_top}{tr}\n\
+         {v1}  {title_c}  {version_c}{p1}  {v2}\n\
+         {v3}  {dot_c} {tagline_c}{p2}  {v4}\n\
+         {bl}{border_bottom}{br}\n",
+        tl = "\u{250c}".with(brass),
+        border_top = border.clone().with(brass),
+        tr = "\u{2510}".with(brass),
+        v1 = "\u{2502}".with(brass),
+        title_c = title.bold(),
+        version_c = version.with(slate),
+        p1 = line1_pad,
+        v2 = "\u{2502}".with(brass),
+        v3 = "\u{2502}".with(brass),
+        dot_c = "\u{25cf}".with(rust),
+        tagline_c = "local models only".with(slate),
+        p2 = line2_pad,
+        v4 = "\u{2502}".with(brass),
+        bl = "\u{2514}".with(brass),
+        border_bottom = border.with(brass),
+        br = "\u{2518}".with(brass),
+    )
+}
+
 /// Owns the ratatui render loop. Takes an already-constructed `Agent` (the
 /// caller built it with the `LlmBackend` + `ToolExecutor` it wants) and the
 /// receiving half of the channel that `Agent` was constructed with; `run`
@@ -207,6 +278,10 @@ pub async fn run(
             }
         }
     });
+
+    print!("{}", startup_banner());
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
 
     let mut guard = TerminalGuard::init()?;
     let mut app = App::new(restored, plan_mode);
@@ -968,6 +1043,32 @@ mod tests {
             rendered.push_str(cell.symbol());
         }
         rendered
+    }
+
+    #[test]
+    fn startup_banner_contains_real_content_and_is_structurally_balanced() {
+        let banner = startup_banner();
+
+        // Real content present (plain substrings survive being wrapped in
+        // ANSI color codes -- crossterm's Stylize wraps content, doesn't
+        // transform it).
+        assert!(banner.contains("aivyx-coder"));
+        assert!(banner.contains(env!("CARGO_PKG_VERSION")));
+        assert!(banner.contains("local models only"));
+        assert!(banner.contains('\u{25cf}')); // the status dot
+
+        // Box-drawing structure: exactly one top-left/top-right/bottom-left/
+        // bottom-right corner each, and exactly 4 vertical-bar glyphs (2 per
+        // content line).
+        assert_eq!(banner.matches('\u{250c}').count(), 1); // ┌
+        assert_eq!(banner.matches('\u{2510}').count(), 1); // ┐
+        assert_eq!(banner.matches('\u{2514}').count(), 1); // └
+        assert_eq!(banner.matches('\u{2518}').count(), 1); // ┘
+        assert_eq!(banner.matches('\u{2502}').count(), 4); // │
+
+        // Exactly 4 printed lines (top border, 2 content lines, bottom
+        // border), each terminated by \n.
+        assert_eq!(banner.matches('\n').count(), 4);
     }
 
     #[test]
