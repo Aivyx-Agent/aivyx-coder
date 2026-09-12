@@ -8,3 +8,6 @@
 # Local model weights parked in-repo (never committed)
 /models/
 .worktrees/
+
+# Superpowers scratch (brainstorm mockups, SDD progress files)
+.superpowers/
