@@ -1,5 +1,11 @@
 # aivyx-coder
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logos/aivyx-lockup-horizontal-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/logos/aivyx-lockup-horizontal-light.svg">
+  <img alt="aivyx-coder" src="docs/logos/aivyx-lockup-horizontal-light.svg" width="280">
+</picture>
+
 [![CI](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
 
