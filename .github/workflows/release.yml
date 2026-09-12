@@ -34,6 +34,8 @@ jobs:
           mkdir -p "dist/${STAGE_NAME}"
           cp target/x86_64-unknown-linux-musl/release/aivyx-coder "dist/${STAGE_NAME}/aivyx-coder"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${STAGE_NAME}/"
+          mkdir -p "dist/${STAGE_NAME}/docs"
+          cp -r docs/logos "dist/${STAGE_NAME}/docs/"
           cd dist
           tar -czf "${STAGE_NAME}.tar.gz" "${STAGE_NAME}"
           sha256sum "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
