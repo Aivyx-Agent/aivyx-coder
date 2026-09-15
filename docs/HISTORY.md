@@ -3993,3 +3993,88 @@ independent repos in one continuous session. Each repo got its own
 branch, its own review cycle, and its own merge — no shared commit
 history, per this workspace's own top-level `CLAUDE.md` convention that
 each repo is fully independent.
+
+### CI hardening + LSP handshake hang, root-caused (2026-09-11) — ✅ shipped
+
+**What shipped**: this repo's first push/PR-triggered CI workflow —
+previously `release.yml` only ran on version tags, so there had been
+zero CI on regular pushes/PRs. Its very first real run hung on `cargo
+test --workspace` for 50+ minutes with no resolution, despite the
+identical command completing in under 2 minutes locally — a genuine
+CI-environment-specific hang, not a real test failure. Added job-level
+timeouts as an immediate safety net so a future hang fails fast instead
+of consuming the whole job budget silently, then root-caused it for
+real rather than stopping at the safety net: the real-`rust-analyzer`
+LSP integration test is meant to skip when `rust-analyzer` isn't on
+`PATH`, but GitHub Actions' `ubuntu-latest` runner has it installed, so
+the test actually ran and never returned. Confirmed both of
+`LspClient`'s own existing timeouts (the bounded `wait_until_idle`
+deadline loop and the per-request `tokio::time::timeout` wrapper) were
+individually correct and bounded — the hang was consistent with
+something blocking the tokio runtime entirely outside those two points.
+
+A follow-up review of that investigation found the actual gap:
+`initialize()` sent the `initialize` request via a raw, unbounded
+`connection.request(...)` call — the only request in the module with no
+timeout — and since `ensure_started` holds the client's state lock
+across the whole call, an unresponsive server there would hang not just
+`initialize` but every later `go_to_definition`/`find_references` too,
+with no recovery. Fixed by threading the client's existing timeout
+through to `initialize()` and wrapping it the same way every other
+request already is, then re-enabled the previously-ignored integration
+test to let real CI prove the fix rather than assuming it. Real CI then
+proved the fix works, and surfaced new, more precise information: the
+test now fails cleanly after exactly 120.11s ("rust-analyzer did not
+respond to the initialize handshake within 120s") instead of hanging
+indefinitely — no longer a timeout-logic bug, but `rust-analyzer` itself
+never answering the handshake on this specific runner. Re-ignored with
+that verified, evidence-based reason in place of the earlier speculative
+one; root-causing why that specific runner's `rust-analyzer` never
+responds is logged as a separate, real follow-up, not closed here.
+
+Same day: added a root `LICENSE` pointer file so GitHub's repo-level
+license detection stops showing null despite real `LICENSE-MIT`/
+`LICENSE-APACHE` files, CI and license badges on the README, and
+bug-report/feature-request issue templates.
+
+### Wick & Compass visual surface (2026-09-12/13) — ✅ shipped
+
+**What shipped**: sub-project 4 of the ecosystem-wide "Wick & Compass"
+rebrand (see `aivyx-brand`/`aivyx`/`aivyx-website`'s own accounts of the
+same rebrand). Grounding found this TUI has no theme system, no
+logo/icon assets, and no ASCII banner anywhere — ratatui's named colors
+were already idiomatic semantic convention with nothing to migrate — so
+scope narrowed to two small, additive pieces: a terminal startup banner
+and a README logo.
+
+The banner prints to plain stdout as the first thing `run()` does,
+before `TerminalGuard::init()` enters raw mode/the alternate screen, so
+it appears as normal scrolled terminal output and then stays in
+scrollback after the TUI exits — real brass/rust/slate hex values via
+`crossterm::style::Color`, fully-qualified throughout to avoid a real,
+verified collision with the file's existing `ratatui::style::Color`
+import (the two `Color::Rgb` variants have different shapes), with box
+width computed from the real content so a longer future version string
+can't misalign the border. TUI-frontend-specific by construction:
+`aivyx-acp` and `aivyx-mcp-server` never call `aivyx_tui::run()`, so no
+gating logic was needed.
+
+The README logo work surfaced a real cross-theme bug along the way: the
+existing dark-theme-only lockup SVG would have been nearly invisible on
+GitHub's light README theme. Fixed via a `<picture>`/
+`prefers-color-scheme` element referencing both a dark and a new
+light-theme lockup variant copied from `aivyx-brand` under
+`docs/logos/` — which in turn required adding that light-theme variant
+to `aivyx-brand` first, keeping it the single source of truth for every
+mark variant, reusing the real Fraunces wordmark path data verbatim
+with only colors changed. The final whole-branch review caught a real
+gap no per-task review could have: the release packaging step copied
+`README.md` but not the new `docs/logos/*.svg` files its `<picture>`
+element references, which would have left two broken-image references
+in anyone's downloaded release tarball (GitHub's own rendering was
+unaffected, since it serves the file directly from the repo). Fixed by
+including `docs/logos/` in the release tarball and confirming, by
+simulating the exact packaging commands locally, that they produce the
+SVGs at the same relative path the packaged README expects.
+
+Also 2026-09-13: added `CONTRIBUTING.md`.
