@@ -290,6 +290,13 @@ mod tests {
             std::time::Duration::from_millis(1),
         )));
         registry.register(Arc::new(ReplStopTool::new(new_shared_repl_session())));
+        // Task 1 (HIGH, 2026-09-16 audit) — web_fetch/web_search must land
+        // on the mutating (hidden-in-plan-mode) side, same as every other
+        // non-session-safe tool above; this is the regression guard the
+        // task's own review asked for, since neither tool was registered
+        // in this test before the fix.
+        registry.register(Arc::new(WebFetchTool::new(5, false)));
+        registry.register(Arc::new(WebSearchTool::new(None, 10, 5)));
 
         let all: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
         let plan: Vec<String> = registry
@@ -298,12 +305,13 @@ mod tests {
             .map(|d| d.name)
             .collect();
 
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 14);
         assert_eq!(
             plan,
             vec![
                 "read_file", "grep", "glob", "set_tasks", "git_read", "repl_send", "repl_stop"
-            ]
+            ],
+            "web_fetch/web_search must NOT appear here -- network access is not session-safe"
         );
     }
 

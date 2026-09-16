@@ -45,9 +45,13 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
 
-    fn mutates_outside_session(&self) -> bool {
-        false
-    }
+    // No `mutates_outside_session` override: the trait's fail-closed
+    // default (`true`) is correct here. Before the 2026-09-16 security
+    // audit fix (Task 1), this returned `false`, offering web_fetch to the
+    // model even in plan mode -- the same "network isn't a session-local
+    // read" bug that `ActionKind::Network` fixed on the `ConfirmationGate`
+    // side. This is the type-level ("static") counterpart the trait's own
+    // doc comment names: "filesystem, processes, network."
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
