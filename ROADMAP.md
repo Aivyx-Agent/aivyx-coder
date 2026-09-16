@@ -1,9 +1,10 @@
 # aivyx-coder Roadmap
 
-_Last updated: 2026-09-03 (the header date had drifted — the file's own
-git history shows real edits through 2026-08-26; the stretch-goal/status
-prose below is otherwise still current, only the stamp and the test
-count were stale)_
+_Last updated: 2026-09-16 (the header date and test count had drifted
+again — this file's own git history shows real content edits through
+2026-09-07, with 6 more days/~15 commits of shipped work never reflected
+here at all; see the new "CI hardening" and "Wick & Compass visual
+surface" entries below and in `docs/HISTORY.md`)_
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -30,8 +31,8 @@ project instructions, `web_fetch`/`web_search`, full MCP client support, a
 startup probe of the *served* context window, goal-bounded turn pausing
 instead of a hard iteration-cap failure, enforced post-edit verification
 with automatic fix-and-retry, and an ACP editor-integration frontend
-(see below). 682 workspace tests (freshly re-run 2026-09-03; up from
-473 as of this doc's own last content update); every security-critical
+(see below). 695 workspace tests (freshly re-run 2026-09-16; up from
+473 as of this doc's original content); every security-critical
 behavior also proven by live E2E against real serving.
 
 **Embedded Rust-native inference (2026-09-07)**: `aivyx-coder` can now
@@ -76,6 +77,29 @@ cache-locality bookkeeping. See `docs/HISTORY.md`'s own entry, and
 for the full cross-repo design and review history — the broker daemon
 itself went through three whole-branch review rounds before merge,
 the most of any single piece of work this project has produced.
+
+**CI hardening + LSP handshake hang, root-caused (2026-09-11)**: this
+repo's first push/PR-triggered CI (previously only version tags
+triggered a workflow) hung for 50+ minutes on its very first real run;
+root-caused to an unbounded LSP `initialize()` call the real-rust-analyzer
+integration test exercises, which GitHub Actions' runner (unlike a local
+machine lacking `rust-analyzer` on `PATH`) actually reaches. Fixed the
+real gap (`initialize()` now shares the same timeout every other LSP
+request already had) and re-ignored the integration test with a
+verified, evidence-based reason (`rust-analyzer` itself never answers
+the handshake on this runner) rather than the earlier speculative one.
+Same day: a root `LICENSE` pointer file, CI/license README badges, and
+issue templates. See `docs/HISTORY.md`'s own entry.
+
+**Wick & Compass visual surface (2026-09-12/13)**: this project's slice
+of the ecosystem-wide rebrand — a terminal startup banner (real
+brass/rust/slate colors, printed before the TUI takes over the screen)
+and a theme-adaptive README logo (a `<picture>`/`prefers-color-scheme`
+element fixing a real bug where the old dark-only lockup was nearly
+invisible on GitHub's light theme). A final review caught the release
+tarball omitting the new logo files the README now references — fixed
+and confirmed by simulating the real packaging commands. Also added
+`CONTRIBUTING.md`. See `docs/HISTORY.md`'s own entry.
 
 **Serving verdict (Phase 10 Part A)**: the serving configuration — not the
 model, not the edit format — was the dominant reliability variable.
