@@ -383,6 +383,22 @@ impl Agent {
         self.last_turn_paused
     }
 
+    /// Returns a clone of this agent's shared `InjectionTaint` handle — a
+    /// read-only peek (`InjectionTaint::current()`) is enough for a caller
+    /// that owns `agent: Agent` directly and drives its own outer
+    /// "continue" loop (e.g. `aivyx-mcp-server`'s `run_bounded_turn`,
+    /// `delegate_task`'s sub-agent loop) to decide whether it's safe to
+    /// send another round-trip once the current one returns, mirroring
+    /// `last_turn_paused()`'s existing rationale. Added alongside Task 3's
+    /// mid-turn taint check: architectures that fix `max_tool_iterations`
+    /// at 1 (MCP-server sessions, `delegate_task`'s inner agent) make that
+    /// per-call internal check moot — every call is already exactly one
+    /// iteration — so the taint has to be checked at the *outer*
+    /// continuation-loop level instead to close the same gap.
+    pub fn injection_taint(&self) -> InjectionTaint {
+        self.injection_taint.clone()
+    }
+
     /// Sends an informational notice into the transcript without going through
     /// a model turn — used by the autonomous driver to report why it stopped
     /// (goal achieved, budget exhausted, cancelled), since none of those are
@@ -1996,6 +2012,36 @@ impl Agent {
 
             if cancellation.is_cancelled() {
                 break;
+            }
+
+            if self.autonomous_mode.active() && self.injection_taint.current().is_some() {
+                // A tool result dispatched in the round-trip that just
+                // completed flagged content as a likely prompt injection.
+                // Previously this was only checked *between* turns (every
+                // frontend's own driver loop, after `run_turn` fully
+                // returned) — since a turn can internally loop through up
+                // to `max_tool_iterations` round-trips, taint flagged on an
+                // early iteration left every Read-class tool call
+                // (`read_file`, `grep`, `glob`, `git_read`, …) free to keep
+                // executing for the rest of that same turn; only
+                // `ConfirmationGate`'s own match arm (Write/Delete/Move/
+                // Command) stopped anything mid-turn. Checking here, right
+                // after each round-trip's tool calls are dispatched and
+                // before the next one is requested, closes that gap
+                // uniformly for every frontend that drives `run_turn` (TUI,
+                // ACP, MCP-server) instead of relying on each one to
+                // re-check only after the whole turn ends. `current()`, not
+                // `take()` — this is a read-only peek; consuming the taint
+                // is each frontend's own driver-loop decision (e.g. the
+                // TUI's `take()` right after `run_turn` returns, which also
+                // decides whether to stop the autonomous run entirely).
+                self.last_turn_paused = true;
+                self.emit(AgentEvent::TurnPaused(
+                    "a tool result in this turn was flagged as a possible prompt injection — \
+                     pausing before any further tool calls for the rest of this turn."
+                        .to_string(),
+                ));
+                return Ok(());
             }
 
             if iteration == self.max_tool_iterations {

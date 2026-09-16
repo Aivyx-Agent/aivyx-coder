@@ -47,6 +47,20 @@ struct DelegateTaskArgs {
 const CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: reached its iteration budget before \
 finishing — the above is its best-effort partial result.)";
 
+/// Mirrors `CUTOFF_NOTICE` but for the injection-taint stop condition below —
+/// added alongside Task 3's `run_turn`-internal mid-turn taint check. That
+/// internal check has no effect on a sub-agent: its own `AgentConfig` fixes
+/// `max_tool_iterations` at 1 (see this file's own `max_tool_iterations: 1`
+/// comment), so every `run_turn`/"continue" call here is already exactly one
+/// iteration — the internal check and the pre-existing cap-pause always fire
+/// on the same call. This outer loop's own taint check (below) is therefore
+/// the only place that can stop a *second* delegated round-trip's tool call
+/// from executing once a result is flagged, mirroring
+/// `aivyx-mcp-server::session::run_bounded_turn`'s identical fix for the
+/// identical `max_tool_iterations: 1` shape.
+const INJECTION_CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: a tool result was flagged as a \
+possible prompt injection — the above is its best-effort partial result.)";
+
 const NO_TEXT_RESPONSE: &str = "(the sub-agent produced no text response)";
 
 const SUB_AGENT_SYSTEM_PROMPT: &str = "You are a sub-agent helping the main assistant with a \
@@ -268,17 +282,28 @@ impl Tool for DelegateTaskTool {
             .run_turn(args.task, &ctx.cwd, ctx.cancellation.clone())
             .await;
         let mut iterations_used = 1u32;
+        // See `INJECTION_CUTOFF_NOTICE`'s doc comment above -- `current()`,
+        // not `take()`: this is the parent's own *shared* `injection_taint`
+        // (`DelegateTaskConfig::injection_taint`'s doc comment), so consuming
+        // it here would clear the flag the parent's own `ConfirmationGate`
+        // and autonomous driver still need to see.
+        let is_injection_tainted = || {
+            self.config.autonomous_mode.active() && self.config.injection_taint.current().is_some()
+        };
         while result.is_ok()
             && sub_agent.last_turn_paused()
             && iterations_used < max_iterations
             && !ctx.cancellation.is_cancelled()
+            && !is_injection_tainted()
         {
             iterations_used += 1;
             result = sub_agent
                 .run_turn("continue".to_string(), &ctx.cwd, ctx.cancellation.clone())
                 .await;
         }
-        let cap_hit = result.is_ok() && sub_agent.last_turn_paused();
+        let paused = result.is_ok() && sub_agent.last_turn_paused();
+        let cap_hit = paused && !is_injection_tainted();
+        let injection_hit = paused && is_injection_tainted();
 
         // Dropping the sub-agent drops its `sub_tx` (the only remaining
         // sender), closing the channel so `forward_task`'s `recv()` loop
@@ -292,7 +317,9 @@ impl Tool for DelegateTaskTool {
                 let mut text = Arc::try_unwrap(accumulated)
                     .map(|m| m.into_inner().unwrap())
                     .unwrap_or_default();
-                if cap_hit {
+                if injection_hit {
+                    text.push_str(INJECTION_CUTOFF_NOTICE);
+                } else if cap_hit {
                     text.push_str(CUTOFF_NOTICE);
                 }
                 if text.trim().is_empty() {
@@ -636,6 +663,117 @@ mod tests {
             .current()
             .expect("the sub-agent's ingested content must flag the parent's shared taint");
         assert_eq!(finding.matched_pattern, "ignore previous instructions");
+    }
+
+    /// A tool that just counts how many times it actually ran -- mirrors
+    /// `aivyx-core/src/agent/tests.rs`'s own `CountingReadTool`, used there
+    /// for the equivalent `run_turn`-internal regression test.
+    struct CountingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "counting_tool"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "counting_tool".to_string(),
+                description: "test".to_string(),
+                parameters_schema: serde_json::json!({}),
+            }
+        }
+
+        fn permission_request(
+            &self,
+            _arguments: &serde_json::Value,
+            _cwd: &Path,
+        ) -> Result<PermissionRequest, ToolError> {
+            Ok(PermissionRequest {
+                tool_name: "counting_tool".to_string(),
+                action: ActionKind::Read,
+                target: PermissionTarget::Other("test".to_string()),
+                arguments_preview: serde_json::json!({}),
+                preview: None,
+                diff: None,
+            })
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolOutput::Ok("harmless".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_agent_delegation_stops_auto_continuing_once_a_tool_result_is_injection_tainted() {
+        // Regression test for the same class of gap Task 3 fixes in
+        // `aivyx-mcp-server::session::run_bounded_turn`: this file's own
+        // outer "continue" loop had no taint check at all, so once a
+        // delegated sub-agent's tool result got flagged, the loop kept
+        // sending "continue" and executing one more (Read-class) tool call
+        // per round anyway -- the sub-agent's own `max_tool_iterations: 1`
+        // means `run_turn`'s internal mid-turn check (this task's primary
+        // fix) never gets a second iteration within one call to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: ToolCallId("c1".to_string()),
+                    name: "injection_echo_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    source: ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: ToolCallId("c2".to_string()),
+                    name: "counting_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    source: ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+        ]));
+        let mut sub_registry = ToolRegistry::new();
+        sub_registry.register(Arc::new(InjectionEchoTool));
+        sub_registry.register(Arc::new(CountingTool(Arc::clone(&counter))));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = base_config(mock, tx, sub_registry, 10);
+        config.autonomous_mode.set_active(true);
+        let injection_taint = InjectionTaint::new();
+        config.injection_taint = injection_taint.clone();
+        let tool = DelegateTaskTool::new(config);
+
+        let output = tool
+            .execute(delegate_call("read the note"), &exec_ctx(dir.path()))
+            .await
+            .unwrap();
+
+        assert!(
+            injection_taint.current().is_some(),
+            "expected the first round-trip's result to flag the taint"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the second tool call must never execute once the sub-agent's tool result is \
+             injection-tainted"
+        );
+        assert!(
+            matches!(&output, ToolOutput::Ok(text) if text.contains("possible prompt injection")),
+            "expected the injection-stop notice, got: {output:?}"
+        );
     }
 
     #[test]

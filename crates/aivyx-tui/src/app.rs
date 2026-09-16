@@ -246,6 +246,15 @@ pub async fn run(
                     agent.notify(cancelled_notice(iterations_used));
                     break;
                 }
+                // Still load-bearing after `run_turn`'s own internal
+                // tool-call loop gained a mid-turn taint check of its own
+                // (see that loop's own comment in `aivyx-core`): that inner
+                // check only ends the turn that just ran early: it says
+                // nothing about whether *this* outer driver loop should
+                // send another "continue" message and start a new turn.
+                // This is the check that actually stops the unattended run
+                // — `.take()`, not `.current()`, since consuming the taint
+                // here is exactly what decides that outcome.
                 if let Some(finding) = autonomous.injection_taint.take() {
                     agent.notify(injection_detected_notice(iterations_used, &finding));
                     break;

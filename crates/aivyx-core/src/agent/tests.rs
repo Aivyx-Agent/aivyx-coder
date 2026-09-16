@@ -156,6 +156,50 @@ impl Tool for InjectionEchoTool {
     }
 }
 
+/// A Read-class tool that just counts how many times it actually ran —
+/// used to prove a *second* scripted tool call was never dispatched, rather
+/// than merely asserting on the emitted event stream.
+struct CountingReadTool(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Tool for CountingReadTool {
+    fn name(&self) -> &str {
+        "counting_read_tool"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "counting_read_tool".to_string(),
+            description: "test".to_string(),
+            parameters_schema: serde_json::json!({}),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "counting_read_tool".to_string(),
+            action: ActionKind::Read,
+            target: PermissionTarget::Other("test".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutput::Ok("read some harmless content".to_string()))
+    }
+}
+
 fn tool_call(id: &str, name: &str) -> ToolCall {
     ToolCall {
         id: ToolCallId(id.to_string()),
@@ -527,6 +571,89 @@ async fn a_tool_result_containing_an_injection_marker_flags_the_shared_taint() {
         .expect("expected the taint to be flagged");
     assert_eq!(finding.matched_pattern, "ignore previous instructions");
     assert!(finding.source.contains("injection_echo_tool"));
+}
+
+#[tokio::test]
+async fn run_turn_stops_issuing_new_read_class_tool_calls_after_mid_turn_taint() {
+    // Two scripted round-trips within a *single* `run_turn` call: the
+    // first dispatches a Read-class call whose result trips the injection
+    // scan; the second (if it were ever requested) would dispatch another
+    // Read-class call. In autonomous mode, the second call must never
+    // execute -- the turn must pause right after the first round-trip's
+    // taint is detected, not keep looping until `max_tool_iterations` (10
+    // here) or the model naturally stops emitting tool calls.
+    let read_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(InjectionEchoTool));
+    registry.register(Arc::new(CountingReadTool(Arc::clone(&read_count))));
+
+    let (tx, mut rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![
+        vec![
+            StreamEvent::ToolCallComplete(tool_call("c1", "injection_echo_tool")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![
+            StreamEvent::ToolCallComplete(tool_call("c2", "counting_read_tool")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+    ]));
+    let llm: std::sync::Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode,
+        tx,
+    );
+    let injection_taint = InjectionTaint::new();
+    agent.set_injection_taint(injection_taint.clone());
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        injection_taint.current().is_some(),
+        "expected the first round-trip's result to flag the taint"
+    );
+    assert_eq!(
+        read_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the second Read-class tool call must never execute once mid-turn taint is flagged"
+    );
+    assert_eq!(
+        mock.received.lock().unwrap().len(),
+        1,
+        "a second LLM round-trip must never even be requested once mid-turn taint is flagged"
+    );
+    assert!(
+        agent.last_turn_paused(),
+        "the turn must be recorded as paused, not completed, so the driver knows not to treat \
+         this like an ordinary finished turn"
+    );
+    assert!(
+        drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnPaused(msg) if msg.contains("prompt injection"))),
+        "expected a TurnPaused event mentioning the injection pause"
+    );
 }
 
 #[tokio::test]
