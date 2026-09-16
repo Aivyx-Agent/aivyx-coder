@@ -68,6 +68,16 @@ pub enum ActionKind {
     /// honestly describe itself this way, and so audit logs don't record an
     /// internal state change as a "Read" of anything.
     Internal,
+    /// A tool that reaches outside the local session/filesystem to the
+    /// network (web_fetch, web_search). Kept distinct from `Read` so
+    /// plan-mode's "read-only" guarantee and autonomous-mode's
+    /// injection-taint pause both actually apply to it — before this
+    /// variant existed, these tools declared themselves `Read` and hit
+    /// the same auto-allow fast path as truly side-effect-free actions,
+    /// bypassing both checks. Still auto-allowed in plain interactive use
+    /// once it survives those two checks — this is not a new confirmation
+    /// prompt for ordinary use.
+    Network,
     /// A tool call dispatched to an external MCP (Model Context Protocol)
     /// server — arbitrary, user-configured third-party code whose actual
     /// behavior this project can't verify, regardless of anything the

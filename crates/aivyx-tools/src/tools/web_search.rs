@@ -81,7 +81,7 @@ impl Tool for WebSearchTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Read,
+            action: ActionKind::Network,
             target: PermissionTarget::Other(args.query.clone()),
             arguments_preview: json!({ "query": args.query }),
             preview: None,
@@ -310,11 +310,11 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_is_read_tier_with_no_confirmation_needed() {
+    fn permission_request_is_network_tier_with_no_confirmation_needed() {
         let tool = WebSearchTool::new(None, 10, 5);
         let request = tool
             .permission_request(&json!({"query": "test"}), Path::new("."))
             .unwrap();
-        assert_eq!(request.action, ActionKind::Read);
+        assert_eq!(request.action, ActionKind::Network);
     }
 }

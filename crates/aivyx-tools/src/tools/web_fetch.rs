@@ -70,7 +70,7 @@ impl Tool for WebFetchTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Read,
+            action: ActionKind::Network,
             target: PermissionTarget::Other(args.url.clone()),
             arguments_preview: json!({ "url": args.url }),
             preview: None,
@@ -298,12 +298,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_request_is_read_tier_with_no_confirmation_needed() {
+    fn permission_request_is_network_tier_with_no_confirmation_needed() {
         let tool = WebFetchTool::new(5, false);
         let request = tool
             .permission_request(&json!({"url": "https://example.com"}), Path::new("."))
             .unwrap();
-        assert_eq!(request.action, ActionKind::Read);
+        assert_eq!(request.action, ActionKind::Network);
         assert_eq!(
             request.target,
             PermissionTarget::Other("https://example.com".to_string())

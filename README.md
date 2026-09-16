@@ -1076,20 +1076,24 @@ max_iterations = 10          # outer round-trip budget per code/code_reply sessi
 Every session runs at a *requested* access level no higher than this
 configured ceiling — three tiers, each additive over the previous:
 
-- **`plan`** — read-only: the session can read, search, and build a task
-  list, but every mutating tool is excluded from its registry (the same
-  mechanism plan mode uses elsewhere in this project).
+- **`plan`** — read-only: the session can read and search the local
+  filesystem and build a task list, but every mutating tool — and
+  `web_fetch`/`web_search`, since a network request isn't a "read" of
+  anything local and must not bypass this tier's read-only guarantee — is
+  excluded from its registry (the same mechanism plan mode uses elsewhere
+  in this project).
 - **`edit`** — adds file mutation: `write_file`/`edit_file`/`patch_file`/
-  `delete_file`/`move_file` become available, but commands and git-mutating
-  tools stay excluded.
+  `delete_file`/`move_file` become available, but commands, git-mutating
+  tools, and `web_fetch`/`web_search` stay excluded.
 - **`execute`** — full access: adds `run_command`/`run_shell`/`git_commit`/
-  `git_branch`/`git_push`/`git_pr`/`memory_write`/`memory_forget`. Nothing
-  is excluded beyond the tools every MCP-server tier always excludes
-  regardless of level (`repl_start`/`repl_send`/`repl_stop`, the dynamically
-  bridged `mcp__<server>__<tool>` adapters, and the `list_mcp_resources`/
-  `read_mcp_resource`/`list_mcp_prompts`/`get_mcp_prompt` mcp_meta tools —
-  a remote MCP caller must not transitively reach a third-party MCP server
-  the operator configured for a different purpose).
+  `git_branch`/`git_push`/`git_pr`/`memory_write`/`memory_forget`/
+  `web_fetch`/`web_search`. Nothing is excluded beyond the tools every
+  MCP-server tier always excludes regardless of level (`repl_start`/
+  `repl_send`/`repl_stop`, the dynamically bridged `mcp__<server>__<tool>`
+  adapters, and the `list_mcp_resources`/`read_mcp_resource`/
+  `list_mcp_prompts`/`get_mcp_prompt` mcp_meta tools — a remote MCP caller
+  must not transitively reach a third-party MCP server the operator
+  configured for a different purpose).
 
 **Security note:** unlike the TUI and ACP frontends, an MCP-server session
 has no human to show a permission prompt to — every tool call within the

@@ -50,6 +50,7 @@ impl AccessLevel {
         const EXECUTE_ONLY: &[&str] = &[
             "run_command", "run_shell", "git_commit", "git_branch", "git_push", "git_pr",
             "memory_write", "memory_forget", "remember_preference",
+            "web_fetch", "web_search",
         ];
         match self {
             Self::Plan => [EDIT_ONLY, EXECUTE_ONLY].concat(),
@@ -91,7 +92,9 @@ mod tests {
         let excluded = AccessLevel::Plan.excluded_tool_names();
         assert!(excluded.contains(&"write_file"));
         assert!(excluded.contains(&"run_command"));
-        assert_eq!(excluded.len(), 5 + 9);
+        assert!(excluded.contains(&"web_fetch"));
+        assert!(excluded.contains(&"web_search"));
+        assert_eq!(excluded.len(), 5 + 11);
     }
 
     #[test]
@@ -99,7 +102,9 @@ mod tests {
         let excluded = AccessLevel::Edit.excluded_tool_names();
         assert!(!excluded.contains(&"write_file"), "edit tier must include write_file");
         assert!(excluded.contains(&"run_command"));
-        assert_eq!(excluded.len(), 9);
+        assert!(excluded.contains(&"web_fetch"), "network tools require at minimum the execute tier");
+        assert!(excluded.contains(&"web_search"));
+        assert_eq!(excluded.len(), 11);
     }
 
     #[test]
@@ -107,7 +112,7 @@ mod tests {
         assert!(AccessLevel::Execute.excluded_tool_names().is_empty());
     }
 
-    /// The 14 names in `EDIT_ONLY`/`EXECUTE_ONLY` are string literals, not
+    /// The 16 names in `EDIT_ONLY`/`EXECUTE_ONLY` are string literals, not
     /// derived from any real `Tool::name()` -- a future rename in
     /// `aivyx-tools` would silently widen whichever tier used to exclude
     /// the renamed tool, with no test failure (`ToolRegistry::exclude`
@@ -120,7 +125,7 @@ mod tests {
         use aivyx_tools::{
             DeleteFileTool, EditFileTool, GitBranchTool, GitCommitTool, GitPrTool, GitPushTool,
             MemoryForgetTool, MemoryWriteTool, MoveFileTool, PatchFileTool, RememberPreferenceTool,
-            RunCommandTool, RunShellTool, WriteFileTool,
+            RunCommandTool, RunShellTool, WebFetchTool, WebSearchTool, WriteFileTool,
         };
         use aivyx_tools::Tool as _;
         use std::sync::Arc;
@@ -146,15 +151,17 @@ mod tests {
             RememberPreferenceTool::new(std::path::PathBuf::from("/irrelevant"))
                 .name()
                 .to_string(),
+            WebFetchTool::new(5, false).name().to_string(),
+            WebSearchTool::new(None, 10, 5).name().to_string(),
         ];
 
         // Both directions: every excluded-list entry is a real tool name
         // (a rename in aivyx-tools would break this), and the real-tool
-        // set above has exactly the 14 names this file's own two lists
+        // set above has exactly the 16 names this file's own two lists
         // expect (a tool added to one of those consts without a matching
         // real tool here would also break this).
         let excluded = AccessLevel::Plan.excluded_tool_names();
-        assert_eq!(excluded.len(), 14);
+        assert_eq!(excluded.len(), 16);
         for name in &excluded {
             assert!(
                 real_names.iter().any(|n| n == name),

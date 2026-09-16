@@ -176,8 +176,8 @@ pub(crate) fn build_pending_request(
                 preview: request.preview.clone(),
             }
         }
-        // `Memory`, `PersistentMemory`, and `Interact` fall back to the
-        // terminal-only path like Read/Internal: there's no
+        // `Memory`, `PersistentMemory`, `Interact`, and `Network` fall back
+        // to the terminal-only path like Read/Internal: there's no
         // `ApprovalContent` shape defined for them yet, and the
         // editor-approval channel simply not participating for these
         // requests is the documented "no editor connected" fallback above,
@@ -186,7 +186,8 @@ pub(crate) fn build_pending_request(
         | ActionKind::Internal
         | ActionKind::Memory
         | ActionKind::PersistentMemory
-        | ActionKind::Interact => return None,
+        | ActionKind::Interact
+        | ActionKind::Network => return None,
     };
 
     Some(PendingApprovalRequest {

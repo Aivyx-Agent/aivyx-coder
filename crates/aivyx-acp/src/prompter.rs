@@ -91,7 +91,7 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
         | ActionKind::Memory
         | ActionKind::PersistentMemory
         | ActionKind::Interact => ToolKind::Other,
-        ActionKind::Read | ActionKind::Internal => ToolKind::Other,
+        ActionKind::Read | ActionKind::Internal | ActionKind::Network => ToolKind::Other,
     };
     let fields = ToolCallUpdateFields::new()
         .kind(kind)
