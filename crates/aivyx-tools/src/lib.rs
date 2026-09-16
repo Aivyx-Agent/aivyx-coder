@@ -288,6 +288,7 @@ mod tests {
             new_shared_repl_session(),
             std::time::Duration::from_millis(1),
             std::time::Duration::from_millis(1),
+            None,
         )));
         registry.register(Arc::new(ReplStopTool::new(new_shared_repl_session())));
         // Task 1 (HIGH, 2026-09-16 audit) — web_fetch/web_search must land

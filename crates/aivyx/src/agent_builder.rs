@@ -336,6 +336,7 @@ pub(crate) async fn build_agent(
         Arc::clone(&repl_session),
         repl_quiet_window,
         repl_max_wait,
+        checkpointer.clone(),
     )));
     registry.register(Arc::new(ReplStopTool::new(Arc::clone(&repl_session))));
     let repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget> =

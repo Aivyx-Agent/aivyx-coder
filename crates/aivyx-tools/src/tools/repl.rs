@@ -90,6 +90,10 @@ pub struct ReplSession {
     last_activity: Instant,
     program: String,
     args: Vec<String>,
+    /// Set once `ReplSendTool::execute` has taken this session's one lazy
+    /// checkpoint (see that tool's doc comment) — `false` from the moment
+    /// `repl_start` creates the session until its first `repl_send`.
+    checkpointed: bool,
 }
 
 /// Process-exit safety net: kills the process group whenever a
@@ -453,6 +457,7 @@ impl Tool for ReplStartTool {
             last_activity: Instant::now(),
             program: args.program.clone(),
             args: args.args.clone(),
+            checkpointed: false,
         });
         drop(guard);
 
@@ -485,20 +490,41 @@ struct ReplSendArgs {
 /// `ActionKind::Interact`'s own doc comment for why this is safe: the
 /// real boundary is `repl_start`'s own `Execute`-tier approval plus
 /// Landlock/seccomp confinement on the process itself, not per-line
-/// review). `mutates_outside_session()` overridden to `false` — no new
-/// checkpoint per send.
+/// review). `mutates_outside_session()` stays overridden to `false` —
+/// correct from *this tool's own* perspective (it just writes bytes to a
+/// pty it already owns, no new gate/plan-mode exposure needed), so
+/// `ToolExecutor::dispatch_inner`'s automatic per-call checkpoint never
+/// fires for it, same as before.
+///
+/// But the process on the other end of that pty (`python`, `sh`, `node`,
+/// ...) can freely create/overwrite/delete real files in the worktree in
+/// response to that input, and a later rollback (batch failure,
+/// autonomous retry) would have no snapshot to recover them from. So this
+/// tool holds its own `Option<Arc<GitCheckpointer>>` (threaded through at
+/// construction, same lifetime as the one `ToolExecutor` holds) and takes
+/// exactly one checkpoint per REPL session, lazily, right before that
+/// session's *first* send actually reaches the process's stdin — not on
+/// every send, which would be needless per-call cost for a tool that's
+/// deliberately not re-prompted per line.
 pub struct ReplSendTool {
     session: SharedReplSession,
     quiet_window: Duration,
     max_wait: Duration,
+    checkpointer: Option<Arc<crate::GitCheckpointer>>,
 }
 
 impl ReplSendTool {
-    pub fn new(session: SharedReplSession, quiet_window: Duration, max_wait: Duration) -> Self {
+    pub fn new(
+        session: SharedReplSession,
+        quiet_window: Duration,
+        max_wait: Duration,
+        checkpointer: Option<Arc<crate::GitCheckpointer>>,
+    ) -> Self {
         Self {
             session,
             quiet_window,
             max_wait,
+            checkpointer,
         }
     }
 }
@@ -572,6 +598,18 @@ impl Tool for ReplSendTool {
         }
 
         session.last_activity = Instant::now();
+
+        // Lazy, once-per-session checkpoint: taken before this session's
+        // first send reaches the process's stdin (the point past which the
+        // process can start mutating the real worktree), never again after
+        // — see the doc comment above for why `mutates_outside_session()`
+        // itself must stay `false` while this still needs to happen.
+        if !session.checkpointed {
+            if let Some(checkpointer) = &self.checkpointer {
+                checkpointer.checkpoint(self.name(), &ctx.cancellation).await;
+            }
+            session.checkpointed = true;
+        }
 
         if let Some(input) = args.input.as_deref().filter(|s| !s.is_empty()) {
             let mut line = input.to_string();
@@ -887,6 +925,7 @@ mod tests {
             last_activity: Instant::now(),
             program,
             args,
+            checkpointed: false,
         };
         drop(session);
 
@@ -942,7 +981,7 @@ mod tests {
         // ioctl before sending input below.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
         let output = send_tool
             .execute(serde_json::json!({ "input": "go" }), &ctx())
             .await
@@ -958,7 +997,7 @@ mod tests {
     async fn repl_send_writes_input_and_returns_the_echoed_response() {
         let (quiet_window, max_wait, _) = short_timing();
         let (session, _start) = started_session(quiet_window, max_wait).await;
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
 
         let output = send_tool
             .execute(serde_json::json!({ "input": "hello" }), &ctx())
@@ -980,7 +1019,7 @@ mod tests {
     async fn repl_send_with_no_input_only_polls_without_writing() {
         let (quiet_window, max_wait, _) = short_timing();
         let (session, _start) = started_session(quiet_window, max_wait).await;
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
 
         let output = send_tool
             .execute(serde_json::json!({}), &ctx())
@@ -997,10 +1036,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_repl_send_to_a_session_gets_checkpointed() {
+        // Covers the finding: repl_send declares mutates_outside_session()
+        // == false (correctly, from its own perspective), so
+        // ToolExecutor::dispatch_inner never checkpoints for it -- but the
+        // real process on the other end of the pty can freely mutate real
+        // worktree files, so repl_send must take its own lazy, once-per-
+        // session checkpoint via a directly-held checkpointer.
+        use aivyx_checkpoint::test_support::{git, init_repo};
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await; // commits tracked.txt = "v1\n"
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let checkpointer =
+            Arc::new(crate::GitCheckpointer::detect(&cwd, vec![]).await.unwrap());
+
+        async fn count_refs(dir: &std::path::Path) -> usize {
+            let out = tokio::process::Command::new("git")
+                .args(["for-each-ref", "refs/aivyx/checkpoints/"])
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        }
+
+        let ctx_in_repo = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+        let session = new_shared_repl_session();
+        let start_tool =
+            ReplStartTool::new(Arc::clone(&session), quiet_window, max_wait, idle_timeout);
+        // A real shell REPL (not the fixed-behavior `fake_repl_args`
+        // fixture) so a repl_send can genuinely mutate a worktree file via
+        // the process's stdin, same as a real `python`/`node` session
+        // could.
+        start_tool
+            .execute(
+                serde_json::json!({
+                    "program": "sh",
+                    "args": ["-c", "while IFS= read -r line; do eval \"$line\"; echo done; done"]
+                }),
+                &ctx_in_repo,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count_refs(&cwd).await,
+            0,
+            "repl_start itself takes no checkpoint via this direct-execute path (that's dispatch_inner's job)"
+        );
+
+        let send_tool = ReplSendTool::new(
+            Arc::clone(&session),
+            quiet_window,
+            max_wait,
+            Some(Arc::clone(&checkpointer)),
+        );
+
+        // First send: mutates tracked.txt via the shell's stdin.
+        send_tool
+            .execute(serde_json::json!({ "input": "echo changed > tracked.txt" }), &ctx_in_repo)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_refs(&cwd).await,
+            1,
+            "the first repl_send to a session must take exactly one checkpoint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "changed\n",
+            "the repl-authored mutation must have actually landed"
+        );
+
+        let ref_name = git(
+            &cwd,
+            &["for-each-ref", "--format=%(refname)", "refs/aivyx/checkpoints/"],
+        )
+        .await
+        .trim()
+        .to_string();
+        let snapshot = git(&cwd, &["show", &format!("{ref_name}:tracked.txt")]).await;
+        assert_eq!(
+            snapshot, "v1\n",
+            "the checkpoint must hold the pre-repl-send content, not the post-mutation content"
+        );
+
+        // Second send: no new checkpoint -- preserves the original "no
+        // checkpoint per send" cost reasoning for every send after the
+        // first.
+        send_tool
+            .execute(
+                serde_json::json!({ "input": "echo changed-again > tracked.txt" }),
+                &ctx_in_repo,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count_refs(&cwd).await,
+            1,
+            "only the session's first send takes a checkpoint, not every send"
+        );
+
+        // Simulate a rollback (batch failure / autonomous retry): restoring
+        // to the checkpoint must recover the pre-repl-send content that
+        // would otherwise have had no snapshot to recover from.
+        checkpointer
+            .restore_to(&ref_name, &tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "v1\n",
+            "restoring to the checkpoint must recover the REPL-authored change"
+        );
+    }
+
+    #[tokio::test]
     async fn repl_send_errors_when_no_session_is_running() {
         let (quiet_window, max_wait, _) = short_timing();
         let session = new_shared_repl_session();
-        let send_tool = ReplSendTool::new(session, quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(session, quiet_window, max_wait, None);
 
         let output = send_tool
             .execute(serde_json::json!({ "input": "hello" }), &ctx())
@@ -1017,7 +1183,7 @@ mod tests {
     async fn repl_send_detects_and_reports_a_spontaneous_exit() {
         let (quiet_window, max_wait, _) = short_timing();
         let (session, _start) = started_session(quiet_window, max_wait).await;
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
 
         // "quit" makes the fake REPL exit(7) on its own.
         send_tool
@@ -1050,6 +1216,7 @@ mod tests {
             new_shared_repl_session(),
             Duration::from_millis(1),
             Duration::from_millis(1),
+            None,
         );
         let request = tool
             .permission_request(&serde_json::json!({ "input": "x" }), std::path::Path::new("."))
@@ -1059,13 +1226,18 @@ mod tests {
 
     #[test]
     fn repl_send_does_not_mutate_outside_session() {
-        // No new checkpoint per send — see the design spec's reasoning
-        // (mirrors git_read overriding to false despite touching the
-        // outside world in a read-only way).
+        // Stays false regardless of the `checkpointer` field added for the
+        // lazy first-send checkpoint (see the tool's doc comment) — this
+        // is about `ToolExecutor::dispatch_inner`'s automatic per-call
+        // checkpoint, which correctly never fires for this tool (mirrors
+        // git_read overriding to false despite touching the outside world
+        // in a read-only way); it says nothing about whether repl_send
+        // takes its own checkpoint internally.
         let tool = ReplSendTool::new(
             new_shared_repl_session(),
             Duration::from_millis(1),
             Duration::from_millis(1),
+            None,
         );
         assert!(!tool.mutates_outside_session());
     }
@@ -1075,7 +1247,7 @@ mod tests {
         let (quiet_window, max_wait, _) = short_timing();
         let (session, _start) = started_session(quiet_window, max_wait).await;
         let stop_tool = ReplStopTool::new(Arc::clone(&session));
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
 
         let output = stop_tool.execute(serde_json::json!({}), &ctx()).await.unwrap();
         let aivyx_types::ToolOutput::Ok(text) = output else {
@@ -1108,7 +1280,7 @@ mod tests {
     async fn repl_stop_reports_an_already_exited_process_instead_of_pretending_to_kill_it() {
         let (quiet_window, max_wait, _) = short_timing();
         let (session, _start) = started_session(quiet_window, max_wait).await;
-        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait);
+        let send_tool = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
         let stop_tool = ReplStopTool::new(Arc::clone(&session));
 
         // Re-inject a session snapshot manually is unnecessary here: send
@@ -1164,6 +1336,7 @@ mod tests {
             new_shared_repl_session(),
             Duration::from_millis(1),
             Duration::from_millis(1),
+            None,
         );
         let stop_tool = ReplStopTool::new(new_shared_repl_session());
 
