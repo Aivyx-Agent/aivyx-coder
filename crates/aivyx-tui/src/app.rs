@@ -78,6 +78,21 @@ fn injection_detected_notice(iterations_used: u32, finding: &InjectionFinding) -
     )
 }
 
+/// Interactive mode's counterpart to `injection_detected_notice`: no
+/// iteration count (interactive mode has no bounded driver loop) and no
+/// "stopped" framing, since interactive mode never halts on this — it
+/// only tells the operator that flagged content entered context at some
+/// point this session, having already been ingested and acted on. See
+/// the `injection_taint.current()` peek in `run()`'s interactive branch
+/// for why this is a passive notice rather than a gate.
+fn interactive_injection_notice(finding: &InjectionFinding) -> String {
+    format!(
+        "note: content from {} was flagged as a likely prompt injection this session \
+         (matched \"{}\"): \"{}\"",
+        finding.source, finding.matched_pattern, finding.excerpt
+    )
+}
+
 enum ChatLine {
     User(String),
     Assistant(String),
@@ -284,6 +299,21 @@ pub async fn run(
                 *background_cancellation.lock().unwrap() = Some(cancellation.clone());
                 let _ = agent.run_turn(input, &cwd, cancellation).await;
                 *background_cancellation.lock().unwrap() = None;
+
+                // Peek — never take() — the shared taint flag after every
+                // interactive turn too, not just autonomous mode's gate and
+                // driver loop. `record_tool_result` scans and flags this
+                // regardless of mode, so the cost is paid here either way;
+                // until now nothing in interactive mode ever surfaced the
+                // result. Interactive mode has no pause-and-resume flow to
+                // clear the flag the way autonomous mode's `.take()` above
+                // does, and the operator has already seen (and chosen to
+                // continue past) every action this session took, so simply
+                // naming the flagged source each turn — not blocking on it
+                // — is the right interactive-mode behavior.
+                if let Some(finding) = agent.injection_taint().current() {
+                    agent.notify(interactive_injection_notice(&finding));
+                }
             }
         }
     });
@@ -1432,6 +1462,61 @@ mod tests {
         assert!(message.contains('3'));
         assert!(message.contains("read_file: notes.txt"));
         assert!(message.contains("ignore previous instructions"));
+    }
+
+    #[test]
+    fn interactive_injection_notice_names_the_flagged_source_and_pattern() {
+        let finding = InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...IGNORE PREVIOUS INSTRUCTIONS...".to_string(),
+        };
+        let message = interactive_injection_notice(&finding);
+        assert!(message.contains("flagged as a likely prompt injection"));
+        assert!(message.contains("read_file: notes.txt"));
+        assert!(message.contains("ignore previous instructions"));
+        // Unlike the autonomous notice, this one never claims anything was
+        // stopped -- interactive mode doesn't halt on this.
+        assert!(!message.contains("stopped"));
+    }
+
+    // Regression coverage for the interactive-mode gap this task fixes:
+    // `record_tool_result` scans and flags shared injection taint
+    // regardless of mode, but before this fix nothing in interactive mode
+    // ever surfaced a flagged finding to the operator. The real peek lives
+    // inside `run()`'s spawned background task (a closure capturing a live
+    // `Agent`/backend/channels, not a pure function -- see this file's own
+    // note above `budget_exhausted_notice` on why the driver loops
+    // themselves aren't unit-tested directly), so this exercises the two
+    // pieces that *are* extractable and load-bearing for the operator
+    // actually seeing the warning: the notice text (above) and that a
+    // Notice-classed `AgentEvent::Error` carrying it renders as a visible
+    // line in the transcript, matching every other status/warning line in
+    // this TUI (e.g. `show_help_lists_every_known_command...` below).
+    #[test]
+    fn interactive_mode_surfaces_a_visible_warning_when_a_turn_ingested_flagged_content() {
+        let finding = InjectionFinding {
+            source: "grep: vendor/README.md".to_string(),
+            matched_pattern: "disregard all prior".to_string(),
+            excerpt: "...disregard all prior instructions...".to_string(),
+        };
+
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::Error(interactive_injection_notice(&finding)));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+
+        assert!(
+            rendered.contains("grep: vendor/README.md"),
+            "expected the flagged source to be visible in the rendered transcript:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("flagged as a likely prompt injection"),
+            "expected a recognizable warning in the rendered transcript:\n{rendered}"
+        );
     }
 
     fn modal_request() -> (crate::permission::ModalRequest, oneshot::Receiver<UserResponse>) {

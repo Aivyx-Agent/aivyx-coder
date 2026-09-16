@@ -89,7 +89,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Agent as AcpAgentBuilder, Result, Stdio};
 use aivyx_core::{Agent, AgentEvent};
-use aivyx_sandbox::PlanMode;
+use aivyx_sandbox::{InjectionFinding, PlanMode};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -144,6 +144,25 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
         text.push_str("(non-text content in this message was not forwarded)");
     }
     text
+}
+
+/// Same fix as `aivyx-tui/src/app.rs`'s own `interactive_injection_notice`
+/// (identical wording, kept as a separate copy since the two frontends
+/// don't share a text-formatting crate): `Agent::record_tool_result` scans
+/// and flags shared injection taint regardless of mode, but an ACP session
+/// is always the "a human is watching, at the editor" case (`--acp` and
+/// `--auto` are mutually exclusive — see the CLI validation in `aivyx`'s
+/// `main.rs` — so `AutonomousMode` is never active here, and neither the
+/// gate's autonomous branch nor `run_turn`'s own mid-turn taint check ever
+/// fire for this frontend). Before this fix, nothing here ever surfaced a
+/// flagged finding to the editor. No iteration count, no "stopped" framing
+/// — this frontend never halts on the flag, it only names the source.
+fn interactive_injection_notice(finding: &InjectionFinding) -> String {
+    format!(
+        "note: content from {} was flagged as a likely prompt injection this session \
+         (matched \"{}\"): \"{}\"",
+        finding.source, finding.matched_pattern, finding.excerpt
+    )
 }
 
 pub async fn run(config: AcpSessionConfig) -> Result<()> {
@@ -312,6 +331,26 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                             ));
                         }
                     }
+                    // Peek — never take() — the shared taint flag after
+                    // every turn, regardless of `result`/`stop_reason`. An
+                    // ACP session is always the interactive-equivalent
+                    // case (see `interactive_injection_notice`'s own doc
+                    // comment), and has no pause-and-resume flow to clear
+                    // this the way autonomous mode's `.take()` in
+                    // `aivyx-tui`'s driver loop does — the editor's user
+                    // already saw every action this turn took, so naming
+                    // the flagged source is a notice, not a gate.
+                    if let Some(finding) = session.agent.injection_taint().current() {
+                        let notice = AgentEvent::Error(interactive_injection_notice(&finding));
+                        if let Some(update) =
+                            crate::translate::translate_event(&session.session_id, &notice)
+                        {
+                            let _ = spawn_connection.send_notification(SessionNotification::new(
+                                session.session_id.clone(),
+                                update,
+                            ));
+                        }
+                    }
                     if let Err(err) = result {
                         return responder.respond_with_error(agent_client_protocol::util::internal_error(err.to_string()));
                     }
@@ -378,5 +417,48 @@ mod tests {
             extract_prompt_text(&blocks),
             "(non-text content in this message was not forwarded)"
         );
+    }
+
+    #[test]
+    fn interactive_injection_notice_names_the_flagged_source_and_pattern() {
+        let finding = InjectionFinding {
+            source: "read_file: notes.txt".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...IGNORE PREVIOUS INSTRUCTIONS...".to_string(),
+        };
+        let message = interactive_injection_notice(&finding);
+        assert!(message.contains("flagged as a likely prompt injection"));
+        assert!(message.contains("read_file: notes.txt"));
+        assert!(message.contains("ignore previous instructions"));
+        // Unlike an autonomous "stopped" notice, this frontend never halts
+        // on the flag -- it only names the source.
+        assert!(!message.contains("stopped"));
+    }
+
+    #[test]
+    fn interactive_injection_notice_translates_to_a_visible_agent_message() {
+        // Regression coverage for the actual wiring: the notice is emitted
+        // as `AgentEvent::Error`, and `translate::translate_event` must
+        // turn that into a real `SessionUpdate` the editor renders (not a
+        // silently-dropped variant, the way `ContextUsage` deliberately
+        // is) -- see `translate.rs`'s own `AgentEvent::Error` arm.
+        let finding = InjectionFinding {
+            source: "grep: vendor/README.md".to_string(),
+            matched_pattern: "disregard all prior".to_string(),
+            excerpt: "...disregard all prior instructions...".to_string(),
+        };
+        let notice = AgentEvent::Error(interactive_injection_notice(&finding));
+        let session_id = SessionId::new("test-session");
+        let update = crate::translate::translate_event(&session_id, &notice)
+            .expect("an Error event must always translate to a visible session update");
+        let agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk) = update
+        else {
+            panic!("expected an AgentMessageChunk carrying the notice text");
+        };
+        let agent_client_protocol::schema::v1::ContentBlock::Text(text) = chunk.content else {
+            panic!("expected a text content block");
+        };
+        assert!(text.text.contains("grep: vendor/README.md"));
+        assert!(text.text.contains("flagged as a likely prompt injection"));
     }
 }
