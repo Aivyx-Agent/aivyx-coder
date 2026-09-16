@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use aivyx_core::{Agent, AgentConfig, AgentEvent, EditFormat};
 use aivyx_sandbox::{
-    AutonomousMode, ConfirmationGate, PermissionGate, PermissionPrompter, PermissionRequest,
-    PlanMode, UserResponse,
+    AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter,
+    PermissionRequest, PlanMode, UserResponse,
 };
 use aivyx_tools::{GitCheckpointer, ToolExecutor, ToolRegistry};
 use async_trait::async_trait;
@@ -132,17 +132,39 @@ pub async fn build_session_agent(
     // branch does the work, and ConfirmationGate's plan-mode-deny branch
     // is the backstop if the model invents a mutating call anyway.
     plan_mode.set_active(level == AccessLevel::Plan);
-    let autonomous_mode = AutonomousMode::new(); // always inactive -- never reused, see Global Constraints
+    // MCP sessions are unattended by construction (TieredPrompter, above,
+    // auto-resolves every in-tier call -- there is no human to prompt), so
+    // they must run under the same guardrails the CLI's own `--auto` mode
+    // relies on for exactly that reason: AUTONOMOUS_HIDDEN_TOOLS'
+    // effect on run_shell/git_commit/repl_start (enforced below by the
+    // gate's Command-target branch, since none are pre-approved for this
+    // frontend), the injection-taint pause, and the cwd-boundary check
+    // (`is_outside_autonomous_worktree`). A hardcoded-inactive
+    // `AutonomousMode` here previously left an Execute-tier MCP session
+    // *less* constrained than `--auto`. Mirrors `agent_builder.rs`'s own
+    // `autonomous_mode.set_active(cli.auto.is_some())` -- always active
+    // here since every MCP session is unattended, not just some.
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    // Mirrors `agent_builder.rs`'s own `injection_taint` handle: shared
+    // between the gate (which pauses autonomous mode on a flagged finding)
+    // and the agent (which sets it when ingested content matches the
+    // scan). A fresh, never-shared instance on each side would mean the
+    // gate never actually sees what the agent flags.
+    let injection_taint = InjectionTaint::new();
 
-    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
-        prompter,
-        config.deny_paths.clone(),
-        Vec::new(), // no pre-approved commands -- everything in-tier already auto-allows via TieredPrompter
-        plan_mode.clone(),
-        autonomous_mode.clone(),
-        config.cwd.clone(),
-        false, // no editor-approval integration for this frontend
-    ));
+    let gate: Arc<dyn PermissionGate> = Arc::new(
+        ConfirmationGate::new(
+            prompter,
+            config.deny_paths.clone(),
+            Vec::new(), // no pre-approved commands -- see README's MCP-server "Security note"
+            plan_mode.clone(),
+            autonomous_mode.clone(),
+            config.cwd.clone(),
+            false, // no editor-approval integration for this frontend
+        )
+        .with_injection_taint(injection_taint.clone()),
+    );
 
     let mut executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::clone(&config.confiner));
     if let Some(checkpointer) = &config.checkpointer {
@@ -166,6 +188,10 @@ pub async fn build_session_agent(
         autonomous_mode,
         events_tx,
     );
+    // See the `injection_taint` binding's own comment above -- must be the
+    // *same* shared instance the gate holds, mirroring
+    // `agent_builder.rs`'s `agent.set_injection_taint(injection_taint.clone())`.
+    agent.set_injection_taint(injection_taint);
     if let Some((map, budget)) = &config.repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
     }
@@ -289,6 +315,30 @@ mod tests {
                 received: Mutex::new(Vec::new()),
             })
         }
+
+        /// A single scripted response that emits one tool call (`name`
+        /// with `arguments`) and finishes with `FinishReason::ToolCalls` --
+        /// used to drive a session's own `ConfirmationGate` decision for
+        /// that call without needing a real model. Only one response is
+        /// ever needed per test here since `build_session_agent` fixes
+        /// `max_tool_iterations` at 1, so `Agent::run_turn` calls the
+        /// backend exactly once per invocation regardless of the finish
+        /// reason.
+        fn calls_tool(name: &str, arguments: serde_json::Value) -> Arc<Self> {
+            use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+            Arc::new(Self {
+                responses: Mutex::new(std::collections::VecDeque::from(vec![vec![
+                    StreamEvent::ToolCallComplete(ToolCall {
+                        id: ToolCallId("c".to_string()),
+                        name: name.to_string(),
+                        arguments,
+                        source: ToolCallSource::Native,
+                    }),
+                    StreamEvent::Done { finish_reason: FinishReason::ToolCalls },
+                ]])),
+                received: Mutex::new(Vec::new()),
+            })
+        }
     }
     #[async_trait]
     impl LlmBackend for MockBackend {
@@ -321,12 +371,51 @@ mod tests {
         }
     }
 
+    /// A fresh, unique directory under the system temp dir -- avoids
+    /// pulling in a `tempfile` dev-dependency (not already declared for
+    /// this crate) just for these two tests; `uuid` already is.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aivyx-mcp-test-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn full_registry() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ReadFileTool));
         registry.register(Arc::new(WriteFileTool));
         registry.register(Arc::new(RunCommandTool::new(Vec::new())));
+        registry.register(Arc::new(RunShellTool));
         registry
+    }
+
+    /// Runs one `agent.run_turn` call to completion while draining
+    /// `events_rx` concurrently (same shape as `run_bounded_turn`'s own
+    /// inner `tokio::select!`), returning every event observed -- used by
+    /// tests that need to inspect `AgentEvent::ToolResult` directly, which
+    /// `run_bounded_turn` itself only exposes as accumulated `TextDelta`
+    /// text.
+    async fn run_turn_collecting_events(
+        agent: &mut Agent,
+        events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        input: String,
+        cwd: &Path,
+    ) -> (Result<(), aivyx_core::AgentError>, Vec<AgentEvent>) {
+        let mut events = Vec::new();
+        let result = {
+            let run = agent.run_turn(input, cwd, CancellationToken::new());
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    r = &mut run => break r,
+                    Some(event) = events_rx.recv() => events.push(event),
+                }
+            }
+        };
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
     }
 
     #[test]
@@ -435,6 +524,82 @@ mod tests {
             "the session's Agent must not attach a slot_hint when SessionConfig.broker_mode is \
              false -- zero behavior change for existing configs"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_execute_session_denies_run_shell_the_same_way_cli_autonomous_mode_does() {
+        // Regression test for the finding that `build_session_agent`
+        // hardcoded `AutonomousMode::new()` (always inactive): with a real,
+        // active `AutonomousMode`, `ConfirmationGate::check`'s autonomous
+        // branch denies any `PermissionTarget::Command` that isn't
+        // pre-approved (this session config passes none), matching
+        // `AUTONOMOUS_HIDDEN_TOOLS`'s effect for the CLI's own `--auto`
+        // mode -- `run_shell` must never auto-resolve to Allow just because
+        // it's in the Execute tier's registry.
+        let cwd = unique_temp_dir("run-shell-cwd");
+        let mut cfg = config(full_registry());
+        cfg.cwd = cwd.clone();
+        cfg.llm = MockBackend::calls_tool("run_shell", serde_json::json!({ "command": "echo hi" }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Execute, tx).await;
+
+        let (result, events) =
+            run_turn_collecting_events(&mut agent, &mut rx, "run a command".to_string(), &cwd).await;
+
+        assert!(result.is_ok(), "a denied tool call must not surface as an AgentError");
+        let denied = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolResult(aivyx_types::ToolResult {
+                    output: aivyx_types::ToolOutput::Denied(_),
+                    ..
+                })
+            )
+        });
+        assert!(
+            denied,
+            "run_shell must be denied at Execute tier once AutonomousMode is really active, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_execute_session_enforces_the_cwd_boundary() {
+        // Regression test for the same finding: `is_outside_autonomous_worktree`
+        // is only consulted when `AutonomousMode` is active, so a hardcoded
+        // -inactive mode silently skipped this check for MCP sessions too --
+        // a write outside the session's own cwd must be denied, exactly
+        // like the CLI's `--auto` mode.
+        let cwd = unique_temp_dir("cwd-boundary-cwd");
+        let outside = unique_temp_dir("cwd-boundary-outside");
+        let target = outside.join("escaped.txt");
+        let mut cfg = config(full_registry());
+        cfg.cwd = cwd.clone();
+        cfg.llm = MockBackend::calls_tool(
+            "write_file",
+            serde_json::json!({ "path": target.display().to_string(), "content": "pwned" }),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Execute, tx).await;
+
+        let (result, events) =
+            run_turn_collecting_events(&mut agent, &mut rx, "write a file".to_string(), &cwd).await;
+
+        assert!(result.is_ok(), "a denied tool call must not surface as an AgentError");
+        let denied = events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolResult(aivyx_types::ToolResult {
+                    output: aivyx_types::ToolOutput::Denied(_),
+                    ..
+                })
+            )
+        });
+        assert!(
+            denied,
+            "a write outside the session's cwd must be denied once AutonomousMode is really \
+             active, got: {events:?}"
+        );
+        assert!(!target.exists(), "the out-of-worktree file must never actually be written");
     }
 
     #[test]

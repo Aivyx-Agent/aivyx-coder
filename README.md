@@ -1096,14 +1096,29 @@ configured ceiling — three tiers, each additive over the previous:
   configured for a different purpose).
 
 **Security note:** unlike the TUI and ACP frontends, an MCP-server session
-has no human to show a permission prompt to — every tool call within the
-session's granted tier auto-resolves. In particular, **`max_access_level =
-"execute"` means any process able to spawn this binary gets `run_shell`
-auto-approved with no human in the loop.** Landlock/seccomp confinement
-still applies to whatever the session runs, but the interactive permission
-gate this project's security model otherwise relies on does not, for
-MCP-server sessions. Set `max_access_level` no higher than the calling
-client actually needs.
+has no human to show a permission prompt to — every in-tier tool call
+auto-resolves via the tier filter itself, with no interactive confirmation
+step. Because of that, every session actually runs under the same
+`AutonomousMode` guardrails the CLI's own `--auto` mode relies on for
+exactly the same reason (unattended execution, no one to prompt):
+file writes/deletes/moves are confined to the session's own cwd, an
+injection-taint finding ingested during the session pauses further
+mutating calls, and any command-shaped tool call
+(`run_command`/`run_shell`/`git_commit`/`git_branch`/`git_push`/`git_pr`)
+is denied unless it exactly matches a pre-approved entry. **In
+particular, `max_access_level = "execute"` does *not* auto-approve
+`run_shell` or the other command tools** — the MCP-server frontend has no
+config surface (yet) to pre-approve specific commands the way
+`[[permissions.allowed_commands]]` does for the CLI, so at Execute tier
+those calls currently always deny with "not pre-approved, and autonomous
+mode has no one to prompt." `memory_write`/`memory_forget` are denied
+outright for the same reason (no pre-approval tier exists for them at
+all, same as `--auto`). `write_file`/`edit_file`/`delete_file`/
+`move_file`/`web_fetch`/`web_search` still auto-resolve as before, the
+first four confined to the session's own working directory. Landlock/
+seccomp confinement applies on top of all of this to whatever a session
+does run. Set `max_access_level` no higher than the calling client
+actually needs.
 
 ## Tools
 
