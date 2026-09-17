@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aivyx_sandbox::{ExecutionConfiner, PermissionGate, PermissionRequest};
+use aivyx_sandbox::{ActionKind, ExecutionConfiner, PermissionGate, PermissionRequest, PermissionTarget};
 use aivyx_types::{ToolCall, ToolDefinition, ToolOutput, ToolResult};
 use async_trait::async_trait;
 use thiserror::Error;
@@ -81,6 +81,38 @@ pub trait Tool: Send + Sync {
         arguments: &serde_json::Value,
         cwd: &Path,
     ) -> Result<PermissionRequest, ToolError>;
+
+    /// The argument-parsing-and-path-resolution slice of `permission_request`
+    /// — just enough to compute the `(ActionKind, PermissionTarget)` pair
+    /// that determines an Always-Allow cache key, with none of the
+    /// additional fallible, *current-filesystem-state*-dependent checks
+    /// (file exists, diff/preview content, "destination doesn't exist yet")
+    /// that the full `permission_request` layers on top.
+    ///
+    /// This distinction matters because some tools' `permission_request`
+    /// is not idempotent with respect to their own prior execution: calling
+    /// it again *after* the tool already ran can fail purely because the
+    /// tool's own effect changed the filesystem state being inspected (e.g.
+    /// `edit_file` re-parsing `old_string` against a file that no longer
+    /// contains it, `delete_file` statting a path it just removed,
+    /// `move_file` statting a `from` that no longer exists). Such a tool
+    /// overrides this method with just the pure parse-and-resolve step so
+    /// `ToolExecutor::reconstruct_permission_request` — which only ever
+    /// needs the key, never the preview — can still recompute a historical
+    /// call's cache key after the call has already run.
+    ///
+    /// Defaults to delegating to `permission_request` and discarding
+    /// everything but `action`/`target`, which is correct for any tool
+    /// whose full implementation has no such execution-state dependency
+    /// (e.g. `write_file`, `run_command`) — override only when it does.
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<(ActionKind, PermissionTarget), ToolError> {
+        self.permission_request(arguments, cwd)
+            .map(|request| (request.action, request.target))
+    }
 
     /// Only ever invoked by `ToolExecutor` after `PermissionGate::check`
     /// returns `Allow`/`AllowAlways`.
@@ -197,30 +229,55 @@ impl ToolExecutor {
         self.registry.plan_definitions()
     }
 
-    /// Rebuilds the `PermissionRequest` a historical `ToolCall` (e.g. one
-    /// about to be dropped from history by compaction) would have produced,
-    /// by replaying it through the *exact same* `tool.permission_request`
-    /// call `dispatch_inner` itself uses. This is what makes the resulting
-    /// `PermissionKey` provably identical to whatever key was cached for
-    /// the original call: it isn't a hand-rolled reconstruction that merely
-    /// mirrors that logic, it's a second call to the same function with the
-    /// same recorded arguments and the same `cwd`.
+    /// Rebuilds the `(action, target)` pair a historical `ToolCall` (e.g.
+    /// one about to be dropped from history by compaction) would have
+    /// produced, by replaying it through `tool.permission_target` — the
+    /// same pure parse-and-resolve step `dispatch_inner`'s own call to
+    /// `tool.permission_request` runs internally before layering any
+    /// execution-state-dependent checks on top. This is what makes the
+    /// resulting `PermissionKey` provably identical to whatever key was
+    /// cached for the original call: it isn't a hand-rolled reconstruction
+    /// that merely mirrors that logic, it's a second call to the same
+    /// underlying derivation with the same recorded arguments and the same
+    /// `cwd`. Deliberately calls `permission_target`, not
+    /// `permission_request`, directly: several tools' full
+    /// `permission_request` (`edit_file`, `delete_file`, `move_file`,
+    /// `patch_file`) re-derives its result from *current* filesystem state
+    /// that the tool's own prior execution already changed (e.g. `edit_file`
+    /// re-matching `old_string` against a file that no longer contains it),
+    /// so calling `permission_request` here would spuriously fail for
+    /// exactly the calls this function most needs to succeed for — see Task
+    /// 8 review Finding 1 (security audit, 2026-09-16).
+    ///
+    /// Builds a minimal `PermissionRequest` around that pair — `preview`/
+    /// `diff` are `None` and `arguments_preview` is the raw call arguments,
+    /// since eviction only ever needs `action`/`target` (what
+    /// `PermissionKey::from_request` reads) and never renders anything to a
+    /// human.
     ///
     /// `None` if the tool is no longer registered, or its arguments no
-    /// longer validate against it (e.g. `run_command` naming an
+    /// longer parse against it (e.g. `run_command` naming an
     /// `allowed_commands` entry removed from config since the call was
-    /// made) — both rare, and in either case there's nothing to evict since
-    /// the same failure would have already prevented the call from ever
-    /// being dispatched (and therefore cached) with today's registry.
+    /// made) — both rare. The caller should log when this happens: unlike
+    /// the case this used to (incorrectly) claim, there generally *is*
+    /// something worth evicting in this situation, since a cached
+    /// Always-Allow entry doesn't disappear just because reconstruction
+    /// failed to name it.
     pub fn reconstruct_permission_request(
         &self,
         call: &ToolCall,
         cwd: &Path,
     ) -> Option<PermissionRequest> {
-        self.registry
-            .get(&call.name)?
-            .permission_request(&call.arguments, cwd)
-            .ok()
+        let tool = self.registry.get(&call.name)?;
+        let (action, target) = tool.permission_target(&call.arguments, cwd).ok()?;
+        Some(PermissionRequest {
+            tool_name: call.name.clone(),
+            action,
+            target,
+            arguments_preview: call.arguments.clone(),
+            preview: None,
+            diff: None,
+        })
     }
 
     /// Evicts a cached Always-Allow decision matching `request`, if any —
@@ -553,6 +610,120 @@ mod tests {
             2,
             "eviction of a Path-target key via the reconstructed request must also \
              force a fresh prompt"
+        );
+    }
+
+    /// Task 8 review Finding 1 (security audit, 2026-09-16): `run_command`
+    /// and `write_file` above happen to be exactly the two tools whose
+    /// `permission_request` is idempotent with respect to their own prior
+    /// execution — which is why the test above passed even while eviction
+    /// silently never fired for `delete_file`/`edit_file`/`move_file`.
+    /// `delete_file`'s own `permission_request` re-derives its target by
+    /// `std::fs::metadata`-ing the path, which its own successful execution
+    /// just removed — before the fix, this made `reconstruct_permission_request`
+    /// return `None` (`Err` swallowed via `.ok()`) for every real
+    /// `delete_file` call once it had actually run, so its cache entry was
+    /// never evicted no matter how many turn-groups compaction dropped.
+    ///
+    /// This drives a REAL `delete_file` dispatch through to completion (the
+    /// file is genuinely deleted), then reconstructs a `PermissionRequest`
+    /// from the resulting historical `ToolCall` and proves both that
+    /// reconstruction succeeds post-execution and that the eviction it
+    /// enables actually takes effect. This test fails before the Finding 1
+    /// fix (`reconstructed` is `None`, the `.expect` panics) and passes
+    /// after it.
+    #[tokio::test]
+    async fn reconstruct_permission_request_succeeds_for_delete_file_after_its_own_execution() {
+        use aivyx_sandbox::{
+            AutonomousMode, ConfirmationGate, NoopConfiner, PermissionPrompter, PlanMode,
+            UserResponse,
+        };
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource, ToolOutput};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAlwaysAllowPrompter(AtomicUsize);
+        #[async_trait]
+        impl PermissionPrompter for CountingAlwaysAllowPrompter {
+            async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                UserResponse::AllowAlways
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::write(dir.path().join("doomed.txt"), "bye\n").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(DeleteFileTool));
+        let prompter = Arc::new(CountingAlwaysAllowPrompter(AtomicUsize::new(0)));
+        let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd.clone(),
+            false,
+        ));
+        let executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::new(NoopConfiner));
+
+        let call = ToolCall {
+            id: ToolCallId("d1".to_string()),
+            name: "delete_file".to_string(),
+            arguments: serde_json::json!({ "path": "doomed.txt" }),
+            source: ToolCallSource::Native,
+        };
+
+        let result = executor
+            .dispatch(call.clone(), &cwd, CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result.output, ToolOutput::Ok(_)),
+            "expected the delete to succeed, got {:?}",
+            result.output
+        );
+        assert_eq!(prompter.0.load(Ordering::SeqCst), 1);
+        assert!(
+            !dir.path().join("doomed.txt").exists(),
+            "the file must really be gone -- this is what breaks the old .ok()-swallowing code"
+        );
+
+        // The load-bearing assertion: reconstruction must succeed even
+        // though delete_file's own permission_request would now fail
+        // (the file it stats no longer exists).
+        let reconstructed = executor
+            .reconstruct_permission_request(&call, &cwd)
+            .expect(
+                "reconstruct_permission_request must succeed for a historical delete_file call \
+                 even after its own execution removed the file -- this is exactly Finding 1's bug",
+            );
+
+        // The cache entry must still be live before eviction: checking the
+        // reconstructed request directly must be a silent cache hit.
+        use aivyx_sandbox::PermissionDecision;
+        assert_eq!(
+            gate.check(&reconstructed).await,
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(
+            prompter.0.load(Ordering::SeqCst),
+            1,
+            "sanity check: the cache entry must still be live before eviction"
+        );
+
+        executor.forget_permission(&reconstructed);
+
+        // If eviction is genuinely wired up (not a vacuous no-op), a repeat
+        // check of the exact same reconstructed target must now prompt again.
+        assert_eq!(
+            gate.check(&reconstructed).await,
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(
+            prompter.0.load(Ordering::SeqCst),
+            2,
+            "forget_permission on the reconstructed request must have evicted the cache entry"
         );
     }
 

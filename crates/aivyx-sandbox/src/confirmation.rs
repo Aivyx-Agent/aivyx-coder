@@ -123,6 +123,18 @@ pub struct ConfirmationGate {
     autonomous_mode: AutonomousMode,
     cwd: PathBuf,
     always_allow: Mutex<HashSet<PermissionKey>>,
+    /// The subset of keys in `always_allow` seeded from
+    /// `[[permissions.allowed_commands]]` at construction, rather than
+    /// earned via an interactive Always Allow during this session. Tracked
+    /// separately so `forget_always_allow` can tell the two apart: a
+    /// conversation-history record disappearing (compaction, `/clear`)
+    /// invalidates only the session-earned kind — a standing config-file
+    /// declaration was never justified by that history record in the first
+    /// place, and has no reason to stop applying just because it did (Task 8
+    /// review Finding 2, security audit, 2026-09-16). Immutable after
+    /// construction — nothing in this codebase adds to `always_allow` from
+    /// config after `new`.
+    pre_approved: HashSet<PermissionKey>,
     editor_approval_enabled: bool,
     injection_taint: InjectionTaint,
 }
@@ -151,7 +163,7 @@ impl ConfirmationGate {
         cwd: PathBuf,
         editor_approval_enabled: bool,
     ) -> Self {
-        let always_allow = pre_approved_commands
+        let pre_approved: HashSet<PermissionKey> = pre_approved_commands
             .into_iter()
             .map(|(program, args)| PermissionKey::Command { program, args })
             .collect();
@@ -161,7 +173,8 @@ impl ConfirmationGate {
             plan_mode,
             autonomous_mode,
             cwd,
-            always_allow: Mutex::new(always_allow),
+            always_allow: Mutex::new(pre_approved.clone()),
+            pre_approved,
             editor_approval_enabled,
             injection_taint: InjectionTaint::new(),
         }
@@ -481,8 +494,20 @@ impl PermissionGate for ConfirmationGate {
     /// from a historical `ToolCall` via the same `Tool::permission_request`
     /// call `check` originally used is guaranteed to hash and compare equal
     /// to whatever was inserted when that call was first approved.
+    ///
+    /// Deliberately never removes a key in `pre_approved`: that tier was
+    /// seeded from `[[permissions.allowed_commands]]` at construction, not
+    /// earned by an interactive approval this session recorded in history —
+    /// a conversation-history record disappearing (compaction, `/clear`)
+    /// has no bearing on whether the operator's config still trusts the
+    /// command, and evicting it would strand `--auto` mode (which never
+    /// prompts) with a command it can now only ever deny (Task 8 review
+    /// Finding 2, security audit, 2026-09-16).
     fn forget_always_allow(&self, request: &PermissionRequest) {
         let key = PermissionKey::from_request(request);
+        if self.pre_approved.contains(&key) {
+            return;
+        }
         let removed = self.always_allow.lock().unwrap().remove(&key);
         if removed {
             tracing::info!(
@@ -1004,6 +1029,73 @@ mod tests {
         // b.rs was never touched -- still cached, no third-for-b prompt.
         gate.check(&write_request("/home/user/project/b.rs")).await;
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Task 8 review Finding 2 (security audit, 2026-09-16):
+    /// `forget_always_allow` must never remove a key seeded from
+    /// `[[permissions.allowed_commands]]` at construction — a
+    /// conversation-history record disappearing (what compaction's eviction
+    /// call responds to) has no bearing on whether the operator's config
+    /// still trusts the command. This matters most in autonomous mode,
+    /// which never prompts: before this fix, a compaction pass that dropped
+    /// the turn-group recording a pre-approved command's most recent
+    /// invocation (including the auto-verification command every `--auto`
+    /// run requires) would permanently deny that command for the rest of
+    /// the session, with nothing able to re-approve it.
+    #[tokio::test]
+    async fn forget_always_allow_never_evicts_a_config_pre_approved_command() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![("cargo".to_string(), vec!["test".to_string()])],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let pre_approved = PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        // Sanity check: it's pre-approved and autonomous mode never prompts.
+        assert_eq!(
+            gate.check(&pre_approved).await,
+            PermissionDecision::AllowAlways
+        );
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+
+        // Simulate compaction (or `/clear`) dropping the turn-group that
+        // recorded this command's most recent invocation.
+        gate.forget_always_allow(&pre_approved);
+
+        // Must still be callable -- autonomous mode has no one to re-prompt,
+        // so if this were evicted the command would be permanently denied
+        // for the rest of the session.
+        assert_eq!(
+            gate.check(&pre_approved).await,
+            PermissionDecision::AllowAlways,
+            "a config-seeded pre-approval must survive forget_always_allow"
+        );
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "autonomous mode must not have been asked to prompt at any point"
+        );
     }
 
     /// Forgetting a request that was never cached (or already evicted) must

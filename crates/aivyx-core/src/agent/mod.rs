@@ -414,6 +414,11 @@ impl Agent {
     /// Never calls the model — this is the `AgentState`-tier `/clear`
     /// command's entire implementation. `plan_mode` is deliberately
     /// untouched: it's a mode setting, not conversation content.
+    ///
+    /// Known gap (logged, not fixed here — out of scope for Task 8, which
+    /// covers compaction only): this wipes `history` without evicting any
+    /// Always-Allow cache entries the wiped calls justified, the same class
+    /// of staleness `compact_if_needed` guards against for compaction.
     pub fn clear_conversation(&mut self) {
         self.history.clear();
         self.tasks.lock().unwrap().clear();
@@ -1000,6 +1005,17 @@ impl Agent {
             for call in &dropped_calls {
                 if let Some(request) = self.executor.reconstruct_permission_request(call, cwd) {
                     self.executor.forget_permission(&request);
+                } else {
+                    // Reconstruction failed (tool no longer registered, or its
+                    // arguments no longer parse) — the call's Always-Allow
+                    // cache entry, if any, is left un-evicted. Rare, and
+                    // logged so it's observable rather than a silent gap
+                    // (Task 8 review Finding 1, security audit, 2026-09-16).
+                    tracing::warn!(
+                        tool = %call.name,
+                        "could not reconstruct a permission request for a compaction-dropped \
+                         tool call — its Always-Allow cache entry, if any, was not evicted"
+                    );
                 }
             }
         }

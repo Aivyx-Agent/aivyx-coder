@@ -61,20 +61,46 @@ impl Tool for MoveFileTool {
         }
     }
 
+    /// Pure parse-and-resolve, with none of the filesystem checks below —
+    /// see the trait doc comment for why this must stay independent of
+    /// whether `from` still exists or `to` still doesn't.
+    /// `reconstruct_permission_request` calls this (not `permission_request`)
+    /// specifically so it keeps working after the move it's reconstructing
+    /// already ran (Task 8 review Finding 1, security audit, 2026-09-16) —
+    /// `permission_request` itself would otherwise always fail
+    /// post-execution, since `from` is now gone and/or `to` now exists.
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<(ActionKind, PermissionTarget), ToolError> {
+        let args: MoveFileArgs = serde_json::from_value(arguments.clone())
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        Ok((
+            ActionKind::Move,
+            PermissionTarget::Move {
+                from: resolve(cwd, &args.from),
+                to: resolve(cwd, &args.to),
+            },
+        ))
+    }
+
     fn permission_request(
         &self,
         arguments: &serde_json::Value,
         cwd: &Path,
     ) -> Result<PermissionRequest, ToolError> {
+        let (action, target) = self.permission_target(arguments, cwd)?;
+        let PermissionTarget::Move { from, to } = &target else {
+            unreachable!("move_file's permission_target always returns a Move target")
+        };
         let args: MoveFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        let from = resolve(cwd, &args.from);
-        let to = resolve(cwd, &args.to);
 
-        let metadata = std::fs::metadata(&from).map_err(|_| {
+        let metadata = std::fs::metadata(from).map_err(|_| {
             ToolError::ExecutionFailed(format!("{} does not exist", from.display()))
         })?;
-        if std::fs::metadata(&to).is_ok() {
+        if std::fs::metadata(to).is_ok() {
             return Err(ToolError::ExecutionFailed(format!(
                 "{} already exists — move_file refuses to overwrite; delete it first if that's \
                  intended",
@@ -83,7 +109,7 @@ impl Tool for MoveFileTool {
         }
 
         let preview = if metadata.is_dir() {
-            if let Some(denied) = find_denied_descendant(&from, &self.deny_paths) {
+            if let Some(denied) = find_denied_descendant(from, &self.deny_paths) {
                 return Err(ToolError::ExecutionFailed(format!(
                     "{} is under a configured deny_paths entry — refusing to move a directory \
                      that contains it (moving would relocate it outside deny_paths' protection)",
@@ -94,10 +120,10 @@ impl Tool for MoveFileTool {
                 "Move directory {} to {}\n\n{}",
                 from.display(),
                 to.display(),
-                directory_listing(&from)
+                directory_listing(from)
             )
         } else {
-            match std::fs::read_to_string(&from) {
+            match std::fs::read_to_string(from) {
                 Ok(content) => {
                     format!("Move {} to {}\n\n{}", from.display(), to.display(), content)
                 }
@@ -112,8 +138,8 @@ impl Tool for MoveFileTool {
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Move,
-            target: PermissionTarget::Move { from, to },
+            action,
+            target,
             arguments_preview: json!({ "from": args.from, "to": args.to }),
             preview: Some(preview),
             diff: None,
@@ -228,6 +254,39 @@ mod tests {
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Task 8 review Finding 1 (security audit, 2026-09-16): after a
+    /// successful move, `from` no longer exists — before the fix, calling
+    /// `permission_request` again with the same arguments would fail
+    /// (`from` fails its `std::fs::metadata` check), which is exactly what
+    /// made `reconstruct_permission_request` return `None` and skip
+    /// eviction. `permission_target` must keep succeeding here.
+    #[tokio::test]
+    async fn permission_target_succeeds_after_the_move_it_describes_already_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "hello\n").unwrap();
+        let args = json!({ "from": "old.txt", "to": "new.txt" });
+
+        let tool = MoveFileTool::new(vec![]);
+        tool.execute(args.clone(), &ctx(dir.path())).await.unwrap();
+        assert!(
+            tool.permission_request(&args, dir.path()).is_err(),
+            "sanity check: permission_request is expected to fail post-execution \
+             (from is gone, to now exists)"
+        );
+
+        let (action, target) = tool
+            .permission_target(&args, dir.path())
+            .expect("permission_target must succeed even though permission_request now fails");
+        assert_eq!(action, ActionKind::Move);
+        assert_eq!(
+            target,
+            PermissionTarget::Move {
+                from: dir.path().join("old.txt"),
+                to: dir.path().join("new.txt"),
+            }
+        );
     }
 
     #[tokio::test]

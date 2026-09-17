@@ -119,16 +119,35 @@ impl Tool for EditFileTool {
         }
     }
 
+    /// Pure parse-and-resolve, with none of the filesystem reads below —
+    /// see the trait doc comment for why this must stay independent of
+    /// whether `old_string` still matches the file's *current* content.
+    /// `reconstruct_permission_request` calls this (not `permission_request`)
+    /// specifically so it keeps working after the edit it's reconstructing
+    /// already ran (Task 8 review Finding 1, security audit, 2026-09-16).
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<(ActionKind, PermissionTarget), ToolError> {
+        let args: EditFileArgs = serde_json::from_value(arguments.clone())
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        Ok((ActionKind::Write, PermissionTarget::Path(resolve(cwd, &args.path))))
+    }
+
     fn permission_request(
         &self,
         arguments: &serde_json::Value,
         cwd: &Path,
     ) -> Result<PermissionRequest, ToolError> {
+        let (action, target) = self.permission_target(arguments, cwd)?;
+        let PermissionTarget::Path(resolved) = &target else {
+            unreachable!("edit_file's permission_target always returns a Path target")
+        };
         let args: EditFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        let resolved = resolve(cwd, &args.path);
 
-        let old_content = std::fs::read_to_string(&resolved).map_err(|err| {
+        let old_content = std::fs::read_to_string(resolved).map_err(|err| {
             ToolError::ExecutionFailed(format!("cannot edit {}: {err}", resolved.display()))
         })?;
         let new_content = apply_edit(
@@ -149,8 +168,8 @@ impl Tool for EditFileTool {
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Write,
-            target: PermissionTarget::Path(resolved),
+            action,
+            target,
             arguments_preview: json!({ "path": args.path, "replace_all": args.replace_all }),
             preview,
             diff,
@@ -184,6 +203,47 @@ impl Tool for EditFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(dir: &Path) -> ToolExecutionContext {
+        ToolExecutionContext {
+            cwd: dir.to_path_buf(),
+            confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Task 8 review Finding 1 (security audit, 2026-09-16): after a
+    /// successful edit, the file no longer contains `old_string` — before
+    /// the fix, calling `permission_request` again with the same arguments
+    /// would fail (`apply_edit`'s zero-match error path), which is exactly
+    /// what made `reconstruct_permission_request` return `None` and skip
+    /// eviction. `permission_target` must keep succeeding here.
+    #[tokio::test]
+    async fn permission_target_succeeds_after_the_edit_it_describes_already_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+        let args = json!({
+            "path": "a.rs",
+            "old_string": "fn foo() {}",
+            "new_string": "fn foo() -> i32 { 42 }",
+        });
+
+        let tool = EditFileTool;
+        // Sanity check: after the edit runs, the full permission_request
+        // (which re-reads the file and re-matches old_string) now fails --
+        // this is the very state reconstruct_permission_request must survive.
+        tool.execute(args.clone(), &ctx(dir.path())).await.unwrap();
+        assert!(
+            tool.permission_request(&args, dir.path()).is_err(),
+            "sanity check: permission_request is expected to fail post-execution"
+        );
+
+        let (action, target) = tool
+            .permission_target(&args, dir.path())
+            .expect("permission_target must succeed even though permission_request now fails");
+        assert_eq!(action, ActionKind::Write);
+        assert_eq!(target, PermissionTarget::Path(dir.path().join("a.rs")));
+    }
 
     #[test]
     fn replaces_the_single_match() {

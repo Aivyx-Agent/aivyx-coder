@@ -67,16 +67,39 @@ impl Tool for PatchFileTool {
         }
     }
 
+    /// Pure parse-and-resolve, with none of the filesystem reads below —
+    /// see the trait doc comment for why this must stay independent of
+    /// whether the patch's hunks still apply against the file's *current*
+    /// content. `reconstruct_permission_request` calls this (not
+    /// `permission_request`) specifically so it keeps working after the
+    /// patch it's reconstructing already ran (Task 8 review Finding 1,
+    /// security audit, 2026-09-16) — `permission_request` itself would
+    /// otherwise typically fail post-execution, since a patch that already
+    /// applied cleanly generally no longer matches the (now-patched) file's
+    /// context lines.
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<(ActionKind, PermissionTarget), ToolError> {
+        let args: PatchFileArgs = serde_json::from_value(arguments.clone())
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        Ok((ActionKind::Write, PermissionTarget::Path(resolve(cwd, &args.path))))
+    }
+
     fn permission_request(
         &self,
         arguments: &serde_json::Value,
         cwd: &Path,
     ) -> Result<PermissionRequest, ToolError> {
+        let (action, target) = self.permission_target(arguments, cwd)?;
+        let PermissionTarget::Path(resolved) = &target else {
+            unreachable!("patch_file's permission_target always returns a Path target")
+        };
         let args: PatchFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        let resolved = resolve(cwd, &args.path);
 
-        let old_content = std::fs::read_to_string(&resolved).map_err(|err| {
+        let old_content = std::fs::read_to_string(resolved).map_err(|err| {
             ToolError::ExecutionFailed(format!("cannot patch {}: {err}", resolved.display()))
         })?;
         let new_content = apply_patch(&old_content, &args.patch)?;
@@ -92,8 +115,8 @@ impl Tool for PatchFileTool {
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Write,
-            target: PermissionTarget::Path(resolved),
+            action,
+            target,
             arguments_preview: json!({ "path": args.path }),
             preview,
             diff,
@@ -129,6 +152,35 @@ mod tests {
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Task 8 review Finding 1 (security audit, 2026-09-16): after a
+    /// successful patch, the file's content has already changed to match
+    /// the patch's result — before the fix, calling `permission_request`
+    /// again with the same arguments would fail (`apply_patch`'s
+    /// context-mismatch or no-op-change error path), which is exactly what
+    /// made `reconstruct_permission_request` return `None` and skip
+    /// eviction. `permission_target` must keep succeeding here.
+    #[tokio::test]
+    async fn permission_target_succeeds_after_the_patch_it_describes_already_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "fn foo() {}\n").unwrap();
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-fn foo() {}\n+fn foo() -> i32 { 42 }\n";
+        let args = json!({ "path": "a.txt", "patch": patch });
+
+        let tool = PatchFileTool;
+        tool.execute(args.clone(), &ctx(dir.path())).await.unwrap();
+        assert!(
+            tool.permission_request(&args, dir.path()).is_err(),
+            "sanity check: permission_request is expected to fail post-execution \
+             (the patch's context no longer matches the already-patched file)"
+        );
+
+        let (action, target) = tool
+            .permission_target(&args, dir.path())
+            .expect("permission_target must succeed even though permission_request now fails");
+        assert_eq!(action, ActionKind::Write);
+        assert_eq!(target, PermissionTarget::Path(dir.path().join("a.txt")));
     }
 
     #[tokio::test]

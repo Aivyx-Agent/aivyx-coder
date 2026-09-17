@@ -42,16 +42,37 @@ impl Tool for DeleteFileTool {
         }
     }
 
+    /// Pure parse-and-resolve, with none of the filesystem checks below —
+    /// see the trait doc comment for why this must stay independent of
+    /// whether the target still exists. `reconstruct_permission_request`
+    /// calls this (not `permission_request`) specifically so it keeps
+    /// working after the delete it's reconstructing already ran (Task 8
+    /// review Finding 1, security audit, 2026-09-16) — `permission_request`
+    /// itself would otherwise always fail post-execution, since the file it
+    /// `std::fs::metadata`s is now gone.
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<(ActionKind, PermissionTarget), ToolError> {
+        let args: DeleteFileArgs = serde_json::from_value(arguments.clone())
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        Ok((ActionKind::Delete, PermissionTarget::Path(resolve(cwd, &args.path))))
+    }
+
     fn permission_request(
         &self,
         arguments: &serde_json::Value,
         cwd: &Path,
     ) -> Result<PermissionRequest, ToolError> {
+        let (action, target) = self.permission_target(arguments, cwd)?;
+        let PermissionTarget::Path(resolved) = &target else {
+            unreachable!("delete_file's permission_target always returns a Path target")
+        };
         let args: DeleteFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        let resolved = resolve(cwd, &args.path);
 
-        let metadata = std::fs::metadata(&resolved).map_err(|_| {
+        let metadata = std::fs::metadata(resolved).map_err(|_| {
             ToolError::ExecutionFailed(format!("{} does not exist", resolved.display()))
         })?;
         if metadata.is_dir() {
@@ -62,7 +83,7 @@ impl Tool for DeleteFileTool {
             )));
         }
 
-        let (preview, diff) = match std::fs::read_to_string(&resolved) {
+        let (preview, diff) = match std::fs::read_to_string(resolved) {
             Ok(content) => (
                 Some(content.clone()),
                 Some(DiffContent { old_content: content, new_content: String::new() }),
@@ -79,8 +100,8 @@ impl Tool for DeleteFileTool {
 
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
-            action: ActionKind::Delete,
-            target: PermissionTarget::Path(resolved),
+            action,
+            target,
             arguments_preview: json!({ "path": args.path }),
             preview,
             diff,
