@@ -1334,6 +1334,22 @@ impl Agent {
             crate::council::convene(council, &subject, digest, &self.events_tx, &cancellation)
                 .await;
         if let Some(message) = entry {
+            // The chairman's synthesis is the sole content this command adds
+            // to history, but it's built by interpolating each council
+            // member's answer text verbatim into both the ranker and
+            // chairman prompts (see `council::convene`) — a single
+            // adversarial or compromised member can carry an injection
+            // phrase straight through to the synthesis. Scan it exactly the
+            // way `record_tool_result` scans every tool result before it
+            // reaches history, flagging the same shared taint so autonomous
+            // mode's existing pause/deny logic and interactive mode's
+            // per-turn notice (see each frontend's own driver loop) cover a
+            // council-poisoned session with no new gate code.
+            if let Some(finding) =
+                aivyx_sandbox::scan_for_injection_markers(&message.text_content(), "council")
+            {
+                self.injection_taint.flag(finding);
+            }
             self.history.push(message);
         }
         self.emit(AgentEvent::TurnComplete);
