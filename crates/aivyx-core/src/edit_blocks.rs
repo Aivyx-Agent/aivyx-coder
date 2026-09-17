@@ -81,6 +81,13 @@ fn extract_path(preceding: &[&str]) -> Option<String> {
 }
 
 pub fn parse_edit_blocks(text: &str) -> Vec<BlockParse> {
+    // Detected once, up front, from the raw text -- `str::lines()` below
+    // strips the `\r` off every CRLF line, so by the time we're looking at
+    // individual lines there's no way to tell CRLF and LF input apart
+    // per-line. Rejoining unconditionally with a bare `\n` (as this used
+    // to) would silently produce a SEARCH/REPLACE string that never
+    // matches a CRLF file's real on-disk content.
+    let line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<&str> = text.lines().collect();
     let mut blocks = Vec::new();
     let mut i = 0;
@@ -138,8 +145,8 @@ pub fn parse_edit_blocks(text: &str) -> Vec<BlockParse> {
 
         blocks.push(BlockParse::Ok(EditBlock {
             path,
-            search: join_block(&search_lines),
-            replace: join_block(&replace_lines),
+            search: join_block(&search_lines, line_ending),
+            replace: join_block(&replace_lines, line_ending),
         }));
         i = k + 1;
     }
@@ -147,14 +154,17 @@ pub fn parse_edit_blocks(text: &str) -> Vec<BlockParse> {
     blocks
 }
 
-/// Block content keeps interior lines verbatim; a single trailing newline
-/// is appended when non-empty so whole-line replacements splice cleanly.
-fn join_block(lines: &[&str]) -> String {
+/// Block content keeps interior lines verbatim; a single trailing line
+/// ending is appended when non-empty so whole-line replacements splice
+/// cleanly. `line_ending` is `"\r\n"` or `"\n"`, detected once per input
+/// text by the caller, so a CRLF-line-ended file's content round-trips
+/// through SEARCH/REPLACE unchanged rather than silently degrading to LF.
+fn join_block(lines: &[&str], line_ending: &str) -> String {
     if lines.is_empty() {
         return String::new();
     }
-    let mut out = lines.join("\n");
-    out.push('\n');
+    let mut out = lines.join(line_ending);
+    out.push_str(line_ending);
     out
 }
 
@@ -266,6 +276,27 @@ mod tests {
         assert!(
             parse_edit_blocks("just a normal answer with code:\n```rust\nfn main() {}\n```")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_replace_matches_against_crlf_line_endings() {
+        // A CRLF-line-ended file's content, quoted verbatim by the model
+        // into its SEARCH section, must round-trip with `\r\n` preserved --
+        // `str::lines()` strips `\r` from each line, so naively rejoining
+        // with a bare `\n` would silently produce a SEARCH string that
+        // never matches the real (CRLF) file content on disk.
+        let file_content = "line one\r\nline two\r\nline three\r\n";
+        let text =
+            "f.txt\r\n<<<<<<< SEARCH\r\nline two\r\n=======\r\nline TWO\r\n>>>>>>> REPLACE\r\n";
+        let blocks = ok_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search, "line two\r\n");
+        assert_eq!(blocks[0].replace, "line TWO\r\n");
+        assert!(
+            file_content.contains(&blocks[0].search),
+            "SEARCH text {:?} does not match the CRLF file content",
+            blocks[0].search
         );
     }
 }

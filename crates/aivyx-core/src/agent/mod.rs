@@ -1705,6 +1705,56 @@ impl Agent {
                     let id = ToolCallId(format!("prompted-edit-{}", self.synthetic_seq));
                     match parsed {
                         BlockParse::Ok(block) => {
+                            // An empty SEARCH section normally means "create
+                            // this file new" -- but a small model emitting
+                            // the `=======` divider one line early against a
+                            // file that already exists would otherwise be
+                            // treated the same way, silently truncating it
+                            // via an unconditional write_file. Only take the
+                            // new-file path when the target genuinely
+                            // doesn't exist yet; route the ambiguous case
+                            // through the same Malformed-retry feedback path
+                            // the parser already uses for other unparseable
+                            // blocks, rather than a bespoke error shape.
+                            //
+                            // A plain `cwd.join(...)` (not the full
+                            // `~`/symlink-aware `resolve()` aivyx-tools uses)
+                            // is deliberate here: this is a cheap pre-check
+                            // deciding which tool call to synthesize, not
+                            // the security-relevant resolution itself --
+                            // whichever call we do emit still goes through
+                            // the real tool's own `resolve()` and the
+                            // permission gate before touching disk. A stat()
+                            // is synchronous but effectively free; matches
+                            // the existing precedent of synchronous
+                            // `std::fs::metadata` existence checks elsewhere
+                            // in this codebase (e.g.
+                            // `move_file::permission_request`) rather than
+                            // `spawn_blocking`.
+                            //
+                            // No TOCTOU concern in the new-file branch: if
+                            // the path doesn't exist now but is created
+                            // between this check and the eventual
+                            // `write_file`, that write still runs under the
+                            // operator's own local filesystem and permission
+                            // gate -- not a trust boundary.
+                            if block.search.is_empty() && cwd.join(&block.path).exists() {
+                                malformed_blocks.push((
+                                    ToolCall {
+                                        id,
+                                        name: "edit_file".to_string(),
+                                        arguments: serde_json::json!({}),
+                                        source: ToolCallSource::TextFallback,
+                                    },
+                                    format!(
+                                        "SEARCH section was empty, but {} already exists -- use \
+                                         a non-empty SEARCH block to edit it, or a different \
+                                         path to create a new file",
+                                        block.path
+                                    ),
+                                ));
+                                continue;
+                            }
                             let (name, arguments) = if block.search.is_empty() {
                                 (
                                     "write_file",

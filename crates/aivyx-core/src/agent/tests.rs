@@ -901,6 +901,9 @@ async fn prompted_blocks_apply_through_the_normal_tool_path() {
 
 #[tokio::test]
 async fn empty_search_block_creates_a_new_file_via_write_file() {
+    // Doubles as the "genuinely new path still creates the file" pin for
+    // the existence-check fix below: the target here never exists, so this
+    // must keep behaving exactly as before.
     let dir = tempfile::tempdir().unwrap();
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(aivyx_tools::WriteFileTool));
@@ -925,6 +928,48 @@ async fn empty_search_block_creates_a_new_file_via_write_file() {
         std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(),
         "hello world\n"
     );
+}
+
+#[tokio::test]
+async fn empty_search_against_an_existing_file_is_rejected_not_silently_overwritten() {
+    // A small model emitting `=======` one line early against a file that
+    // already exists must not be treated as "create this file new" -- that
+    // would silently truncate the existing content via an unconditional
+    // write_file.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("existing.txt"), "original content\n").unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+    let block = "existing.txt\n<<<<<<< SEARCH\n=======\noverwritten!\n>>>>>>> REPLACE";
+    let (mut agent, _rx, mock) = build_agent_with_config(
+        vec![text_response(block), text_response("understood")],
+        registry,
+        prompted_config(),
+    );
+
+    agent
+        .run_turn(
+            "create it".to_string(),
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // Untouched on disk -- no write_file call was ever synthesized.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
+        "original content\n"
+    );
+    // Routed through the same Malformed-retry feedback path as any other
+    // unparseable block, not a bespoke error shape.
+    assert_eq!(
+        count_denied_containing(&agent.history, "already exists"),
+        1
+    );
+    // The feedback drove a second round-trip instead of ending the turn.
+    assert_eq!(mock.received.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
