@@ -370,18 +370,22 @@ same reason `remember_preference` is (see above).
 The persona feature also added `~/.config/aivyx-coder` to the *default*
 `deny_paths` list, protecting the config directory (which can hold
 `backend.api_key`) from the generic `write_file`/`edit_file`/`delete_file`/
-`read_file`/`grep` tools. Since it's a default, it only applies to fresh
-installs — an existing `config.toml` won't pick it up automatically; add
-`"~/.config/aivyx-coder"` to your own `[permissions] deny_paths` list by
-hand to get the same protection.
+`read_file`/`grep` tools.
 
 Cross-session memory added the same default protection for
 `~/.local/state/aivyx-coder` — the state directory `memory/`'s topic files
 (and `sessions/`) live under — so a generic `write_file` can't plant
 content for a later, auto-allowed `memory_read` to surface, bypassing the
-`memory_write` confirmation entirely. Same caveat as above: only fresh
-installs pick this up automatically; add `"~/.local/state/aivyx-coder"` to
-your own `[permissions] deny_paths` list by hand on an existing install.
+`memory_write` confirmation entirely.
+
+Both of these land automatically on an existing install too, not just a
+fresh one: `deny_paths` in an existing `config.toml` (which, on first run,
+was written out as a fully explicit list, frozen at whatever defaults
+existed then) is **merged** with the current build's built-in defaults on
+every load, union-deduplicated by exact string match — never replaced
+outright. A config file's own entries always survive the merge; the only
+thing you can't do through config alone is *remove* a built-in default. See
+"`deny_paths` — a hard block" below.
 
 KV-cache persistence (see below) gets the same protection for whatever
 directory it actually uses — a restored `.slot` file *is* the model's
@@ -1225,7 +1229,18 @@ entry with **no path separator** (e.g. `.env`, `*.pem`) is instead a
 **basename-glob pattern**: it matches any file with that name anywhere,
 not just one fixed absolute location — useful for a project-local secret
 file that recurs across every project directory the agent might be
-pointed at, which a fixed absolute path can't express. This covers:
+pointed at, which a fixed absolute path can't express.
+
+A `deny_paths` list in `config.toml` is **merged** with the built-in
+defaults, never a replacement for them: the deserializer unions your
+entries with the current build's defaults (de-duplicated by exact string
+match) before anything else sees the list. This is deliberate — silently
+losing a security-critical default (e.g. `~/.local/state/aivyx-coder`,
+which stops the model from planting a fake memory-topic file or
+self-approving its own pending permission gate) just because you set your
+own `deny_paths` for a project-local secret would be a much worse failure
+mode than "you can't remove a default via config." There is currently no
+way to *remove* a built-in default through config. This covers:
 
 - **File tools** (`read_file`/`write_file`/`edit_file`): the resolved target
   is checked directly.
@@ -1378,6 +1393,9 @@ context_tokens = 8192
 # ~-expanded and symlink-canonicalized. A bare entry with no separator
 # (e.g. ".env", "*.pem") is a basename-glob pattern instead, matching any
 # file with that name anywhere rather than one fixed location.
+# This list is MERGED with the built-in security defaults (union,
+# de-duplicated), never a replacement for them -- there is no way to
+# remove a built-in default via config, only add to it.
 deny_paths = ["~/.ssh", "~/.aws", ".env", "*.pem"]
 max_tool_iterations_per_turn = 25
 

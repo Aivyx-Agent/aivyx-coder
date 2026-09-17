@@ -716,6 +716,20 @@ pub struct PermissionSettings {
     /// `ConfirmationGate` before any prompt or Always-Allow cache lookup.
     /// Entries may use a leading `~` for the home directory — see
     /// `resolved_deny_paths`.
+    ///
+    /// Deliberately **merged**, not replaced, when a config file supplies
+    /// its own `deny_paths` — see `merge_deny_paths`. The struct-level
+    /// `#[serde(default)]` above only fills in a field that's *absent*
+    /// from the input; without this field's own `deserialize_with`, a
+    /// *present* `deny_paths = [...]` would deserialize as exactly that
+    /// list, silently dropping the security-critical built-in defaults
+    /// (e.g. `~/.local/state/aivyx-coder`, which stops the model from
+    /// planting a fake memory-topic file or self-approving its own
+    /// pending permission gate via the editor-approval channel). An
+    /// operator who wants to *remove* a default entry has no way to do so
+    /// with this fix — a deliberate, much smaller failure mode than
+    /// silently losing the defaults entirely.
+    #[serde(default = "default_deny_paths", deserialize_with = "merge_deny_paths")]
     pub deny_paths: Vec<String>,
     pub max_tool_iterations_per_turn: u32,
     /// Fixed set of commands the `run_command` tool may execute — the model
@@ -725,53 +739,83 @@ pub struct PermissionSettings {
     pub allowed_commands: Vec<AllowedCommand>,
 }
 
+/// The built-in, security-critical `deny_paths` defaults.
+///
+/// `read_file` has no OS-level backstop at all — Landlock only confines
+/// spawned child processes, never this crate's own in-process file reads —
+/// so this list is the *sole* protection against the model reading
+/// plaintext credentials via a normal, auto-allowed `ActionKind::Read`
+/// call. Not exhaustive (impossible to be), but covers the common,
+/// high-value cases beyond SSH/AWS: GPG, generic netrc-style creds,
+/// container/cluster/cloud-CLI auth, and package-registry tokens
+/// (including this project's own toolchain's). The basename-glob entries
+/// below (no leading `~`) match by file name anywhere rather than one
+/// fixed location, covering project-local secrets like `.env` that recur
+/// across arbitrary project directories.
+///
+/// Used both as `PermissionSettings`'s own field default and, via
+/// `merge_deny_paths`, as the base a config-supplied `deny_paths` list is
+/// merged into rather than replacing outright.
+fn default_deny_paths() -> Vec<String> {
+    vec![
+        "~/.ssh".to_string(),
+        "~/.aws".to_string(),
+        "~/.config/aivyx-coder".to_string(),
+        // Protects the whole control-plane state directory, not
+        // just its `memory/` subdirectory (matching the same
+        // whole-directory reasoning as `~/.config/aivyx-coder`
+        // above) — without this, a generic write_file/edit_file
+        // could plant a crafted memory topic file directly under
+        // `memory/`, bypassing the ActionKind::PersistentMemory
+        // gate entirely; a later memory_read (auto-allowed) would
+        // then return the planted content.
+        "~/.local/state/aivyx-coder".to_string(),
+        "~/.gnupg".to_string(),
+        "~/.netrc".to_string(),
+        "~/.docker/config.json".to_string(),
+        "~/.kube/config".to_string(),
+        "~/.npmrc".to_string(),
+        "~/.pypirc".to_string(),
+        "~/.config/gcloud".to_string(),
+        "~/.azure".to_string(),
+        "~/.cargo/credentials.toml".to_string(),
+        "~/.config/gh".to_string(),
+        ".env".to_string(),
+        ".env.*".to_string(),
+        "id_rsa".to_string(),
+        "id_ed25519".to_string(),
+        "*.pem".to_string(),
+        "*.key".to_string(),
+    ]
+}
+
+/// Deserializes a config-supplied `deny_paths` list, merging it into the
+/// built-in defaults (union, de-duplicated by exact string match — entries
+/// are raw, unexpanded strings such as `~/.ssh` at this stage, matching how
+/// `default_deny_paths` itself represents them, so an operator repeating a
+/// default verbatim doesn't produce a duplicate) rather than replacing them
+/// outright. See `PermissionSettings::deny_paths`'s doc comment for why:
+/// the struct-level `#[serde(default)]` only covers a field that's
+/// *missing* from the input, not one that's present with its own value.
+fn merge_deny_paths<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let configured: Vec<String> = Vec::deserialize(deserializer)?;
+    let mut merged = default_deny_paths();
+    for entry in configured {
+        if !merged.contains(&entry) {
+            merged.push(entry);
+        }
+    }
+    Ok(merged)
+}
+
 impl Default for PermissionSettings {
     fn default() -> Self {
         Self {
             mode: PermissionMode::Confirm,
-            // `read_file` has no OS-level backstop at all — Landlock only
-            // confines spawned child processes, never this crate's own
-            // in-process file reads — so this list is the *sole*
-            // protection against the model reading plaintext credentials
-            // via a normal, auto-allowed `ActionKind::Read` call. Not
-            // exhaustive (impossible to be), but covers the common,
-            // high-value cases beyond SSH/AWS: GPG, generic netrc-style
-            // creds, container/cluster/cloud-CLI auth, and package-registry
-            // tokens (including this project's own toolchain's). The
-            // basename-glob entries below (no leading `~`) match by file
-            // name anywhere rather than one fixed location, covering
-            // project-local secrets like `.env` that recur across
-            // arbitrary project directories.
-            deny_paths: vec![
-                "~/.ssh".to_string(),
-                "~/.aws".to_string(),
-                "~/.config/aivyx-coder".to_string(),
-                // Protects the whole control-plane state directory, not
-                // just its `memory/` subdirectory (matching the same
-                // whole-directory reasoning as `~/.config/aivyx-coder`
-                // above) — without this, a generic write_file/edit_file
-                // could plant a crafted memory topic file directly under
-                // `memory/`, bypassing the ActionKind::PersistentMemory
-                // gate entirely; a later memory_read (auto-allowed) would
-                // then return the planted content.
-                "~/.local/state/aivyx-coder".to_string(),
-                "~/.gnupg".to_string(),
-                "~/.netrc".to_string(),
-                "~/.docker/config.json".to_string(),
-                "~/.kube/config".to_string(),
-                "~/.npmrc".to_string(),
-                "~/.pypirc".to_string(),
-                "~/.config/gcloud".to_string(),
-                "~/.azure".to_string(),
-                "~/.cargo/credentials.toml".to_string(),
-                "~/.config/gh".to_string(),
-                ".env".to_string(),
-                ".env.*".to_string(),
-                "id_rsa".to_string(),
-                "id_ed25519".to_string(),
-                "*.pem".to_string(),
-                "*.key".to_string(),
-            ],
+            deny_paths: default_deny_paths(),
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
         }
@@ -1125,6 +1169,52 @@ mod tests {
                 "expected default deny_paths to include {expected:?}, got {deny_paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn operator_supplied_deny_paths_are_added_to_the_security_critical_defaults_not_replacing_them()
+    {
+        // Regression test: `#[serde(default)]` on the struct (not the
+        // field) meant a present `deny_paths = [...]` in config.toml
+        // replaced the whole default vector instead of extending it --
+        // dropping load-bearing entries like `~/.local/state/aivyx-coder`
+        // (prevents planting a fake memory-topic file / self-approving a
+        // pending permission gate via the editor-approval channel) and
+        // `~/.config/aivyx-coder` (protects `backend.api_key`).
+        let toml = r#"deny_paths = ["/my/custom/path"]"#;
+        let config: PermissionSettings = toml::from_str(toml).unwrap();
+        assert!(config.deny_paths.iter().any(|p| p == "/my/custom/path"));
+        assert!(
+            config
+                .deny_paths
+                .iter()
+                .any(|p| p.contains(".local/state/aivyx-coder")),
+            "operator-supplied deny_paths must not drop the security-critical \
+             state-directory default, got {:?}",
+            config.deny_paths
+        );
+        assert!(
+            config
+                .deny_paths
+                .iter()
+                .any(|p| p.contains(".config/aivyx-coder")),
+            "operator-supplied deny_paths must not drop the security-critical \
+             config-directory default, got {:?}",
+            config.deny_paths
+        );
+    }
+
+    #[test]
+    fn operator_supplied_deny_paths_that_duplicate_a_default_are_not_duplicated() {
+        let toml = r#"deny_paths = ["~/.ssh"]"#;
+        let config: PermissionSettings = toml::from_str(toml).unwrap();
+        let occurrences = config.deny_paths.iter().filter(|p| *p == "~/.ssh").count();
+        assert_eq!(
+            occurrences, 1,
+            "a operator-supplied entry that exactly matches a default must not be \
+             duplicated, got {:?}",
+            config.deny_paths
+        );
     }
 
     #[test]
