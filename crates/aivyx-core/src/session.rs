@@ -271,35 +271,39 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    /// Unlike `saved_file_is_owner_only`, this forces a permissive umask
-    /// (`0o022`, i.e. what a plain `std::fs::write` + separate `chmod`
-    /// would briefly leave the file at) before saving, so it actually
-    /// exercises the write-time window rather than just the final mode --
-    /// a `write` + racy `chmod` could still pass the other test by the time
-    /// `save` returns.
-    #[cfg(unix)]
-    #[test]
-    fn session_file_is_never_observable_at_a_wider_mode_than_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.json");
-
-        // SAFETY: umask is process-global; no other thread in this test
-        // binary touches file creation permissions concurrently with the
-        // single `save` call below.
-        let old_umask = unsafe { libc::umask(0o022) };
-        let result = save(&path, &SessionState::new(vec![], vec![], false));
-        unsafe {
-            libc::umask(old_umask);
-        }
-        result.unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "session file must never be created at a mode wider than 0600, \
-             even under a permissive umask"
-        );
-    }
+    // A once-planned second test here bracketed the process umask
+    // (`libc::umask(0o022)` around the `save` call, restored after) to try
+    // to exercise the write-time window under a permissive umask, rather
+    // than just the final mode `saved_file_is_owner_only` above checks.
+    // Removed (Task 9 review) for two independent reasons, either one
+    // sufficient on its own:
+    //
+    // 1. It doesn't actually test anything `saved_file_is_owner_only`
+    //    doesn't already cover: `open()`'s `mode(0o600)` argument sets an
+    //    *absolute* mode, not one relative to umask, and umask can only
+    //    *clear* bits from a requested mode -- `0o600` has no group/other
+    //    bits to clear. So the ambient umask during the call is provably
+    //    irrelevant to the outcome; even the old, vulnerable write-then-
+    //    chmod code would have passed this exact assertion by the time
+    //    `save` returned (chmod also sets an absolute mode). It bought no
+    //    real regression coverage.
+    // 2. Process umask is genuinely global, mutable, per-process state --
+    //    this exact pattern (`libc::umask` bracketed around one call, no
+    //    synchronization) already broke a real, unrelated, pre-existing
+    //    test in the sibling `aivyx-pa` repo's equivalent security-audit
+    //    fix (Task 7, daemon socket bind), reproduced and root-caused to
+    //    racing against concurrent filesystem-touching tests in the same
+    //    binary. This crate's own test suite has dozens of concurrent
+    //    `tempfile`/`fs::write` call sites in the same binary and no test
+    //    isolation config, so the same class of flake was live here too --
+    //    it simply hadn't surfaced yet, since this machine's ambient umask
+    //    already happened to equal the bracketed value.
+    //
+    // The atomicity guarantee (no window at a wider mode, ever, regardless
+    // of ambient umask) is structural -- `mode(0o600)` is passed straight
+    // to `open(2)`'s `O_CREAT` argument -- and is verified by code
+    // inspection, not by a umask-varying test. `saved_file_is_owner_only`
+    // above remains the correct, sufficient regression test: it proves the
+    // resulting mode is exactly `0o600`, which is all `open()`-time mode
+    // assignment can ever produce.
 }
