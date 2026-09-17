@@ -114,19 +114,46 @@ pub fn load(path: &Path) -> Option<SessionState> {
 /// Writes the session owner-only (it can contain file contents / command
 /// output read during the session, so it's treated as sensitive like
 /// `config.toml`). Best-effort at the call site.
+///
+/// The file is opened with mode `0600` set at `open()` time (via
+/// `OpenOptions::mode`, Unix-only) rather than written with the process's
+/// default umask and then `chmod`'d afterward -- the latter has a real
+/// window where the file is observable at a wider mode, plus (as it was
+/// previously written here) a silent failure mode if the `chmod` itself
+/// errors. Any I/O error -- including a failure to apply the mode -- now
+/// propagates as a real `Err` instead of being discarded.
 pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)?;
 
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+
+    use std::io::Write;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -242,5 +269,37 @@ mod tests {
         save(&path, &SessionState::new(vec![], vec![], false)).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Unlike `saved_file_is_owner_only`, this forces a permissive umask
+    /// (`0o022`, i.e. what a plain `std::fs::write` + separate `chmod`
+    /// would briefly leave the file at) before saving, so it actually
+    /// exercises the write-time window rather than just the final mode --
+    /// a `write` + racy `chmod` could still pass the other test by the time
+    /// `save` returns.
+    #[cfg(unix)]
+    #[test]
+    fn session_file_is_never_observable_at_a_wider_mode_than_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+
+        // SAFETY: umask is process-global; no other thread in this test
+        // binary touches file creation permissions concurrently with the
+        // single `save` call below.
+        let old_umask = unsafe { libc::umask(0o022) };
+        let result = save(&path, &SessionState::new(vec![], vec![], false));
+        unsafe {
+            libc::umask(old_umask);
+        }
+        result.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "session file must never be created at a mode wider than 0600, \
+             even under a permissive umask"
+        );
     }
 }
