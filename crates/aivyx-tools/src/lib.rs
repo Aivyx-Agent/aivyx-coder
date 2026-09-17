@@ -197,6 +197,38 @@ impl ToolExecutor {
         self.registry.plan_definitions()
     }
 
+    /// Rebuilds the `PermissionRequest` a historical `ToolCall` (e.g. one
+    /// about to be dropped from history by compaction) would have produced,
+    /// by replaying it through the *exact same* `tool.permission_request`
+    /// call `dispatch_inner` itself uses. This is what makes the resulting
+    /// `PermissionKey` provably identical to whatever key was cached for
+    /// the original call: it isn't a hand-rolled reconstruction that merely
+    /// mirrors that logic, it's a second call to the same function with the
+    /// same recorded arguments and the same `cwd`.
+    ///
+    /// `None` if the tool is no longer registered, or its arguments no
+    /// longer validate against it (e.g. `run_command` naming an
+    /// `allowed_commands` entry removed from config since the call was
+    /// made) — both rare, and in either case there's nothing to evict since
+    /// the same failure would have already prevented the call from ever
+    /// being dispatched (and therefore cached) with today's registry.
+    pub fn reconstruct_permission_request(
+        &self,
+        call: &ToolCall,
+        cwd: &Path,
+    ) -> Option<PermissionRequest> {
+        self.registry
+            .get(&call.name)?
+            .permission_request(&call.arguments, cwd)
+            .ok()
+    }
+
+    /// Evicts a cached Always-Allow decision matching `request`, if any —
+    /// see `PermissionGate::forget_always_allow`.
+    pub fn forget_permission(&self, request: &PermissionRequest) {
+        self.gate.forget_always_allow(request);
+    }
+
     pub async fn dispatch(
         &self,
         call: ToolCall,
@@ -382,6 +414,146 @@ mod tests {
         // The approval for memory_write must NOT satisfy memory_forget on
         // the same topic -- the gate must prompt again.
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Task 8 (security audit, 2026-09-16): the single most important
+    /// correctness question in that task is whether
+    /// `reconstruct_permission_request` really produces a `PermissionRequest`
+    /// whose cache key is byte-for-byte identical to whatever `dispatch`
+    /// itself used to cache the original approval — not merely "close" or
+    /// "the same shape." This drives a REAL `ConfirmationGate` (not a test
+    /// double) through both a `Command`-target tool (`run_command`) and a
+    /// `Path`-target tool (`write_file`), and proves the equivalence
+    /// directly: `forget_permission` fed the *reconstructed* request must
+    /// actually evict the entry `dispatch` cached, forcing the gate to
+    /// prompt again on a replayed identical call instead of silently
+    /// reusing the stale approval.
+    #[tokio::test]
+    async fn reconstruct_permission_request_reproduces_the_exact_cache_key_dispatch_used() {
+        use aivyx_sandbox::{
+            AutonomousMode, ConfirmationGate, NoopConfiner, PermissionPrompter, PlanMode,
+            UserResponse,
+        };
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingAlwaysAllowPrompter(AtomicUsize);
+        #[async_trait]
+        impl PermissionPrompter for CountingAlwaysAllowPrompter {
+            async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                UserResponse::AllowAlways
+            }
+        }
+
+        let cwd = std::env::temp_dir();
+
+        // ---- Command target (run_command) ----
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+            name: "deploy".to_string(),
+            program: "true".to_string(),
+            args: vec![],
+            timeout: std::time::Duration::from_secs(5),
+        }])));
+        let prompter = Arc::new(CountingAlwaysAllowPrompter(AtomicUsize::new(0)));
+        let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd.clone(),
+            false,
+        ));
+        let executor = ToolExecutor::new(registry, gate, Arc::new(NoopConfiner));
+
+        let call = ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "command": "deploy" }),
+            source: ToolCallSource::Native,
+        };
+        // Cache a real AllowAlways approval through the real dispatch path.
+        executor
+            .dispatch(call.clone(), &cwd, CancellationToken::new())
+            .await;
+        assert_eq!(prompter.0.load(Ordering::SeqCst), 1);
+
+        // Dispatching the identical call again must be a silent cache hit
+        // (no second prompt) -- the baseline this test needs to disprove
+        // once eviction runs below.
+        executor
+            .dispatch(call.clone(), &cwd, CancellationToken::new())
+            .await;
+        assert_eq!(
+            prompter.0.load(Ordering::SeqCst),
+            1,
+            "sanity check: a repeat dispatch before eviction must be a cache hit"
+        );
+
+        // Reconstruct the request from the historical ToolCall alone (name
+        // + arguments, exactly what a compacted history block retains) and
+        // evict it.
+        let reconstructed = executor
+            .reconstruct_permission_request(&call, &cwd)
+            .expect("run_command's permission_request must succeed on unchanged arguments");
+        executor.forget_permission(&reconstructed);
+
+        // If the reconstructed key were even slightly different from the
+        // one `dispatch` actually cached, this would still be a silent
+        // cache hit and the count would stay at 1.
+        executor
+            .dispatch(call, &cwd, CancellationToken::new())
+            .await;
+        assert_eq!(
+            prompter.0.load(Ordering::SeqCst),
+            2,
+            "eviction via the reconstructed request must have forced a fresh prompt"
+        );
+
+        // ---- Path target (write_file), same proof shape ----
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteFileTool));
+        let prompter = Arc::new(CountingAlwaysAllowPrompter(AtomicUsize::new(0)));
+        let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd.clone(),
+            false,
+        ));
+        let executor = ToolExecutor::new(registry, gate, Arc::new(NoopConfiner));
+
+        let file = tempfile::NamedTempFile::new_in(&cwd).unwrap();
+        let path = file.path().to_path_buf();
+        let call = ToolCall {
+            id: ToolCallId("w1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "hello\n" }),
+            source: ToolCallSource::Native,
+        };
+        executor
+            .dispatch(call.clone(), &cwd, CancellationToken::new())
+            .await;
+        assert_eq!(prompter.0.load(Ordering::SeqCst), 1);
+
+        let reconstructed = executor
+            .reconstruct_permission_request(&call, &cwd)
+            .expect("write_file's permission_request must succeed on unchanged arguments");
+        executor.forget_permission(&reconstructed);
+
+        executor
+            .dispatch(call, &cwd, CancellationToken::new())
+            .await;
+        assert_eq!(
+            prompter.0.load(Ordering::SeqCst),
+            2,
+            "eviction of a Path-target key via the reconstructed request must also \
+             force a fresh prompt"
+        );
     }
 
     #[tokio::test]

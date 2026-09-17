@@ -475,6 +475,24 @@ impl PermissionGate for ConfirmationGate {
         }
         decision
     }
+
+    /// See the trait doc comment. Computes the key exactly the way `check`
+    /// itself does (`PermissionKey::from_request`), so a request rebuilt
+    /// from a historical `ToolCall` via the same `Tool::permission_request`
+    /// call `check` originally used is guaranteed to hash and compare equal
+    /// to whatever was inserted when that call was first approved.
+    fn forget_always_allow(&self, request: &PermissionRequest) {
+        let key = PermissionKey::from_request(request);
+        let removed = self.always_allow.lock().unwrap().remove(&key);
+        if removed {
+            tracing::info!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "evicted a stale Always-Allow cache entry (its recording turn-group was dropped by compaction)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +929,110 @@ mod tests {
         let third = gate.check(&write_request("/home/user/project/b.rs")).await;
         assert_eq!(third, PermissionDecision::AllowAlways);
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Task 8 (security audit, 2026-09-16): `forget_always_allow` must
+    /// actually evict the entry `check` itself cached — proving that
+    /// `PermissionKey::from_request` computed on a request built
+    /// independently (a fresh literal here, standing in for a request
+    /// rebuilt by `aivyx-core`'s compaction path from a historical
+    /// `ToolCall`) still hashes and compares equal to the key `check`
+    /// inserted for the very same target.
+    #[tokio::test]
+    async fn forget_always_allow_evicts_a_cached_entry_and_forces_a_fresh_prompt() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let first = gate.check(&write_request("/home/user/project/a.rs")).await;
+        assert_eq!(first, PermissionDecision::AllowAlways);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        gate.forget_always_allow(&write_request("/home/user/project/a.rs"));
+
+        // The eviction must actually have taken effect: a repeat of the
+        // exact same target must prompt again, not silently reuse the
+        // (now supposedly forgotten) cached approval.
+        let second = gate.check(&write_request("/home/user/project/a.rs")).await;
+        assert_eq!(second, PermissionDecision::AllowAlways);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            2,
+            "forget_always_allow must have evicted the cache entry, forcing a second prompt"
+        );
+    }
+
+    /// The exact-target discipline `always_allow_caches_per_exact_target_only`
+    /// already proves for caching must hold for eviction too: forgetting one
+    /// target must not disturb a different target's own cached approval.
+    #[tokio::test]
+    async fn forget_always_allow_does_not_disturb_a_different_cached_target() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        gate.check(&write_request("/home/user/project/a.rs")).await;
+        gate.check(&write_request("/home/user/project/b.rs")).await;
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 2);
+
+        gate.forget_always_allow(&write_request("/home/user/project/a.rs"));
+
+        // a.rs was forgotten -- prompts again.
+        gate.check(&write_request("/home/user/project/a.rs")).await;
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 3);
+
+        // b.rs was never touched -- still cached, no third-for-b prompt.
+        gate.check(&write_request("/home/user/project/b.rs")).await;
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Forgetting a request that was never cached (or already evicted) must
+    /// be a harmless no-op, not a panic — compaction may legitimately try
+    /// to evict a call whose approval was `Allow` (never cached) rather
+    /// than `AllowAlways`, or one already forgotten by an earlier pass.
+    #[tokio::test]
+    async fn forget_always_allow_on_an_uncached_request_is_a_harmless_noop() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        gate.forget_always_allow(&write_request("/home/user/project/never-cached.rs"));
+        // No panic, and the gate still works normally afterward.
+        let decision = gate
+            .check(&write_request("/home/user/project/never-cached.rs"))
+            .await;
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

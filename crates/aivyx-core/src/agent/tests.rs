@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use aivyx_llm::LlmError;
 use aivyx_sandbox::{
-    ActionKind, AutonomousMode, ExecutionConfiner, InjectionTaint, NoopConfiner,
-    PermissionDecision, PermissionGate, PermissionRequest, PermissionTarget, PlanMode,
+    ActionKind, AutonomousMode, ConfirmationGate, ExecutionConfiner, InjectionTaint, NoopConfiner,
+    PermissionDecision, PermissionGate, PermissionPrompter, PermissionRequest, PermissionTarget,
+    PlanMode, UserResponse,
 };
 use aivyx_tools::{
     CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry,
@@ -358,6 +359,29 @@ fn ok_tool_result_msg(id: &str, text: &str) -> Message {
             call_id: ToolCallId(id.to_string()),
             output: ToolOutput::Ok(text.to_string()),
         })],
+    }
+}
+
+/// An assistant message carrying a single tool call — used by the
+/// compaction/Always-Allow-eviction tests (Task 8) to build a turn-group
+/// containing a real, recognizable `ToolCall` rather than plain text.
+fn assistant_msg_with_tool_call(call: ToolCall) -> Message {
+    Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolCall(call)],
+        tool_call_id: None,
+    }
+}
+
+/// A `run_command("deploy")` call — the finding's own example of a
+/// mutating, Command-target action whose Always-Allow cache entry must not
+/// outlive the only history record that it already ran.
+fn deploy_call(id: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.to_string()),
+        name: "run_command".to_string(),
+        arguments: serde_json::json!({ "command": "deploy" }),
+        source: ToolCallSource::Native,
     }
 }
 
@@ -4087,7 +4111,7 @@ fn drop_oldest_group_removes_the_first_turn_and_keeps_the_rest() {
         user_msg("u2"),
         assistant_msg("a2"),
     ];
-    assert!(drop_oldest_group(&mut history));
+    assert!(drop_oldest_group(&mut history).is_some());
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].role, Role::User);
     assert_eq!(history[0].text_content(), "u2");
@@ -4096,8 +4120,38 @@ fn drop_oldest_group_removes_the_first_turn_and_keeps_the_rest() {
 #[test]
 fn drop_oldest_group_keeps_the_only_group() {
     let mut history = vec![user_msg("u1"), assistant_msg("a1")];
-    assert!(!drop_oldest_group(&mut history));
+    assert!(drop_oldest_group(&mut history).is_none());
     assert_eq!(history.len(), 2);
+}
+
+#[test]
+fn drop_oldest_group_returns_the_tool_calls_it_dropped() {
+    // The whole point of Task 8's change: the caller needs the actual
+    // dropped `ToolCall`s (not just a bool) to evict their Always-Allow
+    // cache entries. A group with no tool call in it (plain text turn)
+    // must report `Some(vec![])` -- dropped, but nothing to evict -- which
+    // is a distinct case from `None` (nothing dropped at all): the two
+    // must never be conflated, or a caller looping until `None` would stop
+    // dead the first time a droppable group happens to have no tool call.
+    let mut history = vec![
+        user_msg("u1"),
+        assistant_msg_with_tool_call(deploy_call("c1")),
+        ok_tool_result_msg("c1", "deployed"),
+        user_msg("u2"),
+        assistant_msg("a2"),
+    ];
+    let dropped = drop_oldest_group(&mut history).expect("a group was dropped");
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].name, "run_command");
+    assert_eq!(dropped[0].arguments, serde_json::json!({ "command": "deploy" }));
+
+    let mut text_only_history = vec![user_msg("u1"), assistant_msg("a1"), user_msg("u2")];
+    assert_eq!(
+        drop_oldest_group(&mut text_only_history)
+            .expect("a group was dropped even though it had no tool call")
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -4143,7 +4197,7 @@ fn compaction_drops_oldest_turns_and_surfaces_a_notice() {
     }
     let before = agent.history.len();
 
-    agent.compact_if_needed();
+    agent.compact_if_needed(Path::new("."));
 
     assert!(agent.history.len() < before, "history should have shrunk");
     assert!(agent.history_truncated);
@@ -4170,11 +4224,145 @@ fn no_compaction_when_well_under_the_window() {
     agent.history.push(user_msg("hello"));
     agent.history.push(assistant_msg("hi"));
 
-    agent.compact_if_needed();
+    agent.compact_if_needed(Path::new("."));
 
     assert_eq!(agent.history.len(), 2);
     assert!(!agent.history_truncated);
     assert!(drain(&mut rx).is_empty());
+}
+
+/// A `PermissionPrompter` that always answers `AllowAlways` while counting
+/// how many times it was actually asked — lets the test below detect a
+/// *silent* cache hit (the count doesn't move) versus a genuine fresh
+/// confirmation round-trip (the count increments), without reaching into
+/// `ConfirmationGate`'s private cache directly.
+struct CountingAlwaysAllowPrompter(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl PermissionPrompter for CountingAlwaysAllowPrompter {
+    async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        UserResponse::AllowAlways
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_compacted_tool_call_requires_a_fresh_confirmation_on_reissue() {
+    // Task 8 (security audit, 2026-09-16): history compaction dropping a
+    // mutating call's only record must not leave its Always-Allow cache
+    // entry behind. Uses the REAL `ConfirmationGate` (not the loop-mechanics
+    // `AllowAllGate` other tests here use) precisely because the point is
+    // to prove the real caching/eviction path, not stub around it.
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+        name: "deploy".to_string(),
+        program: "true".to_string(),
+        args: vec![],
+        timeout: Duration::from_secs(5),
+    }])));
+
+    let prompter = Arc::new(CountingAlwaysAllowPrompter(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
+        prompter.clone(),
+        vec![],
+        vec![],
+        PlanMode::new(),
+        AutonomousMode::new(),
+        PathBuf::from("."),
+        false,
+    ));
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(registry, gate, confiner);
+
+    let (tx, _rx) = unbounded_channel();
+    let mut agent = Agent::new(
+        Arc::new(MockBackend::new(vec![])),
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    // (a) Dispatch the call once through `agent.executor` -- the exact same
+    // path `run_turn_inner` itself uses -- so a real Always-Allow approval
+    // gets cached under the real `PermissionKey` the gate actually uses.
+    let first_call = deploy_call("c1");
+    let result = agent
+        .executor
+        .dispatch(
+            first_call.clone(),
+            Path::new("."),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        !matches!(result.output, ToolOutput::Denied(_)),
+        "the first call must actually be approved, not denied: {:?}",
+        result.output
+    );
+    assert_eq!(
+        prompter.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first call must have prompted exactly once"
+    );
+
+    // Record it into history exactly as `run_turn_inner` itself would, as
+    // its own oldest turn-group.
+    agent.history.push(user_msg("please deploy"));
+    agent
+        .history
+        .push(assistant_msg_with_tool_call(first_call.clone()));
+    agent.history.push(ok_tool_result_msg("c1", "deployed"));
+    agent.history.push(assistant_msg("deployed"));
+
+    // (b) Pile on enough later turns to force compaction to drop that
+    // oldest group -- mirrors `compaction_drops_oldest_turns_and_surfaces_a_notice`
+    // above.
+    agent.context_limit = 100;
+    for i in 0..5 {
+        agent
+            .history
+            .push(user_msg(&format!("u{i} {}", "x".repeat(150))));
+        agent
+            .history
+            .push(assistant_msg(&format!("a{i} {}", "y".repeat(150))));
+    }
+    agent.compact_if_needed(Path::new("."));
+    assert!(agent.history_truncated, "compaction must actually have run");
+    assert!(
+        !agent
+            .history
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::ToolCall(c) if c.id == first_call.id)),
+        "the deploy call's history record must actually be gone after compaction"
+    );
+
+    // (c) The model re-issues the identical call. It must NOT be served
+    // silently from the (now-stale) Always-Allow cache -- the prompter must
+    // be asked again, proving a fresh confirmation decision was made rather
+    // than a silent cache hit.
+    let second_call = deploy_call("c2");
+    let result = agent
+        .executor
+        .dispatch(second_call, Path::new("."), CancellationToken::new())
+        .await;
+    assert!(
+        !matches!(result.output, ToolOutput::Denied(_)),
+        "the reissued call must still be approvable: {:?}",
+        result.output
+    );
+    assert_eq!(
+        prompter.0.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "compaction must have evicted the cached approval, forcing a second prompt \
+         instead of a silent cache hit"
+    );
 }
 
 // ----- council mode (Phase 11a) -----

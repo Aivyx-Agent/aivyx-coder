@@ -963,7 +963,17 @@ impl Agent {
     /// never separated from its `Role::Tool` result (the loop's invariant),
     /// and the most recent turn is always kept. Truncation is surfaced to the
     /// user (an event) and to the model (a system-prompt note) — never silent.
-    fn compact_if_needed(&mut self) {
+    ///
+    /// A dropped turn-group can be the *only* record that a mutating call
+    /// (e.g. `git_push`, `delete_file`, a deploy `run_command`) already ran
+    /// — and `ConfirmationGate`'s Always-Allow cache is independent of
+    /// history, so without the eviction below, a model that re-issues the
+    /// identical call after compaction would have it run silently off the
+    /// stale cached approval, with no fresh prompt. `cwd` is needed to
+    /// rebuild each dropped call's `PermissionRequest` the same way
+    /// `ToolExecutor::dispatch` originally did (Task 8, security audit
+    /// 2026-09-16).
+    fn compact_if_needed(&mut self, cwd: &Path) {
         let high = (self.context_limit as f64 * COMPACT_HIGH_WATER) as u32;
         if self.estimate_prompt_tokens() <= high {
             return;
@@ -973,11 +983,25 @@ impl Agent {
 
         let low = (self.context_limit as f64 * COMPACT_LOW_WATER) as u32;
         let mut dropped = false;
-        while self.estimate_prompt_tokens() > low {
-            if !drop_oldest_group(&mut self.history) {
+        loop {
+            if self.estimate_prompt_tokens() <= low {
                 break;
             }
+            // `None` means nothing was dropped (one group or fewer left) --
+            // distinct from `Some(vec![])`, a group that *was* dropped but
+            // happened to contain no tool calls (a plain text turn). Conflating
+            // the two would stop compaction dead the first time a droppable
+            // group has no tool call in it, even though more still needs to
+            // go to reach the low-water mark.
+            let Some(dropped_calls) = drop_oldest_group(&mut self.history) else {
+                break;
+            };
             dropped = true;
+            for call in &dropped_calls {
+                if let Some(request) = self.executor.reconstruct_permission_request(call, cwd) {
+                    self.executor.forget_permission(&request);
+                }
+            }
         }
 
         if dropped {
@@ -1548,7 +1572,7 @@ impl Agent {
                 break;
             }
 
-            self.compact_if_needed();
+            self.compact_if_needed(cwd);
             // Recorded here (not from `assemble_messages`) so it pairs with
             // the estimator's own char-count for a consistent calibration.
             self.last_request_chars = Some(self.prompt_chars());
@@ -2174,9 +2198,17 @@ fn message_chars(system_prompt: &str, history: &[Message]) -> usize {
 /// Drops the oldest complete turn-group — everything from the start up to
 /// (but not including) the *second* `Role::User` message. Cutting only at
 /// user boundaries keeps every `tool_call`/`Role::Tool`-result pairing
-/// intact and always preserves the most recent turn. Returns whether
-/// anything was dropped (false when one group or fewer remains).
-fn drop_oldest_group(history: &mut Vec<Message>) -> bool {
+/// intact and always preserves the most recent turn. Returns `None` when
+/// one group or fewer remains (nothing was dropped); otherwise
+/// `Some(calls)`, every `ToolCall` the dropped group contained (possibly
+/// empty, for a group that was text-only) — the caller uses these to evict
+/// the matching Always-Allow cache entries, since this may be the only
+/// record in the model's context that a mutating call already ran (Task 8,
+/// security audit 2026-09-16). The `Option` layer matters: `Some(vec![])`
+/// (dropped, but nothing to evict) must stay distinguishable from `None`
+/// (nothing dropped at all), or a caller looping on this until nothing's
+/// left would stop after the first text-only group instead of continuing.
+fn drop_oldest_group(history: &mut Vec<Message>) -> Option<Vec<ToolCall>> {
     let mut users_seen = 0;
     let mut cut = None;
     for (i, message) in history.iter().enumerate() {
@@ -2188,13 +2220,17 @@ fn drop_oldest_group(history: &mut Vec<Message>) -> bool {
             }
         }
     }
-    match cut {
-        Some(cut) => {
-            history.drain(0..cut);
-            true
-        }
-        None => false,
-    }
+    let cut = cut?;
+    Some(
+        history
+            .drain(0..cut)
+            .flat_map(|message| message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Elides the body of any `ToolOutput::Ok` result longer than `cap` chars to

@@ -232,6 +232,24 @@ pub enum UserResponse {
 #[async_trait]
 pub trait PermissionGate: Send + Sync {
     async fn check(&self, request: &PermissionRequest) -> PermissionDecision;
+
+    /// Evicts any cached Always-Allow decision whose key matches `request`,
+    /// if one exists. Called when history compaction drops the
+    /// `ToolCall`/`ToolResult` pair that recorded an approval, so a call
+    /// reconstructed from a now-dropped historical `ToolCall` and re-issued
+    /// by the model can't silently keep running off a cached approval whose
+    /// only record in the conversation is gone — see
+    /// `aivyx-core`'s `agent::compact_if_needed`. Takes a `&PermissionRequest`
+    /// (not some cache-internal key type) so the caller never has to
+    /// reconstruct anything beyond what `Tool::permission_request` already
+    /// produces — the exact same call that built the request being forgotten
+    /// also built the one that cached it, which is what makes the two keys
+    /// provably identical rather than merely "supposed to match."
+    ///
+    /// Default no-op: only `ConfirmationGate` maintains an Always-Allow
+    /// cache; every other implementation (test doubles, autonomous-mode's
+    /// unconditional-allow gates) has nothing to evict.
+    fn forget_always_allow(&self, _request: &PermissionRequest) {}
 }
 
 /// The human-facing side of a `PermissionGate` decision — implemented by
