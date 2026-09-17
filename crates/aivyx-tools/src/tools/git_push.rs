@@ -105,7 +105,7 @@ impl Tool for GitPushTool {
         let args: GitPushArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let remote = args.remote.unwrap_or_else(|| "origin".to_string());
-        let current = current_branch(&ctx.cwd).ok_or_else(|| {
+        let current = current_branch_confined(ctx).await.ok_or_else(|| {
             ToolError::ExecutionFailed("could not determine the current branch".to_string())
         })?;
         let argv = vec!["push".to_string(), "-u".to_string(), remote, current];
@@ -129,6 +129,16 @@ fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::C
     ctx.confiner.confine(command)
 }
 
+/// Preview-only: called from `permission_request`, which — like every
+/// `Tool::permission_request` in this crate — is synchronous and has no
+/// `ToolExecutionContext`/confiner in scope (see `git_commit.rs`'s and
+/// `git_branch.rs`'s own identically-shaped, identically-unconfined preview
+/// helpers). Confining this would require either awaiting a
+/// `tokio::process::Command` from a non-`async fn` or changing the `Tool`
+/// trait's `permission_request` signature to thread a confiner through
+/// every tool in the crate — both out of scope here. The spawned argv is
+/// fixed and not model-influenced, so this is a bounded, local metadata
+/// read, not the confiner-bypass this task fixes below.
 fn current_branch(cwd: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["branch", "--show-current"])
@@ -136,6 +146,22 @@ fn current_branch(cwd: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .output()
         .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Same query as `current_branch` above, but for `execute` (post-approval),
+/// where a real `ToolExecutionContext` is always in scope — routed through
+/// `ctx.confiner.confine(...)` the same way `git_command` already is.
+async fn current_branch_confined(ctx: &ToolExecutionContext) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(["branch", "--show-current"])
+        .current_dir(&ctx.cwd)
+        .stdin(Stdio::null());
+    let output = ctx.confiner.confine(command).output().await.ok()?;
     output
         .status
         .success()
@@ -177,12 +203,44 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use aivyx_checkpoint::test_support::{git, init_repo};
+    use aivyx_sandbox::ExecutionConfiner;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(dir: &Path) -> ToolExecutionContext {
         ToolExecutionContext {
             cwd: dir.to_path_buf(),
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Records how many times `confine()` was invoked, without altering the
+    /// command — lets a test assert a spawn was actually routed through the
+    /// confiner rather than bypassing it with a raw `std::process::Command`.
+    struct SpyConfiner {
+        calls: AtomicUsize,
+    }
+
+    impl SpyConfiner {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ExecutionConfiner for SpyConfiner {
+        fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            command
+        }
+    }
+
+    fn ctx_with_confiner(dir: &Path, confiner: std::sync::Arc<dyn ExecutionConfiner>) -> ToolExecutionContext {
+        ToolExecutionContext {
+            cwd: dir.to_path_buf(),
+            confiner,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -274,5 +332,17 @@ mod tests {
         let tool = GitPushTool::new();
         let result = tool.permission_request(&json!({ "remote": "-f" }), Path::new("."));
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn current_branch_spawns_through_the_confiner() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let spy = SpyConfiner::new();
+
+        let branch = current_branch_confined(&ctx_with_confiner(dir.path(), spy.clone())).await;
+
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
     }
 }

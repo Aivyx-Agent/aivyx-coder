@@ -141,10 +141,10 @@ impl Tool for GitPrTool {
         let args: GitPrArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
-        if let Err(message) = check_upstream_configured(&ctx.cwd) {
+        if let Err(message) = check_upstream_configured(ctx).await {
             return Ok(ToolOutput::Error(message));
         }
-        if let Err(message) = check_gh_authenticated(&self.gh_program, &ctx.cwd) {
+        if let Err(message) = check_gh_authenticated(&self.gh_program, ctx).await {
             return Ok(ToolOutput::Error(message));
         }
 
@@ -177,14 +177,20 @@ fn gh_command(
 /// configured for the current branch, regardless of the exact stderr text
 /// (which varies across git versions) — the model is told to call
 /// `git_push` first rather than the tool silently pushing on its behalf.
-fn check_upstream_configured(cwd: &Path) -> Result<(), String> {
-    let status = std::process::Command::new("git")
+///
+/// Called only from `execute` (post-approval), so a real `ToolExecutionContext`
+/// — and therefore a confiner — is always in scope; routed through
+/// `ctx.confiner.confine(...)` the same way `gh_command` is, rather than
+/// spawning a raw, unconfined `std::process::Command` the way this used to.
+async fn check_upstream_configured(ctx: &ToolExecutionContext) -> Result<(), String> {
+    let mut command = tokio::process::Command::new("git");
+    command
         .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .current_dir(cwd)
+        .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    let status = ctx.confiner.confine(command).status().await;
     match status {
         Ok(status) if status.success() => Ok(()),
         _ => Err(
@@ -198,14 +204,18 @@ fn check_upstream_configured(cwd: &Path) -> Result<(), String> {
 /// (spawn failure) from "installed but not authenticated" (spawns fine,
 /// exits non-zero) so the error names the actual fix — never by parsing
 /// `gh`'s own stderr text.
-fn check_gh_authenticated(gh_program: &str, cwd: &Path) -> Result<(), String> {
-    let status = std::process::Command::new(gh_program)
+///
+/// Same confinement rationale as `check_upstream_configured` above: this is
+/// only ever reached from `execute`, so `ctx.confiner` is always available.
+async fn check_gh_authenticated(gh_program: &str, ctx: &ToolExecutionContext) -> Result<(), String> {
+    let mut command = tokio::process::Command::new(gh_program);
+    command
         .args(["auth", "status"])
-        .current_dir(cwd)
+        .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    let status = ctx.confiner.confine(command).status().await;
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(_) => Err(
@@ -223,13 +233,45 @@ fn check_gh_authenticated(gh_program: &str, cwd: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use aivyx_checkpoint::test_support::{git, init_repo};
+    use aivyx_sandbox::ExecutionConfiner;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(dir: &Path) -> ToolExecutionContext {
         ToolExecutionContext {
             cwd: dir.to_path_buf(),
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Records how many times `confine()` was invoked, without altering the
+    /// command — lets a test assert a spawn was actually routed through the
+    /// confiner rather than bypassing it with a raw `std::process::Command`.
+    struct SpyConfiner {
+        calls: AtomicUsize,
+    }
+
+    impl SpyConfiner {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ExecutionConfiner for SpyConfiner {
+        fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            command
+        }
+    }
+
+    fn ctx_with_confiner(dir: &Path, confiner: std::sync::Arc<dyn ExecutionConfiner>) -> ToolExecutionContext {
+        ToolExecutionContext {
+            cwd: dir.to_path_buf(),
+            confiner,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -385,5 +427,36 @@ mod tests {
         let tool = GitPrTool::new();
         let result = tool.permission_request(&json!({ "title": "  " }), Path::new("."));
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn check_gh_authenticated_spawns_through_the_confiner() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let script_dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(script_dir.path());
+        let spy = SpyConfiner::new();
+
+        let result = check_gh_authenticated(
+            gh.to_str().unwrap(),
+            &ctx_with_confiner(dir.path(), spy.clone()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn check_upstream_configured_spawns_through_the_confiner() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        push_to_bare_origin(dir.path()).await;
+        let spy = SpyConfiner::new();
+
+        let result = check_upstream_configured(&ctx_with_confiner(dir.path(), spy.clone())).await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(spy.calls.load(Ordering::SeqCst), 1);
     }
 }
