@@ -1335,10 +1335,16 @@ syscall denylist, applied in the forked child before `exec`:
   agent's commands never legitimately need.
 
 `sandbox.require_enforcement` (default **true**): if real Landlock confinement
-can't actually be established — the kernel lacks Landlock, it's disabled, or it
-only partially enforces the ruleset — command tools **refuse to run** rather
-than silently executing unconfined. Set it to `false` to allow unconfined
-execution on such systems (you'll get a warning logged either way).
+can't actually be established at all — the kernel lacks Landlock or it's
+disabled — command tools **refuse to run** rather than silently executing
+unconfined. A kernel that only *partially* enforces the requested ruleset
+(Landlock's own designed graceful degradation when it doesn't support every
+requested restriction at the running `LANDLOCK_ABI` level) is not treated as
+a failure here — it still gets real, meaningful restriction, just not
+literally every requested one, so the command runs confined rather than being
+refused. Set `require_enforcement` to `false` to allow unconfined execution
+when even partial enforcement isn't available (you'll get a warning logged
+either way).
 
 Process execution also: races each command against a timeout (default 300s)
 and Ctrl+C cancellation, killing the whole **process group** (so backgrounded

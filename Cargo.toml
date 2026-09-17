@@ -23,9 +23,9 @@ aivyx-tui = { path = "crates/aivyx-tui" }
 # exactly one place to bump: aivyx-kvcache and aivyx-recall previously
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
-aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "9a9ea5b96e6f97bc196722ebae4c46f61b4750a4", default-features = false }
+aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "f158d957d69f2d4eb95298c5c95b29379406153a", default-features = false }
 aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "37b0ebf200eaf5b31bcb795dfb1beb3356cd12a3" }
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e1b06c9960ee98841d9b91978a11dd99ed388490" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e44314555ba94a8de5c0634b163ef9d425cf1164" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "ad9141c6ca242532db7b8e34eff423084e1eba4d" }
 

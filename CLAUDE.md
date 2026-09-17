@@ -148,11 +148,21 @@ own more detailed doc comments — now lives in that other repo, not here.
 - **`sandbox.require_enforcement`** is checked at *two* points, both
   fail-closed when `true` / fail-open (log + run unconfined) when `false`:
   the parent failing to build the Landlock ruleset at all, and the forked
-  child's `pre_exec` observing a `restrict_self()` status that isn't
-  `RulesetStatus::FullyEnforced`. The `pre_exec` closure is written
-  allocation-free (`ErrorKind`-based `io::Error` only, no
-  `.to_string()`/`io::Error::other`) since it runs post-fork/pre-exec under
-  async-signal-safety constraints.
+  child's `pre_exec` observing a `restrict_self()` status of
+  `RulesetStatus::NotEnforced` (no real restriction applied at all).
+  `RulesetStatus::PartiallyEnforced` — Landlock's own designed graceful
+  degradation when the running kernel doesn't support every restriction at
+  the requested `LANDLOCK_ABI` — is tolerated, not treated as a failure:
+  it still gets real, meaningful restriction, just not literally every
+  requested one, which is what `require_enforcement` is meant to check.
+  Only `FullyEnforced` was accepted before `aivyx-confine`'s
+  fix-require-enforcement-partial change (found via a real CI failure on
+  GitHub's runner kernel, which lands on `PartiallyEnforced` at ABI V7);
+  that stricter check broke real confined execution outright on any kernel
+  that doesn't fully support the requested ABI level. The `pre_exec`
+  closure is written allocation-free (`ErrorKind`-based `io::Error` only,
+  no `.to_string()`/`io::Error::other`) since it runs post-fork/pre-exec
+  under async-signal-safety constraints.
 
 ## Serving backends
 
