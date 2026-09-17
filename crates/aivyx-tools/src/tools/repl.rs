@@ -1163,6 +1163,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fresh_session_after_stop_checkpoints_again_on_its_own_first_send() {
+        // Review finding (Task 5) -- the once-per-session guard lives on
+        // `ReplSession` itself (a fresh struct per `repl_start`, always
+        // `checkpointed: false`), not anywhere global, so it must reset for
+        // an entirely new session rather than staying tripped forever after
+        // the first session's first send. Nothing in the original test
+        // exercised stop-then-restart, only "session A, send #1 vs #2" --
+        // this proves the flag is genuinely per-session, not a global
+        // "has this checkpointer ever fired" latch.
+        use aivyx_checkpoint::test_support::init_repo;
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let checkpointer =
+            Arc::new(crate::GitCheckpointer::detect(&cwd, vec![]).await.unwrap());
+
+        async fn count_refs(dir: &std::path::Path) -> usize {
+            let out = tokio::process::Command::new("git")
+                .args(["for-each-ref", "refs/aivyx/checkpoints/"])
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        }
+
+        let ctx_in_repo = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+
+        async fn start_a_shell(
+            session: &SharedReplSession,
+            quiet_window: std::time::Duration,
+            max_wait: std::time::Duration,
+            idle_timeout: std::time::Duration,
+            ctx: &ToolExecutionContext,
+        ) {
+            ReplStartTool::new(Arc::clone(session), quiet_window, max_wait, idle_timeout)
+                .execute(
+                    serde_json::json!({
+                        "program": "sh",
+                        "args": ["-c", "while IFS= read -r line; do eval \"$line\"; echo done; done"]
+                    }),
+                    ctx,
+                )
+                .await
+                .unwrap();
+        }
+
+        // --- Session A: start, one send, checkpoint fires (count 0 -> 1).
+        let session = new_shared_repl_session();
+        start_a_shell(&session, quiet_window, max_wait, idle_timeout, &ctx_in_repo).await;
+        ReplSendTool::new(
+            Arc::clone(&session),
+            quiet_window,
+            max_wait,
+            Some(Arc::clone(&checkpointer)),
+        )
+        .execute(serde_json::json!({ "input": "echo a > tracked.txt" }), &ctx_in_repo)
+        .await
+        .unwrap();
+        assert_eq!(count_refs(&cwd).await, 1, "session A's first send must checkpoint");
+
+        // --- Stop session A, then start a brand-new session B in the same
+        // shared slot (repl_stop clears the slot; repl_start always
+        // constructs a fresh ReplSession { checkpointed: false, .. }).
+        ReplStopTool::new(Arc::clone(&session)).execute(serde_json::json!({}), &ctx_in_repo).await.unwrap();
+        start_a_shell(&session, quiet_window, max_wait, idle_timeout, &ctx_in_repo).await;
+
+        // --- Session B's first send must checkpoint again (1 -> 2), not
+        // stay silently skipped because *some* session already checkpointed
+        // once before.
+        ReplSendTool::new(
+            Arc::clone(&session),
+            quiet_window,
+            max_wait,
+            Some(Arc::clone(&checkpointer)),
+        )
+        .execute(serde_json::json!({ "input": "echo b > tracked.txt" }), &ctx_in_repo)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_refs(&cwd).await,
+            2,
+            "a fresh session after repl_stop must checkpoint again on its own first send, \
+             not be silently skipped just because a prior (now-stopped) session already did"
+        );
+    }
+
+    #[tokio::test]
     async fn repl_send_errors_when_no_session_is_running() {
         let (quiet_window, max_wait, _) = short_timing();
         let session = new_shared_repl_session();
