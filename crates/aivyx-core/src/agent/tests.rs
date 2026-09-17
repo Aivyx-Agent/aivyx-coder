@@ -227,8 +227,9 @@ impl Tool for FakeNetworkTool {
         }
     }
 
-    // Not overridden: stays at the trait default (`true`), matching
-    // `web_fetch`/`web_search`.
+    // mutates_outside_session is deliberately NOT overridden below —
+    // it stays at the trait default (`true`), matching `web_fetch`/
+    // `web_search`. needs_checkpoint IS overridden, to `false`:
     fn needs_checkpoint(&self) -> bool {
         false
     }
