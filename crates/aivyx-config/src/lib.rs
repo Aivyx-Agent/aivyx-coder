@@ -988,27 +988,80 @@ impl Settings {
         toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })
     }
 
+    /// Writes the config file owner-only, atomically at creation — the
+    /// same pattern `aivyx-core::session::save` established (Task 9 of the
+    /// 2026-09-16 security audit): `fs::write` + a separate, best-effort
+    /// `set_permissions(0o600)` afterward left a real window where a
+    /// freshly-created `config.toml` (which "may contain a plaintext
+    /// `backend.api_key`", per the comment this replaced) was observable
+    /// at the OS/umask default (commonly world-readable), plus a silently
+    /// discarded failure mode if the `chmod` itself errored. `OpenOptions`
+    /// with `.mode(0o600)` sets the mode as part of the `open(2)` call
+    /// itself, so no such window exists. The parent directory is likewise
+    /// tightened to `0700` rather than left at the ambient umask (commonly
+    /// `0755`, world-traversable) after `create_dir_all`.
+    ///
+    /// No "re-tighten a pre-existing wider-mode file" fallback: this
+    /// function is only ever called from `load()`'s `!path.exists()`
+    /// branch (writing fresh defaults on first run), so there is no
+    /// pre-existing `config.toml` for a wider mode to survive from — this
+    /// call never overwrites a file a human hand-edited at a wider mode.
+    /// If a future caller starts invoking `write_to` to persist edited
+    /// settings back over an *existing* file, revisit this: `OpenOptions`'
+    /// `.mode()` only applies when `open(2)` actually creates the inode,
+    /// so it would silently stop re-tightening an existing wide-mode file
+    /// at that point (matching `session::save`'s own documented trade-off).
     fn write_to(&self, path: &Path) -> Result<(), ConfigError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(
+                    |source| ConfigError::Write {
+                        path: path.to_path_buf(),
+                        source,
+                    },
+                )?;
+            }
         }
         let toml_string = toml::to_string_pretty(self)?;
-        fs::write(path, toml_string).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
 
-        // The config may contain a plaintext `backend.api_key` — restrict
-        // it to owner-read-write rather than leaving it at the OS/umask
-        // default (commonly world-readable).
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|source| ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+        };
+        #[cfg(not(unix))]
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        use std::io::Write as _;
+        file.write_all(toml_string.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         Ok(())
     }
@@ -1633,6 +1686,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn config_parent_directory_is_tightened_to_owner_only() {
+        // Final whole-branch review, Finding 3: `create_dir_all` alone
+        // leaves the parent directory at the ambient umask (commonly
+        // `0755`, world-traversable) -- `write_to` must additionally
+        // tighten it to `0700`, matching `aivyx-core::session::save`'s
+        // precedent for its own session-file parent directory.
+        let dir = tempfile::tempdir().unwrap();
+        let nested_parent = dir.path().join("aivyx-coder-config-test");
+        let path = nested_parent.join("config.toml");
+        let settings = Settings::default();
+
+        settings.write_to(&path).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&nested_parent).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

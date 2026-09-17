@@ -251,9 +251,17 @@ taint is carried forward across turns (and into any sub-agent spawned via
 fresh) so a later turn can't act on an earlier injection attempt just because
 the flagged content has scrolled out of the visible context. A
 high-confidence detection pauses the run outright with a loud notice instead
-of continuing unattended. This is a heuristic guard, not a guarantee — see
-"Known limitations" — and only runs in autonomous mode; interactive mode
-relies on the human reviewing each permission prompt instead.
+of continuing unattended, and — until the session ends — the gate denies any
+further Write/Delete/Move/Network tool call or `run_command`/`run_shell`
+invocation outright, forcing a human to look before anything else mutates
+anything. This is a heuristic guard, not a guarantee — see "Known
+limitations." The scan itself always runs, in every mode, not just
+autonomous: in interactive mode (the TUI, and editors via ACP) it surfaces
+the same finding as a passive notice after the turn instead of pausing or
+denying anything, on the theory that the human reviewing each permission
+prompt is already the primary defense there — autonomous mode adds the pause
+and the denial specifically because that human isn't in the loop call by
+call.
 
 **Agent-maintained wiki** (`/wiki`, `/wiki <page>`): generates and keeps
 `docs/wiki/*.md` up to date — one page per workspace crate plus
@@ -1484,12 +1492,18 @@ Deliberately not (yet) addressed — documented rather than hidden:
   such content as data, not instructions, but this is a mitigation, not a
   guarantee. Be especially careful pointing the agent at untrusted repositories
   while `allowed_commands` is configured, since a pre-approved command runs
-  without a per-invocation prompt. **Autonomous mode** (see above) adds a
-  heuristic scan-and-pause guard on top of this, since there's no human
-  reviewing each prompt to catch an injection manually — but it's a
-  pattern-based heuristic, not a structural fix, and it doesn't run in
-  interactive mode at all (there, the permission modal is the mitigation:
-  a human reviewing the actual command/diff before it executes).
+  without a per-invocation prompt. The heuristic injection scan (phrase-list
+  matching over tool results as they re-enter context, `aivyx-injection-guard`)
+  runs in every mode, on top of the mitigation above, but it's a
+  pattern-based heuristic, not a structural fix, and its response to a hit
+  differs by mode. In interactive mode (the TUI, and editors via ACP) a hit
+  surfaces as a passive notice after the turn — it doesn't pause or block
+  anything — because the permission modal (a human reviewing the actual
+  command/diff before it executes) is already the primary mitigation there.
+  **Autonomous mode** (see above) goes further precisely because there's no
+  human reviewing each prompt: it pauses the run outright on a
+  high-confidence hit, and denies any further mutating or network tool call
+  for the rest of that session until a human clears it.
 - **Network is not restricted** by the sandbox. A command you approve can make
   network connections (needed for `cargo build`, `npm install`, `git clone`,
   etc.). Combined with the read scope, an approved command could in principle

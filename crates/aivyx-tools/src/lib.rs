@@ -69,8 +69,32 @@ pub trait Tool: Send + Sync {
     /// static, argument-free counterpart of `permission_request`'s
     /// `ActionKind`. Defaults to `true` (fail-closed): a new tool stays
     /// hidden in plan mode unless it explicitly declares itself safe.
+    ///
+    /// Does NOT by itself decide whether a call is checkpointed — see
+    /// `needs_checkpoint` below for that, separate, question.
     fn mutates_outside_session(&self) -> bool {
         true
+    }
+
+    /// Whether a call to this tool should be preceded by a git checkpoint.
+    /// Defaults to `mutates_outside_session()`, which is correct for every
+    /// tool that actually touches the filesystem — a checkpoint exists so a
+    /// mutating call can be rolled back. `web_fetch`/`web_search` are the
+    /// deliberate exception: they must stay `mutates_outside_session() ==
+    /// true` (network is not session-local, so plan mode must still hide
+    /// them and the gate must still treat them as `ActionKind::Network`),
+    /// but a network read cannot mutate the worktree, so checkpointing one
+    /// only wastes a `git add -A` + `write-tree` and — because
+    /// `GitCheckpointer` dedups by tree hash — can cause a network call
+    /// that runs before a real edit in the same batch to be the one that
+    /// "mints" the checkpoint, misattributing it as an edit in the
+    /// batch-rollback notice (`agent/mod.rs`'s `batch_touched_paths`) while
+    /// the real edit goes unlisted. Override this (not
+    /// `mutates_outside_session`) to `false` on a tool that is gated as
+    /// mutating for plan-mode purposes but never actually changes the
+    /// worktree.
+    fn needs_checkpoint(&self) -> bool {
+        self.mutates_outside_session()
     }
 
     /// Inspect (already schema-validated) arguments and describe the
@@ -326,11 +350,18 @@ impl ToolExecutor {
             }
         }
 
-        // Snapshot the worktree before anything that can mutate outside the
-        // session — after the gate (denied calls change nothing worth
+        // Snapshot the worktree before anything that can actually mutate
+        // it — after the gate (denied calls change nothing worth
         // checkpointing), before the effect. Best-effort: a failed
-        // checkpoint logs and the call proceeds.
-        if tool.mutates_outside_session()
+        // checkpoint logs and the call proceeds. Deliberately
+        // `needs_checkpoint()`, not `mutates_outside_session()`: the latter
+        // also drives plan-mode filtering and must stay `true` for
+        // `web_fetch`/`web_search` (network is not session-local), but
+        // those two never touch the worktree, so checkpointing them would
+        // be pure waste and — worse — can cause a network call to
+        // misattribute itself as the "edit" a later rollback undoes (see
+        // `needs_checkpoint`'s doc comment on the `Tool` trait).
+        if tool.needs_checkpoint()
             && let Some(checkpointer) = &self.checkpointer
         {
             checkpointer.checkpoint(&call.name, &cancellation).await;
@@ -809,6 +840,106 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
             "overwritten\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_checkpoint_web_fetch_but_still_checkpoints_write_file() {
+        // Review-round regression test (final whole-branch review, Finding
+        // 1): Task 1 correctly flipped `web_fetch`/`web_search`'s
+        // `mutates_outside_session()` to `true` (closing a plan-mode
+        // bypass), but `dispatch`'s checkpoint decision must NOT ride
+        // along on that same flag — a network read cannot mutate the
+        // worktree, so checkpointing it is pure waste and, worse, can
+        // misattribute the checkpoint mint to the network call instead of
+        // a real edit later in the same batch (see
+        // `Tool::needs_checkpoint`'s doc comment). This asserts the
+        // `needs_checkpoint()` split actually reaches `dispatch`: a
+        // `web_fetch` call takes zero checkpoints, while a `write_file`
+        // call in the very same executor still takes exactly one.
+        use crate::web::test_support::spawn_mock_http_server;
+        use aivyx_checkpoint::test_support::init_repo;
+        use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+        struct AllowAll;
+        #[async_trait]
+        impl PermissionGate for AllowAll {
+            async fn check(&self, _r: &PermissionRequest) -> PermissionDecision {
+                PermissionDecision::Allow
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WebFetchTool::new(5, true)));
+        registry.register(Arc::new(WriteFileTool));
+        let mut executor = ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner));
+        executor.set_checkpointer(Arc::new(
+            GitCheckpointer::detect(&cwd, vec![]).await.unwrap(),
+        ));
+
+        async fn count_refs(dir: &std::path::Path) -> usize {
+            let out = tokio::process::Command::new("git")
+                .args(["for-each-ref", "refs/aivyx/checkpoints/"])
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        }
+
+        let body = "<html><body>ok</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let addr = spawn_mock_http_server(Box::leak(response.into_boxed_str())).await;
+
+        // A web_fetch dispatch: no checkpoint, even though
+        // `mutates_outside_session()` is `true` for this tool.
+        executor
+            .dispatch(
+                ToolCall {
+                    id: ToolCallId("c1".to_string()),
+                    name: "web_fetch".to_string(),
+                    arguments: serde_json::json!({ "url": format!("http://{addr}/") }),
+                    source: ToolCallSource::Native,
+                },
+                &cwd,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            count_refs(&cwd).await,
+            0,
+            "web_fetch must not take a checkpoint"
+        );
+
+        // A real mutating tool in the same executor: still checkpointed.
+        executor
+            .dispatch(
+                ToolCall {
+                    id: ToolCallId("c2".to_string()),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({ "path": "new.txt", "content": "hi\n" }),
+                    source: ToolCallSource::Native,
+                },
+                &cwd,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            count_refs(&cwd).await,
+            1,
+            "write_file must still take exactly one checkpoint"
         );
     }
 

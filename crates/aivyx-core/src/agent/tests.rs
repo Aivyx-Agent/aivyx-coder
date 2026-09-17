@@ -201,6 +201,67 @@ impl Tool for CountingReadTool {
     }
 }
 
+/// A tool that mimics `WebFetchTool`/`WebSearchTool`'s checkpoint-relevant
+/// shape without any real networking: `mutates_outside_session() == true`
+/// (so plan mode still hides it and the gate still treats it as
+/// non-session-local), but `needs_checkpoint() == false` (a "read" that
+/// cannot mutate the worktree, so nothing to checkpoint) — and it takes a
+/// `url` argument so `describe_tool_call_target` renders it exactly like a
+/// real `web_fetch` call would in a rollback notice. Used to prove the
+/// review-round fix (final whole-branch review, Finding 1): this tool must
+/// never appear in a batch-rollback notice's list of rolled-back edits,
+/// since `ToolExecutor::dispatch` no longer checkpoints it.
+struct FakeNetworkTool;
+
+#[async_trait::async_trait]
+impl Tool for FakeNetworkTool {
+    fn name(&self) -> &str {
+        "fake_network_tool"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "fake_network_tool".to_string(),
+            description: "test".to_string(),
+            parameters_schema: serde_json::json!({}),
+        }
+    }
+
+    // Not overridden: stays at the trait default (`true`), matching
+    // `web_fetch`/`web_search`.
+    fn needs_checkpoint(&self) -> bool {
+        false
+    }
+
+    fn permission_request(
+        &self,
+        arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        let url = arguments
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(PermissionRequest {
+            tool_name: "fake_network_tool".to_string(),
+            action: ActionKind::Network,
+            target: PermissionTarget::Other(url),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::Ok("fetched (not really)".to_string()))
+    }
+}
+
 fn tool_call(id: &str, name: &str) -> ToolCall {
     ToolCall {
         id: ToolCallId(id.to_string()),
@@ -2435,6 +2496,15 @@ fn write_call_in(path: &str, content: &str, id: &str) -> ToolCall {
     }
 }
 
+fn fake_network_call_in(url: &str, id: &str) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.to_string()),
+        name: "fake_network_tool".to_string(),
+        arguments: serde_json::json!({ "url": url }),
+        source: ToolCallSource::Native,
+    }
+}
+
 fn edit_call_in(path: &str, old_string: &str, new_string: &str, id: &str) -> ToolCall {
     ToolCall {
         id: ToolCallId(id.to_string()),
@@ -2759,6 +2829,95 @@ async fn batch_rollback_fires_in_autonomous_mode_too() {
     assert!(
         !dir.path().join("a.txt").exists(),
         "batch rollback must fire in autonomous mode too, independent of pre_experiment_ref"
+    );
+}
+
+#[tokio::test]
+async fn batch_rollback_notice_does_not_misattribute_a_network_call_as_an_edit() {
+    // Review-round regression test (final whole-branch review, Finding 1).
+    // Before the fix, `ToolExecutor::dispatch` checkpointed *any* tool
+    // whose `mutates_outside_session()` was `true` — which, after Task 1,
+    // included `web_fetch`/`web_search`. Because `GitCheckpointer` dedups
+    // by tree hash, a network call that runs first in a batch (before the
+    // worktree has changed at all) can be the one that "mints" the very
+    // first checkpoint, while the real edit right after it produces no new
+    // mint (the tree was already captured). `batch_touched_paths` then
+    // names the network call, not the edit, as the thing a later failure
+    // rolled back — exactly the dishonest rollback message Task 7 was
+    // supposed to prevent. `FakeNetworkTool` reproduces the mechanism
+    // (`mutates_outside_session() == true`, `needs_checkpoint() == false`)
+    // without any real networking.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+    registry.register(Arc::new(FakeNetworkTool));
+
+    let url = "https://example.com/definitely-not-an-edit";
+    let response = multi_call_response(vec![
+        fake_network_call_in(url, "c1"), // runs first, in the same batch
+        write_call_in("a.txt", "A\n", "c2"), // the real edit
+        edit_call_in("a.txt", "does not exist", "x", "c3"), // fails -> rollback
+    ]);
+
+    let (tx, _rx) = unbounded_channel();
+    let mock = Arc::new(MockBackend::new(vec![response, text_response("done")]));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let mut executor = ToolExecutor::new(registry, gate, confiner);
+    executor.set_checkpointer(Arc::new(
+        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap(),
+    ));
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "a.txt was created in this same batch — must still be rolled back"
+    );
+
+    let error_text = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { call_id, output: ToolOutput::Error(text) })
+                if call_id.0 == "c3" =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("expected an Error result for the failing edit_file call");
+
+    assert!(
+        !error_text.contains(url),
+        "the rollback notice must not name the network call as a rolled-back edit: {error_text}"
+    );
+    assert!(
+        error_text.contains("a.txt"),
+        "the rollback notice must still name the file that actually got rolled back: {error_text}"
     );
 }
 

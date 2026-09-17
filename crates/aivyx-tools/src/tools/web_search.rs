@@ -65,6 +65,15 @@ impl Tool for WebSearchTool {
     // counterpart the trait's own doc comment names: "filesystem,
     // processes, network."
 
+    // `needs_checkpoint` IS overridden, though, to `false`: a network read
+    // cannot mutate the worktree, so there is nothing here for a
+    // checkpoint to protect — see `WebFetchTool`'s identical override and
+    // `Tool::needs_checkpoint`'s doc comment for the full rationale
+    // (misattribution in the batch-rollback notice).
+    fn needs_checkpoint(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
@@ -312,6 +321,20 @@ mod tests {
             panic!("expected Ok output")
         };
         assert_eq!(text, "no results found");
+    }
+
+    #[test]
+    fn needs_checkpoint_is_false_while_mutates_outside_session_stays_true() {
+        // Same split as `WebFetchTool` — see that test's comment.
+        let tool = WebSearchTool::new(None, 10, 5);
+        assert!(
+            tool.mutates_outside_session(),
+            "web_search must stay hidden from plan mode"
+        );
+        assert!(
+            !tool.needs_checkpoint(),
+            "web_search must not trigger a git checkpoint"
+        );
     }
 
     #[test]

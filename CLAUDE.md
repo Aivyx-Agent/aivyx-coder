@@ -79,12 +79,19 @@ Always-Allow cache lookup, keyed on the **exact** target — full path or full
 `(program, args)`, never the tool or program alone, so approving `write
 a.rs` never blesses `write b.rs` — → interactive prompt (cache seeded at
 startup from config `allowed_commands`) → on Allow, **any** tool whose
-`mutates_outside_session()` is true is checkpointed to
-`refs/aivyx/checkpoints/<ts>` first (not just `run_command`/`run_shell` —
-`write_file`/`edit_file`/`git_commit` checkpoint too, since the gate check
-already ran) → if a command tool, `ExecutionConfiner` applies Landlock
-(filesystem scoping) + seccomp (syscall denylist) to the forked child before
-`exec` → result returned to the model.
+`needs_checkpoint()` is true is checkpointed to `refs/aivyx/checkpoints/<ts>`
+first (not just `run_command`/`run_shell` — `write_file`/`edit_file`/
+`git_commit` checkpoint too, since the gate check already ran) → if a
+command tool, `ExecutionConfiner` applies Landlock (filesystem scoping) +
+seccomp (syscall denylist) to the forked child before `exec` → result
+returned to the model. `needs_checkpoint()` defaults to
+`mutates_outside_session()` and is distinct from it only for
+`web_fetch`/`web_search` (still `mutates_outside_session() == true`, so
+plan mode and the gate still treat them as non-session-local, but
+`needs_checkpoint() == false` since a network read cannot mutate the
+worktree — checkpointing it anyway risked the checkpoint mint being
+misattributed to the network call instead of a real edit later in the same
+batch; final whole-branch review, 2026-09-16).
 
 `git_commit`'s permission target is a `Command{"git", [...]}`, not a
 `Path` — every distinct commit message is therefore a distinct cache key, so
@@ -178,13 +185,15 @@ config field.
 ## Known, deliberately-undefended limitations
 
 Documented in `README.md` "Known limitations" — worth checking before
-assuming a gap is a bug: indirect prompt injection (a heuristic
-scan-and-pause guard exists in autonomous mode — see `aivyx-sandbox`'s
-`InjectionTaint`/`scan_for_injection_markers`, now sourced from the
-`aivyx-injection-guard` crate — but it's pattern-based, not structural,
-and doesn't run in interactive mode at all), network is unrestricted for
-approved commands, env vars are inherited by spawned commands, TOCTOU
-windows on path resolution, and `git_commit` (re)stages full paths rather
+assuming a gap is a bug: indirect prompt injection (a heuristic scan — see
+`aivyx-sandbox`'s `InjectionTaint`/`scan_for_injection_markers`, now sourced
+from the `aivyx-injection-guard` crate — always runs, in every mode, but
+it's pattern-based, not structural; a hit surfaces as a passive notice in
+interactive mode (TUI, ACP), while autonomous mode additionally pauses the
+run and denies further mutating/network tool calls for the rest of the
+session), network is unrestricted for approved commands, env vars are
+inherited by spawned commands, TOCTOU windows on path resolution, and
+`git_commit` (re)stages full paths rather
 than partial hunks.
 
 ## Where to look next

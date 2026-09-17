@@ -53,6 +53,19 @@ impl Tool for WebFetchTool {
     // side. This is the type-level ("static") counterpart the trait's own
     // doc comment names: "filesystem, processes, network."
 
+    // `needs_checkpoint` IS overridden, though, to `false`: a network read
+    // cannot mutate the worktree, so there is nothing here for a
+    // checkpoint to protect. Left at the trait default (which just mirrors
+    // `mutates_outside_session`), the Task 1 fix above would silently opt
+    // every web_fetch call into taking a git checkpoint too — wasted work,
+    // and worse, a web_fetch that runs before a real edit in the same
+    // batch could "mint" that edit's checkpoint (GitCheckpointer dedups by
+    // tree hash) and get misattributed as the edit in a later
+    // batch-rollback notice. See `Tool::needs_checkpoint`'s doc comment.
+    fn needs_checkpoint(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
@@ -298,6 +311,24 @@ mod tests {
         assert!(
             msg.contains(target),
             "expected error to name the redirect target {target:?}, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_checkpoint_is_false_while_mutates_outside_session_stays_true() {
+        // The split from Task 1's review fix: plan-mode filtering
+        // (`mutates_outside_session`) must still treat web_fetch as
+        // mutating (network isn't session-local), but checkpointing
+        // (`needs_checkpoint`) must not, since a network read cannot
+        // change the worktree.
+        let tool = WebFetchTool::new(5, false);
+        assert!(
+            tool.mutates_outside_session(),
+            "web_fetch must stay hidden from plan mode"
+        );
+        assert!(
+            !tool.needs_checkpoint(),
+            "web_fetch must not trigger a git checkpoint"
         );
     }
 
