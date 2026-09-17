@@ -2029,8 +2029,10 @@ impl Agent {
                             result.output = ToolOutput::Error(format!(
                                 "{original_error}\n\nThis failure automatically rolled back {} \
                                  earlier edit(s) in this same response to keep the codebase \
-                                 consistent: {}. The codebase is now back to its state before \
-                                 this response's edits began.",
+                                 consistent: {}. The codebase's git-tracked files are now back \
+                                 to their state before this response's edits began — any \
+                                 gitignored files touched during this response were not \
+                                 restored (checkpoints only capture git-tracked content).",
                                 batch_touched_paths.len(),
                                 batch_touched_paths.join(", "),
                             ));

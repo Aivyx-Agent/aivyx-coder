@@ -2530,6 +2530,46 @@ async fn batch_rollback_notice_lists_every_rolled_back_path() {
 }
 
 #[tokio::test]
+async fn batch_rollback_notice_names_the_gitignored_file_caveat() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        write_call_in("b.txt", "B\n", "c2"),
+        edit_call_in("a.txt", "does not exist", "x", "c3"),
+    ]);
+    let (mut agent, _rx, _mock) =
+        checkpointed_agent(dir.path(), vec![response, text_response("done")], false).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let error_text = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { call_id, output: ToolOutput::Error(text) })
+                if call_id.0 == "c3" =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("expected an Error result for the failing edit_file call");
+
+    assert!(
+        error_text.contains("gitignored"),
+        "rollback notice must not overclaim full restoration — it must name the \
+         gitignored-file caveat that checkpoint/restore never captures or restores \
+         gitignored paths: {error_text}"
+    );
+}
+
+#[tokio::test]
 async fn remaining_calls_in_a_rolled_back_batch_are_skipped_not_executed() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
