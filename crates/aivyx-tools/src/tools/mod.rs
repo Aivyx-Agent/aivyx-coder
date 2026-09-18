@@ -1,6 +1,7 @@
 mod delete_file;
 mod edit_file;
 mod find_references;
+mod generate_svg_completer;
 mod git_branch;
 mod git_commit;
 mod git_pr;
@@ -29,6 +30,7 @@ mod write_file;
 pub use delete_file::DeleteFileTool;
 pub use edit_file::EditFileTool;
 pub use find_references::FindReferencesTool;
+pub use generate_svg_completer::CoderTextCompleter;
 pub use git_branch::GitBranchTool;
 pub use git_commit::GitCommitTool;
 pub use git_pr::GitPrTool;

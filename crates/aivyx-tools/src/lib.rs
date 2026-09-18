@@ -31,13 +31,13 @@ pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use process::{CommandSpec, run};
 pub use tools::{
-    DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool, GitBranchTool,
-    GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool,
-    ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
-    MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
-    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
-    RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool, WebSearchTool,
-    WriteFileTool, new_shared_repl_session,
+    CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
+    GitBranchTool, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
+    GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, McpToolAdapter,
+    MemoryForgetTool, MemoryReadTool, MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool,
+    ReadMcpResourceTool, RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool,
+    ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool,
+    WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 
 #[derive(Debug, Error)]
