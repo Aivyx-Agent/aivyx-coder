@@ -29,7 +29,7 @@ use aivyx_tools::{
     McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool, MoveFileTool, PatchFileTool,
     ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplResizeTarget, ReplSendTool,
     ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session, resolve,
 };
 use tokio::sync::mpsc;
 
@@ -437,12 +437,20 @@ pub(crate) async fn build_agent(
             broker_url: settings.vision.broker_url.clone(),
             mold_url: settings.vision.mold_url.clone(),
             api_key: settings.vision.api_key.clone(),
-            output_dir: cwd.join("assets/generated"),
+            // `resolve`, not a raw `cwd.join(...)`, so the directory
+            // `MoldProvider` actually writes into is the same
+            // canonicalized path `GenerateImageTool`/`GenerateThreeDTool`'s
+            // own `permission_request` reasons about — see those tools'
+            // doc comments and `path_resolve::resolve`'s own.
+            output_dir: resolve(&cwd, "assets/generated"),
         };
         match aivyx_vision_mold::MoldProvider::new(mold_config) {
             Ok(provider) => {
                 let provider: Arc<dyn aivyx_vision_core::GenerationProvider> = Arc::new(provider);
-                registry.register(Arc::new(GenerateImageTool::new(provider.clone())));
+                registry.register(Arc::new(GenerateImageTool::new(
+                    provider.clone(),
+                    deny_paths.clone(),
+                )));
                 registry.register(Arc::new(GenerateThreeDTool::new(provider)));
             }
             Err(e) => {

@@ -29,6 +29,7 @@ pub mod wiki;
 pub use aivyx_checkpoint::GitCheckpointer;
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
+pub use path_resolve::resolve;
 pub use process::{CommandSpec, run};
 pub use tools::{
     CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GenerateImageTool,

@@ -18,7 +18,15 @@ use std::path::{Component, Path, PathBuf};
 /// exists on disk. Reading filesystem metadata (stat/readlink, no writes)
 /// is safe to do from `Tool::permission_request` — its contract forbids
 /// mutating side effects, not filesystem reads.
-pub(crate) fn resolve(cwd: &Path, raw: &str) -> PathBuf {
+///
+/// `pub` (re-exported as `aivyx_tools::resolve`), not `pub(crate)`, so a
+/// consumer outside this crate — `aivyx`'s `agent_builder.rs`, building
+/// `MoldConfig::output_dir` — can canonicalize `assets/generated` through
+/// the exact same helper `GenerateImageTool`/`GenerateThreeDTool` use for
+/// their own `PermissionTarget`, rather than a second, independently
+/// written `cwd.join(...)` that could silently drift from what the
+/// permission system actually reasons about.
+pub fn resolve(cwd: &Path, raw: &str) -> PathBuf {
     let lexical = resolve_lexical(cwd, raw);
     resolve_symlinks(&lexical)
 }

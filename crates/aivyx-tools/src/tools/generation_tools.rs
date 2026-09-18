@@ -16,10 +16,10 @@
 //! operator-chosen) filename -- see this crate's own design doc for why
 //! that's the correct Always-Allow cache key here, not a shortcut.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use aivyx_vision_core::{GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest};
 use async_trait::async_trait;
@@ -43,13 +43,28 @@ struct GenerateImageArgs {
     reference_image: Option<String>,
 }
 
+/// `deny_paths` is required separately from the usual
+/// `permission_request`-level check for exactly the reason `GrepTool`'s own
+/// doc comment explains: that check only sees the declared
+/// `PermissionTarget` (here, `assets/generated/`, the *output* directory),
+/// never `reference_image` — an entirely different, caller-supplied path
+/// this tool also reads (for image-to-image generation) and hands to the
+/// generation backend. Without its own check, `reference_image` could read
+/// and transmit a `deny_paths`-protected file (e.g. `~/.ssh/id_rsa`) with
+/// zero gate involvement, and — because the Always-Allow cache key is the
+/// declared target alone — every call after the first approval would
+/// silently auto-allow it too, regardless of `reference_image`.
 pub struct GenerateImageTool {
     provider: Arc<dyn GenerationProvider>,
+    deny_paths: Vec<PathBuf>,
 }
 
 impl GenerateImageTool {
-    pub fn new(provider: Arc<dyn GenerationProvider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<dyn GenerationProvider>, deny_paths: Vec<PathBuf>) -> Self {
+        Self {
+            provider,
+            deny_paths,
+        }
     }
 }
 
@@ -80,8 +95,11 @@ impl Tool for GenerateImageTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::Write,
-            target: PermissionTarget::Path(cwd.join("assets/generated")),
-            arguments_preview: json!({ "prompt": args.prompt }),
+            target: PermissionTarget::Path(resolve(cwd, "assets/generated")),
+            arguments_preview: json!({
+                "prompt": args.prompt,
+                "reference_image": args.reference_image,
+            }),
             preview: None,
             diff: None,
         })
@@ -98,6 +116,19 @@ impl Tool for GenerateImageTool {
             .reference_image
             .as_ref()
             .map(|path| resolve(&ctx.cwd, path));
+        // `reference_image` is never the declared `PermissionTarget` above
+        // (that's `assets/generated/`, the output directory) — so
+        // `ConfirmationGate::is_denied` never sees this path at all. Check
+        // it against `deny_paths` here, before it's read and transmitted to
+        // the generation backend, the same way `GrepTool`/`MoveFileTool`
+        // check every path they touch beyond their own declared target.
+        if let Some(path) = &reference_image
+            && path_is_denied(path, &self.deny_paths)
+        {
+            return Ok(ToolOutput::Denied(
+                "reference_image is under a configured deny_paths entry (hard-blocked)".to_string(),
+            ));
+        }
         let req = ImageRequest {
             prompt: args.prompt,
             reference_image,
@@ -157,7 +188,7 @@ impl Tool for GenerateThreeDTool {
         Ok(PermissionRequest {
             tool_name: self.name().to_string(),
             action: ActionKind::Write,
-            target: PermissionTarget::Path(cwd.join("assets/generated")),
+            target: PermissionTarget::Path(resolve(cwd, "assets/generated")),
             arguments_preview: json!({ "prompt": args.prompt }),
             preview: None,
             diff: None,
@@ -224,7 +255,7 @@ mod tests {
     #[test]
     fn generate_image_metadata_is_sound() {
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
-        let tool = GenerateImageTool::new(Arc::new(provider));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         assert_eq!(tool.name(), "generate_image");
         let request = tool
             .permission_request(&json!({"prompt": "a red circle"}), &ctx().cwd)
@@ -232,7 +263,7 @@ mod tests {
         assert_eq!(request.action, ActionKind::Write);
         assert_eq!(
             request.target,
-            PermissionTarget::Path(ctx().cwd.join("assets/generated"))
+            PermissionTarget::Path(resolve(&ctx().cwd, "assets/generated"))
         );
     }
 
@@ -241,7 +272,7 @@ mod tests {
         // Unlike generate_svg's deliberate false override, generate_image
         // has a real filesystem effect and must keep both defaults.
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
-        let tool = GenerateImageTool::new(Arc::new(provider));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         assert!(tool.mutates_outside_session());
         assert!(tool.needs_checkpoint());
     }
@@ -250,7 +281,7 @@ mod tests {
     async fn generate_image_returns_the_generated_asset_on_success() {
         let provider =
             FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/out/abc.png")));
-        let tool = GenerateImageTool::new(Arc::new(provider));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         let output = tool
             .execute(json!({"prompt": "a red circle"}), &ctx())
             .await
@@ -266,7 +297,7 @@ mod tests {
     async fn generate_image_passes_width_height_seed_style_hint_through() {
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
         let provider = Arc::new(provider);
-        let tool = GenerateImageTool::new(provider.clone());
+        let tool = GenerateImageTool::new(provider.clone(), vec![]);
         tool.execute(
             json!({
                 "prompt": "a mountain",
@@ -292,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn generate_image_fails_clearly_on_a_missing_prompt_field() {
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
-        let tool = GenerateImageTool::new(Arc::new(provider));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         let result = tool.execute(json!({}), &ctx()).await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
@@ -300,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn generate_image_fails_clearly_when_generation_errors() {
         let provider = FakeGenerationProvider::with_image_result(Err(VisionError::GpuLockTimeout));
-        let tool = GenerateImageTool::new(Arc::new(provider));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         let output = tool
             .execute(json!({"prompt": "anything"}), &ctx())
             .await
@@ -317,7 +348,7 @@ mod tests {
         std::fs::write(dir.path().join("ref.png"), b"fake png bytes").unwrap();
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
         let provider = Arc::new(provider);
-        let tool = GenerateImageTool::new(provider.clone());
+        let tool = GenerateImageTool::new(provider.clone(), vec![]);
         let ctx = ToolExecutionContext {
             cwd: dir.path().to_path_buf(),
             confiner: Arc::new(aivyx_sandbox::NoopConfiner),
@@ -333,6 +364,42 @@ mod tests {
         assert_eq!(
             captured.reference_image,
             Some(crate::path_resolve::resolve(dir.path(), "ref.png"))
+        );
+    }
+
+    /// Regression test for the whole-branch review finding this fix closes:
+    /// `reference_image` is never the declared `PermissionTarget`
+    /// (`assets/generated/`, the output directory), so
+    /// `ConfirmationGate::is_denied` never checked it against `deny_paths`
+    /// at all. `execute` must now refuse on its own, before the provider is
+    /// ever called — asserted here via `captured_image_request()`, which
+    /// stays `None` if `generate_image` was never invoked on the fake.
+    #[tokio::test]
+    async fn generate_image_refuses_a_reference_image_under_a_deny_paths_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, b"private key bytes").unwrap();
+        let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
+        let provider = Arc::new(provider);
+        let tool = GenerateImageTool::new(provider.clone(), vec![secret.canonicalize().unwrap()]);
+        let ctx = ToolExecutionContext {
+            cwd: dir.path().to_path_buf(),
+            confiner: Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let output = tool
+            .execute(json!({"prompt": "x", "reference_image": "id_rsa"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(output, ToolOutput::Denied(_)),
+            "expected Denied, got {output:?}"
+        );
+        assert!(
+            provider.captured_image_request().is_none(),
+            "the provider must never be called when reference_image is denied"
         );
     }
 
