@@ -33,6 +33,11 @@ futures = "0.3"
 # pinned rev aivyx-tools itself depends on (now centralized in the
 # workspace root's [workspace.dependencies]).
 aivyx-recall = { workspace = true }
+# Only used by tiers.rs's own real-tool-name test, to construct a real
+# GenerateSvgTool (via a minimal fake TextCompleter) and assert its
+# Tool::name() matches the tier's hardcoded exclusion string, same
+# rationale as aivyx-recall directly above.
+aivyx-vision-svg = { workspace = true }
 # Only used by the cutoff-notice test's scripted ToolCallComplete event
 # (ToolCall/ToolCallId/ToolCallSource) -- Cargo requires this be a direct
 # dependency of this crate even though aivyx-core already depends on it;

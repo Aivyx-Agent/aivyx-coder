@@ -22,13 +22,14 @@ use aivyx_sandbox::{
     AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
 };
 use aivyx_tools::{
-    CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool, GetMcpPromptTool,
-    GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
-    GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
-    McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool, MoveFileTool, PatchFileTool,
-    ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplResizeTarget, ReplSendTool,
-    ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
-    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
+    CoderTextCompleter, CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool,
+    GenerateSvgTool, GetMcpPromptTool, GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool,
+    GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
+    ListMcpResourcesTool, LspClient, McpClient, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
+    MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
+    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
+    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
+    WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -407,6 +408,18 @@ pub(crate) async fn build_agent(
             settings.web.fetch_timeout_secs,
         )));
     }
+
+    // Unlike web_fetch/web_search above, generate_svg is not gated behind
+    // settings.web.enabled: it never reaches the actual internet, only
+    // the agent's own already-configured LLM backend (see
+    // CoderTextCompleter's doc comment) — settings.web.enabled controls
+    // real network egress, which this tool doesn't perform. Still
+    // classified ActionKind::Network for permission purposes (it reaches
+    // outside the local session/filesystem), same as web_search/web_fetch
+    // — see GenerateSvgTool's own doc comment.
+    let vision_completer: Arc<dyn aivyx_vision_svg::TextCompleter> =
+        Arc::new(CoderTextCompleter::new(Arc::clone(&llm), 2048));
+    registry.register(Arc::new(GenerateSvgTool::new(vision_completer)));
 
     // Every configured server connects concurrently, each bounded by its
     // own `timeout_secs` — a slow or broken server can't hang startup or

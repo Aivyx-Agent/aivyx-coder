@@ -526,6 +526,20 @@ configure it when called unconfigured, rather than being silently absent),
 `max_search_results` (default `10`), `fetch_timeout_secs` (default `30`),
 `allow_private_targets` (default `false`).
 
+**`generate_svg(prompt)`**: the agent's third network-reaching tool, via
+the standalone `aivyx-vision-svg` crate — but unlike `web_fetch`/
+`web_search`, it never touches the actual internet. It reuses the exact
+same `Arc<dyn LlmBackend>` instance already built for this conversation
+(wrapped in a small adapter, `CoderTextCompleter`) to turn a text prompt
+into sanitized SVG markup, returned as plain text via `ToolOutput::Ok` —
+it does not write a file itself; pair it with `write_file` if you want the
+result saved. Classified `ActionKind::Network` for permission purposes
+(same auto-allow tier as `web_fetch`/`web_search`, since it reaches
+outside the local session/filesystem) even though no socket is opened, and
+is **not** gated behind `[web] enabled` for the same reason — that flag
+controls real network egress, which this tool doesn't perform, so it's
+always registered.
+
 **MCP (Model Context Protocol) client support**: aivyx-coder can connect to
 arbitrary user-configured MCP servers over stdio, covering all three MCP
 primitives — tools, resources, and prompts. Each configured
@@ -1090,16 +1104,16 @@ configured ceiling — three tiers, each additive over the previous:
 
 - **`plan`** — read-only: the session can read and search the local
   filesystem and build a task list, but every mutating tool — and
-  `web_fetch`/`web_search`, since a network request isn't a "read" of
-  anything local and must not bypass this tier's read-only guarantee — is
-  excluded from its registry (the same mechanism plan mode uses elsewhere
-  in this project).
+  `web_fetch`/`web_search`/`generate_svg`, since a network (or
+  LLM-backend) call isn't a "read" of anything local and must not bypass
+  this tier's read-only guarantee — is excluded from its registry (the
+  same mechanism plan mode uses elsewhere in this project).
 - **`edit`** — adds file mutation: `write_file`/`edit_file`/`patch_file`/
   `delete_file`/`move_file` become available, but commands, git-mutating
-  tools, and `web_fetch`/`web_search` stay excluded.
+  tools, and `web_fetch`/`web_search`/`generate_svg` stay excluded.
 - **`execute`** — full access: adds `run_command`/`run_shell`/`git_commit`/
   `git_branch`/`git_push`/`git_pr`/`memory_write`/`memory_forget`/
-  `web_fetch`/`web_search`. Nothing is excluded beyond the tools every
+  `web_fetch`/`web_search`/`generate_svg`. Nothing is excluded beyond the tools every
   MCP-server tier always excludes regardless of level (`repl_start`/
   `repl_send`/`repl_stop`, the dynamically bridged `mcp__<server>__<tool>`
   adapters, and the `list_mcp_resources`/`read_mcp_resource`/
@@ -1154,6 +1168,7 @@ actually needs.
 | `git_pr` | open a pull request via `gh` | prompt (then cacheable) |
 | `web_fetch` | fetch a URL and convert to readable text | none (auto-allowed) |
 | `web_search` | query a configured SearXNG instance | none (auto-allowed) |
+| `generate_svg` | generate a sanitized SVG image from a text prompt, via the agent's own LLM backend | none (auto-allowed) |
 | `go_to_definition` | resolve a symbol to its definition (via `rust-analyzer`) | none (auto-allowed) |
 | `find_references` | find every reference to a symbol across the workspace | none (auto-allowed) |
 | `delegate_task` | hand a bounded task to a fresh sub-agent | none (internal state only) |

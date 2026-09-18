@@ -50,7 +50,7 @@ impl AccessLevel {
         const EXECUTE_ONLY: &[&str] = &[
             "run_command", "run_shell", "git_commit", "git_branch", "git_push", "git_pr",
             "memory_write", "memory_forget", "remember_preference",
-            "web_fetch", "web_search",
+            "web_fetch", "web_search", "generate_svg",
         ];
         match self {
             Self::Plan => [EDIT_ONLY, EXECUTE_ONLY].concat(),
@@ -94,7 +94,8 @@ mod tests {
         assert!(excluded.contains(&"run_command"));
         assert!(excluded.contains(&"web_fetch"));
         assert!(excluded.contains(&"web_search"));
-        assert_eq!(excluded.len(), 5 + 11);
+        assert!(excluded.contains(&"generate_svg"));
+        assert_eq!(excluded.len(), 5 + 12);
     }
 
     #[test]
@@ -104,7 +105,12 @@ mod tests {
         assert!(excluded.contains(&"run_command"));
         assert!(excluded.contains(&"web_fetch"), "network tools require at minimum the execute tier");
         assert!(excluded.contains(&"web_search"));
-        assert_eq!(excluded.len(), 11);
+        assert!(
+            excluded.contains(&"generate_svg"),
+            "generate_svg reaches outside the local session (ActionKind::Network) same as \
+             web_fetch/web_search, so it requires at minimum the execute tier too"
+        );
+        assert_eq!(excluded.len(), 12);
     }
 
     #[test]
@@ -112,7 +118,7 @@ mod tests {
         assert!(AccessLevel::Execute.excluded_tool_names().is_empty());
     }
 
-    /// The 16 names in `EDIT_ONLY`/`EXECUTE_ONLY` are string literals, not
+    /// The 17 names in `EDIT_ONLY`/`EXECUTE_ONLY` are string literals, not
     /// derived from any real `Tool::name()` -- a future rename in
     /// `aivyx-tools` would silently widen whichever tier used to exclude
     /// the renamed tool, with no test failure (`ToolRegistry::exclude`
@@ -123,12 +129,26 @@ mod tests {
     #[test]
     fn every_excluded_tool_name_matches_a_real_registered_tool() {
         use aivyx_tools::{
-            DeleteFileTool, EditFileTool, GitBranchTool, GitCommitTool, GitPrTool, GitPushTool,
-            MemoryForgetTool, MemoryWriteTool, MoveFileTool, PatchFileTool, RememberPreferenceTool,
-            RunCommandTool, RunShellTool, WebFetchTool, WebSearchTool, WriteFileTool,
+            DeleteFileTool, EditFileTool, GenerateSvgTool, GitBranchTool, GitCommitTool, GitPrTool,
+            GitPushTool, MemoryForgetTool, MemoryWriteTool, MoveFileTool, PatchFileTool,
+            RememberPreferenceTool, RunCommandTool, RunShellTool, WebFetchTool, WebSearchTool,
+            WriteFileTool,
         };
         use aivyx_tools::Tool as _;
+        use aivyx_vision_svg::{TextCompleter, TextCompleterError};
         use std::sync::Arc;
+
+        // Minimal fake -- only needed so GenerateSvgTool::new has a
+        // TextCompleter to hold; never actually called (this test checks
+        // Tool::name() only, mirroring the other tools constructed here
+        // with equally-inert placeholder arguments).
+        struct FakeCompleter;
+        #[async_trait::async_trait]
+        impl TextCompleter for FakeCompleter {
+            async fn complete(&self, _prompt: &str) -> Result<String, TextCompleterError> {
+                unreachable!("not called by this test")
+            }
+        }
 
         let real_names: Vec<String> = vec![
             WriteFileTool.name().to_string(),
@@ -153,15 +173,18 @@ mod tests {
                 .to_string(),
             WebFetchTool::new(5, false).name().to_string(),
             WebSearchTool::new(None, 10, 5).name().to_string(),
+            GenerateSvgTool::new(Arc::new(FakeCompleter) as Arc<dyn TextCompleter>)
+                .name()
+                .to_string(),
         ];
 
         // Both directions: every excluded-list entry is a real tool name
         // (a rename in aivyx-tools would break this), and the real-tool
-        // set above has exactly the 16 names this file's own two lists
+        // set above has exactly the 17 names this file's own two lists
         // expect (a tool added to one of those consts without a matching
         // real tool here would also break this).
         let excluded = AccessLevel::Plan.excluded_tool_names();
-        assert_eq!(excluded.len(), 16);
+        assert_eq!(excluded.len(), 17);
         for name in &excluded {
             assert!(
                 real_names.iter().any(|n| n == name),
