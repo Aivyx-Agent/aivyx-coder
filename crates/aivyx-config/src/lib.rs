@@ -48,6 +48,7 @@ pub struct Settings {
     pub editor_context: EditorContextSettings,
     pub editor_approval: EditorApprovalSettings,
     pub web: WebSettings,
+    pub vision: VisionSettings,
     pub mcp: McpSettings,
     pub persona: PersonaSettings,
     pub repl: ReplSettings,
@@ -319,6 +320,33 @@ impl Default for WebSettings {
             max_search_results: 10,
             fetch_timeout_secs: 30,
             allow_private_targets: false,
+        }
+    }
+}
+
+/// Governs `generate_image`/`generate_3d` (`aivyx-tools`'s
+/// `GenerateImageTool`/`GenerateThreeDTool`) -- both registered only when
+/// `enabled`, since they depend on external infrastructure
+/// (`aivyx-broker`, `mold serve`) that isn't installed by default,
+/// unlike `generate_svg` which reuses the agent's own already-configured
+/// LLM backend and needs no separate opt-in. See
+/// `docs/superpowers/specs/2026-09-18-vision-image-3d-adoption-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionSettings {
+    pub enabled: bool,
+    pub broker_url: String,
+    pub mold_url: String,
+    pub api_key: Option<String>,
+}
+
+impl Default for VisionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            broker_url: "http://127.0.0.1:8899".to_string(),
+            mold_url: "http://127.0.0.1:7680".to_string(),
+            api_key: None,
         }
     }
 }
@@ -1134,7 +1162,8 @@ mod tests {
         let settings = Settings::default();
         let path = settings.backend.resolved_kvcache_store_path();
         assert!(
-            path.to_string_lossy().contains(".local/share/aivyx-coder/kvcache"),
+            path.to_string_lossy()
+                .contains(".local/share/aivyx-coder/kvcache"),
             "default kvcache path must be unchanged when no override is configured, got {path:?}"
         );
     }
@@ -1158,10 +1187,9 @@ mod tests {
     fn default_effective_deny_paths_includes_the_kvcache_directory() {
         let settings = Settings::default();
         assert!(
-            settings
-                .effective_deny_paths()
-                .iter()
-                .any(|p| p.to_string_lossy().contains(".local/share/aivyx-coder/kvcache")),
+            settings.effective_deny_paths().iter().any(|p| p
+                .to_string_lossy()
+                .contains(".local/share/aivyx-coder/kvcache")),
             "kvcache store directory must be in effective deny_paths, same rationale as the \
              state directory"
         );
@@ -1431,7 +1459,10 @@ mod tests {
             max_iterations = 5
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
-        assert_eq!(settings.mcp_server.max_access_level.as_deref(), Some("edit"));
+        assert_eq!(
+            settings.mcp_server.max_access_level.as_deref(),
+            Some("edit")
+        );
         assert_eq!(settings.mcp_server.session_ttl_secs, 600);
         assert_eq!(settings.mcp_server.max_concurrent_sessions, 4);
         assert_eq!(settings.mcp_server.max_iterations, 5);
@@ -1619,6 +1650,49 @@ mod tests {
     }
 
     #[test]
+    fn vision_settings_default_is_disabled_with_sane_endpoints() {
+        let settings = Settings::default();
+        assert!(!settings.vision.enabled);
+        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:8899");
+        assert_eq!(settings.vision.mold_url, "http://127.0.0.1:7680");
+        assert_eq!(settings.vision.api_key, None);
+    }
+
+    #[test]
+    fn vision_settings_parses_from_a_full_toml_section() {
+        let toml_str = r#"
+            [vision]
+            enabled = true
+            broker_url = "http://127.0.0.1:9999"
+            mold_url = "http://127.0.0.1:8888"
+            api_key = "secret"
+        "#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(settings.vision.enabled);
+        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:9999");
+        assert_eq!(settings.vision.mold_url, "http://127.0.0.1:8888");
+        assert_eq!(settings.vision.api_key.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn vision_settings_defaults_partial_fields_when_only_enabled_is_set() {
+        let toml_str = r#"
+            [vision]
+            enabled = true
+        "#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(settings.vision.enabled);
+        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:8899");
+        assert_eq!(settings.vision.mold_url, "http://127.0.0.1:7680");
+    }
+
+    #[test]
+    fn settings_with_no_vision_section_at_all_still_parses() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.vision.enabled);
+    }
+
+    #[test]
     fn sub_agent_settings_default_max_iterations_is_ten() {
         let settings = SubAgentSettings::default();
         assert_eq!(settings.max_iterations, 10);
@@ -1703,7 +1777,10 @@ mod tests {
         settings.write_to(&path).unwrap();
 
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&nested_parent).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&nested_parent)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o700);
     }
 
@@ -1814,7 +1891,10 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.backend.kind, BackendKind::LlamaServerBroker);
-        assert_eq!(settings.backend.broker_base_url.as_deref(), Some("http://127.0.0.1:8899"));
+        assert_eq!(
+            settings.backend.broker_base_url.as_deref(),
+            Some("http://127.0.0.1:8899")
+        );
     }
 
     #[test]
