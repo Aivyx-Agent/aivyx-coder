@@ -548,6 +548,28 @@ contacts on every turn regardless of this flag — gating it the same way
 would add no security and would break a legitimate feature, so it's
 always registered.
 
+**`generate_image(prompt, width?, height?, seed?, style_hint?, reference_image?)`**:
+generates an image via a local `mold serve` instance (coordinated with
+local LLM inference through `aivyx-broker`'s GPU lock, so it doesn't
+contend with this same conversation's own backend calls), saved under
+`assets/generated/<uuid>.<ext>` in the current project. `reference_image`,
+if given, is resolved the same way `read_file`/`write_file` resolve their
+own `path` argument (absolute or cwd-relative) -- no additional
+restriction. Classified `ActionKind::Write` (unlike `generate_svg`'s
+`Network` tier): it has a real filesystem effect, so it prompts for
+confirmation like `write_file`, then is cacheable. The permission target
+is the `assets/generated/` directory itself, not the specific (randomly
+named) output file -- one approval covers the rest of the session, since
+the actual filename is never something you'd choose or review ahead of
+time. Requires `[vision] enabled = true` (default `false`) plus
+`broker_url`/`mold_url` pointing at a running `aivyx-broker` and
+`mold serve` -- see "Configuration" below.
+
+**`generate_3d(prompt)`**: same backend and permission shape as
+`generate_image` above. **Not yet implemented** -- every call currently
+fails with a clear error (mold's async 3D generation isn't built yet);
+registered now so it's discoverable ahead of a future backend.
+
 **MCP (Model Context Protocol) client support**: aivyx-coder can connect to
 arbitrary user-configured MCP servers over stdio, covering all three MCP
 primitives — tools, resources, and prompts. Each configured
@@ -1177,6 +1199,8 @@ actually needs.
 | `web_fetch` | fetch a URL and convert to readable text | none (auto-allowed) |
 | `web_search` | query a configured SearXNG instance | none (auto-allowed) |
 | `generate_svg` | generate a sanitized SVG image from a text prompt, via the agent's own LLM backend | none (auto-allowed) |
+| `generate_image` | generate an image from a text prompt via a local backend, saved under `assets/generated/` | prompt (then cacheable) |
+| `generate_3d` | generate a 3D model from a text prompt -- **not yet implemented**, always fails today | prompt (then cacheable) |
 | `go_to_definition` | resolve a symbol to its definition (via `rust-analyzer`) | none (auto-allowed) |
 | `find_references` | find every reference to a symbol across the workspace | none (auto-allowed) |
 | `delegate_task` | hand a bounded task to a fresh sub-agent | none (internal state only) |

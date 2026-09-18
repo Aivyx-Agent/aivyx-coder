@@ -23,13 +23,13 @@ use aivyx_sandbox::{
 };
 use aivyx_tools::{
     CoderTextCompleter, CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool,
-    GenerateSvgTool, GetMcpPromptTool, GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool,
-    GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
-    ListMcpResourcesTool, LspClient, McpClient, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
-    MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
-    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
-    RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor, ToolRegistry, WebFetchTool,
-    WebSearchTool, WriteFileTool, new_shared_repl_session,
+    GenerateImageTool, GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool, GitBranchTool,
+    GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
+    GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LspClient, McpClient,
+    McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool, MoveFileTool, PatchFileTool,
+    ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool, ReplResizeTarget, ReplSendTool,
+    ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool, SetTasksTool, ToolExecutor,
+    ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 use tokio::sync::mpsc;
 
@@ -427,6 +427,32 @@ pub(crate) async fn build_agent(
     let vision_completer: Arc<dyn aivyx_vision_svg::TextCompleter> =
         Arc::new(CoderTextCompleter::new(Arc::clone(&llm), 2048));
     registry.register(Arc::new(GenerateSvgTool::new(vision_completer)));
+
+    // Unlike generate_svg above, generate_image/generate_3d genuinely
+    // need external infrastructure (aivyx-broker, mold serve) that isn't
+    // installed by default -- gated the same way web_fetch/web_search
+    // are, not always-registered like generate_svg.
+    if settings.vision.enabled {
+        let mold_config = aivyx_vision_mold::MoldConfig {
+            broker_url: settings.vision.broker_url.clone(),
+            mold_url: settings.vision.mold_url.clone(),
+            api_key: settings.vision.api_key.clone(),
+            output_dir: cwd.join("assets/generated"),
+        };
+        match aivyx_vision_mold::MoldProvider::new(mold_config) {
+            Ok(provider) => {
+                let provider: Arc<dyn aivyx_vision_core::GenerationProvider> = Arc::new(provider);
+                registry.register(Arc::new(GenerateImageTool::new(provider.clone())));
+                registry.register(Arc::new(GenerateThreeDTool::new(provider)));
+            }
+            Err(e) => {
+                eprintln!(
+                    "aivyx-coder: failed to construct the mold provider, \
+                     generate_image/generate_3d will be unavailable: {e}"
+                );
+            }
+        }
+    }
 
     // Every configured server connects concurrently, each bounded by its
     // own `timeout_secs` — a slow or broken server can't hang startup or
