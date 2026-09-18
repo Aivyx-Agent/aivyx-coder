@@ -85,19 +85,38 @@ why its `reference_image` field was restricted to a bare filename inside
 the tool's own output directory (any arbitrary path would have been an
 unguarded exfiltration route with zero human review).
 
-`aivyx-coder` has no such gap: every tool call — `generate_image`
-included — runs **in-process**, through the exact same
-`ConfirmationGate`/`deny_paths`/human-confirmation pipeline every other
-tool (`read_file`, `write_file`, `grep`, ...) already goes through. There
-is nothing structurally special about a path `generate_image` might touch
-that `read_file`/`write_file` don't already handle identically. Building
-a bespoke restriction here would be solving a problem this product
-doesn't have, at the cost of an inconsistent, harder-to-explain rule
-("every tool accepts any path except this one"). So `reference_image`
-just uses the existing `resolve()` helper, no extra checks — decision 3
-below is close to trivial once this architectural difference is named
-explicitly, which is the whole point of writing it down here rather than
-silently porting `aivyx-pa`'s answer.
+**Amendment, post-implementation whole-branch review:** the paragraph
+below originally argued no extra check was needed at all. That reasoning
+was wrong and the review caught a real, reachable bug from it — corrected
+here rather than silently rewritten, so a future reader doesn't draw the
+same false conclusion from the same-looking architectural observation.
+
+`aivyx-coder` has no separate-process gap the way `aivyx-pa` does: every
+tool call — `generate_image` included — runs **in-process**, through the
+exact same `ConfirmationGate` every other tool goes through. That part is
+still true and is the right reason `aivyx-pa`'s bespoke *output-dir-only*
+restriction isn't needed here. What does **not** follow from it is "no
+check is needed at all" — `ConfirmationGate`'s `deny_paths` hard-block
+only ever inspects the *one declared* `PermissionTarget` per call.
+`generate_image` declares `assets/generated/` (the write target) as that
+target, but `reference_image` names a **different** path the tool also
+reads — so `deny_paths` silently never saw it. `read_file`/`write_file`
+don't have this problem because their own declared target *is* the path
+they touch; `generate_image` is the first tool in this crate whose
+declared target and actual filesystem footprint diverge in this specific
+way. `GrepTool`/`GlobTool`/`MoveFileTool`/`GitCommitTool` already solved
+exactly this shape of problem (a walk/scan/rename touching paths beyond
+the one declared target) by taking `deny_paths` directly and calling
+`aivyx_sandbox::path_is_denied` themselves inside `execute()` — the
+review's fix applies that same, already-established pattern to
+`reference_image`, plus surfaces it in `arguments_preview` so the
+confirmation modal shows it, plus resolves the `assets/generated/`
+target itself through `resolve()` (it wasn't, unlike every other `Path`
+target in this crate — a symlinked `assets/` could otherwise defeat both
+`deny_paths` and the autonomous-mode worktree-boundary check the same
+way). None of this reopens the *output-dir-only* question decision 3
+below settles — that one's reasoning holds — it only means "in-process
+means no check needed" was too strong a conclusion from a true premise.
 
 ## Decisions
 
@@ -125,15 +144,24 @@ gets a git checkpoint like any other real write, matching `write_file`'s
 own (absence of an) override.
 
 **3. `reference_image` is a plain path through the existing
-`resolve(cwd, path)` helper — no extra restriction.** See "Why this
-design differs from `aivyx-pa`'s" above for the full reasoning. Concretely:
-`GenerateImageArgs.reference_image: Option<String>`, resolved exactly
-like `read_file`'s/`write_file`'s own `path` argument, read directly (not
-separately permission-gated — matching `write_file`'s own ungated
-diff-preview read of pre-existing file content). The tool's one declared
-`PermissionRequest` covers the write; reading a reference image to inform
-that write is no more separately gated than `write_file` reading the file
-it's about to overwrite.
+`resolve(cwd, path)` helper, PLUS an explicit `deny_paths` check —
+not the `aivyx-pa`-style output-dir-only sandbox, but not unchecked
+either.** Amended post-implementation review (see "Why this design
+differs from `aivyx-pa`'s" above): `GenerateImageArgs.reference_image:
+Option<String>` still resolves exactly like `read_file`'s/`write_file`'s
+own `path` argument — no bare-filename-only or output-dir-only
+restriction, that part of the original reasoning holds. But because
+`reference_image` is a path the tool touches *beyond* its one declared
+`PermissionRequest` target (`assets/generated/`), `deny_paths` never
+sees it through the gate's own target-based check — the same structural
+gap `GrepTool`/`GlobTool`/`MoveFileTool`/`GitCommitTool` already solve by
+taking `deny_paths` as a constructor parameter and calling
+`aivyx_sandbox::path_is_denied` on every such path themselves.
+`GenerateImageTool` does the same: resolved `reference_image` is checked
+against `deny_paths` inside `execute()`, returning `ToolOutput::Denied`
+on a hit, before ever reaching the provider. Also now included in
+`arguments_preview` so the confirmation modal shows the actual path, not
+just the prompt.
 
 **4. The permission target is the `assets/generated/` directory itself,
 not a specific future filename.** `write_file`'s Always-Allow cache keys
