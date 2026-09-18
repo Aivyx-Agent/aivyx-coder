@@ -126,7 +126,10 @@ impl Tool for GenerateImageTool {
             && path_is_denied(path, &self.deny_paths)
         {
             return Ok(ToolOutput::Denied(
-                "reference_image is under a configured deny_paths entry (hard-blocked)".to_string(),
+                format!(
+                    "reference_image `{}` is under a configured deny_paths entry (hard-blocked)",
+                    path.display()
+                ),
             ));
         }
         let req = ImageRequest {
@@ -158,6 +161,8 @@ impl GenerateThreeDTool {
     pub fn new(provider: Arc<dyn GenerationProvider>) -> Self {
         Self { provider }
     }
+
+    // TODO: when a real reference_image parameter is added here, add the same deny_paths check GenerateImageTool has.
 }
 
 #[async_trait]

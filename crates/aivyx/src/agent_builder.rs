@@ -454,9 +454,9 @@ pub(crate) async fn build_agent(
                 registry.register(Arc::new(GenerateThreeDTool::new(provider)));
             }
             Err(e) => {
-                eprintln!(
-                    "aivyx-coder: failed to construct the mold provider, \
-                     generate_image/generate_3d will be unavailable: {e}"
+                tracing::warn!(
+                    error = %e,
+                    "aivyx-coder: failed to construct the mold provider — generate_image/generate_3d will be unavailable"
                 );
             }
         }

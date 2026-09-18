@@ -554,8 +554,9 @@ local LLM inference through `aivyx-broker`'s GPU lock, so it doesn't
 contend with this same conversation's own backend calls), saved under
 `assets/generated/<uuid>.<ext>` in the current project. `reference_image`,
 if given, is resolved the same way `read_file`/`write_file` resolve their
-own `path` argument (absolute or cwd-relative) -- no additional
-restriction. Classified `ActionKind::Write` (unlike `generate_svg`'s
+own `path` argument (absolute or cwd-relative), and is checked against
+`deny_paths` before it's read -- a hit returns a clean denial and the backend
+is never called. Classified `ActionKind::Write` (unlike `generate_svg`'s
 `Network` tier): it has a real filesystem effect, so it prompts for
 confirmation like `write_file`, then is cacheable. The permission target
 is the `assets/generated/` directory itself, not the specific (randomly
