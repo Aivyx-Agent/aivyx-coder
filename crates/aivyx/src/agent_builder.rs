@@ -410,13 +410,20 @@ pub(crate) async fn build_agent(
     }
 
     // Unlike web_fetch/web_search above, generate_svg is not gated behind
-    // settings.web.enabled: it never reaches the actual internet, only
-    // the agent's own already-configured LLM backend (see
-    // CoderTextCompleter's doc comment) — settings.web.enabled controls
-    // real network egress, which this tool doesn't perform. Still
-    // classified ActionKind::Network for permission purposes (it reaches
-    // outside the local session/filesystem), same as web_search/web_fetch
-    // — see GenerateSvgTool's own doc comment.
+    // settings.web.enabled. It does open a real socket (CoderTextCompleter
+    // -> LlmBackend::stream_chat, an HTTP POST to settings.backend.base_url
+    // -- see that struct's own doc comment), so "never touches the
+    // internet" would overstate it: a remote base_url makes this a real
+    // network call. What settings.web.enabled actually governs is
+    // model-chosen, arbitrary-URL egress (web_fetch/web_search can be
+    // pointed anywhere the model likes); generate_svg can only ever reach
+    // the one operator-configured backend endpoint the agent's own turn
+    // loop already contacts on every turn regardless of this flag, so
+    // gating it the same way would add no security and would break a
+    // legitimate feature. Still classified ActionKind::Network for
+    // permission purposes (it reaches outside the local session/
+    // filesystem), same as web_search/web_fetch — see GenerateSvgTool's
+    // own doc comment.
     let vision_completer: Arc<dyn aivyx_vision_svg::TextCompleter> =
         Arc::new(CoderTextCompleter::new(Arc::clone(&llm), 2048));
     registry.register(Arc::new(GenerateSvgTool::new(vision_completer)));

@@ -508,11 +508,14 @@ inference happens (Ollama/vLLM/llama.cpp), not in network isolation — the
 agent has full network access. `web_fetch(url)` fetches a URL and converts
 its HTML to readable text via `html2text`, head-truncated at 50KB.
 `web_search(query)` queries a configured SearXNG instance and returns
-ranked `title | url | content` results, one per line. Both use the same
-`ActionKind::Read` auto-allow tier as `read_file`/`grep` — no confirmation
-modal, a deliberate choice over the more conservative confirm-by-default
-alternative, on the reasoning that fetched/searched content is already
-covered by the standing untrusted-tool-output convention. `web_fetch`
+ranked `title | url | content` results, one per line. Both are classified
+`ActionKind::Network` (the 2026-09-16 security audit moved them off the
+`Read` tier they used to share with `read_file`/`grep` — a network call is
+not session-local regardless of whether it mutates anything) — no
+confirmation modal by default at that tier, a deliberate choice over the
+more conservative confirm-by-default alternative, on the reasoning that
+fetched/searched content is already covered by the standing
+untrusted-tool-output convention. `web_fetch`
 carries its own pre-flight SSRF check: before connecting, it resolves the
 target host and refuses loopback/private/link-local addresses (override
 with `[web] allow_private_targets = true`) — a best-effort mitigation with
@@ -527,17 +530,22 @@ configure it when called unconfigured, rather than being silently absent),
 `allow_private_targets` (default `false`).
 
 **`generate_svg(prompt)`**: the agent's third network-reaching tool, via
-the standalone `aivyx-vision-svg` crate — but unlike `web_fetch`/
-`web_search`, it never touches the actual internet. It reuses the exact
-same `Arc<dyn LlmBackend>` instance already built for this conversation
+the standalone `aivyx-vision-svg` crate. It reuses the exact same
+`Arc<dyn LlmBackend>` instance already built for this conversation
 (wrapped in a small adapter, `CoderTextCompleter`) to turn a text prompt
 into sanitized SVG markup, returned as plain text via `ToolOutput::Ok` —
 it does not write a file itself; pair it with `write_file` if you want the
 result saved. Classified `ActionKind::Network` for permission purposes
 (same auto-allow tier as `web_fetch`/`web_search`, since it reaches
-outside the local session/filesystem) even though no socket is opened, and
-is **not** gated behind `[web] enabled` for the same reason — that flag
-controls real network egress, which this tool doesn't perform, so it's
+outside the local session/filesystem), and it does open a real socket —
+`CoderTextCompleter` calls the same `LlmBackend::stream_chat` the
+conversation itself uses, an HTTP POST to `[backend] base_url`. It's
+**not** gated behind `[web] enabled` because that flag governs a
+different, broader risk: `web_fetch`/`web_search` let the *model* choose
+an arbitrary URL, while `generate_svg` can only ever reach the one
+operator-configured backend endpoint the agent's own turn loop already
+contacts on every turn regardless of this flag — gating it the same way
+would add no security and would break a legitimate feature, so it's
 always registered.
 
 **MCP (Model Context Protocol) client support**: aivyx-coder can connect to

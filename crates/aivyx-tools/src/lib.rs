@@ -418,6 +418,21 @@ mod tests {
         // in this test before the fix.
         registry.register(Arc::new(WebFetchTool::new(5, false)));
         registry.register(Arc::new(WebSearchTool::new(None, 10, 5)));
+        // Same regression-guard reasoning as web_fetch/web_search above,
+        // for generate_svg (Aivyx-Vision adoption, 2026-09-18): a new
+        // network-reaching tool must land on the mutating side here too,
+        // not just be covered by its own unit test in isolation.
+        struct NeverCalledCompleter;
+        #[async_trait::async_trait]
+        impl aivyx_vision_svg::TextCompleter for NeverCalledCompleter {
+            async fn complete(
+                &self,
+                _prompt: &str,
+            ) -> Result<String, aivyx_vision_svg::TextCompleterError> {
+                unreachable!("this test only inspects tool definitions, never executes one")
+            }
+        }
+        registry.register(Arc::new(GenerateSvgTool::new(Arc::new(NeverCalledCompleter))));
 
         let all: Vec<String> = registry.definitions().into_iter().map(|d| d.name).collect();
         let plan: Vec<String> = registry
@@ -426,13 +441,13 @@ mod tests {
             .map(|d| d.name)
             .collect();
 
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
         assert_eq!(
             plan,
             vec![
                 "read_file", "grep", "glob", "set_tasks", "git_read", "repl_send", "repl_stop"
             ],
-            "web_fetch/web_search must NOT appear here -- network access is not session-safe"
+            "web_fetch/web_search/generate_svg must NOT appear here -- network access is not session-safe"
         );
     }
 
