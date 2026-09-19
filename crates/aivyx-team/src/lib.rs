@@ -52,7 +52,7 @@ impl TeamConfig {
     /// [`effective_tool_allowlist`], which take the same kind of
     /// `&[&str]` tool-name list but are meant to be called with the
     /// specific running lead `Agent`'s actual registered tools instead.
-    /// Same predicate under the hood ([`first_unavailable_tool`]),
+    /// Same predicate under the hood (`first_unavailable_tool`),
     /// different intended input -- not a difference in strength.
     pub fn validate(&self, available_tools: &[&str]) -> Result<(), TeamConfigError> {
         if !self.members.iter().any(|m| m.name == self.lead) {
@@ -448,6 +448,21 @@ mod attenuation_tests {
         assert_eq!(effective, vec!["read_file".to_string(), "grep".to_string()]);
     }
 
+    #[test]
+    fn effective_tool_allowlist_is_empty_when_lead_tools_is_empty() {
+        let m = member(&["read_file", "grep"], &[]);
+        assert_eq!(effective_tool_allowlist(&m, &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn effective_tool_allowlist_is_empty_for_empty_member_allowlist() {
+        let m = member(&[], &[]);
+        assert_eq!(
+            effective_tool_allowlist(&m, &["read_file", "grep"]),
+            Vec::<String>::new()
+        );
+    }
+
     /// The cross-task incoherence the final whole-branch review caught:
     /// `default_coding_roster`'s coordinator/lead member has
     /// `tool_allowlist: ["set_tasks"]` only. If a caller naively passed
@@ -517,10 +532,21 @@ mod attenuation_tests {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        assert_ne!(
-            coordinator_tools, real_lead_registry,
-            "the coordinator's own declared tool_allowlist must not be conflated with the lead's real tool registry"
-        );
+
+        // Proves the conflation is actually harmful, not just that the
+        // two lists happen to differ in length: using the coordinator's
+        // own narrow tool_allowlist as `lead_tools` really would make
+        // every other member of this roster fail the subset check.
+        let other_members = roster.members.iter().filter(|m| m.name != roster.lead);
+        for member in other_members {
+            assert!(
+                !tool_allowlist_is_subset(member, &coordinator_tools),
+                "member {:?} unexpectedly passed against the coordinator's own \
+                 narrow tool_allowlist -- this test is meant to prove that \
+                 conflating the two lists breaks the roster",
+                member.name
+            );
+        }
     }
 }
 
