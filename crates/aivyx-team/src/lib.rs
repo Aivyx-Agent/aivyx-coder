@@ -189,3 +189,96 @@ mod validation_tests {
         );
     }
 }
+
+/// A specialist's effective deny-list: the union of the lead's own
+/// `deny_paths` and the member's `extra_deny_paths`, de-duplicated. A
+/// specialist can only ever be handed *more* restriction than the lead
+/// already has -- there is deliberately no way for a member's config to
+/// remove one of the lead's own entries.
+pub fn effective_deny_paths(lead_deny_paths: &[String], member: &TeamMember) -> Vec<String> {
+    let mut effective: Vec<String> = lead_deny_paths.to_vec();
+    for path in &member.extra_deny_paths {
+        if !effective.contains(path) {
+            effective.push(path.clone());
+        }
+    }
+    effective
+}
+
+/// True iff every tool in `member`'s `tool_allowlist` is present in
+/// `lead_tools` -- the direct analog of NT-02 ("a specialist can never
+/// exceed its lead") for tool access, checked against the lead's own
+/// actual current tool set (a stronger, more specific check than
+/// `TeamConfig::validate`'s crate-wide available-tools check).
+pub fn tool_allowlist_is_subset(member: &TeamMember, lead_tools: &[&str]) -> bool {
+    member
+        .tool_allowlist
+        .iter()
+        .all(|t| lead_tools.contains(&t.as_str()))
+}
+
+#[cfg(test)]
+mod attenuation_tests {
+    use super::*;
+
+    fn member(tool_allowlist: &[&str], extra_deny_paths: &[&str]) -> TeamMember {
+        TeamMember {
+            name: "implementer".to_string(),
+            role: "Implementer".to_string(),
+            persona: "You write code.".to_string(),
+            tool_allowlist: tool_allowlist.iter().map(|s| s.to_string()).collect(),
+            extra_deny_paths: extra_deny_paths.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn effective_deny_paths_unions_lead_and_member_paths() {
+        let lead_deny_paths = vec![".env".to_string(), "*.pem".to_string()];
+        let m = member(&["read_file"], &["secrets/"]);
+        let mut effective = effective_deny_paths(&lead_deny_paths, &m);
+        effective.sort();
+        let mut expected = vec![
+            ".env".to_string(),
+            "*.pem".to_string(),
+            "secrets/".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(effective, expected);
+    }
+
+    #[test]
+    fn effective_deny_paths_deduplicates_overlapping_entries() {
+        let lead_deny_paths = vec![".env".to_string()];
+        let m = member(&["read_file"], &[".env"]);
+        let effective = effective_deny_paths(&lead_deny_paths, &m);
+        assert_eq!(effective, vec![".env".to_string()]);
+    }
+
+    #[test]
+    fn effective_deny_paths_with_no_extra_paths_equals_lead_paths() {
+        let lead_deny_paths = vec![".env".to_string()];
+        let m = member(&["read_file"], &[]);
+        assert_eq!(effective_deny_paths(&lead_deny_paths, &m), lead_deny_paths);
+    }
+
+    #[test]
+    fn tool_allowlist_is_subset_true_when_every_tool_is_available() {
+        let m = member(&["read_file", "grep"], &[]);
+        assert!(tool_allowlist_is_subset(
+            &m,
+            &["read_file", "grep", "write_file"]
+        ));
+    }
+
+    #[test]
+    fn tool_allowlist_is_subset_false_when_a_tool_is_missing() {
+        let m = member(&["read_file", "run_command"], &[]);
+        assert!(!tool_allowlist_is_subset(&m, &["read_file", "grep"]));
+    }
+
+    #[test]
+    fn tool_allowlist_is_subset_true_for_empty_allowlist() {
+        let m = member(&[], &[]);
+        assert!(tool_allowlist_is_subset(&m, &["read_file"]));
+    }
+}
