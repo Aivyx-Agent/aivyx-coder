@@ -42,6 +42,18 @@ impl TeamConfig {
     /// a path pattern here) -- only structural validity: the lead
     /// exists, member names are unique, and every tool_allowlist entry
     /// is one the lead itself could grant.
+    ///
+    /// `available_tools` is meant to be a crate/workspace-wide list of
+    /// every tool `aivyx-coder` has ever registered anywhere -- this is
+    /// a load-time sanity check that a config doesn't reference a tool
+    /// that doesn't exist *at all*, not a check against any particular
+    /// running lead's actual current tool set. For that narrower,
+    /// delegation-time check, see [`tool_allowlist_is_subset`] and
+    /// [`effective_tool_allowlist`], which take the same kind of
+    /// `&[&str]` tool-name list but are meant to be called with the
+    /// specific running lead `Agent`'s actual registered tools instead.
+    /// Same predicate under the hood ([`first_unavailable_tool`]),
+    /// different intended input -- not a difference in strength.
     pub fn validate(&self, available_tools: &[&str]) -> Result<(), TeamConfigError> {
         if !self.members.iter().any(|m| m.name == self.lead) {
             return Err(TeamConfigError::UnknownLead(self.lead.clone()));
@@ -55,13 +67,11 @@ impl TeamConfig {
         }
 
         for member in &self.members {
-            for tool in &member.tool_allowlist {
-                if !available_tools.contains(&tool.as_str()) {
-                    return Err(TeamConfigError::UnknownTool {
-                        member: member.name.clone(),
-                        tool: tool.clone(),
-                    });
-                }
+            if let Some(tool) = first_unavailable_tool(member, available_tools) {
+                return Err(TeamConfigError::UnknownTool {
+                    member: member.name.clone(),
+                    tool: tool.to_string(),
+                });
             }
         }
 
@@ -69,8 +79,175 @@ impl TeamConfig {
     }
 }
 
+/// Shared predicate behind both `TeamConfig::validate`'s tool-checking
+/// loop and [`tool_allowlist_is_subset`]: the first tool in `member`'s
+/// `tool_allowlist` that is *not* present in `available`, if any. Both
+/// call sites ask the same structural question ("is every tool in this
+/// member's allowlist present in this list of tool names?") -- what
+/// differs between them is what `available` is meant to contain, not
+/// the logic itself. See `validate`'s and `tool_allowlist_is_subset`'s
+/// own doc comments for that distinction.
+fn first_unavailable_tool<'a>(member: &'a TeamMember, available: &[&str]) -> Option<&'a str> {
+    member
+        .tool_allowlist
+        .iter()
+        .map(|t| t.as_str())
+        .find(|t| !available.contains(t))
+}
+
+/// A specialist's effective deny-list: the union of the lead's own
+/// `deny_paths` and the member's `extra_deny_paths`, with member entries
+/// de-duplicated against the lead's own list (duplicates already present
+/// *within* `lead_deny_paths` itself, if any, pass through unchanged --
+/// harmless for the real consumer described below, but not something
+/// this function collapses). A specialist can only ever be handed *more*
+/// restriction than the lead already has -- there is deliberately no way
+/// for a member's config to remove one of the lead's own entries.
+///
+/// Both `lead_deny_paths` and `member.extra_deny_paths` are plain
+/// `String`s (matching `TeamMember::extra_deny_paths`'s TOML-sourced
+/// type), but the real downstream consumer this will eventually feed --
+/// `aivyx_sandbox::path_is_denied`, which takes `deny_paths: &[PathBuf]`
+/// with component-wise `starts_with` semantics -- is `PathBuf`-typed, so
+/// a future Phase 2 caller needs a `String` -> `PathBuf` conversion step;
+/// this function's string-equality-based de-duplication also won't
+/// collapse semantically-equivalent-but-textually-different entries like
+/// `".env"` vs `"./.env"` (safe -- over-denies at worst, never
+/// under-denies -- but worth knowing going in).
+pub fn effective_deny_paths(lead_deny_paths: &[String], member: &TeamMember) -> Vec<String> {
+    let mut effective: Vec<String> = lead_deny_paths.to_vec();
+    for path in &member.extra_deny_paths {
+        if !effective.contains(path) {
+            effective.push(path.clone());
+        }
+    }
+    effective
+}
+
+/// True iff every tool in `member`'s `tool_allowlist` is present in
+/// `lead_tools` -- the direct analog of NT-02 ("a specialist can never
+/// exceed its lead") for tool access.
+///
+/// `lead_tools` means the tool names registered on the *running lead
+/// `Agent`'s actual tool registry* -- the same kind of list
+/// `build_session_agent` in `crates/aivyx-mcp-server/src/session.rs`
+/// filters a session's registry down to (there: `registry.definitions()
+/// .into_iter().map(|d| d.name)`). It is deliberately **not** the lead
+/// member's own declared `tool_allowlist` field in `TeamConfig`: a
+/// team's coordinator/lead member can (and in the shipped
+/// [`default_coding_roster`], does) hold a narrower `tool_allowlist`
+/// than what it's actually capable of granting to specialists -- the
+/// lead's *own* usable tools and the tools it's *allowed to delegate*
+/// are two separate concepts this phase's schema doesn't conflate. See
+/// `attenuation_tests::default_coding_roster_members_pass_against_a_real_lead_registry`
+/// for a worked example of this distinction.
+///
+/// This is a cheap predicate a caller could simply not check -- see
+/// [`effective_tool_allowlist`] for the safer shape that returns the
+/// actual attenuated value instead, matching [`effective_deny_paths`]'s
+/// precedent. `tool_allowlist_is_subset` remains useful on its own,
+/// though -- e.g. to assert "this member's declared list is fully
+/// honored, with nothing silently dropped" -- which is exactly what
+/// `default_coding_roster`'s validity depends on against a real lead
+/// registry, not against the coordinator's own narrow list.
+pub fn tool_allowlist_is_subset(member: &TeamMember, lead_tools: &[&str]) -> bool {
+    first_unavailable_tool(member, lead_tools).is_none()
+}
+
+/// The actual attenuated tool-allowlist for `member`: every tool in
+/// `member.tool_allowlist` that is also present in `lead_tools`, in
+/// order. This is the safer companion to [`tool_allowlist_is_subset`],
+/// matching [`effective_deny_paths`]'s shape -- a caller that builds a
+/// specialist's real tool set *from this returned value* cannot
+/// accidentally over-grant a tool the lead doesn't actually have,
+/// whereas a caller of the bool-returning predicate could simply forget
+/// to check it. `lead_tools` has the same meaning here as in
+/// `tool_allowlist_is_subset`: the running lead `Agent`'s actual
+/// registered tool names, not the lead member's own declared
+/// `tool_allowlist`.
+pub fn effective_tool_allowlist(member: &TeamMember, lead_tools: &[&str]) -> Vec<String> {
+    member
+        .tool_allowlist
+        .iter()
+        .filter(|t| lead_tools.contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The default, coding-shaped roster this crate ships: `coordinator`
+/// (lead, delegates/verifies/synthesizes -- never executes directly),
+/// `implementer`, `reviewer`, `tester`. Ships as ready-to-use,
+/// schema-valid config data even though no delegation tooling exists
+/// yet to invoke it (Phase 2's job) -- matching aivyx-pa's own
+/// Foundation-phase precedent of shipping role definitions ahead of the
+/// tooling that uses them.
+pub fn default_coding_roster() -> TeamConfig {
+    TeamConfig {
+        lead: "coordinator".to_string(),
+        members: vec![
+            TeamMember {
+                name: "coordinator".to_string(),
+                role: "Lead".to_string(),
+                persona: "You coordinate a small coding team. You decompose \
+                    the task, delegate pieces to implementer/reviewer/tester, \
+                    verify their output, and synthesize the final result. You \
+                    never write, edit, or run anything directly."
+                    .to_string(),
+                tool_allowlist: vec!["set_tasks".to_string()],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "implementer".to_string(),
+                role: "Implementer".to_string(),
+                persona: "You write and edit code to satisfy the task you were \
+                    delegated. Read what you need, make the change, keep it \
+                    minimal and focused."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "write_file".to_string(),
+                    "edit_file".to_string(),
+                    "grep".to_string(),
+                    "glob".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "reviewer".to_string(),
+                role: "Reviewer".to_string(),
+                persona: "You review code changes for correctness, clarity, and \
+                    whether they actually satisfy the delegated task. You never \
+                    modify files yourself -- you report findings."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "grep".to_string(),
+                    "glob".to_string(),
+                    "git_read".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "tester".to_string(),
+                role: "Tester".to_string(),
+                persona: "You verify a change actually works -- run the \
+                    relevant tests or commands and report the real output, \
+                    pass or fail."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "run_command".to_string(),
+                    "run_shell".to_string(),
+                    "grep".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod schema_tests {
     use super::*;
 
     #[test]
@@ -190,157 +367,6 @@ mod validation_tests {
     }
 }
 
-/// A specialist's effective deny-list: the union of the lead's own
-/// `deny_paths` and the member's `extra_deny_paths`, de-duplicated. A
-/// specialist can only ever be handed *more* restriction than the lead
-/// already has -- there is deliberately no way for a member's config to
-/// remove one of the lead's own entries.
-pub fn effective_deny_paths(lead_deny_paths: &[String], member: &TeamMember) -> Vec<String> {
-    let mut effective: Vec<String> = lead_deny_paths.to_vec();
-    for path in &member.extra_deny_paths {
-        if !effective.contains(path) {
-            effective.push(path.clone());
-        }
-    }
-    effective
-}
-
-/// True iff every tool in `member`'s `tool_allowlist` is present in
-/// `lead_tools` -- the direct analog of NT-02 ("a specialist can never
-/// exceed its lead") for tool access, checked against the lead's own
-/// actual current tool set (a stronger, more specific check than
-/// `TeamConfig::validate`'s crate-wide available-tools check).
-pub fn tool_allowlist_is_subset(member: &TeamMember, lead_tools: &[&str]) -> bool {
-    member
-        .tool_allowlist
-        .iter()
-        .all(|t| lead_tools.contains(&t.as_str()))
-}
-
-/// The default, coding-shaped roster this crate ships: `coordinator`
-/// (lead, delegates/verifies/synthesizes -- never executes directly),
-/// `implementer`, `reviewer`, `tester`. Ships as ready-to-use,
-/// schema-valid config data even though no delegation tooling exists
-/// yet to invoke it (Phase 2's job) -- matching aivyx-pa's own
-/// Foundation-phase precedent of shipping role definitions ahead of the
-/// tooling that uses them.
-pub fn default_coding_roster() -> TeamConfig {
-    TeamConfig {
-        lead: "coordinator".to_string(),
-        members: vec![
-            TeamMember {
-                name: "coordinator".to_string(),
-                role: "Lead".to_string(),
-                persona: "You coordinate a small coding team. You decompose \
-                    the task, delegate pieces to implementer/reviewer/tester, \
-                    verify their output, and synthesize the final result. You \
-                    never write, edit, or run anything directly."
-                    .to_string(),
-                tool_allowlist: vec!["set_tasks".to_string()],
-                extra_deny_paths: vec![],
-            },
-            TeamMember {
-                name: "implementer".to_string(),
-                role: "Implementer".to_string(),
-                persona: "You write and edit code to satisfy the task you were \
-                    delegated. Read what you need, make the change, keep it \
-                    minimal and focused."
-                    .to_string(),
-                tool_allowlist: vec![
-                    "read_file".to_string(),
-                    "write_file".to_string(),
-                    "edit_file".to_string(),
-                    "grep".to_string(),
-                    "glob".to_string(),
-                ],
-                extra_deny_paths: vec![],
-            },
-            TeamMember {
-                name: "reviewer".to_string(),
-                role: "Reviewer".to_string(),
-                persona: "You review code changes for correctness, clarity, and \
-                    whether they actually satisfy the delegated task. You never \
-                    modify files yourself -- you report findings."
-                    .to_string(),
-                tool_allowlist: vec![
-                    "read_file".to_string(),
-                    "grep".to_string(),
-                    "glob".to_string(),
-                    "git_read".to_string(),
-                ],
-                extra_deny_paths: vec![],
-            },
-            TeamMember {
-                name: "tester".to_string(),
-                role: "Tester".to_string(),
-                persona: "You verify a change actually works -- run the \
-                    relevant tests or commands and report the real output, \
-                    pass or fail."
-                    .to_string(),
-                tool_allowlist: vec![
-                    "read_file".to_string(),
-                    "run_command".to_string(),
-                    "run_shell".to_string(),
-                    "grep".to_string(),
-                ],
-                extra_deny_paths: vec![],
-            },
-        ],
-    }
-}
-
-#[cfg(test)]
-mod roster_tests {
-    use super::*;
-
-    #[test]
-    fn default_coding_roster_is_schema_valid() {
-        let roster = default_coding_roster();
-        // The full set of tool names this roster's members reference --
-        // matches Task 4's Step 1 verification against the real
-        // aivyx-tools registry at plan-writing time.
-        let available = [
-            "set_tasks",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "grep",
-            "glob",
-            "run_command",
-            "run_shell",
-            "git_read",
-            "git_commit",
-        ];
-        assert!(roster.validate(&available).is_ok());
-    }
-
-    #[test]
-    fn default_coding_roster_has_the_four_expected_members() {
-        let roster = default_coding_roster();
-        let names: Vec<&str> = roster.members.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["coordinator", "implementer", "reviewer", "tester"]
-        );
-        assert_eq!(roster.lead, "coordinator");
-    }
-
-    #[test]
-    fn default_coding_roster_coordinator_has_no_direct_execution_tools() {
-        let roster = default_coding_roster();
-        let coordinator = &roster.members[0];
-        // Matches aivyx-pa's own Nonagon convention: the coordinator's
-        // persona forbids direct execution -- its tool_allowlist should
-        // not include any file-mutating or command-running tool.
-        for forbidden in ["write_file", "edit_file", "run_command", "run_shell"] {
-            assert!(
-                !coordinator.tool_allowlist.contains(&forbidden.to_string()),
-                "coordinator should not directly hold {forbidden}"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod attenuation_tests {
     use super::*;
@@ -404,5 +430,148 @@ mod attenuation_tests {
     fn tool_allowlist_is_subset_true_for_empty_allowlist() {
         let m = member(&[], &[]);
         assert!(tool_allowlist_is_subset(&m, &["read_file"]));
+    }
+
+    #[test]
+    fn effective_tool_allowlist_drops_tools_not_in_lead_tools() {
+        let m = member(&["read_file", "run_command", "grep"], &[]);
+        // run_command is not in lead_tools -- it should be dropped from
+        // the returned intersection, not cause an error.
+        let effective = effective_tool_allowlist(&m, &["read_file", "grep", "write_file"]);
+        assert_eq!(effective, vec!["read_file".to_string(), "grep".to_string()]);
+    }
+
+    #[test]
+    fn effective_tool_allowlist_is_full_allowlist_when_all_tools_available() {
+        let m = member(&["read_file", "grep"], &[]);
+        let effective = effective_tool_allowlist(&m, &["read_file", "grep", "write_file"]);
+        assert_eq!(effective, vec!["read_file".to_string(), "grep".to_string()]);
+    }
+
+    /// The cross-task incoherence the final whole-branch review caught:
+    /// `default_coding_roster`'s coordinator/lead member has
+    /// `tool_allowlist: ["set_tasks"]` only. If a caller naively passed
+    /// the lead *member*'s own declared `tool_allowlist` as
+    /// `lead_tools`, every other member in this roster would fail
+    /// `tool_allowlist_is_subset` -- the roster would contradict the
+    /// invariant it's meant to satisfy. `lead_tools` is deliberately
+    /// NOT that: it's the running lead `Agent`'s actual registered tool
+    /// set, a runtime concept Phase 2 constructs (see
+    /// `build_session_agent` in `crates/aivyx-mcp-server/src/session.rs`
+    /// for the real analog: `registry.definitions().into_iter()
+    /// .map(|d| d.name)`). This test pins that relationship: it builds a
+    /// plausible "real lead registry" -- the full set every member's
+    /// `tool_allowlist` references, plus a couple more tools a real
+    /// aivyx-coder lead Agent might also have registered -- and asserts
+    /// every member passes against *that*, not against the coordinator's
+    /// own narrow `tool_allowlist`.
+    #[test]
+    fn default_coding_roster_members_pass_against_a_real_lead_registry() {
+        let roster = default_coding_roster();
+
+        // What a real running lead `Agent` might actually have
+        // registered -- the union of every member's tool_allowlist, plus
+        // a couple of tools no member currently uses (git_commit,
+        // repl_start) to make clear this is meant to be the lead's own
+        // full capability set, not just "whatever the roster happens to
+        // reference".
+        let real_lead_registry: Vec<&str> = vec![
+            "set_tasks",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "run_command",
+            "run_shell",
+            "git_read",
+            "git_commit",
+            "repl_start",
+        ];
+
+        for member in &roster.members {
+            assert!(
+                tool_allowlist_is_subset(member, &real_lead_registry),
+                "member {:?} should pass against the lead's real tool registry",
+                member.name
+            );
+        }
+
+        // The point being pinned: the coordinator's own declared
+        // tool_allowlist ("set_tasks" only) is deliberately NOT the same
+        // list as the lead's real registry above. It is far narrower --
+        // the coordinator itself only ever calls set_tasks directly --
+        // yet it's still the *lead*, capable of granting a much wider
+        // set of tools to the specialists it delegates to. Using the
+        // coordinator's own tool_allowlist as `lead_tools` would make
+        // every other member in this roster fail the subset check,
+        // which is exactly the incoherence this test exists to prevent
+        // from silently regressing.
+        let coordinator = roster
+            .members
+            .iter()
+            .find(|m| m.name == roster.lead)
+            .unwrap();
+        let coordinator_tools: Vec<&str> = coordinator
+            .tool_allowlist
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_ne!(
+            coordinator_tools, real_lead_registry,
+            "the coordinator's own declared tool_allowlist must not be conflated with the lead's real tool registry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    #[test]
+    fn default_coding_roster_is_schema_valid() {
+        let roster = default_coding_roster();
+        // The full set of tool names this roster's members reference --
+        // matches Task 4's Step 1 verification against the real
+        // aivyx-tools registry at plan-writing time.
+        let available = [
+            "set_tasks",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "run_command",
+            "run_shell",
+            "git_read",
+            "git_commit",
+        ];
+        assert!(roster.validate(&available).is_ok());
+    }
+
+    #[test]
+    fn default_coding_roster_has_the_four_expected_members() {
+        let roster = default_coding_roster();
+        let names: Vec<&str> = roster.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["coordinator", "implementer", "reviewer", "tester"]
+        );
+        assert_eq!(roster.lead, "coordinator");
+    }
+
+    #[test]
+    fn default_coding_roster_coordinator_has_no_direct_execution_tools() {
+        let roster = default_coding_roster();
+        let coordinator = &roster.members[0];
+        // Matches aivyx-pa's own Nonagon convention: the coordinator's
+        // persona forbids direct execution -- its tool_allowlist should
+        // not include any file-mutating or command-running tool.
+        for forbidden in ["write_file", "edit_file", "run_command", "run_shell"] {
+            assert!(
+                !coordinator.tool_allowlist.contains(&forbidden.to_string()),
+                "coordinator should not directly hold {forbidden}"
+            );
+        }
     }
 }
