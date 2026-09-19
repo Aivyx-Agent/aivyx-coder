@@ -551,7 +551,18 @@ impl Default for SandboxSettings {
     fn default() -> Self {
         Self {
             extra_read_paths: Vec::new(),
-            require_enforcement: true,
+            // A platform that cannot compile sandbox-backend at all
+            // (anything non-Linux -- landlock/seccompiler are Linux-only,
+            // see crates/aivyx-sandbox/Cargo.toml) has no real
+            // enforcement to ever succeed at, so defaulting to `true`
+            // there wouldn't be "safe by default" -- it would be
+            // "refuses to run anything, with no clear cause, on every
+            // fresh install." Linux keeps the existing fail-closed
+            // default; every other platform starts unconfined by
+            // default (matching its actual capability), same as an
+            // explicit `--no-default-features` build on Linux already
+            // behaves when a user opts into that themselves.
+            require_enforcement: cfg!(target_os = "linux"),
         }
     }
 }
@@ -1430,8 +1441,19 @@ mod tests {
     }
 
     #[test]
-    fn require_enforcement_defaults_to_true() {
-        assert!(SandboxSettings::default().require_enforcement);
+    fn require_enforcement_defaults_to_true_on_linux() {
+        // This assertion is only meaningful on Linux -- see the Default
+        // impl's own doc comment for why the default is platform-
+        // conditional. On any other target this test would need the
+        // opposite assertion; it isn't cfg-gated here because this
+        // workspace's CI only runs on Linux today (see the parent plan's
+        // darwin-aarch64 release-pipeline work, which adds a macOS *build*
+        // leg but not a macOS *test* leg).
+        if cfg!(target_os = "linux") {
+            assert!(SandboxSettings::default().require_enforcement);
+        } else {
+            assert!(!SandboxSettings::default().require_enforcement);
+        }
     }
 
     #[test]
