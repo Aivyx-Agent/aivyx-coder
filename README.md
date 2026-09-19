@@ -1108,6 +1108,16 @@ startup), mid-turn cancellation (`session/cancel`), and non-text prompt
 content (images, embedded resources) — see `docs/superpowers/specs/
 2026-07-20-acp-editor-integration-design.md` for the full scope.
 
+### First-run setup
+
+`aivyx-coder --setup` runs an interactive wizard (pick a backend, pick a
+model, verify it responds) and writes `config.toml` for you, instead of
+the silent defaults-on-first-run behavior. First-run only -- if
+`config.toml` already exists, it tells you to edit it directly rather
+than overwriting it. This is also the entry point Zed/JetBrains/other
+ACP clients launch automatically as this agent's `terminal` authentication
+method, before the agent is otherwise usable.
+
 ## MCP server integration
 
 `aivyx-coder --mcp-server` runs as a third frontend: a [Model Context

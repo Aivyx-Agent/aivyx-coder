@@ -179,11 +179,28 @@ struct Cli {
     /// session).
     #[arg(long)]
     mcp_server: bool,
+
+    /// Run the interactive first-run setup wizard (pick a backend, pick
+    /// a model, write config.toml) instead of starting the agent.
+    /// First-run only -- refuses if config.toml already exists. Also the
+    /// entry point Zed/JetBrains/other ACP clients launch for this
+    /// agent's "terminal" authentication method (see aivyx-acp's own
+    /// InitializeResponse wiring).
+    #[arg(long)]
+    setup: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Must run before Settings::load()'s own first-run-writes-defaults
+    // behavior could otherwise fire silently -- the wizard is specifically
+    // supposed to create config.toml interactively, not race a default
+    // write on first launch.
+    if cli.setup {
+        return crate::setup_wizard::run().await;
+    }
 
     // Checked here, before either --acp's or --mcp-server's own branch can
     // early-return, because --acp's branch returns unconditionally and

@@ -186,9 +186,30 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
         .name("aivyx-coder")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
+                // `AuthMethodTerminal` is `#[non_exhaustive]`, so it's built
+                // via its own builder methods rather than a struct literal
+                // (a struct literal naming every field still doesn't
+                // compile outside the defining crate once a struct carries
+                // that attribute).
+                let terminal_auth = agent_client_protocol::schema::v1::AuthMethodTerminal::new(
+                    agent_client_protocol::schema::v1::AuthMethodId::new("setup"),
+                    "Run first-run setup",
+                )
+                .description(
+                    "Pick a backend and model, and write config.toml, before this agent can \
+                     start.",
+                )
+                .args(vec!["--setup".to_string()])
+                .env(std::collections::HashMap::from([(
+                    "AIVYX_CODER_ACP_TERMINAL_AUTH".to_string(),
+                    "1".to_string(),
+                )]));
                 responder.respond(
                     InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new()),
+                        .agent_capabilities(AgentCapabilities::new())
+                        .auth_methods(vec![agent_client_protocol::schema::v1::AuthMethod::Terminal(
+                            terminal_auth,
+                        )]),
                 )
             },
             agent_client_protocol::on_receive_request!(),

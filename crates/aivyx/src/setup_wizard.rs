@@ -21,6 +21,16 @@ pub(crate) enum BackendChoice {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WizardAnswers {
+    // Captured from the prompt but not read by `backend_settings_from_answers`
+    // -- the wizard always writes `BackendKind::Generic` regardless of this
+    // choice (out of scope for this plan to branch on, see the design spec's
+    // Decision 2). Kept on `WizardAnswers` anyway since it's the natural home
+    // for this answer and a future plan may want to read it back. Only
+    // surfaces as a `dead_code` warning once `run()` itself became reachable
+    // from `main()` (Task 4) -- rustc's dead-code analysis doesn't descend
+    // into an unreachable function's own field usage, so this was invisible
+    // before that wiring landed.
+    #[allow(dead_code)]
     pub(crate) backend_choice: BackendChoice,
     pub(crate) base_url: String,
     pub(crate) model: String,

@@ -5,7 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-client-protocol = "2.0.0"
+# unstable_auth_methods enables AuthMethod::Terminal -- see this crate's
+# own session.rs InitializeResponse wiring and docs/superpowers/specs/
+# 2026-09-19-acp-registry-listing-design.md for why this is a deliberate
+# dependency on an explicitly-unstable part of this crate's own Rust API
+# surface (the underlying wire-protocol shape is stable/documented ACP,
+# confirmed directly against agentclientprotocol.com's own RFD -- this is
+# a crate-API-stability risk, not a protocol-legality one). Only this one
+# feature, not the umbrella "unstable" (which also pulls in unrelated
+# surfaces: elicitation, session-fork, MCP-over-ACP).
+agent-client-protocol = { version = "2.0.0", features = ["unstable_auth_methods"] }
 aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
