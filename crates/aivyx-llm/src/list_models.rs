@@ -63,9 +63,7 @@ fn parse_ollama_tags(json: &serde_json::Value) -> Vec<String> {
 /// server implements this — a non-success status or unparseable body is
 /// `Unsupported`, not a hard error, so the wizard can fall back to
 /// manual entry.
-pub async fn list_openai_compatible_models(
-    base_url: &str,
-) -> Result<Vec<String>, ListModelsError> {
+pub async fn list_openai_compatible_models(base_url: &str) -> Result<Vec<String>, ListModelsError> {
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
     let client = reqwest::Client::builder()
         .timeout(LIST_MODELS_TIMEOUT)
@@ -123,7 +121,10 @@ mod tests {
 
     #[test]
     fn parses_ollama_tags_response_with_no_models_field() {
-        assert_eq!(parse_ollama_tags(&serde_json::json!({})), Vec::<String>::new());
+        assert_eq!(
+            parse_ollama_tags(&serde_json::json!({})),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -142,7 +143,10 @@ mod tests {
 
     #[test]
     fn parses_openai_models_response_with_no_data_field() {
-        assert_eq!(parse_openai_models(&serde_json::json!({})), Vec::<String>::new());
+        assert_eq!(
+            parse_openai_models(&serde_json::json!({})),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

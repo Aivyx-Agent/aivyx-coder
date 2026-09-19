@@ -92,20 +92,21 @@ pub async fn run() -> anyhow::Result<()> {
         // printed unconditionally below, so nothing extra here.
         ServedContext::OllamaDefaultUnknown => {}
     }
-    // Compare against the default context_tokens a freshly-written config
-    // would otherwise carry (the value backend_settings_from_answers falls
-    // back to when the served window isn't Known) -- this is exactly the
-    // silent-truncation footgun probe_served_context exists to catch.
-    if let Some(warning) = context_warning(BackendSettings::default().context_tokens, &served) {
-        println!("  warning: {warning}");
-    }
-
     let answers = WizardAnswers {
         backend_choice,
         base_url,
         model,
     };
     let backend = backend_settings_from_answers(&answers, &served);
+    // Compare against what backend_settings_from_answers is actually about
+    // to write -- for ServedContext::Known(n) that's n itself (the measured
+    // window), so there is no truncation risk and no warning; for
+    // OllamaDefaultUnknown it's still the untouched default, so the warning
+    // about Ollama's hidden served window still fires as before.
+    if let Some(warning) = context_warning(backend.context_tokens, &served) {
+        println!("  warning: {warning}");
+    }
+
     let settings = Settings {
         backend,
         ..Default::default()
@@ -230,6 +231,40 @@ mod tests {
             ollama_default_unknown.context_tokens,
             default_context_tokens
         );
+    }
+
+    #[test]
+    fn context_warning_against_the_written_backend_fires_only_for_ollama_default_unknown() {
+        let answers = WizardAnswers {
+            backend_choice: BackendChoice::Ollama,
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen3.5:9b".to_string(),
+        };
+
+        // ServedContext::Known(n) -> backend_settings_from_answers writes
+        // context_tokens = n exactly, so comparing against the real,
+        // already-built BackendSettings (not the unrelated default) must
+        // produce no warning -- there is no truncation risk.
+        let known = backend_settings_from_answers(&answers, &ServedContext::Known(4096));
+        assert_eq!(known.context_tokens, 4096);
+        assert!(
+            aivyx_llm::context_warning(known.context_tokens, &ServedContext::Known(4096)).is_none()
+        );
+
+        // ServedContext::OllamaDefaultUnknown doesn't feed a measured value
+        // in, so context_tokens stays at the BackendSettings default and the
+        // warning about Ollama's hidden served window must still fire.
+        let ollama_default_unknown =
+            backend_settings_from_answers(&answers, &ServedContext::OllamaDefaultUnknown);
+        assert_eq!(
+            ollama_default_unknown.context_tokens,
+            BackendSettings::default().context_tokens
+        );
+        let warning = aivyx_llm::context_warning(
+            ollama_default_unknown.context_tokens,
+            &ServedContext::OllamaDefaultUnknown,
+        );
+        assert!(warning.is_some_and(|w| w.contains("num_ctx")));
     }
 
     #[test]

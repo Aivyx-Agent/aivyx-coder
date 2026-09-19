@@ -197,7 +197,12 @@ async fn main() -> anyhow::Result<()> {
     // Must run before Settings::load()'s own first-run-writes-defaults
     // behavior could otherwise fire silently -- the wizard is specifically
     // supposed to create config.toml interactively, not race a default
-    // write on first launch.
+    // write on first launch. Deliberately has no exclusivity check against
+    // --acp (unlike every other mode-flag pair below): a real ACP client's
+    // "terminal" auth method launches this binary with both flags at once
+    // (its base --acp launch config plus the auth method's own --setup
+    // arg), so --setup must still win and run the wizard even when --acp
+    // is set -- do not add an --acp+--setup exclusivity check here.
     if cli.setup {
         return crate::setup_wizard::run().await;
     }
