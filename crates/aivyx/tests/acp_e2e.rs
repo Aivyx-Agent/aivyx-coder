@@ -86,14 +86,37 @@ async fn acp_session_new_fails_with_auth_required_when_no_config_exists() {
 /// same integration point Zed itself would use — rather than the crate's
 /// own translation-layer unit tests. Requires no LLM backend:
 /// `initialize`/`session/new` never call the model.
+///
+/// Hermetic by construction: since `fb088cf` switched the `--acp` branch
+/// from `Settings::load()` (writes a default `config.toml` on first run) to
+/// `Settings::load_existing()` (never writes, returns `None` if absent),
+/// this test must supply its own `config.toml` under a scratch
+/// `XDG_CONFIG_HOME` rather than relying on the ambient environment already
+/// happening to have one at `~/.config/aivyx-coder/config.toml` -- that
+/// would only be true by coincidence on a given developer machine and false
+/// on a clean CI runner. Also exercises the "config already exists ->
+/// normal session" branch that `acp_session_new_fails_with_auth_required_when_no_config_exists`
+/// deliberately does not cover.
 #[tokio::test]
 async fn acp_initialize_and_new_session_round_trip() {
     let bin = env!("CARGO_BIN_EXE_aivyx-coder");
     let cwd = tempdir().unwrap();
+    let config_home = tempdir().unwrap();
+    // Write a real config.toml via the crate's own serialization path
+    // (`Settings::write_if_absent_at`, the same `write_to` internals
+    // `Settings::load()` itself uses to write first-run defaults) rather
+    // than hand-writing a TOML string, so this test can never drift out of
+    // sync with the real `Settings` schema.
+    let config_path = config_home.path().join("aivyx-coder").join("config.toml");
+    aivyx_config::Settings::default()
+        .write_if_absent_at(&config_path)
+        .expect("failed to write test config.toml");
+
     // A dummy backend URL is fine here — this test never sends a prompt,
     // so the LLM backend is never actually contacted.
     let command = format!(
-        "{bin} --acp --base-url http://127.0.0.1:1/v1 --model test-model"
+        "XDG_CONFIG_HOME={} {bin} --acp --base-url http://127.0.0.1:1/v1 --model test-model",
+        config_home.path().display()
     );
     let agent = AcpAgent::from_str(&command).expect("valid command");
 
