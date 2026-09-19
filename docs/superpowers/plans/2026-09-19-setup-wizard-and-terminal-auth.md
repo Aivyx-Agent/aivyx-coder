@@ -1000,6 +1000,309 @@ cargo fmt --check
   individually reviewed and a final whole-branch review has passed, same
   as every other plan executed this cycle.
 
+## Addendum: Tasks 5-6 (added post-hoc from the final whole-branch review)
+
+The final whole-branch review (opus, after Tasks 1-4 were each independently
+approved) found a Critical cross-task seam no single task's diff could show:
+an editor client must launch `aivyx-coder --acp` to receive the `initialize`
+response advertising the `terminal` auth method — but that same launch
+already runs `Settings::load()`, which silently writes a default
+`config.toml` if none exists (this is deliberate, desired behavior for the
+TUI/MCP-server paths). By the time the client then launches `--setup`
+(per the advertised auth method), the config already exists, the wizard
+refuses immediately (by design, per Task 3), and the client treats the
+exit-0 refusal as "authentication succeeded" — the gate never gates
+anything. Confirmed as a real, forced consequence of the current control
+flow, not a hypothetical: traced end to end against the actual code.
+
+Per-conversation decision: fix this for real now (not just document the
+limitation), since the whole point of wiring `terminal` auth was for it to
+work. Two small tasks, executed via the same subagent-driven-development
+flow as Tasks 1-4.
+
+### Task 5: A non-writing config check, and an ACP server that gates on it
+
+**Files:**
+- Modify: `crates/aivyx-config/src/lib.rs`
+- Modify: `crates/aivyx-acp/src/session.rs`
+- Modify: `crates/aivyx/src/main.rs`
+
+**Interfaces:**
+- Produces: `Settings::load_existing() -> Result<Option<Settings>, ConfigError>`
+  (never writes; `None` if no config file exists yet).
+- Produces: `aivyx_acp::run_unconfigured() -> agent_client_protocol::Result<()>`
+  (a minimal ACP server: `initialize` advertises the same `terminal` auth
+  method as today; `session/new` always fails with `auth_required` — no
+  `Agent` is ever built, since there's no configured backend to build one
+  from).
+
+- [ ] **Step 1: Add `Settings::load_existing()`**
+
+```rust
+/// Like `load()`, but never creates a config file — returns `None` if
+/// none exists yet, `Some(Settings)` parsed the same way `load()` parses
+/// one if it does. Used by the ACP frontend: advertising a `terminal`
+/// auth method that gates on "no config yet" would be self-defeating if
+/// simply checking for that state silently created it (as `load()`
+/// deliberately does for the TUI/MCP-server paths, where that's the
+/// desired first-run behavior).
+pub fn load_existing() -> Result<Option<Self>, ConfigError> {
+    let path = Self::config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|source| ConfigError::Read { path: path.clone(), source })?;
+    let settings = toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })?;
+    Ok(Some(settings))
+}
+```
+
+Place near `load()`. Add a unit test mirroring `load()`'s own existing
+test fixtures (temp dir, no real XDG path touched): one asserting `None`
+when no file exists, one asserting `Some` with correct fields when a
+real file does, using the same test-isolation mechanism the file's other
+tests already use.
+
+- [ ] **Step 2: Factor the `terminal` auth method into a shared helper, add `run_unconfigured`**
+
+In `crates/aivyx-acp/src/session.rs`, extract the existing inline
+`terminal_auth`-building code (currently inside `run()`'s
+`InitializeRequest` handler, lines ~189-206) into a private helper:
+
+```rust
+/// The one `terminal` auth method this agent advertises, shared by both
+/// `run()` (a real session is possible) and `run_unconfigured()` (no
+/// config exists yet, so `session/new` will always fail with
+/// `auth_required` until the client runs this method and reconnects).
+fn terminal_auth_method() -> agent_client_protocol::schema::v1::AuthMethod {
+    // `AuthMethodTerminal` is `#[non_exhaustive]`, so it's built via its
+    // own builder methods rather than a struct literal.
+    let terminal_auth = agent_client_protocol::schema::v1::AuthMethodTerminal::new(
+        agent_client_protocol::schema::v1::AuthMethodId::new("setup"),
+        "Run first-run setup",
+    )
+    .description(
+        "Pick a backend and model, and write config.toml, before this agent can start.",
+    )
+    .args(vec!["--setup".to_string()])
+    .env(std::collections::HashMap::from([(
+        "AIVYX_CODER_ACP_TERMINAL_AUTH".to_string(),
+        "1".to_string(),
+    )]));
+    agent_client_protocol::schema::v1::AuthMethod::Terminal(terminal_auth)
+}
+```
+
+Update `run()`'s `InitializeRequest` handler to call
+`.auth_methods(vec![terminal_auth_method()])` instead of building the
+value inline.
+
+Add the new entry point, in the same file:
+
+```rust
+/// A minimal ACP server for when no `config.toml` exists yet:
+/// `initialize` advertises the same `terminal` auth method `run()`
+/// does, but `session/new` always fails with `auth_required` -- there
+/// is no configured backend to build a real `Agent` from. The client is
+/// expected to launch this process's own `--setup` (per the advertised
+/// method's `args`/`env`), then reconnect to a *fresh* `aivyx --acp`
+/// process -- which by then finds `Settings::load_existing()` returning
+/// `Some` and runs `run()` normally instead of this function.
+pub async fn run_unconfigured() -> Result<()> {
+    AcpAgentBuilder
+        .builder()
+        .name("aivyx-coder")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _connection| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new())
+                        .auth_methods(vec![terminal_auth_method()]),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _connection| {
+                responder.respond_with_error(agent_client_protocol::Error::auth_required())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_to(Stdio::new())
+        .await
+}
+```
+
+Verify `agent_client_protocol::Error::auth_required()` is the correct,
+real call before trusting this snippet verbatim — confirm
+`agent_client_protocol::Error` really is a re-export of
+`agent_client_protocol_schema::v1::Error` (check the crate's own
+`lib.rs` re-exports) and that `Error::auth_required()` exists on it,
+matching `respond_with_error(self, error: crate::Error)`'s expected
+type.
+
+- [ ] **Step 3: Wire the branch in `main.rs`**
+
+Restructure the `cli.acp` handling so it no longer shares the unconditional
+`Settings::load()` call the TUI/MCP-server paths use. Move the ACP
+mutual-exclusivity checks (`--plan`, `--auto`, `--resume`) up, before any
+settings loading, and give ACP its own `load_existing()`-based path:
+
+```rust
+if cli.acp {
+    if cli.plan {
+        anyhow::bail!("--acp and --plan cannot be used together");
+    }
+    if cli.auto.is_some() {
+        anyhow::bail!("--acp and --auto cannot be used together");
+    }
+    if cli.resume {
+        anyhow::bail!(
+            "--acp and --resume cannot be used together (the editor manages its own \
+             conversation view; resumed history would be invisible to it)"
+        );
+    }
+    let Some(mut settings) = aivyx_config::Settings::load_existing()? else {
+        return aivyx_acp::run_unconfigured()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()));
+    };
+    settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
+    let (deferred, acp_prompter_installer) = aivyx_acp::deferred_prompter();
+    let built =
+        crate::agent_builder::build_agent(&cli, &settings, Arc::new(deferred)).await?;
+    return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
+        agent: built.agent,
+        events_rx: built.events_rx,
+        cwd: built.cwd,
+        plan_mode: built.plan_mode,
+        prompter_installer: acp_prompter_installer,
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!(e.to_string()));
+}
+```
+
+Place this block where the current `if cli.acp { ... }` block is (after
+`init_tracing()?`, replacing both the shared `Settings::load()` call's
+effect on the ACP path and the existing `if cli.acp` block) — but the
+shared `let mut settings = Settings::load()?; settings.apply_overrides(...);`
+line, and the shared `build_agent` call currently above the `if cli.acp`
+check, must remain intact for the TUI and `--mcp-server` paths, which
+still want `load()`'s write-defaults-on-first-run behavior. Read the
+full current `main()` function before editing — the exact restructuring
+needed depends on the real current control flow around the shared
+`settings`/`built` bindings the TUI/MCP-server branches below still
+consume; do not break those paths while carving out ACP's own early
+branch.
+
+- [ ] **Step 4: Tests and verification**
+
+Add the new `load_existing` unit tests (Step 1). Extend the existing
+ACP e2e test (`crates/aivyx/tests/acp_e2e.rs`) with a new test that
+spawns `aivyx-coder --acp` in a temp `XDG_CONFIG_HOME` with no
+`config.toml` present, sends `initialize`, then sends `session/new`, and
+asserts the response is a JSON-RPC error with `auth_required`'s code
+(-32000) rather than a success — this is the one behavior this whole
+addendum exists to guarantee, so it must have direct test coverage, not
+just manual verification. Match the existing e2e test's harness/style
+(spawn pattern, temp dir setup) exactly.
+
+Run `cargo build --workspace`, `cargo test --workspace`,
+`cargo clippy --workspace --all-targets -- -D warnings` (the pre-existing,
+out-of-scope fmt drift noted elsewhere in this plan is expected to still
+be present and is not this task's concern), `cargo fmt --check` scoped to
+just the files this task touches.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/aivyx-config/src/lib.rs crates/aivyx-acp/src/session.rs crates/aivyx/src/main.rs crates/aivyx/tests/acp_e2e.rs
+git commit -m "fix: make ACP terminal auth a real gate, not a structural no-op
+
+Settings::load_existing() never writes a default config (unlike load(),
+whose write-defaults-on-first-run behavior is correct for the TUI/MCP-
+server paths but was silently defeating the ACP terminal auth method:
+the client had to boot --acp to see the auth method was advertised,
+which already created config.toml, so the wizard --setup launched to
+satisfy it always found the file already there and refused immediately,
+reporting exit-0 success for a gate that never gated anything).
+
+aivyx_acp::run_unconfigured() is what --acp now runs when no config
+exists yet: initialize still advertises the terminal auth method, but
+session/new always fails with auth_required instead of ever building a
+real Agent. The client launches --setup per the advertised method,
+then reconnects to a fresh --acp process, which now finds
+load_existing() returning Some and runs the normal session flow."
+```
+
+### Task 6: Bundled Important fixes (context window, test coverage, README placement)
+
+Three small, independent fixes the final review flagged as Important —
+bundled into one implementer dispatch per the subagent-driven-development
+skill's guidance against one-fixer-per-finding, since each is small and
+none touch the same lines as another.
+
+**Files:**
+- Modify: `crates/aivyx/src/setup_wizard.rs`
+- Modify: `crates/aivyx/tests/acp_e2e.rs` (or wherever Task 5's new test
+  landed — add the `auth_methods` shape assertion here too, in the same
+  spawned-process test if one already exists post-Task-5, to avoid a
+  second full binary spawn)
+- Modify: `README.md`
+
+**Fix A — the wizard discards the context window it just measured.**
+`backend_settings_from_answers` currently uses `..Default::default()`,
+so `context_tokens` is always the default (8192) regardless of what
+`probe_served_context` actually measured. Thread the probed value
+through: change `backend_settings_from_answers`'s signature to accept
+the measured context (or add a second pure function/field), set
+`context_tokens` from `ServedContext::Known(n)` when available, and call
+the existing, already-public `aivyx_llm::context_warning(configured,
+&served)` helper (`crates/aivyx-llm/src/probe.rs`) to print a real
+warning on a mismatch instead of the wizard's own weaker hand-rolled
+message. Read `probe.rs`'s `context_warning` signature and all three
+`ServedContext` variants' real current messages before writing this —
+do not duplicate logic `context_warning` already provides correctly.
+Add/update a unit test on `backend_settings_from_answers` (or its
+replacement) confirming a measured context value actually lands in the
+written `BackendSettings`.
+
+**Fix B — `auth_methods` shape has no direct test.** If Task 5's own new
+e2e test didn't already assert on the exact `auth_methods` contents
+(only that `session/new` fails), add an assertion to the `initialize`
+response step: `auth_methods` contains exactly one `AuthMethod::Terminal`
+with `id.0 == "setup"` and `args == ["--setup"]`. If Task 5's test
+already covers this exactly, skip this fix and note in your report that
+it was already covered.
+
+**Fix C — README's "Getting started" doesn't mention `--setup`.** Find
+the existing "first run" paragraph (near the top of `README.md`, the one
+describing the config file being written with defaults on first run) and
+add one sentence recommending `aivyx-coder --setup` as the first-run
+path, pointing at the fuller `### First-run setup` section already added
+in Task 4. Keep the existing ACP-section entry as-is — do not duplicate
+its full content, just cross-link.
+
+- [ ] **Step 1: Implement all three fixes**
+- [ ] **Step 2: Run the affected crates' tests, plus the full workspace suite once**
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/aivyx/src/setup_wizard.rs crates/aivyx/tests/acp_e2e.rs README.md
+git commit -m "fix: wizard writes the context window it measures; test auth_methods shape; surface --setup in Getting started
+
+The wizard was printing the real served context window from
+probe_served_context and then writing the unrelated 8192 default
+regardless -- the exact silent-truncation footgun the design spec cites
+as this verification step's reason to exist. Now threads the measured
+value through and reuses the existing context_warning helper instead of
+a weaker hand-rolled message. Also adds direct e2e coverage of the
+auth_methods shape the ACP registry's own CI validates, and surfaces
+--setup where a first-run user will actually read it."
+```
+
 ## Explicitly out of scope for this plan
 
 (Copied forward from the design spec's own "What this spec does not
