@@ -27,6 +27,10 @@ pub enum ConfigError {
     },
     #[error("failed to serialize default config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error(
+        "config file already exists at {path:?} -- edit it directly, or delete it to re-run setup"
+    )]
+    AlreadyExists { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1094,6 +1098,34 @@ impl Settings {
         Ok(())
     }
 
+    /// Writes `self` to `path`, but only if nothing is there yet -- never
+    /// overwrites an existing config file. Reuses the existing, private
+    /// `write_to` internally (same 0600-at-create/0700-parent-dir
+    /// guarantees, single-sourced), so this carries no new file-writing
+    /// logic of its own. Returns the path written to on success.
+    ///
+    /// Deliberately first-run-only: `write_to`'s own doc comment already
+    /// flags that overwriting an existing file would need a different
+    /// (currently unimplemented) permission-retightening approach, so this
+    /// refuses outright with `ConfigError::AlreadyExists` rather than
+    /// extending the 0600-at-create-time guarantee to an overwrite path.
+    pub fn write_if_absent_at(&self, path: &Path) -> Result<PathBuf, ConfigError> {
+        if path.exists() {
+            return Err(ConfigError::AlreadyExists {
+                path: path.to_path_buf(),
+            });
+        }
+        self.write_to(path)?;
+        Ok(path.to_path_buf())
+    }
+
+    /// Same as `write_if_absent_at`, resolved against the standard XDG
+    /// config path (the same one `load()` itself uses).
+    pub fn write_if_absent(&self) -> Result<PathBuf, ConfigError> {
+        let path = Self::config_path()?;
+        self.write_if_absent_at(&path)
+    }
+
     /// CLI flags win over the config file when present.
     pub fn apply_overrides(&mut self, base_url: Option<String>, model: Option<String>) {
         if let Some(base_url) = base_url {
@@ -1782,6 +1814,41 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn write_if_absent_writes_a_fresh_file_and_returns_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let settings = Settings {
+            backend: BackendSettings {
+                base_url: "http://localhost:11434/v1".to_string(),
+                model: "qwen3.5:9b".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let written = settings.write_if_absent_at(&path).unwrap();
+
+        assert_eq!(written, path);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("qwen3.5:9b"));
+    }
+
+    #[test]
+    fn write_if_absent_refuses_when_the_file_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "provider = \"already here\"\n").unwrap();
+        let settings = Settings::default();
+
+        let err = settings.write_if_absent_at(&path).unwrap_err();
+
+        assert!(matches!(err, ConfigError::AlreadyExists { .. }));
+        // The pre-existing file must be untouched.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, "provider = \"already here\"\n");
     }
 
     #[test]
