@@ -212,22 +212,20 @@ async fn main() -> anyhow::Result<()> {
 
     let _tracing_guard = init_tracing()?;
 
-    let mut settings = Settings::load()?;
-    settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
-
-    let (prompter, tui_permission_rx, acp_prompter_installer): (
-        Arc<dyn PermissionPrompter>,
-        Option<aivyx_tui::PermissionModalReceiver>,
-        Option<aivyx_acp::PrompterInstaller>,
-    ) = if cli.acp {
-        let (deferred, installer) = aivyx_acp::deferred_prompter();
-        (Arc::new(deferred), None, Some(installer))
-    } else {
-        let (tui_prompter, permission_rx) = aivyx_tui::permission_channel();
-        (Arc::new(tui_prompter), Some(permission_rx), None)
-    };
-    let built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
-
+    // ACP gets its own settings-loading path, deliberately not the shared
+    // `Settings::load()` call below: an editor client must launch
+    // `aivyx-coder --acp` just to receive the `initialize` response that
+    // advertises the `terminal` auth method -- and `Settings::load()`'s
+    // write-defaults-on-first-run behavior (correct and desired for the
+    // TUI/`--mcp-server` paths below) would silently create `config.toml`
+    // during that very launch, so that by the time the client ran the
+    // advertised `--setup` to satisfy the auth method, the wizard would
+    // find the file already there and refuse immediately -- the auth gate
+    // never actually gating anything. `Settings::load_existing()` never
+    // writes, so `session/new` can genuinely fail with `auth_required`
+    // until the client runs real setup. This whole branch always returns;
+    // it never falls through to the shared `settings`/`built` bindings the
+    // TUI and `--mcp-server` paths below still use.
     if cli.acp {
         if cli.plan {
             anyhow::bail!("--acp and --plan cannot be used together");
@@ -241,16 +239,31 @@ async fn main() -> anyhow::Result<()> {
                  conversation view; resumed history would be invisible to it)"
             );
         }
+        let Some(mut settings) = aivyx_config::Settings::load_existing()? else {
+            return aivyx_acp::run_unconfigured()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()));
+        };
+        settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
+        let (deferred, acp_prompter_installer) = aivyx_acp::deferred_prompter();
+        let built = crate::agent_builder::build_agent(&cli, &settings, Arc::new(deferred)).await?;
         return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
             agent: built.agent,
             events_rx: built.events_rx,
             cwd: built.cwd,
             plan_mode: built.plan_mode,
-            prompter_installer: acp_prompter_installer.expect("set above when cli.acp"),
+            prompter_installer: acp_prompter_installer,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()));
     }
+
+    let mut settings = Settings::load()?;
+    settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
+
+    let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
+    let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
+    let built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
 
     if cli.mcp_server {
         if cli.plan {
@@ -311,7 +324,6 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
-    let permission_rx = tui_permission_rx.expect("TUI path always sets this");
     let autonomous_run = cli.auto.map(|goal| aivyx_tui::AutonomousRun {
         goal,
         max_iterations: settings.autonomous.max_iterations,
@@ -323,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
         built.agent,
         built.events_rx,
         built.cwd,
-        permission_rx,
+        tui_permission_rx,
         built.restored,
         built.plan_mode,
         autonomous_run,

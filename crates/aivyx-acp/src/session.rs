@@ -165,6 +165,60 @@ fn interactive_injection_notice(finding: &InjectionFinding) -> String {
     )
 }
 
+/// The one `terminal` auth method this agent advertises, shared by both
+/// `run()` (a real session is possible) and `run_unconfigured()` (no
+/// config exists yet, so `session/new` will always fail with
+/// `auth_required` until the client runs this method and reconnects).
+fn terminal_auth_method() -> agent_client_protocol::schema::v1::AuthMethod {
+    // `AuthMethodTerminal` is `#[non_exhaustive]`, so it's built via its
+    // own builder methods rather than a struct literal (a struct literal
+    // naming every field still doesn't compile outside the defining crate
+    // once a struct carries that attribute).
+    let terminal_auth = agent_client_protocol::schema::v1::AuthMethodTerminal::new(
+        agent_client_protocol::schema::v1::AuthMethodId::new("setup"),
+        "Run first-run setup",
+    )
+    .description("Pick a backend and model, and write config.toml, before this agent can start.")
+    .args(vec!["--setup".to_string()])
+    .env(std::collections::HashMap::from([(
+        "AIVYX_CODER_ACP_TERMINAL_AUTH".to_string(),
+        "1".to_string(),
+    )]));
+    agent_client_protocol::schema::v1::AuthMethod::Terminal(terminal_auth)
+}
+
+/// A minimal ACP server for when no `config.toml` exists yet:
+/// `initialize` advertises the same `terminal` auth method `run()` does,
+/// but `session/new` always fails with `auth_required` -- there is no
+/// configured backend to build a real `Agent` from. The client is
+/// expected to launch this process's own `--setup` (per the advertised
+/// method's `args`/`env`), then reconnect to a *fresh* `aivyx --acp`
+/// process -- which by then finds `Settings::load_existing()` returning
+/// `Some` and runs `run()` normally instead of this function.
+pub async fn run_unconfigured() -> Result<()> {
+    AcpAgentBuilder
+        .builder()
+        .name("aivyx-coder")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _connection| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new())
+                        .auth_methods(vec![terminal_auth_method()]),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _connection| {
+                responder.respond_with_error(agent_client_protocol::Error::auth_required())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_to(Stdio::new())
+        .await
+}
+
 pub async fn run(config: AcpSessionConfig) -> Result<()> {
     // `plan_mode` is a cheap `Arc<AtomicBool>` clone, kept outside the
     // session lock entirely — see the module doc comment on why
@@ -186,30 +240,10 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
         .name("aivyx-coder")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
-                // `AuthMethodTerminal` is `#[non_exhaustive]`, so it's built
-                // via its own builder methods rather than a struct literal
-                // (a struct literal naming every field still doesn't
-                // compile outside the defining crate once a struct carries
-                // that attribute).
-                let terminal_auth = agent_client_protocol::schema::v1::AuthMethodTerminal::new(
-                    agent_client_protocol::schema::v1::AuthMethodId::new("setup"),
-                    "Run first-run setup",
-                )
-                .description(
-                    "Pick a backend and model, and write config.toml, before this agent can \
-                     start.",
-                )
-                .args(vec!["--setup".to_string()])
-                .env(std::collections::HashMap::from([(
-                    "AIVYX_CODER_ACP_TERMINAL_AUTH".to_string(),
-                    "1".to_string(),
-                )]));
                 responder.respond(
                     InitializeResponse::new(req.protocol_version)
                         .agent_capabilities(AgentCapabilities::new())
-                        .auth_methods(vec![agent_client_protocol::schema::v1::AuthMethod::Terminal(
-                            terminal_auth,
-                        )]),
+                        .auth_methods(vec![terminal_auth_method()]),
                 )
             },
             agent_client_protocol::on_receive_request!(),

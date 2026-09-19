@@ -1020,6 +1020,36 @@ impl Settings {
         toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })
     }
 
+    /// Like `load()`, but never creates a config file — returns `None` if
+    /// none exists yet, `Some(Settings)` parsed the same way `load()`
+    /// parses one if it does. Used by the ACP frontend: advertising a
+    /// `terminal` auth method that gates on "no config yet" would be
+    /// self-defeating if simply checking for that state silently created
+    /// it (as `load()` deliberately does for the TUI/MCP-server paths,
+    /// where that's the desired first-run behavior).
+    pub fn load_existing() -> Result<Option<Self>, ConfigError> {
+        Self::load_existing_at(&Self::config_path()?)
+    }
+
+    /// Core logic behind `load_existing()`, taking an explicit path so
+    /// tests can exercise it against a temp directory instead of the real
+    /// XDG config path — same split as `write_to`/`write_if_absent_at`
+    /// below.
+    fn load_existing_at(path: &Path) -> Result<Option<Self>, ConfigError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let settings = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Some(settings))
+    }
+
     /// Writes the config file owner-only, atomically at creation — the
     /// same pattern `aivyx-core::session::save` established (Task 9 of the
     /// 2026-09-16 security audit): `fs::write` + a separate, best-effort
@@ -1849,6 +1879,45 @@ mod tests {
         // The pre-existing file must be untouched.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw, "provider = \"already here\"\n");
+    }
+
+    #[test]
+    fn load_existing_returns_none_when_no_file_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let result = Settings::load_existing_at(&path).unwrap();
+
+        assert!(
+            result.is_none(),
+            "load_existing must never create a config file -- it should report None, not write \
+             defaults, when nothing exists yet"
+        );
+        assert!(
+            !path.exists(),
+            "load_existing must not have created a file as a side effect"
+        );
+    }
+
+    #[test]
+    fn load_existing_returns_some_with_correct_fields_when_a_file_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let settings = Settings {
+            backend: BackendSettings {
+                base_url: "http://localhost:8080/v1".to_string(),
+                model: "custom-model".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        settings.write_to(&path).unwrap();
+
+        let result = Settings::load_existing_at(&path).unwrap();
+
+        let loaded = result.expect("a real file must load as Some");
+        assert_eq!(loaded.backend.base_url, "http://localhost:8080/v1");
+        assert_eq!(loaded.backend.model, "custom-model");
     }
 
     #[test]
