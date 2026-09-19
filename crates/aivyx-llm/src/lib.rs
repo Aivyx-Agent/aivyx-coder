@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod openai_compat;
 pub mod probe;
+pub mod list_models;
 mod kv_slot_pool;
 #[cfg(feature = "provider-mistral-rs")]
 pub mod mistral_rs;
