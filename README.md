@@ -1398,7 +1398,7 @@ fact.
 
 ### 3. Landlock + seccomp — kernel-enforced process confinement
 
-This tier is Linux-only — see "Platform support" below. On the macOS
+This tier is Linux-only — see "Platform support" above. On the macOS
 binary, process execution stops after tier 2 (`ConfirmationGate`); no
 OS-level confinement applies.
 
