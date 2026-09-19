@@ -26,8 +26,7 @@ repeated full-codebase audits (see `docs/HISTORY.md` for the phase history).
 cargo run -p aivyx
 ```
 
-For a release build (Linux x86_64 only, static musl binary, matching
-where the real Landlock+seccomp sandbox actually works):
+For a release build (Linux x86_64, static musl binary):
 
 ```
 scripts/build-release.sh
@@ -35,8 +34,10 @@ scripts/build-release.sh
 
 Produces `dist/aivyx-coder-v<version>-x86_64-linux-musl.tar.gz` plus a
 `.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are built
-and published automatically via GitHub Actions — grab a pre-built
-binary instead of building from source:
+and published automatically via GitHub Actions for **both** Linux
+x86_64 (static musl) and macOS aarch64 (Apple Silicon) — grab a
+pre-built binary instead of building from source (see "Platform
+support" below for what differs between the two):
 
 ```sh
 curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.1.0-x86_64-linux-musl.tar.gz \
@@ -55,6 +56,19 @@ works), but the produced binary is renamed via `[[bin]]` in
 `crates/aivyx/Cargo.toml` so it can't collide on `PATH` with the
 unrelated `Rust/aivyx-pa` Personal Assistant project, which also ships a
 binary literally named `aivyx-pa`.
+
+**Platform support.** The Linux binary is built with the real
+Landlock+seccomp sandbox (`sandbox-backend` feature, on by default) and
+gets full kernel-level process confinement — see "Landlock + seccomp"
+below. The macOS binary is built with `--no-default-features` (landlock/
+seccompiler are Linux-only) and runs **unconfined at the OS level**:
+process execution relies solely on the permission-gate and checkpoint/
+rollback layers, with no kernel-enforced filesystem or syscall
+restriction. The macOS binary is also unsigned and unnotarized — a
+tarball downloaded through a browser may get Gatekeeper's quarantine
+flag and refuse to launch; installing via `curl | tar` (as shown above)
+avoids that, since quarantine is only applied by apps that set it on
+download (browsers, `curl` does not).
 
 Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
@@ -691,7 +705,9 @@ The real OS-level sandbox (Linux Landlock + seccomp) is on by default. To
 build without it (non-Linux, or a kernel without Landlock), use
 `--no-default-features` on `aivyx-sandbox` — the agent then falls back to no
 process confinement (see "require_enforcement" below for how that interacts
-with running commands).
+with running commands). The shipped macOS release binary (see "Platform
+support" above) *is* exactly this `--no-default-features` build — it's not
+a hypothetical, it's what actually ships there today.
 
 ## Serving
 
@@ -1316,10 +1332,12 @@ way to *remove* a built-in default through config. This covers:
 - **Search tools** (`grep`/`glob`): every walked entry is checked, so a search
   rooted *above* a denied directory still can't descend into it.
 - **Command tools** (`run_command`/`run_shell`): for a path-separator entry,
-  `deny_paths` is enforced at the **kernel** level — the Landlock sandbox
-  (below) simply never grants access to a denied path, so a shell command
-  physically cannot read or write it regardless of how the command is phrased
-  (redirection, env vars, etc.). Basename-glob entries (no separator, e.g.
+  `deny_paths` is enforced at the **kernel** level on the Linux binary — the
+  Landlock sandbox (below) simply never grants access to a denied path, so a
+  shell command physically cannot read or write it regardless of how the
+  command is phrased (redirection, env vars, etc.). On the macOS binary there
+  is no Landlock, so this reduces to the same gate-only enforcement as reads
+  below — see "Platform support". Basename-glob entries (no separator, e.g.
   `.env`, `*.pem`) are enforced too: `LandlockConfiner` resolves them to
   concrete file paths once at startup by scanning the working directory and
   any configured `extra_read_paths` (the roots a project's own secrets could
@@ -1380,6 +1398,10 @@ fact.
 
 ### 3. Landlock + seccomp — kernel-enforced process confinement
 
+This tier is Linux-only — see "Platform support" below. On the macOS
+binary, process execution stops after tier 2 (`ConfirmationGate`); no
+OS-level confinement applies.
+
 Confinement isn't limited to `run_command`/`run_shell` — it applies to every
 tool that spawns a child process: `git_commit`/`git_push`/`git_branch`/
 `git_pr`/`git_read`'s `git` invocations, `find_references`/`go_to_definition`'s
@@ -1403,7 +1425,9 @@ syscall denylist, applied in the forked child before `exec`:
   more — confinement-escape and privilege-escalation primitives a coding
   agent's commands never legitimately need.
 
-`sandbox.require_enforcement` (default **true**): if real Landlock confinement
+`sandbox.require_enforcement` (default **true** on Linux, **false** on every
+other platform — non-Linux builds have no Landlock/seccomp backend compiled
+in to enforce with in the first place): if real Landlock confinement
 can't actually be established at all — the kernel lacks Landlock or it's
 disabled — command tools **refuse to run** rather than silently executing
 unconfined. A kernel that only *partially* enforces the requested ruleset

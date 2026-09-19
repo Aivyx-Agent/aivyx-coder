@@ -39,7 +39,11 @@ cargo test -p aivyx-core some_test_name
 - The real sandbox (Linux Landlock + seccomp) is on by default. To build
   without it (non-Linux, or a kernel without Landlock), use
   `--no-default-features` on `aivyx-sandbox` — this changes runtime behavior
-  (see `sandbox.require_enforcement` below), not just the build.
+  (see `sandbox.require_enforcement` below), not just the build. The macOS
+  release leg (`.github/workflows/release.yml`, `aarch64-apple-darwin`) is
+  a real, shipped instance of this `--no-default-features` build, not just
+  a theoretical one — see "Sandbox internals" below and README.md's
+  "Platform support" section.
 - Config lives at `~/.config/aivyx-coder/config.toml` (written `0600` on
   first run — it may hold an `api_key`). Sessions persist under
   `~/.local/state/aivyx-coder/sessions/`, one per project directory keyed by
@@ -135,6 +139,13 @@ is unchanged — see `aivyx-sandbox/src/lib.rs`'s own doc comment). The
 policy summary below is still accurate and worth knowing before touching
 `ExecutionConfiner` or its call sites, but the actual source — and its
 own more detailed doc comments — now lives in that other repo, not here.
+All of it (`aivyx-confine`'s `sandbox-backend` feature) is Linux-only —
+`landlock`/`seccompiler` don't build on other platforms — so a
+`--no-default-features` build has none of this; this is no longer purely
+hypothetical, since the shipped `aarch64-apple-darwin` release binary
+(`.github/workflows/release.yml`) is built exactly that way and runs with
+`NoopConfiner` (no OS-level confinement, gate-only) — see README.md's
+"Platform support" section.
 
 - **Landlock** (ABI V7): write grants are `cwd` + the system temp dir(s);
   read grants are `cwd` + a fixed system/toolchain list (`/usr`, `/lib`,

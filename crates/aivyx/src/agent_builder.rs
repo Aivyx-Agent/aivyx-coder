@@ -279,6 +279,17 @@ pub(crate) async fn build_agent(
         &deny_paths,
         settings.sandbox.require_enforcement,
     );
+    // This build has no `sandbox-backend` compiled in (e.g. a macOS
+    // binary, where landlock/seccompiler don't exist), so `default_confiner`
+    // above always returns the `NoopConfiner` fallback — real OS-level
+    // filesystem/process confinement never happens here, no matter what
+    // `sandbox.require_enforcement` says in the user's config.
+    #[cfg(not(feature = "sandbox-backend"))]
+    tracing::warn!(
+        "compiled without the sandbox-backend feature — no OS-level (Landlock/seccomp) \
+         confinement is available on this build; filesystem and process access are not \
+         enforced regardless of sandbox.require_enforcement"
+    );
 
     let mut checkpointer: Option<Arc<GitCheckpointer>> = None;
     if settings.git.checkpoints

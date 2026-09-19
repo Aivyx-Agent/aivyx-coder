@@ -541,9 +541,11 @@ pub struct SandboxSettings {
     /// Landlock confinement can't actually be established (kernel support
     /// missing/disabled, or the kernel only partially enforces the
     /// requested ruleset) — fail closed rather than silently running
-    /// unconfined. Defaults to `true`: a coding agent whose core value
-    /// proposition includes real sandboxing should not silently degrade to
-    /// no sandboxing at all without the user explicitly opting into that.
+    /// unconfined. Defaults to `true` on Linux (a coding agent whose core
+    /// value proposition includes real sandboxing should not silently
+    /// degrade to no sandboxing at all without the user explicitly opting
+    /// into that) and `false` elsewhere, since non-Linux builds have no
+    /// `sandbox-backend` to enforce with in the first place.
     pub require_enforcement: bool,
 }
 

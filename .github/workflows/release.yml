@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -44,6 +45,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p aivyx --no-default-features
 
       - name: Package release artifact
+        env:
+          # macOS's tar emits `._*` AppleDouble sidecar files for anything
+          # carrying extended attributes unless this is set; harmless on
+          # the Linux leg (its tar doesn't look at this var), scoped by
+          # expression anyway so it's only ever set on the macOS leg.
+          COPYFILE_DISABLE: ${{ matrix.target == 'aarch64-apple-darwin' && '1' || '' }}
         run: |
           STAGE_NAME="aivyx-coder-${GITHUB_REF_NAME}-${{ matrix.stage_suffix }}"
           mkdir -p "dist/${STAGE_NAME}"

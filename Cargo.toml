@@ -8,16 +8,25 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-aivyx-acp = { path = "crates/aivyx-acp" }
+# `default-features = false` on aivyx-acp/aivyx-core/aivyx-mcp-server/
+# aivyx-sandbox/aivyx-tools/aivyx-tui below: no crate currently pulls
+# these in via `{ workspace = true }` (each still sets its own
+# `default-features = false` at its own call site instead), so this isn't
+# fixing an active bug -- it's a latent-gap hardening. Without it, a
+# future crate adopting the more idiomatic `{ workspace = true }` style
+# would silently default these features back on, reintroducing the
+# Linux-only landlock/seccompiler deps into a macOS build without
+# touching any file the feature-forwarding fix changed.
+aivyx-acp = { path = "crates/aivyx-acp", default-features = false }
 aivyx-types = { path = "crates/aivyx-types" }
 aivyx-llm = { path = "crates/aivyx-llm" }
-aivyx-mcp-server = { path = "crates/aivyx-mcp-server" }
-aivyx-sandbox = { path = "crates/aivyx-sandbox" }
-aivyx-tools = { path = "crates/aivyx-tools" }
+aivyx-mcp-server = { path = "crates/aivyx-mcp-server", default-features = false }
+aivyx-sandbox = { path = "crates/aivyx-sandbox", default-features = false }
+aivyx-tools = { path = "crates/aivyx-tools", default-features = false }
 aivyx-repomap = { path = "crates/aivyx-repomap" }
-aivyx-core = { path = "crates/aivyx-core" }
+aivyx-core = { path = "crates/aivyx-core", default-features = false }
 aivyx-config = { path = "crates/aivyx-config" }
-aivyx-tui = { path = "crates/aivyx-tui" }
+aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # Not on crates.io -- pinned by commit SHA (see each repo's own README).
 # Centralized here (rather than repeated per-crate) so each pin has
 # exactly one place to bump: aivyx-kvcache and aivyx-recall previously
