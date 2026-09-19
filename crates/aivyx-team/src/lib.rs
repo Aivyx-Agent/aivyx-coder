@@ -217,6 +217,130 @@ pub fn tool_allowlist_is_subset(member: &TeamMember, lead_tools: &[&str]) -> boo
         .all(|t| lead_tools.contains(&t.as_str()))
 }
 
+/// The default, coding-shaped roster this crate ships: `coordinator`
+/// (lead, delegates/verifies/synthesizes -- never executes directly),
+/// `implementer`, `reviewer`, `tester`. Ships as ready-to-use,
+/// schema-valid config data even though no delegation tooling exists
+/// yet to invoke it (Phase 2's job) -- matching aivyx-pa's own
+/// Foundation-phase precedent of shipping role definitions ahead of the
+/// tooling that uses them.
+pub fn default_coding_roster() -> TeamConfig {
+    TeamConfig {
+        lead: "coordinator".to_string(),
+        members: vec![
+            TeamMember {
+                name: "coordinator".to_string(),
+                role: "Lead".to_string(),
+                persona: "You coordinate a small coding team. You decompose \
+                    the task, delegate pieces to implementer/reviewer/tester, \
+                    verify their output, and synthesize the final result. You \
+                    never write, edit, or run anything directly."
+                    .to_string(),
+                tool_allowlist: vec!["set_tasks".to_string()],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "implementer".to_string(),
+                role: "Implementer".to_string(),
+                persona: "You write and edit code to satisfy the task you were \
+                    delegated. Read what you need, make the change, keep it \
+                    minimal and focused."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "write_file".to_string(),
+                    "edit_file".to_string(),
+                    "grep".to_string(),
+                    "glob".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "reviewer".to_string(),
+                role: "Reviewer".to_string(),
+                persona: "You review code changes for correctness, clarity, and \
+                    whether they actually satisfy the delegated task. You never \
+                    modify files yourself -- you report findings."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "grep".to_string(),
+                    "glob".to_string(),
+                    "git_read".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "tester".to_string(),
+                role: "Tester".to_string(),
+                persona: "You verify a change actually works -- run the \
+                    relevant tests or commands and report the real output, \
+                    pass or fail."
+                    .to_string(),
+                tool_allowlist: vec![
+                    "read_file".to_string(),
+                    "run_command".to_string(),
+                    "run_shell".to_string(),
+                    "grep".to_string(),
+                ],
+                extra_deny_paths: vec![],
+            },
+        ],
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    #[test]
+    fn default_coding_roster_is_schema_valid() {
+        let roster = default_coding_roster();
+        // The full set of tool names this roster's members reference --
+        // matches Task 4's Step 1 verification against the real
+        // aivyx-tools registry at plan-writing time.
+        let available = [
+            "set_tasks",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "run_command",
+            "run_shell",
+            "git_read",
+            "git_commit",
+        ];
+        assert!(roster.validate(&available).is_ok());
+    }
+
+    #[test]
+    fn default_coding_roster_has_the_four_expected_members() {
+        let roster = default_coding_roster();
+        let names: Vec<&str> = roster.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["coordinator", "implementer", "reviewer", "tester"]
+        );
+        assert_eq!(roster.lead, "coordinator");
+    }
+
+    #[test]
+    fn default_coding_roster_coordinator_has_no_direct_execution_tools() {
+        let roster = default_coding_roster();
+        let coordinator = &roster.members[0];
+        // Matches aivyx-pa's own Nonagon convention: the coordinator's
+        // persona forbids direct execution -- its tool_allowlist should
+        // not include any file-mutating or command-running tool.
+        for forbidden in ["write_file", "edit_file", "run_command", "run_shell"] {
+            assert!(
+                !coordinator.tool_allowlist.contains(&forbidden.to_string()),
+                "coordinator should not directly hold {forbidden}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod attenuation_tests {
     use super::*;
