@@ -1,5 +1,5 @@
-use agent_client_protocol::schema::v1::InitializeRequest;
 use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{AuthMethod, InitializeRequest};
 use agent_client_protocol::{AcpAgent, Client};
 use std::str::FromStr;
 use tempfile::tempdir;
@@ -130,6 +130,25 @@ async fn acp_initialize_and_new_session_round_trip() {
                 .await
                 .expect("initialize should succeed");
             assert_eq!(init.protocol_version, ProtocolVersion::V1);
+
+            // Direct coverage of the auth_methods shape (not just
+            // non-emptiness, which acp_session_new_fails_with_auth_required_when_no_config_exists
+            // already checks): exactly the one `terminal` auth method
+            // `terminal_auth_method()` builds, with the `id`/`args` a
+            // client actually parses to know what to launch.
+            assert_eq!(
+                init.auth_methods.len(),
+                1,
+                "expected exactly one advertised auth method, got {:?}",
+                init.auth_methods
+            );
+            match &init.auth_methods[0] {
+                AuthMethod::Terminal(terminal) => {
+                    assert_eq!(terminal.id.0.as_ref(), "setup");
+                    assert_eq!(terminal.args, vec!["--setup".to_string()]);
+                }
+                other => panic!("expected AuthMethod::Terminal, got {other:?}"),
+            }
 
             cx.build_session(cwd.path())
                 .block_task()

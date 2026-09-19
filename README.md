@@ -58,7 +58,10 @@ binary literally named `aivyx-pa`.
 
 Requires a local inference server. On first run a config file is written to
 your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
-pointing at Ollama (`http://localhost:11434/v1`); edit it to taste.
+pointing at Ollama (`http://localhost:11434/v1`); edit it to taste. Prefer
+`aivyx-coder --setup` instead — it walks you through picking a backend and
+model interactively rather than leaving you to hand-edit the defaults; see
+[First-run setup](#first-run-setup) below for details.
 
 Sessions persist automatically: after every completed turn the conversation
 history and task list are saved (one session per project directory, keyed by

@@ -10,6 +10,7 @@
 //! plus the existing `probe_served_context` before writing.
 
 use aivyx_config::{BackendKind, BackendSettings, Settings};
+use aivyx_llm::context_warning;
 use aivyx_llm::list_models::{list_ollama_models, list_openai_compatible_models};
 use aivyx_llm::probe::{ServedContext, probe_served_context};
 
@@ -43,13 +44,25 @@ pub(crate) fn default_base_url(choice: BackendChoice) -> &'static str {
     }
 }
 
-pub(crate) fn backend_settings_from_answers(answers: &WizardAnswers) -> BackendSettings {
-    BackendSettings {
+/// Pure decision layer: maps the wizard's answers plus the probed served
+/// context window (`ServedContext::Known(n)` -> `context_tokens = n`, any
+/// other variant -> the `BackendSettings` default) to the `BackendSettings`
+/// that gets written. Takes the already-probed value rather than probing
+/// itself, so it stays I/O-free and unit-testable.
+pub(crate) fn backend_settings_from_answers(
+    answers: &WizardAnswers,
+    served: &ServedContext,
+) -> BackendSettings {
+    let mut settings = BackendSettings {
         base_url: answers.base_url.clone(),
         model: answers.model.clone(),
         kind: BackendKind::Generic,
         ..Default::default()
+    };
+    if let ServedContext::Known(n) = served {
+        settings.context_tokens = *n;
     }
+    settings
 }
 
 /// The wizard's real entry point -- checks for an existing config first,
@@ -69,18 +82,22 @@ pub async fn run() -> anyhow::Result<()> {
     let model = prompt_model(backend_choice, &base_url).await?;
 
     println!("Verifying {model} at {base_url} ...");
-    match probe_served_context(&base_url, &model).await {
+    let served = probe_served_context(&base_url, &model).await;
+    match &served {
         ServedContext::Known(n) => println!("  served context window: {n} tokens"),
-        ServedContext::OllamaDefaultUnknown => println!(
-            "  warning: this model's served context window could not be determined -- \
-             Ollama serves a 4096-token default unless the model or service says \
-             otherwise; set context_tokens in config.toml once you know the real value"
+        ServedContext::Unknown => println!(
+            "  warning: could not verify the server responded at all -- writing config anyway"
         ),
-        ServedContext::Unknown => {
-            println!(
-                "  warning: could not verify the server responded at all -- writing config anyway"
-            )
-        }
+        // context_warning() always has something to say for this variant --
+        // printed unconditionally below, so nothing extra here.
+        ServedContext::OllamaDefaultUnknown => {}
+    }
+    // Compare against the default context_tokens a freshly-written config
+    // would otherwise carry (the value backend_settings_from_answers falls
+    // back to when the served window isn't Known) -- this is exactly the
+    // silent-truncation footgun probe_served_context exists to catch.
+    if let Some(warning) = context_warning(BackendSettings::default().context_tokens, &served) {
+        println!("  warning: {warning}");
     }
 
     let answers = WizardAnswers {
@@ -88,7 +105,7 @@ pub async fn run() -> anyhow::Result<()> {
         base_url,
         model,
     };
-    let backend = backend_settings_from_answers(&answers);
+    let backend = backend_settings_from_answers(&answers, &served);
     let settings = Settings {
         backend,
         ..Default::default()
@@ -165,7 +182,7 @@ mod tests {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "qwen3.5:9b".to_string(),
         };
-        let settings = backend_settings_from_answers(&answers);
+        let settings = backend_settings_from_answers(&answers, &ServedContext::Unknown);
         assert_eq!(settings.base_url, "http://localhost:11434/v1");
         assert_eq!(settings.model, "qwen3.5:9b");
         assert_eq!(settings.kind, aivyx_config::BackendKind::Generic);
@@ -178,10 +195,41 @@ mod tests {
             base_url: "http://localhost:8080/v1".to_string(),
             model: "some-model".to_string(),
         };
-        let settings = backend_settings_from_answers(&answers);
+        let settings = backend_settings_from_answers(&answers, &ServedContext::Unknown);
         assert_eq!(settings.base_url, "http://localhost:8080/v1");
         assert_eq!(settings.model, "some-model");
         assert_eq!(settings.kind, aivyx_config::BackendKind::Generic);
+    }
+
+    #[test]
+    fn backend_settings_from_answers_writes_the_measured_context_window_when_known() {
+        let answers = WizardAnswers {
+            backend_choice: BackendChoice::Ollama,
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen3.5:9b".to_string(),
+        };
+        let settings = backend_settings_from_answers(&answers, &ServedContext::Known(16384));
+        assert_eq!(settings.context_tokens, 16384);
+    }
+
+    #[test]
+    fn backend_settings_from_answers_falls_back_to_the_default_context_window_when_not_known() {
+        let answers = WizardAnswers {
+            backend_choice: BackendChoice::Ollama,
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen3.5:9b".to_string(),
+        };
+        let default_context_tokens = BackendSettings::default().context_tokens;
+
+        let unknown = backend_settings_from_answers(&answers, &ServedContext::Unknown);
+        assert_eq!(unknown.context_tokens, default_context_tokens);
+
+        let ollama_default_unknown =
+            backend_settings_from_answers(&answers, &ServedContext::OllamaDefaultUnknown);
+        assert_eq!(
+            ollama_default_unknown.context_tokens,
+            default_context_tokens
+        );
     }
 
     #[test]
