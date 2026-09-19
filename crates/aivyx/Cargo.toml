@@ -25,6 +25,7 @@ aivyx-vision-core = { workspace = true }
 aivyx-vision-mold = { workspace = true }
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
+dialoguer = "0.11"
 directories = "6.0.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
 serde_json = "1.0.150"
