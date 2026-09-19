@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
+aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 anyhow = "1.0.103"
 async-trait = "0.1.89"
@@ -16,6 +16,22 @@ ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-util = "0.7.18"
 tui-textarea = "0.7.0"
+
+[features]
+# Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
+# syscall denylist), forwarded from aivyx-sandbox. Opt out with
+# --no-default-features on platforms/kernels where it isn't available
+# (e.g. macOS) -- NoopConfiner remains the fallback. This crate must
+# forward the feature explicitly: depending on aivyx-sandbox without
+# default-features = false means --no-default-features never actually
+# reaches aivyx-sandbox's own sandbox-backend feature, no matter how
+# this crate itself is built. Also forwards through aivyx-core (which
+# this crate depends on and which itself re-forwards sandbox-backend) --
+# that dependency edge also needed default-features = false, since an
+# unguarded edge implicitly requests aivyx-core's own default feature
+# regardless of this crate's own feature flags.
+default = ["sandbox-backend"]
+sandbox-backend = ["aivyx-sandbox/sandbox-backend", "aivyx-core/sandbox-backend"]
 
 [dev-dependencies]
 serde_json = "1.0.150"

@@ -8,8 +8,8 @@ license.workspace = true
 aivyx-kvcache = { workspace = true }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
-aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-tools = { version = "0.1.0", path = "../aivyx-tools", default-features = false }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 async-trait = "0.1.89"
 directories = "6.0.0"
@@ -22,6 +22,22 @@ time = { version = "0.3.53", features = ["parsing", "formatting", "serde"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tokio-util = "0.7.18"
 tracing = "0.1.44"
+
+[features]
+# Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
+# syscall denylist), forwarded from aivyx-sandbox. Opt out with
+# --no-default-features on platforms/kernels where it isn't available
+# (e.g. macOS) -- NoopConfiner remains the fallback. This crate must
+# forward the feature explicitly: depending on aivyx-sandbox without
+# default-features = false means --no-default-features never actually
+# reaches aivyx-sandbox's own sandbox-backend feature, no matter how
+# this crate itself is built. Also forwards through aivyx-tools (which
+# this crate depends on and which itself re-forwards sandbox-backend) --
+# that dependency edge also needed default-features = false, since an
+# unguarded edge implicitly requests aivyx-tools' own default feature
+# regardless of this crate's own feature flags.
+default = ["sandbox-backend"]
+sandbox-backend = ["aivyx-sandbox/sandbox-backend", "aivyx-tools/sandbox-backend"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

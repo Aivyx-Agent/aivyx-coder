@@ -9,17 +9,17 @@ name = "aivyx-coder"
 path = "src/main.rs"
 
 [dependencies]
-aivyx-acp = { version = "0.1.0", path = "../aivyx-acp" }
+aivyx-acp = { version = "0.1.0", path = "../aivyx-acp", default-features = false }
 aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
-aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
 aivyx-kvcache = { workspace = true }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
-aivyx-mcp-server = { version = "0.1.0", path = "../aivyx-mcp-server" }
+aivyx-mcp-server = { version = "0.1.0", path = "../aivyx-mcp-server", default-features = false }
 aivyx-recall = { workspace = true }
 aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
-aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
-aivyx-tui = { version = "0.1.0", path = "../aivyx-tui" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-tools = { version = "0.1.0", path = "../aivyx-tools", default-features = false }
+aivyx-tui = { version = "0.1.0", path = "../aivyx-tui", default-features = false }
 aivyx-vision-svg = { workspace = true }
 aivyx-vision-core = { workspace = true }
 aivyx-vision-mold = { workspace = true }
@@ -37,6 +37,33 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [features]
+# Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
+# syscall denylist), forwarded from aivyx-sandbox. Opt out with
+# --no-default-features on platforms/kernels where it isn't available
+# (e.g. macOS) -- NoopConfiner remains the fallback. This crate must
+# forward the feature explicitly: depending on aivyx-sandbox without
+# default-features = false means --no-default-features never actually
+# reaches aivyx-sandbox's own sandbox-backend feature, no matter how
+# this crate itself is built. This also forwards through every sibling
+# workspace crate this one depends on that itself re-forwards
+# sandbox-backend (aivyx-acp, aivyx-core, aivyx-mcp-server, aivyx-tools,
+# aivyx-tui) -- each of those dependency edges also needed
+# default-features = false, since (with resolver = "3") an unguarded
+# path/workspace dependency edge implicitly requests the dependency's
+# own default feature regardless of what flags the top-level build was
+# invoked with; leaving even one such edge unguarded reintroduces
+# landlock/seccompiler through that edge alone. Verified empirically via
+# cargo tree -i landlock under single-package builds of each affected
+# crate (e.g. -p aivyx-tui --no-default-features) before this was fixed.
+default = ["sandbox-backend"]
+sandbox-backend = [
+    "aivyx-sandbox/sandbox-backend",
+    "aivyx-acp/sandbox-backend",
+    "aivyx-core/sandbox-backend",
+    "aivyx-mcp-server/sandbox-backend",
+    "aivyx-tools/sandbox-backend",
+    "aivyx-tui/sandbox-backend",
+]
 provider-mistral-rs = ["aivyx-llm/provider-mistral-rs"]
 provider-mistral-rs-cuda = ["aivyx-llm/provider-mistral-rs-cuda"]
 provider-mistral-rs-metal = ["aivyx-llm/provider-mistral-rs-metal"]

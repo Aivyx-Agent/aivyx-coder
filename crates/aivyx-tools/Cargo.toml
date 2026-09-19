@@ -8,7 +8,7 @@ license.workspace = true
 aivyx-checkpoint = { workspace = true }
 aivyx-recall = { workspace = true }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 aivyx-vision-svg = { workspace = true }
 aivyx-vision-core = { workspace = true }
@@ -30,6 +30,18 @@ thiserror = "2.0.18"
 tracing = "0.1.44"
 tokio = { version = "1.52.3", features = ["process", "fs", "rt", "macros", "io-util", "time", "sync", "net"] }
 tokio-util = "0.7.18"
+
+[features]
+# Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
+# syscall denylist), forwarded from aivyx-sandbox. Opt out with
+# --no-default-features on platforms/kernels where it isn't available
+# (e.g. macOS) -- NoopConfiner remains the fallback. This crate must
+# forward the feature explicitly: depending on aivyx-sandbox without
+# default-features = false means --no-default-features never actually
+# reaches aivyx-sandbox's own sandbox-backend feature, no matter how
+# this crate itself is built.
+default = ["sandbox-backend"]
+sandbox-backend = ["aivyx-sandbox/sandbox-backend"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -6,10 +6,10 @@ license.workspace = true
 
 [dependencies]
 rmcp = { version = "0.11.0", features = ["transport-io"] }
-aivyx-core = { version = "0.1.0", path = "../aivyx-core" }
+aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
 aivyx-kvcache = { workspace = true }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox" }
-aivyx-tools = { version = "0.1.0", path = "../aivyx-tools" }
+aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-tools = { version = "0.1.0", path = "../aivyx-tools", default-features = false }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
 anyhow = "1.0.103"
@@ -21,6 +21,27 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 tracing = "0.1.44"
 tokio-util = "0.7.18"
 uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf
+# syscall denylist), forwarded from aivyx-sandbox. Opt out with
+# --no-default-features on platforms/kernels where it isn't available
+# (e.g. macOS) -- NoopConfiner remains the fallback. This crate must
+# forward the feature explicitly: depending on aivyx-sandbox without
+# default-features = false means --no-default-features never actually
+# reaches aivyx-sandbox's own sandbox-backend feature, no matter how
+# this crate itself is built. Also forwards through aivyx-core and
+# aivyx-tools (which this crate depends on and which themselves
+# re-forward sandbox-backend) -- those dependency edges also needed
+# default-features = false, since an unguarded edge implicitly requests
+# the dependency's own default feature regardless of this crate's own
+# feature flags.
+default = ["sandbox-backend"]
+sandbox-backend = [
+    "aivyx-sandbox/sandbox-backend",
+    "aivyx-core/sandbox-backend",
+    "aivyx-tools/sandbox-backend",
+]
 
 [dev-dependencies]
 # Only used by test-only LlmBackend mocks (BoxStream, StreamExt,
