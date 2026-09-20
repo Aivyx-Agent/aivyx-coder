@@ -23,7 +23,7 @@ use aivyx_sandbox::{
     PermissionRequest, PermissionTarget, PlanMode,
 };
 use aivyx_team::TeamConfig;
-use aivyx_tools::{GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry};
+use aivyx_tools::{GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolRegistry};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -36,10 +36,16 @@ use crate::agent::{AgentEvent, EditFormat};
 struct DelegateToSpecialistArgs {
     /// The name of a `TeamConfig` member to delegate to -- must match
     /// one of `team.members`' own `name` fields.
+    #[allow(dead_code)] // read via execute() once Task 2 implements it;
+    // this struct is only ever constructed via serde_json::from_value,
+    // never field-by-field in Rust code yet.
     member: String,
     /// A complete, self-contained description of the task for the
     /// specialist -- it starts with no context beyond this text and the
     /// specialist's own persona.
+    #[allow(dead_code)] // read via execute() once Task 2 implements it;
+    // this struct is only ever constructed via serde_json::from_value,
+    // never field-by-field in Rust code yet.
     task: String,
 }
 
@@ -99,6 +105,8 @@ pub struct DelegateToSpecialistConfig {
 }
 
 pub struct DelegateToSpecialistTool {
+    #[allow(dead_code)] // read via execute() once Task 2 implements it;
+    // currently only ever assigned, via DelegateToSpecialistTool::new.
     config: DelegateToSpecialistConfig,
 }
 
@@ -249,7 +257,11 @@ mod registry_attenuation_tests {
         let parent = registry_with(&["read_file"]);
         let m = member(&["read_file", "nonexistent_tool"]);
         let attenuated = compute_specialist_registry(&m, &parent);
-        let names: Vec<String> = attenuated.definitions().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = attenuated
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert_eq!(names, vec!["read_file".to_string()]);
     }
 }

@@ -459,10 +459,7 @@ mod tests {
 
     #[test]
     fn strip_think_removes_closed_and_unclosed_spans() {
-        assert_eq!(
-            strip_think("<think>hmm</think>the answer"),
-            "the answer"
-        );
+        assert_eq!(strip_think("<think>hmm</think>the answer"), "the answer");
         assert_eq!(
             strip_think("first<think>a</think>mid<think>b</think>last"),
             "firstmidlast"

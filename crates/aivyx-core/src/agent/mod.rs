@@ -28,9 +28,7 @@ mod tests;
 mod types;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
-use types::{
-    AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig,
-};
+use types::{AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig};
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from
 /// a misbehaving backend that never stops streaming.
@@ -94,8 +92,13 @@ const PROMPTED_EDIT_HIDDEN_TOOLS: &[&str] = &["edit_file", "write_file"];
 /// and `patch_file`/`delete_file`/`move_file` have nothing to do with
 /// SEARCH/REPLACE block synthesis. Sharing the list meant those three tools
 /// never triggered verification at all until this fix.
-const VERIFICATION_TRIGGER_TOOLS: &[&str] =
-    &["edit_file", "write_file", "patch_file", "delete_file", "move_file"];
+const VERIFICATION_TRIGGER_TOOLS: &[&str] = &[
+    "edit_file",
+    "write_file",
+    "patch_file",
+    "delete_file",
+    "move_file",
+];
 
 /// Appended to the system prompt in prompted edit mode (outside plan mode).
 const EDIT_FORMAT_PROMPT: &str = "To modify or create files, do NOT call tools. Write \
@@ -495,7 +498,13 @@ impl Agent {
         model_id: String,
         build_hash: String,
     ) {
-        self.kv_cache = Some(KvCacheConfig { pool, store, backend_id, model_id, build_hash });
+        self.kv_cache = Some(KvCacheConfig {
+            pool,
+            store,
+            backend_id,
+            model_id,
+            build_hash,
+        });
     }
 
     /// Opts this `Agent` into attaching a `slot_hint` to every outgoing
@@ -631,7 +640,10 @@ impl Agent {
                              partial/corrupt slot is never recorded as a valid cache entry"
                         );
                     } else {
-                        let meta = CacheMeta { size_bytes: 1, token_count: 1 };
+                        let meta = CacheMeta {
+                            size_bytes: 1,
+                            token_count: 1,
+                        };
                         match kv.store.save_from_slot(&key, slot_id, meta).await {
                             Ok(()) => {
                                 tracing::info!(
@@ -2080,7 +2092,11 @@ impl Agent {
                 if let ToolOutput::Error(original_error) = &result.output
                     && let Some(start_ref) = batch_start_ref.take()
                 {
-                    match self.executor.restore_to_checkpoint(&start_ref, &cancellation).await {
+                    match self
+                        .executor
+                        .restore_to_checkpoint(&start_ref, &cancellation)
+                        .await
+                    {
                         Ok(()) => {
                             result.output = ToolOutput::Error(format!(
                                 "{original_error}\n\nThis failure automatically rolled back {} \
