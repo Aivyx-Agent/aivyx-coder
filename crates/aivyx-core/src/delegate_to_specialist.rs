@@ -3,10 +3,11 @@
 //! `aivyx_team::TeamMember`'s `effective_tool_allowlist` and `persona`,
 //! reusing the exact same shared gate/confiner/checkpointer,
 //! fresh-history, bounded-iteration mechanism `delegate_task` already
-//! has. Deliberately NOT registered onto the default agent's tool list
-//! (see `docs/superpowers/plans/2026-09-20-nonagon-team-delegation.md`'s
-//! Global Constraints) -- that's a later phase's job, once there's a
-//! real way to load a `TeamConfig` and opt into team mode at all.
+//! has. Registered conditionally in `agent_builder.rs`, gated on
+//! `[team] enabled` (`TeamSettings`, off by default) -- see
+//! `docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md`.
+//! When enabled, the team is always `aivyx_team::default_coding_roster()`;
+//! a custom-roster config format is still separate, later scope.
 //!
 //! Deny-paths attenuation is explicitly out of scope here: a specialist
 //! shares the lead's exact `deny_paths` (baked into each tool instance
@@ -102,10 +103,9 @@ pub struct DelegateToSpecialistConfig {
     /// attenuates it per-member at call time, so (unlike
     /// `delegate_task`'s pre-cloned, pre-excluded `sub_agent_registry`)
     /// this is the *unfiltered* parent registry, cloned once here at
-    /// construction time (before this tool itself would ever be
-    /// registered onto it, mirroring `delegate_task`'s own recursion-
-    /// prevention structure -- though this tool is not registered onto
-    /// the default agent at all this phase, see the module doc comment).
+    /// construction time (before this tool itself is registered onto
+    /// it, in `agent_builder.rs`, mirroring `delegate_task`'s own
+    /// recursion-prevention structure -- see the module doc comment).
     pub parent_registry: ToolRegistry,
     pub team: TeamConfig,
     pub plan_mode: PlanMode,
