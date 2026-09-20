@@ -8,8 +8,8 @@ use agent_client_protocol::schema::v1::{
     SessionUpdate, StopReason, TextContent, ToolCall as AcpToolCall, ToolCallContent,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use aivyx_core::AgentEvent;
-use aivyx_types::{ToolOutput, TaskStatus};
+use aivyx_core::{AgentEvent, SpecialistSessionSummary};
+use aivyx_types::{MissionPlan, StepStatus, Task, TaskStatus, ToolOutput};
 
 /// Best-effort classification of a tool name into ACP's `ToolKind`, for
 /// client icon/UI hints only — never affects behavior. Unknown/unlisted
@@ -33,6 +33,66 @@ fn tool_kind(name: &str) -> ToolKind {
 
 fn text_chunk(text: String) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+}
+
+/// Builds the single merged ACP `Plan` from three tracked state sources
+/// -- tasks first, then mission steps, then open specialist sessions,
+/// each origin-prefixed so they're distinguishable in one flat list,
+/// since ACP has no dedicated "mission" slot (only `Plan`, which is
+/// whole-list-replace). See `docs/superpowers/specs/
+/// 2026-09-21-nonagon-team-acp-missions-surface-design.md`.
+pub(crate) fn build_merged_plan(
+    tasks: &[Task],
+    mission_plan: Option<&MissionPlan>,
+    open_specialist_sessions: &[SpecialistSessionSummary],
+) -> Plan {
+    let mut entries = Vec::new();
+    for task in tasks {
+        let status = match task.status {
+            TaskStatus::Pending => PlanEntryStatus::Pending,
+            TaskStatus::InProgress => PlanEntryStatus::InProgress,
+            TaskStatus::Done => PlanEntryStatus::Completed,
+        };
+        entries.push(PlanEntry::new(
+            format!("[Task] {}", task.text),
+            PlanEntryPriority::Medium,
+            status,
+        ));
+    }
+    if let Some(plan) = mission_plan {
+        for step in &plan.steps {
+            let (content, status) = match step.status {
+                StepStatus::Pending => (
+                    format!("[Mission: {}] {}", step.member, step.task),
+                    PlanEntryStatus::Pending,
+                ),
+                StepStatus::Verified => (
+                    format!("[Mission: {}] {}", step.member, step.task),
+                    PlanEntryStatus::Completed,
+                ),
+                // Never Completed -- PlanEntryStatus has no failure state,
+                // so Pending (not a false success) plus a text marker is
+                // the honest mapping, mirroring the same reasoning behind
+                // the TUI's own Failed-step handling (Phase 6a).
+                StepStatus::Failed => (
+                    format!("[Mission: {}] (FAILED) {}", step.member, step.task),
+                    PlanEntryStatus::Pending,
+                ),
+            };
+            entries.push(PlanEntry::new(content, PlanEntryPriority::Medium, status));
+        }
+    }
+    for session in open_specialist_sessions {
+        entries.push(PlanEntry::new(
+            format!("[Specialist: {}] session open", session.member),
+            PlanEntryPriority::Medium,
+            // No real "done" concept for a parked session -- it's open or
+            // it's gone (closed/evicted sessions simply aren't present in
+            // this slice, they don't get a terminal status here).
+            PlanEntryStatus::InProgress,
+        ));
+    }
+    Plan::new(entries)
 }
 
 pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Option<SessionUpdate> {
@@ -79,19 +139,6 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
                     .raw_output(serde_json::Value::String(text)),
             ))
         }
-        AgentEvent::TasksUpdated(tasks) => SessionUpdate::Plan(Plan::new(
-            tasks
-                .iter()
-                .map(|task| {
-                    let status = match task.status {
-                        TaskStatus::Pending => PlanEntryStatus::Pending,
-                        TaskStatus::InProgress => PlanEntryStatus::InProgress,
-                        TaskStatus::Done => PlanEntryStatus::Completed,
-                    };
-                    PlanEntry::new(task.text.clone(), PlanEntryPriority::Medium, status)
-                })
-                .collect(),
-        )),
         AgentEvent::SubAgentActivity(inner) => return translate_event(session_id, inner),
         // Turn-terminal (handled by `terminal_stop_reason` instead) or
         // deliberately non-notification events — not surfaced as a
@@ -103,16 +150,64 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         | AgentEvent::TurnPaused(_)
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::ConversationCleared
-        // No ACP `SessionUpdate` variant maps to a mission plan or a
-        // specialist-session list -- this editor frontend doesn't have a
-        // missions panel (that's TUI-only, see the TUI Missions Surface
-        // design spec), so these are silently dropped here, same as
-        // `ConversationCleared` above.
+        // Tasks/mission/specialist-session state all feed a single,
+        // merged ACP Plan (see `build_merged_plan`) -- handled
+        // exclusively by `translate_event_with_state`, which tracks
+        // last-known state and rebuilds the union on every change. This
+        // stateless function must never handle any of the three, or a
+        // direct call here would silently bypass the merge and produce
+        // an un-prefixed, single-source Plan.
+        | AgentEvent::TasksUpdated(_)
         | AgentEvent::MissionsUpdated(_)
         | AgentEvent::SpecialistSessionsUpdated(_) => return None,
     };
     let _ = session_id; // session_id threading happens at the SessionNotification wrapper in Task 5
     Some(update)
+}
+
+/// Session-aware wrapper around `translate_event`: `TasksUpdated`/
+/// `MissionsUpdated`/`SpecialistSessionsUpdated` update the relevant
+/// tracked value and return the full re-merged `Plan`
+/// (`build_merged_plan`); every other event passes straight through to
+/// `translate_event`, unchanged. Takes the three tracked-state slots by
+/// `&mut` directly (not a `&mut Session`) so this whole mechanism stays
+/// testable with plain values, no `Agent`/`Session` construction needed
+/// -- `Session::translate_and_merge` in `session.rs` is a thin wrapper
+/// over this.
+pub(crate) fn translate_event_with_state(
+    session_id: &SessionId,
+    tasks: &mut Vec<Task>,
+    mission_plan: &mut Option<MissionPlan>,
+    open_specialist_sessions: &mut Vec<SpecialistSessionSummary>,
+    event: &AgentEvent,
+) -> Option<SessionUpdate> {
+    match event {
+        AgentEvent::TasksUpdated(new_tasks) => {
+            *tasks = new_tasks.clone();
+            Some(SessionUpdate::Plan(build_merged_plan(
+                tasks,
+                mission_plan.as_ref(),
+                open_specialist_sessions,
+            )))
+        }
+        AgentEvent::MissionsUpdated(plan) => {
+            *mission_plan = Some(plan.clone());
+            Some(SessionUpdate::Plan(build_merged_plan(
+                tasks,
+                mission_plan.as_ref(),
+                open_specialist_sessions,
+            )))
+        }
+        AgentEvent::SpecialistSessionsUpdated(sessions) => {
+            *open_specialist_sessions = sessions.clone();
+            Some(SessionUpdate::Plan(build_merged_plan(
+                tasks,
+                mission_plan.as_ref(),
+                open_specialist_sessions,
+            )))
+        }
+        other => translate_event(session_id, other),
+    }
 }
 
 pub(crate) fn terminal_stop_reason(event: &AgentEvent) -> Option<StopReason> {
@@ -126,7 +221,7 @@ pub(crate) fn terminal_stop_reason(event: &AgentEvent) -> Option<StopReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aivyx_types::{Task, ToolCall, ToolCallId, ToolCallSource, ToolResult};
+    use aivyx_types::{MissionStep, Task, ToolCall, ToolCallId, ToolCallSource, ToolResult};
 
     fn sid() -> SessionId {
         SessionId::new("sess-1")
@@ -152,8 +247,13 @@ mod tests {
 
     #[test]
     fn council_and_architect_notes_become_plain_message_text() {
-        let council = translate_event(&sid(), &AgentEvent::CouncilNote("council said x".to_string())).unwrap();
-        let architect = translate_event(&sid(), &AgentEvent::ArchitectNote("plan is y".to_string())).unwrap();
+        let council = translate_event(
+            &sid(),
+            &AgentEvent::CouncilNote("council said x".to_string()),
+        )
+        .unwrap();
+        let architect =
+            translate_event(&sid(), &AgentEvent::ArchitectNote("plan is y".to_string())).unwrap();
         assert!(matches!(council, SessionUpdate::AgentMessageChunk(_)));
         assert!(matches!(architect, SessionUpdate::AgentMessageChunk(_)));
     }
@@ -217,18 +317,273 @@ mod tests {
     }
 
     #[test]
-    fn tasks_updated_becomes_a_plan() {
+    fn tasks_updated_is_not_handled_by_the_stateless_translate_event() {
+        // TasksUpdated is handled exclusively by translate_event_with_state
+        // now (see merged_plan_prefixes_tasks_and_maps_their_status and
+        // translate_event_with_state_updates_tasks_and_returns_the_merged_plan
+        // above) -- translate_event alone must return None for it, or a
+        // direct call here would silently bypass the merge.
+        let tasks = vec![Task {
+            id: 1,
+            text: "write tests".to_string(),
+            status: TaskStatus::Done,
+        }];
+        assert!(translate_event(&sid(), &AgentEvent::TasksUpdated(tasks)).is_none());
+    }
+
+    #[test]
+    fn merged_plan_prefixes_tasks_and_maps_their_status() {
         let tasks = vec![
-            Task { id: 1, text: "write tests".to_string(), status: TaskStatus::Done },
-            Task { id: 2, text: "write code".to_string(), status: TaskStatus::InProgress },
+            Task {
+                id: 1,
+                text: "write tests".to_string(),
+                status: TaskStatus::Done,
+            },
+            Task {
+                id: 2,
+                text: "write code".to_string(),
+                status: TaskStatus::InProgress,
+            },
         ];
-        let update = translate_event(&sid(), &AgentEvent::TasksUpdated(tasks)).unwrap();
+        let plan = build_merged_plan(&tasks, None, &[]);
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries[0].content, "[Task] write tests");
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+        assert_eq!(plan.entries[1].content, "[Task] write code");
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
+    }
+
+    #[test]
+    fn merged_plan_prefixes_mission_steps_with_their_member() {
+        let mission = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            }],
+            summary: None,
+        };
+        let plan = build_merged_plan(&[], Some(&mission), &[]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].content,
+            "[Mission: implementer] write the fix"
+        );
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+    }
+
+    #[test]
+    fn merged_plan_maps_a_failed_step_to_pending_with_a_failed_marker() {
+        let mission = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Failed,
+                notes: Some("does not compile".to_string()),
+            }],
+            summary: None,
+        };
+        let plan = build_merged_plan(&[], Some(&mission), &[]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].content,
+            "[Mission: implementer] (FAILED) write the fix"
+        );
+        // Never Completed -- a failed step must never look like a success.
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+    }
+
+    #[test]
+    fn merged_plan_maps_a_verified_step_to_completed() {
+        let mission = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Verified,
+                notes: Some("looks good".to_string()),
+            }],
+            summary: None,
+        };
+        let plan = build_merged_plan(&[], Some(&mission), &[]);
+        assert_eq!(
+            plan.entries[0].content,
+            "[Mission: implementer] write the fix"
+        );
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+    }
+
+    #[test]
+    fn merged_plan_prefixes_open_specialist_sessions_as_in_progress() {
+        let sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "reviewer".to_string(),
+        }];
+        let plan = build_merged_plan(&[], None, &sessions);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].content,
+            "[Specialist: reviewer] session open"
+        );
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+    }
+
+    #[test]
+    fn merged_plan_orders_tasks_then_mission_steps_then_sessions() {
+        let tasks = vec![Task {
+            id: 1,
+            text: "a task".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        let mission = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "a step".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            }],
+            summary: None,
+        };
+        let sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "reviewer".to_string(),
+        }];
+        let plan = build_merged_plan(&tasks, Some(&mission), &sessions);
+        assert_eq!(plan.entries.len(), 3);
+        assert!(plan.entries[0].content.starts_with("[Task]"));
+        assert!(plan.entries[1].content.starts_with("[Mission:"));
+        assert!(plan.entries[2].content.starts_with("[Specialist:"));
+    }
+
+    #[test]
+    fn merged_plan_with_no_sources_is_empty() {
+        let plan = build_merged_plan(&[], None, &[]);
+        assert!(plan.entries.is_empty());
+    }
+
+    #[test]
+    fn translate_event_with_state_updates_tasks_and_returns_the_merged_plan() {
+        let mut tasks = Vec::new();
+        let mut mission_plan = None;
+        let mut open_specialist_sessions = Vec::new();
+        let new_tasks = vec![Task {
+            id: 1,
+            text: "write tests".to_string(),
+            status: TaskStatus::Done,
+        }];
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::TasksUpdated(new_tasks.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(tasks, new_tasks);
+        let SessionUpdate::Plan(plan) = update else {
+            panic!("expected Plan");
+        };
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].content, "[Task] write tests");
+    }
+
+    #[test]
+    fn translate_event_with_state_preserves_other_sources_when_one_changes() {
+        let mut tasks = vec![Task {
+            id: 1,
+            text: "a task".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        let mut mission_plan = None;
+        let mut open_specialist_sessions = Vec::new();
+        let mission = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "a step".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            }],
+            summary: None,
+        };
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::MissionsUpdated(mission.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(mission_plan, Some(mission));
+        // The pre-existing task must still be present in the re-merged plan
+        // -- this is the whole point of the union merge (a MissionsUpdated
+        // event must not clobber the Tasks entries).
         let SessionUpdate::Plan(plan) = update else {
             panic!("expected Plan");
         };
         assert_eq!(plan.entries.len(), 2);
-        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
-        assert_eq!(plan.entries[1].status, PlanEntryStatus::InProgress);
+        assert!(plan.entries[0].content.starts_with("[Task]"));
+        assert!(plan.entries[1].content.starts_with("[Mission:"));
+    }
+
+    #[test]
+    fn translate_event_with_state_updates_specialist_sessions() {
+        let mut tasks = Vec::new();
+        let mut mission_plan = None;
+        let mut open_specialist_sessions = Vec::new();
+        let sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "reviewer".to_string(),
+        }];
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::SpecialistSessionsUpdated(sessions.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(open_specialist_sessions, sessions);
+        let SessionUpdate::Plan(plan) = update else {
+            panic!("expected Plan");
+        };
+        assert_eq!(
+            plan.entries[0].content,
+            "[Specialist: reviewer] session open"
+        );
+    }
+
+    #[test]
+    fn translate_event_with_state_passes_other_events_straight_through() {
+        let mut tasks = Vec::new();
+        let mut mission_plan = None;
+        let mut open_specialist_sessions = Vec::new();
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::TextDelta("hi".to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(update, SessionUpdate::AgentMessageChunk(_)));
     }
 
     #[test]
@@ -238,19 +593,33 @@ mod tests {
         assert!(matches!(update, SessionUpdate::AgentMessageChunk(_)));
         // Non-terminal: an Error event must never itself resolve the
         // in-flight `session/prompt` call.
-        assert!(terminal_stop_reason(&AgentEvent::Error("backend timed out".to_string())).is_none());
+        assert!(
+            terminal_stop_reason(&AgentEvent::Error("backend timed out".to_string())).is_none()
+        );
     }
 
     #[test]
     fn context_usage_is_not_surfaced() {
-        assert!(translate_event(&sid(), &AgentEvent::ContextUsage { used: 10, limit: 100 }).is_none());
+        assert!(
+            translate_event(
+                &sid(),
+                &AgentEvent::ContextUsage {
+                    used: 10,
+                    limit: 100
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn turn_complete_and_turn_paused_are_not_session_updates_but_are_stop_reasons() {
         assert!(translate_event(&sid(), &AgentEvent::TurnComplete).is_none());
         assert!(translate_event(&sid(), &AgentEvent::TurnPaused("paused".to_string())).is_none());
-        assert_eq!(terminal_stop_reason(&AgentEvent::TurnComplete), Some(StopReason::EndTurn));
+        assert_eq!(
+            terminal_stop_reason(&AgentEvent::TurnComplete),
+            Some(StopReason::EndTurn)
+        );
         assert_eq!(
             terminal_stop_reason(&AgentEvent::TurnPaused("paused".to_string())),
             Some(StopReason::MaxTurnRequests)

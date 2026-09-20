@@ -78,19 +78,20 @@
 //! re-checks on every call").
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, InitializeRequest, InitializeResponse, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{Agent as AcpAgentBuilder, Result, Stdio};
-use aivyx_core::{Agent, AgentEvent};
+use aivyx_core::{Agent, AgentEvent, SpecialistSessionSummary};
 use aivyx_sandbox::{InjectionFinding, PlanMode};
-use tokio::sync::{mpsc, Mutex};
+use aivyx_types::{MissionPlan, Task};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::prompter::{AcpPrompter, PrompterInstaller};
@@ -118,6 +119,30 @@ struct Session {
     events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     cwd: PathBuf,
     session_id: SessionId,
+    /// Last-known state from each of the three sources
+    /// `translate::build_merged_plan` unions into one ACP `Plan` --
+    /// updated by `translate_and_merge` below. Not persisted across
+    /// process restart (in-memory only, same as the TUI's own equivalent
+    /// fields from Phase 6a).
+    tasks: Vec<Task>,
+    mission_plan: Option<MissionPlan>,
+    open_specialist_sessions: Vec<SpecialistSessionSummary>,
+}
+
+impl Session {
+    /// Thin wrapper over `translate::translate_event_with_state`,
+    /// threading this session's own tracked-state fields into it. See
+    /// that function's doc comment for why the real merge logic lives
+    /// there (testable with plain values) rather than here.
+    fn translate_and_merge(&mut self, event: &AgentEvent) -> Option<SessionUpdate> {
+        crate::translate::translate_event_with_state(
+            &self.session_id,
+            &mut self.tasks,
+            &mut self.mission_plan,
+            &mut self.open_specialist_sessions,
+            event,
+        )
+    }
 }
 
 /// Turns `req.prompt`'s content blocks into the plain text `Agent::run_turn`
@@ -299,6 +324,9 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     // diverge.
                     cwd: req.cwd.clone(),
                     session_id: session_id.clone(),
+                    tasks: Vec::new(),
+                    mission_plan: None,
+                    open_specialist_sessions: Vec::new(),
                 });
                 drop(guard);
                 new_session_exists.store(true, Ordering::Release);
@@ -362,7 +390,26 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                                     if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
                                         stop_reason = Some(reason);
                                     }
-                                    if let Some(update) = crate::translate::translate_event(&session.session_id, &event) {
+                                    // Calls the free function with disjoint
+                                    // field-path borrows directly, rather
+                                    // than `session.translate_and_merge(...)`
+                                    // -- `run` (above) holds `session.agent`
+                                    // mutably borrowed for this whole loop,
+                                    // and a `&mut self` method call borrows
+                                    // the entire `session` value, which the
+                                    // borrow checker rejects as overlapping.
+                                    // Field-path arguments to a free
+                                    // function get disjoint-borrow treatment
+                                    // instead. The second call site below
+                                    // (after `run` is dropped) has no such
+                                    // conflict and uses the method as usual.
+                                    if let Some(update) = crate::translate::translate_event_with_state(
+                                        &session.session_id,
+                                        &mut session.tasks,
+                                        &mut session.mission_plan,
+                                        &mut session.open_specialist_sessions,
+                                        &event,
+                                    ) {
                                         let _ = spawn_connection.send_notification(SessionNotification::new(
                                             session.session_id.clone(),
                                             update,
@@ -379,7 +426,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                         if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
                             stop_reason = Some(reason);
                         }
-                        if let Some(update) = crate::translate::translate_event(&session.session_id, &event) {
+                        if let Some(update) = session.translate_and_merge(&event) {
                             let _ = spawn_connection.send_notification(SessionNotification::new(
                                 session.session_id.clone(),
                                 update,
