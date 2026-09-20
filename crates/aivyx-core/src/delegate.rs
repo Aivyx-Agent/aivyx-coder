@@ -23,9 +23,7 @@ use aivyx_sandbox::{
     ActionKind, AutonomousMode, ExecutionConfiner, InjectionTaint, PermissionGate,
     PermissionRequest, PermissionTarget, PlanMode,
 };
-use aivyx_tools::{
-    GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry,
-};
+use aivyx_tools::{GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -373,12 +371,7 @@ mod tests {
             request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
             self.received.lock().unwrap().push(request);
-            let events = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default();
+            let events = self.responses.lock().unwrap().pop_front().unwrap_or_default();
             Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
         }
     }
@@ -440,17 +433,13 @@ mod tests {
     #[tokio::test]
     async fn drives_a_nested_agent_to_a_natural_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![text_response(
-            "the auth module uses JWTs",
-        )]));
+        let mock: Arc<dyn LlmBackend> =
+            Arc::new(MockBackend::new(vec![text_response("the auth module uses JWTs")]));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let tool = DelegateTaskTool::new(base_config(mock, tx, ToolRegistry::new(), 10));
 
         let output = tool
-            .execute(
-                delegate_call("explain the auth module"),
-                &exec_ctx(dir.path()),
-            )
+            .execute(delegate_call("explain the auth module"), &exec_ctx(dir.path()))
             .await
             .unwrap();
 
@@ -524,9 +513,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let tool = DelegateTaskTool::new(base_config(mock, tx, sub_registry, 10));
 
-        let _ = tool
-            .execute(delegate_call("anything"), &exec_ctx(dir.path()))
-            .await;
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await;
 
         assert!(
             !tool
@@ -818,15 +805,10 @@ mod tests {
         config.broker_mode = true;
         let tool = DelegateTaskTool::new(config);
 
-        let _ = tool
-            .execute(delegate_call("anything"), &exec_ctx(dir.path()))
-            .await
-            .unwrap();
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await.unwrap();
 
         let received = mock.received.lock().unwrap();
-        let request = received
-            .last()
-            .expect("the sub-agent must have sent a request");
+        let request = received.last().expect("the sub-agent must have sent a request");
         assert!(
             request.slot_hint.is_some(),
             "the delegated sub-agent must attach a slot_hint when the parent is in broker mode"
@@ -842,15 +824,10 @@ mod tests {
         // base_config's broker_mode defaults to false -- left untouched.
         let tool = DelegateTaskTool::new(base_config(llm, tx, ToolRegistry::new(), 10));
 
-        let _ = tool
-            .execute(delegate_call("anything"), &exec_ctx(dir.path()))
-            .await
-            .unwrap();
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await.unwrap();
 
         let received = mock.received.lock().unwrap();
-        let request = received
-            .last()
-            .expect("the sub-agent must have sent a request");
+        let request = received.last().expect("the sub-agent must have sent a request");
         assert!(
             request.slot_hint.is_none(),
             "the delegated sub-agent must not attach a slot_hint when the parent never opted \

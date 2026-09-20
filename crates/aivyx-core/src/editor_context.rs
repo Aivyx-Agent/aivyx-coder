@@ -59,7 +59,11 @@ pub(crate) fn editor_context_file_path(cwd: &Path) -> Option<PathBuf> {
 
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let key = format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()));
-    Some(state_dir.join("editor-context").join(format!("{key}.json")))
+    Some(
+        state_dir
+            .join("editor-context")
+            .join(format!("{key}.json")),
+    )
 }
 
 /// FNV-1a, inlined for the same reason `session::fnv1a` is: the key must
