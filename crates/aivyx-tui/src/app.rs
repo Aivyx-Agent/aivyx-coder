@@ -2,11 +2,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aivyx_core::{Agent, AgentEvent, SessionState, Task, TaskStatus};
+use aivyx_core::{Agent, AgentEvent, SessionState, SpecialistSessionSummary, Task, TaskStatus};
 use aivyx_sandbox::{
     InjectionFinding, InjectionTaint, PermissionRequest, PermissionTarget, PlanMode, UserResponse,
 };
-use aivyx_types::{ContentBlock, Message, Role, ToolCallSource, ToolOutput};
+use aivyx_types::{
+    ContentBlock, Message, MissionPlan, MissionStep, Role, StepStatus, ToolCallSource, ToolOutput,
+};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -24,6 +26,11 @@ use crate::terminal::TerminalGuard;
 /// the list instead — the transcript, not the task list, deserves the
 /// vertical space.
 const MAX_VISIBLE_TASKS: usize = 6;
+
+/// Mission-panel step rows before the panel stops growing and shows a
+/// window into the list instead -- same rationale and value as
+/// `MAX_VISIBLE_TASKS`.
+const MAX_VISIBLE_MISSION_STEPS: usize = 6;
 
 /// The autonomous driver's goal-achieved signal: every task in the list is
 /// `Done`, and there is at least one task — an empty list means the model
@@ -441,6 +448,15 @@ struct App {
     /// The agent's task list, rendered as a panel between the transcript
     /// and the input box whenever it's non-empty.
     tasks: Vec<Task>,
+    /// The current mission plan, if `decompose_task` has been called this
+    /// session -- rendered as part of the Mission panel. Not persisted
+    /// across `--resume` (mission state is in-memory only, same as
+    /// specialist sessions).
+    mission_plan: Option<MissionPlan>,
+    /// Every currently-open specialist session's (session_id, member) --
+    /// rendered as a compact line in the Mission panel. Empty until the
+    /// first `spawn_specialist` call.
+    open_specialist_sessions: Vec<SpecialistSessionSummary>,
     /// Shared with the gate (enforcement) and the agent (tool filtering +
     /// system-prompt note); the TUI owns the only toggle.
     plan_mode: PlanMode,
@@ -466,6 +482,8 @@ impl App {
             pending_permission: None,
             context_usage: None,
             tasks,
+            mission_plan: None,
+            open_specialist_sessions: Vec::new(),
             plan_mode,
         }
     }
@@ -585,9 +603,17 @@ impl App {
             AgentEvent::TasksUpdated(tasks) => {
                 self.tasks = tasks;
             }
+            AgentEvent::MissionsUpdated(plan) => {
+                self.mission_plan = Some(plan);
+            }
+            AgentEvent::SpecialistSessionsUpdated(sessions) => {
+                self.open_specialist_sessions = sessions;
+            }
             AgentEvent::ConversationCleared => {
                 self.transcript.clear();
                 self.tasks.clear();
+                self.mission_plan = None;
+                self.open_specialist_sessions.clear();
                 self.context_usage = None;
                 self.streaming_active = false;
             }
@@ -600,10 +626,6 @@ impl App {
             AgentEvent::SubAgentActivity(inner) => {
                 self.transcript.push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
-            // The mission/specialist-session panel itself is later scope
-            // (Task 2 of the TUI Missions Surface plan) -- this match must
-            // still be exhaustive in the meantime.
-            AgentEvent::MissionsUpdated(_) | AgentEvent::SpecialistSessionsUpdated(_) => {}
         }
     }
 
@@ -616,9 +638,35 @@ impl App {
         } else {
             self.tasks.len().min(MAX_VISIBLE_TASKS) as u16 + 2 // + borders
         };
+        // The Mission panel occupies its own conditional row, independent
+        // of the Tasks panel above — either, both, or neither can be
+        // present, so its layout index below is computed dynamically
+        // (`panel_index`) rather than hardcoded, unlike the Tasks panel's
+        // own pre-existing `layout[1]` (safe there only because Tasks was
+        // always the sole optional row before this panel existed).
+        let mission_step_count = self
+            .mission_plan
+            .as_ref()
+            .map(|p| p.steps.len())
+            .unwrap_or(0);
+        let mission_height = if mission_step_count == 0 && self.open_specialist_sessions.is_empty()
+        {
+            0
+        } else {
+            let step_rows = mission_step_count.min(MAX_VISIBLE_MISSION_STEPS) as u16;
+            let sessions_row: u16 = if self.open_specialist_sessions.is_empty() {
+                0
+            } else {
+                1
+            };
+            step_rows + sessions_row + 2 // + borders
+        };
         let mut constraints = vec![Constraint::Min(1)];
         if tasks_height > 0 {
             constraints.push(Constraint::Length(tasks_height));
+        }
+        if mission_height > 0 {
+            constraints.push(Constraint::Length(mission_height));
         }
         constraints.push(Constraint::Length(3));
         constraints.push(Constraint::Length(1));
@@ -656,6 +704,7 @@ impl App {
             .scroll((scroll, 0));
         frame.render_widget(transcript, layout[0]);
 
+        let mut panel_index = 1;
         if tasks_height > 0 {
             let done = self
                 .tasks
@@ -671,7 +720,41 @@ impl App {
                     .borders(Borders::ALL)
                     .title(format!("Tasks ({done}/{})", self.tasks.len())),
             );
-            frame.render_widget(panel, layout[1]);
+            frame.render_widget(panel, layout[panel_index]);
+            panel_index += 1;
+        }
+
+        if mission_height > 0 {
+            let mut lines: Vec<Line> = Vec::new();
+            if let Some(plan) = &self.mission_plan {
+                lines.extend(
+                    mission_step_window(&plan.steps, MAX_VISIBLE_MISSION_STEPS)
+                        .iter()
+                        .map(mission_step_line),
+                );
+            }
+            if !self.open_specialist_sessions.is_empty() {
+                let members: Vec<&str> = self
+                    .open_specialist_sessions
+                    .iter()
+                    .map(|s| s.member.as_str())
+                    .collect();
+                lines.push(Line::from(format!("Open: {}", members.join(", "))));
+            }
+            let title = match &self.mission_plan {
+                Some(plan) => {
+                    let verified = plan
+                        .steps
+                        .iter()
+                        .filter(|s| s.status == StepStatus::Verified)
+                        .count();
+                    format!("Mission ({verified}/{} steps)", plan.steps.len())
+                }
+                None => "Mission".to_string(),
+            };
+            let panel =
+                Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+            frame.render_widget(panel, layout[panel_index]);
         }
 
         frame.render_widget(&self.input, input_area);
@@ -833,6 +916,31 @@ fn task_line(task: &Task) -> Line<'static> {
         TaskStatus::Done => ("[x]", Style::default().fg(Color::DarkGray)),
     };
     Line::from(format!("{marker} {}. {}", task.id, task.text)).style(style)
+}
+
+fn mission_step_window(steps: &[MissionStep], max: usize) -> &[MissionStep] {
+    if steps.len() <= max {
+        return steps;
+    }
+    let first_pending = steps
+        .iter()
+        .position(|s| s.status == StepStatus::Pending)
+        .unwrap_or(0);
+    let start = first_pending.min(steps.len() - max);
+    &steps[start..start + max]
+}
+
+fn mission_step_line(step: &MissionStep) -> Line<'static> {
+    let (marker, style) = match step.status {
+        StepStatus::Pending => ("[ ]", Style::default()),
+        StepStatus::Verified => ("[x]", Style::default().fg(Color::DarkGray)),
+        StepStatus::Failed => ("[!]", Style::default().fg(Color::Red)),
+    };
+    Line::from(format!(
+        "{marker} {}. [{}] {}",
+        step.id, step.member, step.task
+    ))
+    .style(style)
 }
 
 /// Compact token count for the status line: `6.1k`, `512`, `128.0k`.
@@ -1190,6 +1298,16 @@ mod tests {
         }
     }
 
+    fn mission_step(id: u32, member: &str, task: &str, status: StepStatus) -> MissionStep {
+        MissionStep {
+            id,
+            member: member.to_string(),
+            task: task.to_string(),
+            status,
+            notes: None,
+        }
+    }
+
     fn tool_call(id: &str, name: &str) -> aivyx_types::ToolCall {
         aivyx_types::ToolCall {
             id: aivyx_types::ToolCallId(id.to_string()),
@@ -1354,6 +1472,99 @@ mod tests {
     fn task_window_of_all_done_tasks_shows_the_head() {
         let tasks: Vec<Task> = (1..=9).map(|i| task(i, "done", TaskStatus::Done)).collect();
         let window = task_window(&tasks, 6);
+        assert_eq!(window.len(), 6);
+        assert_eq!(window[0].id, 1);
+    }
+
+    #[test]
+    fn missions_updated_stores_the_new_plan() {
+        let mut app = App::new(None, PlanMode::new());
+        let plan = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![mission_step(
+                1,
+                "implementer",
+                "write the fix",
+                StepStatus::Pending,
+            )],
+            summary: None,
+        };
+        app.handle_agent_event(AgentEvent::MissionsUpdated(plan.clone()));
+        assert_eq!(app.mission_plan, Some(plan));
+    }
+
+    #[test]
+    fn specialist_sessions_updated_stores_the_new_list() {
+        let mut app = App::new(None, PlanMode::new());
+        let sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "implementer".to_string(),
+        }];
+        app.handle_agent_event(AgentEvent::SpecialistSessionsUpdated(sessions.clone()));
+        assert_eq!(app.open_specialist_sessions, sessions);
+    }
+
+    #[test]
+    fn conversation_cleared_resets_mission_state() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::MissionsUpdated(MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![mission_step(
+                1,
+                "implementer",
+                "write the fix",
+                StepStatus::Pending,
+            )],
+            summary: None,
+        }));
+        app.handle_agent_event(AgentEvent::SpecialistSessionsUpdated(vec![
+            SpecialistSessionSummary {
+                session_id: "abc123".to_string(),
+                member: "implementer".to_string(),
+            },
+        ]));
+
+        app.handle_agent_event(AgentEvent::ConversationCleared);
+
+        assert_eq!(app.mission_plan, None);
+        assert!(app.open_specialist_sessions.is_empty());
+    }
+
+    #[test]
+    fn mission_step_window_shows_everything_when_it_fits() {
+        let steps = vec![
+            mission_step(1, "implementer", "a", StepStatus::Verified),
+            mission_step(2, "implementer", "b", StepStatus::Pending),
+        ];
+        assert_eq!(mission_step_window(&steps, 6).len(), 2);
+    }
+
+    #[test]
+    fn mission_step_window_skips_a_leading_run_of_verified_steps() {
+        let mut steps: Vec<MissionStep> = (1..=6)
+            .map(|i| mission_step(i, "implementer", "done", StepStatus::Verified))
+            .collect();
+        steps.push(mission_step(
+            7,
+            "implementer",
+            "current",
+            StepStatus::Pending,
+        ));
+        steps.push(mission_step(8, "implementer", "next", StepStatus::Pending));
+
+        let window = mission_step_window(&steps, 6);
+
+        assert_eq!(window.len(), 6);
+        assert!(window.iter().any(|s| s.task == "current"));
+        assert!(window.iter().any(|s| s.task == "next"));
+    }
+
+    #[test]
+    fn mission_step_window_of_all_verified_steps_shows_the_head() {
+        let steps: Vec<MissionStep> = (1..=9)
+            .map(|i| mission_step(i, "implementer", "done", StepStatus::Verified))
+            .collect();
+        let window = mission_step_window(&steps, 6);
         assert_eq!(window.len(), 6);
         assert_eq!(window[0].id, 1);
     }
