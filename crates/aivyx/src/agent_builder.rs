@@ -653,28 +653,32 @@ pub(crate) async fn build_agent(
     // sub-agent's own tool list. team_parent_registry follows the identical
     // clone-before-registering shape for the same reason.
     if settings.team.enabled {
-        // Cloned *before* delegate_to_specialist itself is registered onto
-        // `registry`, for the same structural reason sub_agent_registry/
-        // mcp_registry are cloned before delegate_task is registered above
-        // -- a specialist's own attenuated registry (computed per-call by
+        // Cloned *before* delegate_to_specialist/spawn_specialist are
+        // themselves registered onto `registry`, for the same structural
+        // reason sub_agent_registry/mcp_registry are cloned before
+        // delegate_task is registered above -- a specialist's own
+        // attenuated registry (computed per-call by
         // compute_specialist_registry from this snapshot) must never be
-        // able to include delegate_to_specialist itself, or recursive
+        // able to include either delegation tool, or recursive
         // delegation becomes possible. Mirrors sub_agent_registry's own
         // repl_start/repl_send/repl_stop exclusion, for the identical
         // reason: a specialist sharing the parent's single global REPL
-        // session would break the isolated-history guarantee delegation is
-        // supposed to provide. Unlike sub_agent_registry, this does NOT
-        // exclude delegate_task itself or any MCP-bridged tools -- a
-        // specialist can still see/call those, so one-level-deep delegation
-        // isn't fully structural yet for specialists; that's accepted,
-        // current scope, not a bug to fix here. Because this snapshot is
-        // taken before decompose_task/verify_output/synthesize_results are
-        // registered further down, a specialist's own attenuated registry
-        // can never include those three mission-structure tools either,
-        // even if a future custom roster's tool_allowlist tried to name
-        // them -- a phase adding custom rosters will need to revisit where
-        // this snapshot is taken if specialists should ever be granted
-        // them.
+        // session would break the isolated-history guarantee delegation
+        // is supposed to provide. Unlike sub_agent_registry, this does
+        // NOT exclude delegate_task itself or any MCP-bridged tools -- a
+        // specialist can still see/call those, so one-level-deep
+        // delegation isn't fully structural yet for specialists; that's
+        // accepted, current scope, not a bug to fix here. Because this
+        // snapshot is taken before decompose_task/verify_output/
+        // synthesize_results/spawn_specialist/query_specialist/
+        // close_specialist are registered further down, a specialist's
+        // own attenuated registry can never include any of those six
+        // tools either, even if a future custom roster's tool_allowlist
+        // tried to name them -- a phase adding custom rosters will need
+        // to revisit where this snapshot is taken if specialists should
+        // ever be granted them. Cloned (not moved) at each use below
+        // since both delegate_to_specialist and spawn_specialist,
+        // registered later in this same block, need their own copy.
         let mut team_parent_registry = registry.clone();
         team_parent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
         let team = aivyx_team::default_coding_roster();
@@ -686,7 +690,7 @@ pub(crate) async fn build_agent(
                 checkpointer: checkpointer.clone(),
                 repo_map: repo_map.clone(),
                 events_tx: events_tx.clone(),
-                parent_registry: team_parent_registry,
+                parent_registry: team_parent_registry.clone(),
                 team: team.clone(),
                 plan_mode: plan_mode.clone(),
                 autonomous_mode: autonomous_mode.clone(),
@@ -715,7 +719,7 @@ pub(crate) async fn build_agent(
             summary: None,
         }));
         let mission_tools_config = aivyx_core::MissionToolsConfig {
-            team,
+            team: team.clone(),
             plan: mission_plan,
         };
         registry.register(Arc::new(aivyx_core::DecomposeTaskTool::new(
@@ -726,6 +730,48 @@ pub(crate) async fn build_agent(
         )));
         registry.register(Arc::new(aivyx_core::SynthesizeResultsTool::new(
             mission_tools_config,
+        )));
+
+        // Nonagon-style specialist sessions (see
+        // docs/superpowers/specs/2026-09-20-nonagon-team-specialist-sessions-design.md):
+        // spawn_specialist/query_specialist/close_specialist, gated behind
+        // the same [team] enabled flag as the tools above -- no new config
+        // knob for on/off (the concurrent-session cap and idle timeout ARE
+        // separately configurable, see TeamSettings). Additive alongside
+        // delegate_to_specialist, not a replacement -- see that spec's
+        // Decision 1. `team` and `team_parent_registry` get their final
+        // move here -- nothing below this point reuses them.
+        let specialist_session_pool = aivyx_core::SpecialistSessionPool::new(
+            settings.team.max_concurrent_specialist_sessions,
+            std::time::Duration::from_secs(settings.team.specialist_session_idle_timeout_secs),
+        );
+        let specialist_sessions_config = aivyx_core::SpecialistSessionsConfig {
+            llm: Arc::clone(&llm),
+            gate: Arc::clone(&gate),
+            confiner: Arc::clone(&confiner),
+            checkpointer: checkpointer.clone(),
+            repo_map: repo_map.clone(),
+            events_tx: events_tx.clone(),
+            parent_registry: team_parent_registry,
+            team,
+            plan_mode: plan_mode.clone(),
+            autonomous_mode: autonomous_mode.clone(),
+            injection_taint: injection_taint.clone(),
+            context_tokens: settings.backend.context_tokens,
+            edit_format,
+            verification: verification.clone(),
+            max_iterations: settings.sub_agent.max_iterations,
+            broker_mode,
+            pool: specialist_session_pool,
+        };
+        registry.register(Arc::new(aivyx_core::SpawnSpecialistTool::new(
+            specialist_sessions_config.clone(),
+        )));
+        registry.register(Arc::new(aivyx_core::QuerySpecialistTool::new(
+            specialist_sessions_config.clone(),
+        )));
+        registry.register(Arc::new(aivyx_core::CloseSpecialistTool::new(
+            specialist_sessions_config,
         )));
     }
 
