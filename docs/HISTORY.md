@@ -3321,12 +3321,27 @@ real, unresolved risk: this project's core security mechanism
 — the `landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`
 syscalls are almost certainly not on Docker's default allowlist, based
 on reasonably corroborated (but not empirically confirmed — no Docker
-daemon was accessible in the research session) search findings. A
+daemon was accessible in the research session) search findings. ~~A
 containerized aivyx-coder would likely either refuse to run confined
 commands (`sandbox.require_enforcement`'s fail-closed default) or
 silently run them unconfined, undermining the property `CLAUDE.md`
 calls "load-bearing." This is logged as a separate, real, future design
-question — not solved here, not part of this chapter.
+question — not solved here, not part of this chapter.~~ **Empirically
+resolved 2026-09-21, the risk does not materialize** — see
+`ROADMAP.md`'s backlog entry (2026-07-30 audit item) for the full
+account: a real Docker daemon (v29.7.2) was reached this session, and a
+minimal static probe performing the complete real Landlock restriction
+cycle succeeded end-to-end under a fully default `docker run` (no
+`--privileged`, no custom seccomp), confirmed non-privileged three
+independent ways (`Seccomp: 2`/`Seccomp_filters: 1` inside the
+container, `docker info`'s `profile=builtin`, and a normal non-privileged
+capability set). Docker's default seccomp profile is a denylist of ~44
+specific dangerous syscalls, not an allowlist — Landlock's syscalls were
+never on that denylist, so they pass through unaffected. The larger
+"package aivyx-coder as a container for end users" idea this gated is
+now unblocked, though not re-scoped or scheduled here — this chapter's
+own remaining scope (live DMR verification, below) is unrelated and
+still open.
 
 **What actually shipped this chapter: a new `README.md` "Serving"
 subsection documenting Docker Model Runner as a supported LLM backend**

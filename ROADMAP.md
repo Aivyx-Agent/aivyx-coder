@@ -583,22 +583,52 @@ gap: this entry itself was missing — `docs/HISTORY.md`'s Docker Model
 Runner chapter states that whether Docker's default seccomp profile
 blocks the Landlock syscalls needed for `aivyx-coder`'s own sandbox is
 "logged as a separate, real, future design question," but no
-corresponding backlog entry existed here. It's a real open question, not
-yet scheduled: **does containerizing `aivyx-coder` itself defeat its own
-Landlock enforcement?** Docker's default seccomp profile likely blocks
-`landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`
-(reasonably corroborated via research, not empirically confirmed — no
-Docker daemon was accessible to test directly). If so, a containerized
-build would either refuse to run confined commands
-(`sandbox.require_enforcement`'s fail-closed default) or need
-`require_enforcement: false` (silently unconfined) unless launched with
-a custom seccomp profile permitting those three syscalls. Verifying this
-needs a real Docker daemon: run a minimal image with a Landlock-probe
-binary and check whether `landlock_create_ruleset` returns success or
-`EPERM`/`ENOSYS`. This is the original, larger "package aivyx-coder as a
-container for end users" idea, still gated on this question — see
-`docs/HISTORY.md`'s "Docker Model Runner serving support" chapter for
-the full descoping story.
+corresponding backlog entry existed here. ~~It's a real open question,
+not yet scheduled: **does containerizing `aivyx-coder` itself defeat its
+own Landlock enforcement?** Docker's default seccomp profile likely
+blocks `landlock_create_ruleset`/`landlock_add_rule`/
+`landlock_restrict_self` (reasonably corroborated via research, not
+empirically confirmed — no Docker daemon was accessible to test
+directly).~~ **Empirically resolved 2026-09-21 — the answer is no, it
+does not.** A real Docker daemon (v29.7.2) was accessible this session.
+Built a minimal static (musl) C probe performing the full real Landlock
+restriction cycle — `landlock_create_ruleset` (a genuine ruleset, not
+just an ABI-version query), `landlock_add_rule` (a real path-beneath
+rule granting read access to `/`), `prctl(PR_SET_NO_NEW_PRIVS)`, then
+`landlock_restrict_self` — and ran it via a completely default
+`docker run` (no `--privileged`, no custom `--security-opt`, no
+`--cap-add`) against a stock `alpine:latest` image. All three syscalls
+succeeded end to end, identical to the bare-host baseline (ABI version
+9 both times). Confirmed this wasn't accidentally privileged/unconfined
+three independent ways: `cat /proc/self/status` inside the container
+showed `Seccomp: 2` (`SECCOMP_MODE_FILTER`, a real BPF filter active —
+not `0`/disabled) and `Seccomp_filters: 1` (exactly one filter, Docker's
+own default, not zero for unconfined or several for a custom stack);
+`docker info --format '{{.SecurityOptions}}'` reported
+`profile=builtin` (Docker's real, current built-in default profile, not
+`unconfined`); and the container's effective capability set matched
+Docker's normal non-privileged default, not a privileged/full set.
+**Conclusion**: Landlock's three syscalls aren't on Docker's default
+seccomp profile's denylist (that profile blocks a fixed list of ~44
+specifically dangerous syscalls — `ptrace`, `mount`, `reboot`, and
+similar — rather than allowlisting only pre-approved ones, so a newer
+syscall like Landlock's, added in kernel 5.13, passes through
+unaffected unless Docker's maintainers specifically added it to the
+denylist, which they haven't). A containerized `aivyx-coder` build does
+**not** need `require_enforcement: false` and does **not** silently run
+unconfined — Landlock enforcement works identically inside a
+completely default container as on the bare host. This **unblocks**
+the original, larger "package aivyx-coder as a container for end users"
+idea this question was gating — see `docs/HISTORY.md`'s "Docker Model
+Runner serving support" chapter for the prior descoping story, now
+superseded by this finding. (Caveat, worth remembering: this result is
+specific to the kernel/Docker version tested — v29.7.2, kernel Landlock
+ABI 9 — and to `alpine:latest`'s own base image; a different
+kernel/Docker/container-runtime combination, or a host running Docker
+inside another layer of containerization — e.g. Docker-in-Docker, a
+managed CI runner, gVisor/Kata — was not tested and could plausibly
+differ, since some of those add their own additional seccomp/namespace
+restrictions on top of Docker's own default.)
 
 A follow-up audit (2026-08-01) covering the same four dimensions against
 everything shipped since 2026-07-30 (the real PTY for `repl_start`/
