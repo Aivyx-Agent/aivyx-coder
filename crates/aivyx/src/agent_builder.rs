@@ -667,7 +667,14 @@ pub(crate) async fn build_agent(
         // exclude delegate_task itself or any MCP-bridged tools -- a
         // specialist can still see/call those, so one-level-deep delegation
         // isn't fully structural yet for specialists; that's accepted,
-        // current scope, not a bug to fix here.
+        // current scope, not a bug to fix here. Because this snapshot is
+        // taken before decompose_task/verify_output/synthesize_results are
+        // registered further down, a specialist's own attenuated registry
+        // can never include those three mission-structure tools either,
+        // even if a future custom roster's tool_allowlist tried to name
+        // them -- a phase adding custom rosters will need to revisit where
+        // this snapshot is taken if specialists should ever be granted
+        // them.
         let mut team_parent_registry = registry.clone();
         team_parent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
         let team = aivyx_team::default_coding_roster();
@@ -708,8 +715,8 @@ pub(crate) async fn build_agent(
             summary: None,
         }));
         let mission_tools_config = aivyx_core::MissionToolsConfig {
-            team: team.clone(),
-            plan: Arc::clone(&mission_plan),
+            team,
+            plan: mission_plan,
         };
         registry.register(Arc::new(aivyx_core::DecomposeTaskTool::new(
             mission_tools_config.clone(),

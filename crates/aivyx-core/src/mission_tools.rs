@@ -77,7 +77,9 @@ impl Tool for DecomposeTaskTool {
                 "Decompose a mission into steps, each delegated to one team specialist. Call \
                 this once at the start of a team mission, before delegating anything. Returns \
                 the stored plan with step numbers you'll use with verify_output. Available \
-                specialists: {}.",
+                specialists: {}. This is separate from set_tasks -- keep using set_tasks for \
+                your own visible task list and progress tracking (including autonomous mode's \
+                stop signal); decompose_task only records which specialist owns which step.",
                 crate::delegate_to_specialist::specialist_roster_description(&self.config.team)
             ),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(DecomposeTaskArgs)),
@@ -240,8 +242,8 @@ impl Tool for VerifyOutputTool {
         };
         step.notes = Some(args.notes.clone());
         Ok(ToolOutput::Ok(format!(
-            "step {} marked {:?}: {}",
-            args.step_id, step.status, args.notes
+            "step {} ({}: {}) marked {:?}: {}",
+            step.id, step.member, step.task, step.status, args.notes
         )))
     }
 }
@@ -278,7 +280,8 @@ impl Tool for SynthesizeResultsTool {
             description: "Record the final synthesized deliverable for the current mission, \
                 once every step has been delegated and verified. This is a structured \
                 checkpoint, not your final answer to the user -- still write your own summary \
-                as your next response after calling this."
+                as your next response after calling this. This does not mark set_tasks' own \
+                task list done -- that's tracked separately and still needs its own update."
                 .to_string(),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(
                 SynthesizeResultsArgs
@@ -308,10 +311,11 @@ impl Tool for SynthesizeResultsTool {
     ) -> Result<ToolOutput, ToolError> {
         let args: SynthesizeResultsArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        self.config.plan.lock().unwrap().summary = Some(args.summary.clone());
+        let char_count = args.summary.chars().count();
+        let line_count = args.summary.lines().count();
+        self.config.plan.lock().unwrap().summary = Some(args.summary);
         Ok(ToolOutput::Ok(format!(
-            "mission synthesis recorded: {}",
-            args.summary
+            "mission synthesis recorded ({char_count} chars, {line_count} line(s))"
         )))
     }
 }
@@ -417,6 +421,37 @@ mod mission_tools_tests {
     }
 
     #[tokio::test]
+    async fn decompose_task_replaces_the_whole_plan_including_the_summary() {
+        let cfg = config(simple_team());
+        let tool = DecomposeTaskTool::new(cfg.clone());
+
+        let first_args = serde_json::json!({
+            "mission": "fix the bug",
+            "steps": [{ "member": "implementer", "task": "write the fix" }],
+        });
+        tool.execute(first_args, &ctx()).await.unwrap();
+        cfg.plan.lock().unwrap().summary = Some("old synthesis result".to_string());
+
+        let second_args = serde_json::json!({
+            "mission": "ship the feature",
+            "steps": [
+                { "member": "implementer", "task": "write the feature" },
+                { "member": "implementer", "task": "write tests" },
+            ],
+        });
+        tool.execute(second_args, &ctx()).await.unwrap();
+
+        let stored = cfg.plan.lock().unwrap();
+        assert_eq!(stored.mission, "ship the feature");
+        assert_eq!(stored.steps.len(), 2);
+        assert_eq!(stored.steps[0].id, 1);
+        assert_eq!(stored.steps[0].task, "write the feature");
+        assert_eq!(stored.steps[1].id, 2);
+        assert_eq!(stored.steps[1].task, "write tests");
+        assert_eq!(stored.summary, None);
+    }
+
+    #[tokio::test]
     async fn verify_output_updates_the_named_steps_status() {
         let cfg = config(simple_team());
         cfg.plan
@@ -437,6 +472,30 @@ mod mission_tools_tests {
         let stored = cfg.plan.lock().unwrap();
         assert_eq!(stored.steps[0].status, StepStatus::Verified);
         assert_eq!(stored.steps[0].notes, Some("looks good".to_string()));
+    }
+
+    #[tokio::test]
+    async fn verify_output_records_a_failed_verdict() {
+        let cfg = config(simple_team());
+        cfg.plan
+            .lock()
+            .unwrap()
+            .steps
+            .push(aivyx_types::MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            });
+        let tool = VerifyOutputTool::new(cfg.clone());
+        let args =
+            serde_json::json!({ "step_id": 1, "verdict": "fail", "notes": "does not compile" });
+        let result = tool.execute(args, &ctx()).await.unwrap();
+        assert!(matches!(result, aivyx_types::ToolOutput::Ok(_)));
+        let stored = cfg.plan.lock().unwrap();
+        assert_eq!(stored.steps[0].status, StepStatus::Failed);
+        assert_eq!(stored.steps[0].notes, Some("does not compile".to_string()));
     }
 
     #[tokio::test]
