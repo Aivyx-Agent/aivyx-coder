@@ -102,7 +102,14 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         AgentEvent::TurnComplete
         | AgentEvent::TurnPaused(_)
         | AgentEvent::ContextUsage { .. }
-        | AgentEvent::ConversationCleared => return None,
+        | AgentEvent::ConversationCleared
+        // No ACP `SessionUpdate` variant maps to a mission plan or a
+        // specialist-session list -- this editor frontend doesn't have a
+        // missions panel (that's TUI-only, see the TUI Missions Surface
+        // design spec), so these are silently dropped here, same as
+        // `ConversationCleared` above.
+        | AgentEvent::MissionsUpdated(_)
+        | AgentEvent::SpecialistSessionsUpdated(_) => return None,
     };
     let _ = session_id; // session_id threading happens at the SessionNotification wrapper in Task 5
     Some(update)

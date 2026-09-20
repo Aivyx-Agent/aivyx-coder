@@ -721,6 +721,7 @@ pub(crate) async fn build_agent(
         let mission_tools_config = aivyx_core::MissionToolsConfig {
             team: team.clone(),
             plan: mission_plan,
+            events_tx: events_tx.clone(),
         };
         registry.register(Arc::new(aivyx_core::DecomposeTaskTool::new(
             mission_tools_config.clone(),

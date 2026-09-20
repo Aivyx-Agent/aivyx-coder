@@ -22,5 +22,5 @@ pub use mission_tools::{
 pub use session::{SessionState, Task, TaskStatus};
 pub use specialist_sessions::{
     CloseSpecialistTool, QuerySpecialistTool, SpawnSpecialistTool, SpecialistSessionPool,
-    SpecialistSessionsConfig,
+    SpecialistSessionSummary, SpecialistSessionsConfig,
 };

@@ -65,6 +65,18 @@ struct ParkedSpecialistSession {
     last_active: Instant,
 }
 
+/// A minimal snapshot of one open specialist session -- interpolated into
+/// cap-exceeded error messages (`open_sessions_description`) and exposed
+/// to observability consumers (the TUI's mission panel) via
+/// `AgentEvent::SpecialistSessionsUpdated`. Deliberately just
+/// `(session_id, member)` -- no status/last-active/exchange-count, per
+/// this phase's own explicit scope decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialistSessionSummary {
+    pub session_id: String,
+    pub member: String,
+}
+
 struct SessionPoolState {
     sessions: HashMap<String, ParkedSpecialistSession>,
     max_concurrent: usize,
@@ -116,19 +128,32 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().max_concurrent
     }
 
+    /// A snapshot of every currently-open session's id and member, in no
+    /// particular order -- backs both `open_sessions_description()`'s
+    /// error-message listing and `AgentEvent::SpecialistSessionsUpdated`.
+    pub fn open_sessions(&self) -> Vec<SpecialistSessionSummary> {
+        let state = self.inner.lock().unwrap();
+        state
+            .sessions
+            .iter()
+            .map(|(id, session)| SpecialistSessionSummary {
+                session_id: id.clone(),
+                member: session.member.clone(),
+            })
+            .collect()
+    }
+
     /// A short `"<session_id> (<member>)"` listing of every currently-open
     /// session, comma-separated -- interpolated into `spawn_specialist`'s
     /// cap-exceeded error messages so a model that hits the cap can see
     /// which sessions it could close, mirroring
     /// `delegate_to_specialist.rs`'s own `specialist_names` convention of
     /// giving a model that guessed wrong a recovery path in the same tool
-    /// result. Locks briefly, mirroring `max_concurrent()`'s own pattern.
+    /// result.
     fn open_sessions_description(&self) -> String {
-        let state = self.inner.lock().unwrap();
-        state
-            .sessions
+        self.open_sessions()
             .iter()
-            .map(|(id, session)| format!("{id} ({})", session.member))
+            .map(|s| format!("{} ({})", s.session_id, s.member))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -529,6 +554,13 @@ impl Tool for SpawnSpecialistTool {
             )));
         }
 
+        let _ = self
+            .config
+            .events_tx
+            .send(AgentEvent::SpecialistSessionsUpdated(
+                self.config.pool.open_sessions(),
+            ));
+
         Ok(ToolOutput::Ok(format!(
             "session_id: {session_id}\n\n{text}"
         )))
@@ -678,6 +710,14 @@ impl Tool for CloseSpecialistTool {
         let member = session.member.clone();
         drop(session.agent);
         let _ = session.forward_task.await;
+
+        let _ = self
+            .config
+            .events_tx
+            .send(AgentEvent::SpecialistSessionsUpdated(
+                self.config.pool.open_sessions(),
+            ));
+
         Ok(ToolOutput::Ok(format!(
             "specialist session {:?} closed ({member})",
             args.session_id
@@ -1189,5 +1229,134 @@ mod specialist_session_tests {
             "the second (failed) exchange's partial text leaked into the third exchange's \
              output: {third_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_specialist_emits_specialist_sessions_updated() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm, tx, simple_team(), pool);
+        let tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        tool.execute(
+            serde_json::json!({ "member": "implementer", "task": "task" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SpecialistSessionsUpdated(sessions) = event {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].member, "implementer");
+                found = true;
+            }
+        }
+        assert!(found, "expected a SpecialistSessionsUpdated event");
+    }
+
+    #[tokio::test]
+    async fn close_specialist_emits_specialist_sessions_updated_with_the_session_removed() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm, tx, simple_team(), pool);
+        let spawn_tool = SpawnSpecialistTool::new(cfg.clone());
+        let close_tool = CloseSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let spawn_result = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "task" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(spawn_text) = spawn_result else {
+            panic!("expected Ok");
+        };
+        let session_id = spawn_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+        // Drain spawn's own event so only close's event remains below.
+        while rx.try_recv().is_ok() {}
+
+        close_tool
+            .execute(serde_json::json!({ "session_id": session_id }), &ctx)
+            .await
+            .unwrap();
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SpecialistSessionsUpdated(sessions) = event {
+                assert!(
+                    sessions.is_empty(),
+                    "expected the closed session to be gone, got: {sessions:?}"
+                );
+                found = true;
+            }
+        }
+        assert!(found, "expected a SpecialistSessionsUpdated event");
+    }
+
+    #[tokio::test]
+    async fn query_specialist_does_not_emit_specialist_sessions_updated() {
+        let llm = Arc::new(MockBackend::new(vec![
+            text_response("first"),
+            text_response("second"),
+        ]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm, tx, simple_team(), pool);
+        let spawn_tool = SpawnSpecialistTool::new(cfg.clone());
+        let query_tool = QuerySpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let spawn_result = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "task" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(spawn_text) = spawn_result else {
+            panic!("expected Ok");
+        };
+        let session_id = spawn_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+        while rx.try_recv().is_ok() {}
+
+        query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // query_specialist's own turn still forwards its sub-agent's normal
+        // conversation events (TextDelta/ToolResult/TurnComplete) as
+        // `SubAgentActivity` -- that's pre-existing, correct behavior
+        // unrelated to this task, so the channel is NOT expected to be
+        // empty. What must never appear is a `SpecialistSessionsUpdated`
+        // event, since the open-session set is unchanged by query_specialist.
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::SpecialistSessionsUpdated(_)),
+                "query_specialist must not emit SpecialistSessionsUpdated"
+            );
+        }
     }
 }

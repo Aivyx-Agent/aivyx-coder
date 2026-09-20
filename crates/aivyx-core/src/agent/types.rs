@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use aivyx_llm::LlmError;
-use aivyx_types::{ToolCall, ToolResult};
+use aivyx_types::{MissionPlan, ToolCall, ToolResult};
 use thiserror::Error;
 
 use crate::session::Task;
@@ -38,10 +38,22 @@ pub enum AgentEvent {
     /// The task list changed during this turn (the model called
     /// `set_tasks`) — carries the full new list for the TUI's task panel.
     TasksUpdated(Vec<Task>),
+    /// The mission plan changed (`decompose_task`/`verify_output`/
+    /// `synthesize_results` was called) -- carries the full new plan for
+    /// the TUI's mission panel. Unlike `TasksUpdated`, emitted directly by
+    /// the mission-structure tools themselves (each holds its own
+    /// `events_tx`), not polled/emitted by `Agent`'s own turn loop -- see
+    /// `docs/superpowers/specs/2026-09-20-nonagon-team-tui-missions-surface-design.md`.
+    MissionsUpdated(MissionPlan),
+    /// The set of open specialist sessions changed (`spawn_specialist` or
+    /// `close_specialist` was called -- not `query_specialist`, which only
+    /// exchanges messages with an already-open session, changing nothing
+    /// about which sessions exist). Carries the full new list.
+    SpecialistSessionsUpdated(Vec<crate::specialist_sessions::SpecialistSessionSummary>),
     /// `Agent::clear_conversation` ran (the `/clear` command) — the
     /// frontend should reset whatever display state it owns (transcript,
-    /// task panel, context-usage indicator). Carries no payload: the new
-    /// state is simply "empty" in every dimension.
+    /// task panel, mission panel, context-usage indicator). Carries no
+    /// payload: the new state is simply "empty" in every dimension.
     ConversationCleared,
     /// One block of council-mode output (a stage banner, a member's answer
     /// or ranking, the chairman's synthesis, or a failure note) — the whole

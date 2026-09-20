@@ -600,6 +600,10 @@ impl App {
             AgentEvent::SubAgentActivity(inner) => {
                 self.transcript.push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
+            // The mission/specialist-session panel itself is later scope
+            // (Task 2 of the TUI Missions Surface plan) -- this match must
+            // still be exhaustive in the meantime.
+            AgentEvent::MissionsUpdated(_) | AgentEvent::SpecialistSessionsUpdated(_) => {}
         }
     }
 
@@ -798,7 +802,9 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         | AgentEvent::CouncilNote(_)
         | AgentEvent::ArchitectNote(_)
         | AgentEvent::SubAgentActivity(_)
-        | AgentEvent::ConversationCleared => String::new(),
+        | AgentEvent::ConversationCleared
+        | AgentEvent::MissionsUpdated(_)
+        | AgentEvent::SpecialistSessionsUpdated(_) => String::new(),
     }
 }
 

@@ -21,7 +21,9 @@ use aivyx_types::{MissionPlan, MissionStep, StepStatus, ToolDefinition, ToolOutp
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::mpsc::UnboundedSender;
 
+use crate::agent::AgentEvent;
 use crate::delegate_to_specialist::{specialist_names, specialists};
 
 /// Shared by all three tools -- unlike `DelegateToSpecialistConfig`,
@@ -31,6 +33,7 @@ use crate::delegate_to_specialist::{specialist_names, specialists};
 pub struct MissionToolsConfig {
     pub team: TeamConfig,
     pub plan: Arc<Mutex<MissionPlan>>,
+    pub events_tx: UnboundedSender<AgentEvent>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -141,11 +144,16 @@ impl Tool for DecomposeTaskTool {
             .collect();
 
         let summary = summarize_plan(&args.mission, &steps);
-        *self.config.plan.lock().unwrap() = MissionPlan {
+        let new_plan = MissionPlan {
             mission: args.mission,
             steps,
             summary: None,
         };
+        *self.config.plan.lock().unwrap() = new_plan.clone();
+        let _ = self
+            .config
+            .events_tx
+            .send(AgentEvent::MissionsUpdated(new_plan));
         Ok(ToolOutput::Ok(summary))
     }
 }
@@ -241,10 +249,17 @@ impl Tool for VerifyOutputTool {
             Verdict::Fail => StepStatus::Failed,
         };
         step.notes = Some(args.notes.clone());
-        Ok(ToolOutput::Ok(format!(
+        let message = format!(
             "step {} ({}: {}) marked {:?}: {}",
             step.id, step.member, step.task, step.status, args.notes
-        )))
+        );
+        let updated_plan = plan.clone();
+        drop(plan);
+        let _ = self
+            .config
+            .events_tx
+            .send(AgentEvent::MissionsUpdated(updated_plan));
+        Ok(ToolOutput::Ok(message))
     }
 }
 
@@ -313,7 +328,15 @@ impl Tool for SynthesizeResultsTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let char_count = args.summary.chars().count();
         let line_count = args.summary.lines().count();
-        self.config.plan.lock().unwrap().summary = Some(args.summary);
+        let updated_plan = {
+            let mut plan = self.config.plan.lock().unwrap();
+            plan.summary = Some(args.summary);
+            plan.clone()
+        };
+        let _ = self
+            .config
+            .events_tx
+            .send(AgentEvent::MissionsUpdated(updated_plan));
         Ok(ToolOutput::Ok(format!(
             "mission synthesis recorded ({char_count} chars, {line_count} line(s))"
         )))
@@ -348,7 +371,7 @@ mod mission_tools_tests {
         }
     }
 
-    fn config(team: TeamConfig) -> MissionToolsConfig {
+    fn config(events_tx: UnboundedSender<AgentEvent>, team: TeamConfig) -> MissionToolsConfig {
         MissionToolsConfig {
             team,
             plan: Arc::new(Mutex::new(MissionPlan {
@@ -356,6 +379,7 @@ mod mission_tools_tests {
                 steps: vec![],
                 summary: None,
             })),
+            events_tx,
         }
     }
 
@@ -369,7 +393,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn decompose_task_stores_a_valid_plan_and_echoes_it_back() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = DecomposeTaskTool::new(cfg.clone());
         let args = serde_json::json!({
             "mission": "fix the bug",
@@ -387,7 +412,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn decompose_task_rejects_the_lead_as_a_step_member() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = DecomposeTaskTool::new(cfg.clone());
         let args = serde_json::json!({
             "mission": "fix the bug",
@@ -403,7 +429,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn decompose_task_rejects_an_unknown_member() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = DecomposeTaskTool::new(cfg.clone());
         let args = serde_json::json!({
             "mission": "fix the bug",
@@ -422,7 +449,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn decompose_task_replaces_the_whole_plan_including_the_summary() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = DecomposeTaskTool::new(cfg.clone());
 
         let first_args = serde_json::json!({
@@ -452,8 +480,31 @@ mod mission_tools_tests {
     }
 
     #[tokio::test]
+    async fn decompose_task_emits_missions_updated() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
+        let tool = DecomposeTaskTool::new(cfg);
+        let args = serde_json::json!({
+            "mission": "fix the bug",
+            "steps": [{ "member": "implementer", "task": "write the fix" }],
+        });
+        tool.execute(args, &ctx()).await.unwrap();
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::MissionsUpdated(plan) = event {
+                assert_eq!(plan.mission, "fix the bug");
+                assert_eq!(plan.steps.len(), 1);
+                found = true;
+            }
+        }
+        assert!(found, "expected a MissionsUpdated event");
+    }
+
+    #[tokio::test]
     async fn verify_output_updates_the_named_steps_status() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         cfg.plan
             .lock()
             .unwrap()
@@ -476,7 +527,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn verify_output_records_a_failed_verdict() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         cfg.plan
             .lock()
             .unwrap()
@@ -500,7 +552,8 @@ mod mission_tools_tests {
 
     #[tokio::test]
     async fn verify_output_rejects_an_unknown_step_id() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = VerifyOutputTool::new(cfg.clone());
         let args = serde_json::json!({ "step_id": 99, "verdict": "pass", "notes": "n/a" });
         let result = tool.execute(args, &ctx()).await.unwrap();
@@ -508,8 +561,38 @@ mod mission_tools_tests {
     }
 
     #[tokio::test]
+    async fn verify_output_emits_missions_updated() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
+        cfg.plan
+            .lock()
+            .unwrap()
+            .steps
+            .push(aivyx_types::MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            });
+        let tool = VerifyOutputTool::new(cfg);
+        let args = serde_json::json!({ "step_id": 1, "verdict": "pass", "notes": "looks good" });
+        tool.execute(args, &ctx()).await.unwrap();
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::MissionsUpdated(plan) = event {
+                assert_eq!(plan.steps[0].status, StepStatus::Verified);
+                found = true;
+            }
+        }
+        assert!(found, "expected a MissionsUpdated event");
+    }
+
+    #[tokio::test]
     async fn synthesize_results_stores_the_summary() {
-        let cfg = config(simple_team());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
         let tool = SynthesizeResultsTool::new(cfg.clone());
         let args = serde_json::json!({ "summary": "done, fix applied and verified" });
         let result = tool.execute(args, &ctx()).await.unwrap();
@@ -518,5 +601,26 @@ mod mission_tools_tests {
             cfg.plan.lock().unwrap().summary,
             Some("done, fix applied and verified".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn synthesize_results_emits_missions_updated() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cfg = config(tx, simple_team());
+        let tool = SynthesizeResultsTool::new(cfg);
+        let args = serde_json::json!({ "summary": "done, fix applied and verified" });
+        tool.execute(args, &ctx()).await.unwrap();
+
+        let mut found = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::MissionsUpdated(plan) = event {
+                assert_eq!(
+                    plan.summary,
+                    Some("done, fix applied and verified".to_string())
+                );
+                found = true;
+            }
+        }
+        assert!(found, "expected a MissionsUpdated event");
     }
 }
