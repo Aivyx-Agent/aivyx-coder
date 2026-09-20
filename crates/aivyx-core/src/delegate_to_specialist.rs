@@ -150,6 +150,14 @@ impl Tool for DelegateToSpecialistTool {
         }
     }
 
+    // Offered during plan mode too, not hidden: see `delegate.rs`'s
+    // identical override on `DelegateTaskTool` for the full rationale --
+    // the specialist's own turn loop reads the same shared `PlanMode`
+    // flag baked into `self.config.plan_mode`, so a specialist spawned
+    // during plan mode automatically only sees read-only tools (further
+    // narrowed by `compute_specialist_registry`'s attenuation on top) --
+    // it degrades gracefully rather than needing this tool hidden
+    // outright.
     fn mutates_outside_session(&self) -> bool {
         false
     }
@@ -300,8 +308,63 @@ impl Tool for DelegateToSpecialistTool {
     }
 }
 
+/// Shared lightweight test fixtures for building a synthetic, non-empty
+/// `ToolRegistry` -- used by both `registry_attenuation_tests` (which
+/// exercises `compute_specialist_registry` in isolation) and
+/// `delegation_tests` (which needs a *non-empty* `parent_registry` to
+/// prove attenuation reaches all the way through `execute()`). Shared
+/// here rather than duplicated so the two modules can't drift apart on
+/// what a "named tool" fixture even means.
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    // A minimal Tool impl for building a test registry -- named tools
+    // with no real behavior, matching this crate's existing test
+    // conventions of lightweight stand-ins rather than the real
+    // aivyx-tools types (which this crate cannot depend on -- see the
+    // parent plan's Global Constraints on dependency direction).
+    pub(super) struct NamedTool(pub(super) &'static str);
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn definition(&self) -> aivyx_types::ToolDefinition {
+            aivyx_types::ToolDefinition {
+                name: self.0.to_string(),
+                description: String::new(),
+                parameters_schema: serde_json::json!({}),
+            }
+        }
+        fn permission_request(
+            &self,
+            _arguments: &serde_json::Value,
+            _cwd: &std::path::Path,
+        ) -> Result<aivyx_sandbox::PermissionRequest, aivyx_tools::ToolError> {
+            unreachable!("not exercised by these tests")
+        }
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _ctx: &aivyx_tools::ToolExecutionContext,
+        ) -> Result<aivyx_types::ToolOutput, aivyx_tools::ToolError> {
+            unreachable!("not exercised by these tests")
+        }
+    }
+
+    pub(super) fn registry_with(names: &[&'static str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.register(Arc::new(NamedTool(name)));
+        }
+        registry
+    }
+}
+
 #[cfg(test)]
 mod delegation_tests {
+    use super::test_support::registry_with;
     use super::*;
     use aivyx_llm::{ChatRequest, FinishReason, LlmError, StreamEvent};
     use aivyx_sandbox::{NoopConfiner, PermissionDecision};
@@ -449,6 +512,13 @@ mod delegation_tests {
             ToolOutput::Error(msg) => assert!(msg.contains("nonexistent")),
             other => panic!("expected Error, got {other:?}"),
         }
+        // An unknown member must short-circuit before any specialist
+        // `Agent` is ever constructed -- no request should have reached
+        // the backend at all.
+        assert!(
+            llm.received.lock().unwrap().is_empty(),
+            "no backend request should have been sent for an unknown member"
+        );
     }
 
     #[tokio::test]
@@ -472,10 +542,76 @@ mod delegation_tests {
             "expected the member's persona in the outgoing request, got: {first_request:?}"
         );
     }
+
+    /// The end-to-end proof that `execute()` actually wires
+    /// `compute_specialist_registry`'s attenuated output into the
+    /// specialist it constructs, rather than (say) handing the specialist
+    /// `self.config.parent_registry.clone()` unattenuated. Task 1's own
+    /// `registry_attenuation_tests` prove `compute_specialist_registry` is
+    /// correct in isolation, and the other tests in this module prove
+    /// `execute()` works end-to-end -- but every one of those uses an
+    /// *empty* `parent_registry`, so none of them can distinguish "the
+    /// attenuated registry was used" from "any registry, attenuated or
+    /// not, was used" -- both look identical against an empty registry.
+    /// This test uses a non-empty `parent_registry` and a member whose
+    /// `tool_allowlist` is a strict subset of it, then inspects the real
+    /// `ChatRequest` the specialist's backend call received: if `execute`
+    /// were ever changed to bypass attenuation (e.g. cloning
+    /// `parent_registry` directly instead of calling
+    /// `compute_specialist_registry`), this is the test that would catch
+    /// it -- the request's `tools` would carry all four parent tool names
+    /// instead of just the member's two.
+    #[tokio::test]
+    async fn attenuation_reaches_the_specialists_actual_chat_request() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("ok")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let team = TeamConfig {
+            lead: "coordinator".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "coordinator".to_string(),
+                    role: "Lead".to_string(),
+                    persona: "You delegate.".to_string(),
+                    tool_allowlist: vec![],
+                    extra_deny_paths: vec![],
+                },
+                TeamMember {
+                    name: "implementer".to_string(),
+                    role: "Implementer".to_string(),
+                    persona: "You are the implementer specialist. You write code.".to_string(),
+                    tool_allowlist: vec!["read_file".to_string(), "grep".to_string()],
+                    extra_deny_paths: vec![],
+                },
+            ],
+        };
+        let mut config = base_config(Arc::clone(&llm) as Arc<dyn LlmBackend>, tx, team);
+        config.parent_registry = registry_with(&["read_file", "write_file", "grep", "run_command"]);
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "implementer", "task": "read something" });
+        let _ = tool.execute(args, &ctx).await.unwrap();
+
+        let received = llm.received.lock().unwrap();
+        let first_request = received.first().expect("one request should have been sent");
+        let mut tool_names: Vec<&str> = first_request
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        tool_names.sort();
+        assert_eq!(
+            tool_names,
+            vec!["grep", "read_file"],
+            "expected exactly the member's allowed tools ([\"grep\", \"read_file\"]) in the \
+             outgoing request's `tools` field -- not the full parent registry and not empty; \
+             got: {tool_names:?}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod registry_attenuation_tests {
+    use super::test_support::registry_with;
     use super::*;
     use aivyx_team::TeamMember;
 
@@ -487,48 +623,6 @@ mod registry_attenuation_tests {
             tool_allowlist: tool_allowlist.iter().map(|s| s.to_string()).collect(),
             extra_deny_paths: vec![],
         }
-    }
-
-    // A minimal Tool impl for building a test registry -- named tools
-    // with no real behavior, matching this crate's existing test
-    // conventions of lightweight stand-ins rather than the real
-    // aivyx-tools types (which this crate cannot depend on -- see the
-    // parent plan's Global Constraints on dependency direction).
-    struct NamedTool(&'static str);
-    #[async_trait::async_trait]
-    impl Tool for NamedTool {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn definition(&self) -> aivyx_types::ToolDefinition {
-            aivyx_types::ToolDefinition {
-                name: self.0.to_string(),
-                description: String::new(),
-                parameters_schema: serde_json::json!({}),
-            }
-        }
-        fn permission_request(
-            &self,
-            _arguments: &serde_json::Value,
-            _cwd: &std::path::Path,
-        ) -> Result<aivyx_sandbox::PermissionRequest, aivyx_tools::ToolError> {
-            unreachable!("not exercised by these tests")
-        }
-        async fn execute(
-            &self,
-            _arguments: serde_json::Value,
-            _ctx: &aivyx_tools::ToolExecutionContext,
-        ) -> Result<aivyx_types::ToolOutput, aivyx_tools::ToolError> {
-            unreachable!("not exercised by these tests")
-        }
-    }
-
-    fn registry_with(names: &[&'static str]) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        for name in names {
-            registry.register(Arc::new(NamedTool(name)));
-        }
-        registry
     }
 
     #[test]
