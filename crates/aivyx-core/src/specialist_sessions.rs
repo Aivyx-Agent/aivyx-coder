@@ -128,19 +128,28 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().max_concurrent
     }
 
-    /// A snapshot of every currently-open session's id and member, in no
-    /// particular order -- backs both `open_sessions_description()`'s
-    /// error-message listing and `AgentEvent::SpecialistSessionsUpdated`.
+    /// A snapshot of every currently-open session's id and member, evicting
+    /// stale (idle-timed-out) entries first -- mirroring `take`'s/
+    /// `insert_new`'s own pattern, so this really is "every currently-open
+    /// session" rather than including entries that have already timed out
+    /// but not yet been touched. Sorted by `session_id` for deterministic
+    /// output -- backs both `open_sessions_description()`'s error-message
+    /// listing and `AgentEvent::SpecialistSessionsUpdated`, both of which
+    /// would otherwise reorder arbitrarily between calls (`HashMap`
+    /// iteration order is not stable).
     pub fn open_sessions(&self) -> Vec<SpecialistSessionSummary> {
-        let state = self.inner.lock().unwrap();
-        state
+        let mut state = self.inner.lock().unwrap();
+        state.evict_stale();
+        let mut sessions: Vec<SpecialistSessionSummary> = state
             .sessions
             .iter()
             .map(|(id, session)| SpecialistSessionSummary {
                 session_id: id.clone(),
                 member: session.member.clone(),
             })
-            .collect()
+            .collect();
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        sessions
     }
 
     /// A short `"<session_id> (<member>)"` listing of every currently-open

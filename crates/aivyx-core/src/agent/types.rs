@@ -5,6 +5,7 @@ use aivyx_types::{MissionPlan, ToolCall, ToolResult};
 use thiserror::Error;
 
 use crate::session::Task;
+use crate::specialist_sessions::SpecialistSessionSummary;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -44,12 +45,24 @@ pub enum AgentEvent {
     /// the mission-structure tools themselves (each holds its own
     /// `events_tx`), not polled/emitted by `Agent`'s own turn loop -- see
     /// `docs/superpowers/specs/2026-09-20-nonagon-team-tui-missions-surface-design.md`.
+    ///
+    /// Note: `Agent::clear_conversation` (`/clear`) only resets the TUI's
+    /// *displayed* `mission_plan` (see `ConversationCleared`'s own doc
+    /// comment) -- the underlying `Arc<Mutex<MissionPlan>>` inside
+    /// `MissionToolsConfig` is owned by the mission tools, not by `Agent`,
+    /// and is untouched by `/clear`. A subsequent `verify_output`/
+    /// `synthesize_results` call against that pre-clear plan will still
+    /// emit a fresh `MissionsUpdated` carrying the OLD (pre-clear) plan,
+    /// resurrecting the panel with stale content. This is a known, accepted
+    /// display-only limitation for this phase, not something `/clear`
+    /// itself is expected to fix -- noted here so a future phase (e.g.
+    /// Phase 6b) doesn't assume the reset is authoritative.
     MissionsUpdated(MissionPlan),
     /// The set of open specialist sessions changed (`spawn_specialist` or
     /// `close_specialist` was called -- not `query_specialist`, which only
     /// exchanges messages with an already-open session, changing nothing
     /// about which sessions exist). Carries the full new list.
-    SpecialistSessionsUpdated(Vec<crate::specialist_sessions::SpecialistSessionSummary>),
+    SpecialistSessionsUpdated(Vec<SpecialistSessionSummary>),
     /// `Agent::clear_conversation` ran (the `/clear` command) — the
     /// frontend should reset whatever display state it owns (transcript,
     /// task panel, mission panel, context-usage indicator). Carries no

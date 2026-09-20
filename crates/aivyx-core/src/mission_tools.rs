@@ -144,16 +144,19 @@ impl Tool for DecomposeTaskTool {
             .collect();
 
         let summary = summarize_plan(&args.mission, &steps);
-        let new_plan = MissionPlan {
-            mission: args.mission,
-            steps,
-            summary: None,
+        let updated_plan = {
+            let mut plan = self.config.plan.lock().unwrap();
+            *plan = MissionPlan {
+                mission: args.mission,
+                steps,
+                summary: None,
+            };
+            plan.clone()
         };
-        *self.config.plan.lock().unwrap() = new_plan.clone();
         let _ = self
             .config
             .events_tx
-            .send(AgentEvent::MissionsUpdated(new_plan));
+            .send(AgentEvent::MissionsUpdated(updated_plan));
         Ok(ToolOutput::Ok(summary))
     }
 }

@@ -931,11 +931,18 @@ fn mission_step_window(steps: &[MissionStep], max: usize) -> &[MissionStep] {
     if steps.len() <= max {
         return steps;
     }
-    let first_pending = steps
+    // Anchor on the first step that still needs attention -- `Pending` OR
+    // `Failed`, not just `Pending`. Anchoring on `Pending` alone used to
+    // hide a trailing `Failed` step entirely whenever every other step was
+    // already `Verified` (no `Pending` steps left at all): `position` would
+    // find nothing, fall back to `unwrap_or(0)`, and show the window from
+    // the start -- burying the one actionable, red-highlighted `[!]` step
+    // `mission_step_line` exists to surface. See the regression test below.
+    let first_unverified = steps
         .iter()
-        .position(|s| s.status == StepStatus::Pending)
+        .position(|s| s.status != StepStatus::Verified)
         .unwrap_or(0);
-    let start = first_pending.min(steps.len() - max);
+    let start = first_unverified.min(steps.len() - max);
     &steps[start..start + max]
 }
 
@@ -1605,6 +1612,30 @@ mod tests {
         let window = mission_step_window(&steps, 6);
         assert_eq!(window.len(), 6);
         assert_eq!(window[0].id, 1);
+    }
+
+    #[test]
+    fn mission_step_window_does_not_hide_a_trailing_failed_step() {
+        // Regression test: anchoring on the first `Pending` step alone used
+        // to miss a `Failed` step entirely once no `Pending` steps remained
+        // -- `position` found nothing, fell back to `unwrap_or(0)`, and the
+        // window showed the leading run of `Verified` steps instead of the
+        // one actionable, red-highlighted `[!]` step at the end. 8 steps
+        // `Verified`, the 9th `Failed`, no `Pending` steps at all -- the
+        // window must still include the `Failed` step.
+        let mut steps: Vec<MissionStep> = (1..=8)
+            .map(|i| mission_step(i, "implementer", "done", StepStatus::Verified))
+            .collect();
+        steps.push(mission_step(9, "implementer", "broke", StepStatus::Failed));
+
+        let window = mission_step_window(&steps, 6);
+
+        assert_eq!(window.len(), 6);
+        assert!(
+            window.iter().any(|s| s.status == StepStatus::Failed),
+            "the trailing Failed step must be visible in the window"
+        );
+        assert!(window.iter().any(|s| s.task == "broke"));
     }
 
     #[test]
