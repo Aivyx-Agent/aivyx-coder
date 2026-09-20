@@ -461,11 +461,32 @@ pub struct CouncilMember {
 /// just a switch, no custom-roster config -- when enabled, the lead's
 /// specialist team is always `aivyx_team::default_coding_roster()`. See
 /// `docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TeamSettings {
-    #[serde(default)]
     pub enabled: bool,
+    /// Hard cap on specialist sessions (`spawn_specialist`) that may be
+    /// open at once. A `spawn_specialist` call beyond this cap errors
+    /// clearly rather than evicting an existing session -- see
+    /// `docs/superpowers/specs/2026-09-20-nonagon-team-specialist-sessions-design.md`.
+    /// Default matches `default_coding_roster()`'s exact non-lead
+    /// specialist count (implementer/reviewer/tester).
+    pub max_concurrent_specialist_sessions: usize,
+    /// Auto-close a specialist session with no `query_specialist`
+    /// activity for this long, in seconds -- a safety net against a
+    /// model that spawns sessions and forgets to close them, matching
+    /// `ReplSettings.idle_timeout_secs`'s own precedent and default.
+    pub specialist_session_idle_timeout_secs: u64,
+}
+
+impl Default for TeamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_specialist_sessions: 3,
+            specialist_session_idle_timeout_secs: 600,
+        }
+    }
 }
 
 /// Architect/editor model-pairing (`/architect <task>`, ROADMAP.md Phase 9):
@@ -2170,5 +2191,21 @@ mod tests {
     fn team_settings_defaults_when_section_omitted() {
         let settings: Settings = toml::from_str("").unwrap();
         assert!(!settings.team.enabled);
+    }
+
+    #[test]
+    fn team_settings_defaults_to_a_usable_zero_config_shape() {
+        let settings = TeamSettings::default();
+        assert_eq!(settings.max_concurrent_specialist_sessions, 3);
+        assert_eq!(settings.specialist_session_idle_timeout_secs, 600);
+    }
+
+    #[test]
+    fn team_settings_specialist_session_fields_round_trip_through_toml() {
+        let toml_str = "[team]\nenabled = true\nmax_concurrent_specialist_sessions = 5\nspecialist_session_idle_timeout_secs = 120\n";
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(settings.team.enabled);
+        assert_eq!(settings.team.max_concurrent_specialist_sessions, 5);
+        assert_eq!(settings.team.specialist_session_idle_timeout_secs, 120);
     }
 }
