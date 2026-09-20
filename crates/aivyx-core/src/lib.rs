@@ -8,6 +8,7 @@ pub mod edit_blocks;
 pub mod editor_context;
 pub mod mission_tools;
 pub mod session;
+pub mod specialist_sessions;
 pub mod wiki;
 
 pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, EditFormat};
@@ -19,3 +20,7 @@ pub use mission_tools::{
     DecomposeTaskTool, MissionToolsConfig, SynthesizeResultsTool, VerifyOutputTool,
 };
 pub use session::{SessionState, Task, TaskStatus};
+pub use specialist_sessions::{
+    CloseSpecialistTool, QuerySpecialistTool, SpawnSpecialistTool, SpecialistSessionPool,
+    SpecialistSessionsConfig,
+};
