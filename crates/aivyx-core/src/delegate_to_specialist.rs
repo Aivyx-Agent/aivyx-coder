@@ -23,31 +23,45 @@ use aivyx_sandbox::{
     PermissionRequest, PermissionTarget, PlanMode,
 };
 use aivyx_team::TeamConfig;
-use aivyx_tools::{GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolRegistry};
+use aivyx_tools::{
+    GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry,
+};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::agent::{AgentEvent, EditFormat};
+use crate::agent::{Agent, AgentConfig, AgentEvent, EditFormat};
 
 #[derive(Deserialize, JsonSchema)]
 struct DelegateToSpecialistArgs {
     /// The name of a `TeamConfig` member to delegate to -- must match
     /// one of `team.members`' own `name` fields.
-    #[allow(dead_code)] // read via execute() once Task 2 implements it;
-    // this struct is only ever constructed via serde_json::from_value,
-    // never field-by-field in Rust code yet.
     member: String,
     /// A complete, self-contained description of the task for the
     /// specialist -- it starts with no context beyond this text and the
     /// specialist's own persona.
-    #[allow(dead_code)] // read via execute() once Task 2 implements it;
-    // this struct is only ever constructed via serde_json::from_value,
-    // never field-by-field in Rust code yet.
     task: String,
 }
+
+/// Mirrors `delegate.rs`'s own `CUTOFF_NOTICE` -- same wording, "sub-agent"
+/// kept as-is rather than reworded to "specialist" (no behavioral
+/// difference either way; consistency with the sibling tool's text won
+/// out).
+const CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: reached its iteration budget before \
+finishing — the above is its best-effort partial result.)";
+
+/// Mirrors `delegate.rs`'s own `INJECTION_CUTOFF_NOTICE` -- see that
+/// constant's doc comment for why this outer loop's own taint check is
+/// the only place that can stop a second delegated round-trip's tool call
+/// once a result is flagged, given the specialist's own `AgentConfig`
+/// fixes `max_tool_iterations` at 1 just like `delegate_task`'s sub-agent.
+const INJECTION_CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: a tool result was flagged as a \
+possible prompt injection — the above is its best-effort partial result.)";
+
+const NO_TEXT_RESPONSE: &str = "(the sub-agent produced no text response)";
 
 /// Turns `member`'s `tool_allowlist` into an attenuated `ToolRegistry`:
 /// every tool in `parent_registry` whose name is in
@@ -105,8 +119,6 @@ pub struct DelegateToSpecialistConfig {
 }
 
 pub struct DelegateToSpecialistTool {
-    #[allow(dead_code)] // read via execute() once Task 2 implements it;
-    // currently only ever assigned, via DelegateToSpecialistTool::new.
     config: DelegateToSpecialistConfig,
 }
 
@@ -159,10 +171,306 @@ impl Tool for DelegateToSpecialistTool {
 
     async fn execute(
         &self,
-        _arguments: serde_json::Value,
-        _ctx: &ToolExecutionContext,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        todo!("Task 2 implements this")
+        let args: DelegateToSpecialistArgs = serde_json::from_value(arguments)
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+
+        let Some(member) = self
+            .config
+            .team
+            .members
+            .iter()
+            .find(|m| m.name == args.member)
+        else {
+            return Ok(ToolOutput::Error(format!(
+                "unknown team member: {:?}",
+                args.member
+            )));
+        };
+
+        let specialist_registry = compute_specialist_registry(member, &self.config.parent_registry);
+        let mut sub_executor = ToolExecutor::new(
+            specialist_registry,
+            Arc::clone(&self.config.gate),
+            Arc::clone(&self.config.confiner),
+        );
+        if let Some(checkpointer) = &self.config.checkpointer {
+            sub_executor.set_checkpointer(Arc::clone(checkpointer));
+        }
+
+        // See `delegate.rs`'s own `execute()` for the full rationale --
+        // the specialist gets its own event channel, forwarded onto the
+        // parent's real channel wrapped in `AgentEvent::SubAgentActivity`,
+        // with `TextDelta` content accumulated separately into
+        // `accumulated` since `AgentEvent` doesn't expose the specialist's
+        // assembled response text directly.
+        let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
+        let accumulated = Arc::new(std::sync::Mutex::new(String::new()));
+        let accumulated_for_task = Arc::clone(&accumulated);
+        let parent_tx = self.config.events_tx.clone();
+        let forward_task = tokio::spawn(async move {
+            while let Some(event) = sub_rx.recv().await {
+                if let AgentEvent::TextDelta(text) = &event {
+                    accumulated_for_task.lock().unwrap().push_str(text);
+                }
+                let _ = parent_tx.send(AgentEvent::SubAgentActivity(Box::new(event)));
+            }
+        });
+
+        let mut specialist = Agent::new(
+            Arc::clone(&self.config.llm),
+            sub_executor,
+            member.persona.clone(),
+            AgentConfig {
+                // Deliberately 1, not `self.config.max_iterations` -- see
+                // `delegate.rs`'s identical `max_tool_iterations: 1`
+                // comment for why: the outer loop below bounds the
+                // specialist's total LLM round-trip budget instead.
+                max_tool_iterations: 1,
+                context_tokens: self.config.context_tokens,
+                edit_format: self.config.edit_format,
+            },
+            Arc::default(),
+            self.config.plan_mode.clone(),
+            self.config.autonomous_mode.clone(),
+            sub_tx,
+        );
+        if let Some((map, budget)) = &self.config.repo_map {
+            specialist.set_repo_map(Arc::clone(map), *budget);
+        }
+        if let Some((command, max_retries)) = &self.config.verification {
+            specialist.set_verification(command.clone(), *max_retries);
+        }
+        // Must be the parent's own *shared* instance -- see
+        // `DelegateTaskConfig::injection_taint`'s doc comment in
+        // `delegate.rs` for why a fresh, disconnected instance here would
+        // let a specialist's own ingested content poison autonomous mode
+        // with the guard never seeing it.
+        specialist.set_injection_taint(self.config.injection_taint.clone());
+        specialist.set_broker_mode(self.config.broker_mode);
+
+        let max_iterations = self.config.max_iterations.max(1);
+        let mut result = specialist
+            .run_turn(args.task, &ctx.cwd, ctx.cancellation.clone())
+            .await;
+        let mut iterations_used = 1u32;
+        let is_injection_tainted = || {
+            self.config.autonomous_mode.active() && self.config.injection_taint.current().is_some()
+        };
+        while result.is_ok()
+            && specialist.last_turn_paused()
+            && iterations_used < max_iterations
+            && !ctx.cancellation.is_cancelled()
+            && !is_injection_tainted()
+        {
+            iterations_used += 1;
+            result = specialist
+                .run_turn("continue".to_string(), &ctx.cwd, ctx.cancellation.clone())
+                .await;
+        }
+        let paused = result.is_ok() && specialist.last_turn_paused();
+        let cap_hit = paused && !is_injection_tainted();
+        let injection_hit = paused && is_injection_tainted();
+
+        // Dropping the specialist drops its `sub_tx` (the only remaining
+        // sender), closing the channel so `forward_task`'s `recv()` loop
+        // ends and it can be awaited to completion.
+        drop(specialist);
+        let _ = forward_task.await;
+
+        match result {
+            Err(err) => Ok(ToolOutput::Error(format!("sub-agent failed: {err}"))),
+            Ok(()) => {
+                let mut text = Arc::try_unwrap(accumulated)
+                    .map(|m| m.into_inner().unwrap())
+                    .unwrap_or_default();
+                if injection_hit {
+                    text.push_str(INJECTION_CUTOFF_NOTICE);
+                } else if cap_hit {
+                    text.push_str(CUTOFF_NOTICE);
+                }
+                if text.trim().is_empty() {
+                    text = NO_TEXT_RESPONSE.to_string();
+                }
+                Ok(ToolOutput::Ok(text))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod delegation_tests {
+    use super::*;
+    use aivyx_llm::{ChatRequest, FinishReason, LlmError, StreamEvent};
+    use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+    use aivyx_team::TeamMember;
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
+    struct MockBackend {
+        responses: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        received: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl MockBackend {
+        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                received: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmBackend for MockBackend {
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+            self.received.lock().unwrap().push(request);
+            let events = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
+        }
+    }
+
+    struct AllowAllGate;
+    #[async_trait]
+    impl PermissionGate for AllowAllGate {
+        async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
+            PermissionDecision::Allow
+        }
+    }
+
+    fn text_response(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta(text.to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]
+    }
+
+    fn exec_ctx(cwd: &std::path::Path) -> ToolExecutionContext {
+        ToolExecutionContext {
+            cwd: cwd.to_path_buf(),
+            confiner: Arc::new(NoopConfiner),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn simple_team() -> TeamConfig {
+        TeamConfig {
+            lead: "coordinator".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "coordinator".to_string(),
+                    role: "Lead".to_string(),
+                    persona: "You delegate.".to_string(),
+                    tool_allowlist: vec![],
+                    extra_deny_paths: vec![],
+                },
+                TeamMember {
+                    name: "implementer".to_string(),
+                    role: "Implementer".to_string(),
+                    persona: "You are the implementer specialist. You write code.".to_string(),
+                    tool_allowlist: vec![],
+                    extra_deny_paths: vec![],
+                },
+            ],
+        }
+    }
+
+    fn base_config(
+        llm: Arc<dyn LlmBackend>,
+        events_tx: UnboundedSender<AgentEvent>,
+        team: TeamConfig,
+    ) -> DelegateToSpecialistConfig {
+        DelegateToSpecialistConfig {
+            llm,
+            gate: Arc::new(AllowAllGate),
+            confiner: Arc::new(NoopConfiner),
+            checkpointer: None,
+            repo_map: None,
+            events_tx,
+            parent_registry: ToolRegistry::new(),
+            team,
+            plan_mode: PlanMode::new(),
+            autonomous_mode: AutonomousMode::new(),
+            injection_taint: InjectionTaint::new(),
+            context_tokens: 8192,
+            edit_format: EditFormat::Native,
+            verification: None,
+            max_iterations: 3,
+            broker_mode: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn delegating_to_a_known_member_returns_the_specialists_final_answer() {
+        let llm = Arc::new(MockBackend::new(vec![text_response(
+            "done: the fix is applied",
+        )]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(Arc::clone(&llm) as Arc<dyn LlmBackend>, tx, simple_team());
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "implementer", "task": "fix the bug" });
+        let result = tool.execute(args, &ctx).await.unwrap();
+        match result {
+            ToolOutput::Ok(text) => assert!(text.contains("done: the fix is applied")),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegating_to_an_unknown_member_returns_a_tool_error() {
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(Arc::clone(&llm) as Arc<dyn LlmBackend>, tx, simple_team());
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "nonexistent", "task": "do something" });
+        let result = tool.execute(args, &ctx).await.unwrap();
+        match result {
+            ToolOutput::Error(msg) => assert!(msg.contains("nonexistent")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn specialist_system_prompt_is_the_members_persona() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("ok")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(Arc::clone(&llm) as Arc<dyn LlmBackend>, tx, simple_team());
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "implementer", "task": "do the thing" });
+        let _ = tool.execute(args, &ctx).await.unwrap();
+        let received = llm.received.lock().unwrap();
+        let first_request = received.first().expect("one request should have been sent");
+        // ChatRequest's Debug output includes its `messages: Vec<Message>`
+        // field (verified directly against aivyx-llm's real ChatRequest/
+        // Message definitions), and the specialist's system prompt is
+        // carried as a Message in that vec -- so the persona text shows
+        // up in the request's Debug output.
+        assert!(
+            format!("{first_request:?}").contains("You are the implementer specialist"),
+            "expected the member's persona in the outgoing request, got: {first_request:?}"
+        );
     }
 }
 
