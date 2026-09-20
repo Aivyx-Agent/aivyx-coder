@@ -639,6 +639,46 @@ pub(crate) async fn build_agent(
         },
     )));
 
+    // Nonagon-style team delegation (ROADMAP.md Phase 5): off by default,
+    // see TeamSettings' own doc comment. When enabled, the lead gains
+    // delegate_to_specialist as an ordinary tool -- no toggle, no
+    // keybinding, always available for the whole session once configured,
+    // exactly like delegate_task above. Registered *after* delegate_task
+    // (not before) so this tool's own name never appears in delegate_task's
+    // sub_agent_registry snapshot above -- matches that snapshot's own
+    // "clone before registering the delegation tool itself" recursion-
+    // prevention shape, applied here too via team_parent_registry below.
+    if settings.team.enabled {
+        // Cloned *before* delegate_to_specialist itself is registered onto
+        // `registry`, for the same structural reason sub_agent_registry/
+        // mcp_registry are cloned before delegate_task is registered above
+        // -- a specialist's own attenuated registry (computed per-call by
+        // compute_specialist_registry from this snapshot) must never be
+        // able to include delegate_to_specialist itself, or recursive
+        // delegation becomes possible.
+        let team_parent_registry = registry.clone();
+        registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
+            aivyx_core::DelegateToSpecialistConfig {
+                llm: Arc::clone(&llm),
+                gate: Arc::clone(&gate),
+                confiner: Arc::clone(&confiner),
+                checkpointer: checkpointer.clone(),
+                repo_map: repo_map.clone(),
+                events_tx: events_tx.clone(),
+                parent_registry: team_parent_registry,
+                team: aivyx_team::default_coding_roster(),
+                plan_mode: plan_mode.clone(),
+                autonomous_mode: autonomous_mode.clone(),
+                injection_taint: injection_taint.clone(),
+                context_tokens: settings.backend.context_tokens,
+                edit_format,
+                verification: verification.clone(),
+                max_iterations: settings.sub_agent.max_iterations,
+                broker_mode,
+            },
+        )));
+    }
+
     let mut executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::clone(&confiner));
     if let Some(cp) = &checkpointer {
         executor.set_checkpointer(Arc::clone(cp));

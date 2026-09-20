@@ -111,6 +111,7 @@ dependencies = [
  "aivyx-recall",
  "aivyx-repomap",
  "aivyx-sandbox",
+ "aivyx-team",
  "aivyx-tools",
  "aivyx-tui",
  "aivyx-vision-core",
