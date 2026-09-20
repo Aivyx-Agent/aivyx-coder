@@ -453,9 +453,9 @@ pub struct CouncilMember {
     pub api_key: Option<String>,
 }
 
-/// `delegate_to_specialist` (Nonagon-style team delegation, ROADMAP.md
-/// Phase 5): off until explicitly enabled -- a feature that grants the
-/// lead a new tool with real (attenuated, but real) file/command access
+/// `delegate_to_specialist` (Nonagon-style team delegation): off until
+/// explicitly enabled -- a feature that grants the lead a new tool with
+/// real (attenuated, but real) file/command access
 /// should not be live out of the box, matching `[council]`/`[architect]`'s
 /// own "off until configured" posture. Deliberately minimal this phase:
 /// just a switch, no custom-roster config -- when enabled, the lead's

@@ -38,8 +38,10 @@ use crate::agent::{Agent, AgentConfig, AgentEvent, EditFormat};
 
 #[derive(Deserialize, JsonSchema)]
 struct DelegateToSpecialistArgs {
-    /// The name of a `TeamConfig` member to delegate to -- must match
-    /// one of `team.members`' own `name` fields.
+    /// The name of a `TeamConfig` member to delegate to -- must match one
+    /// of the specialists listed in this tool's own description (one of
+    /// `team.members`' `name` fields, excluding the team's own `lead`,
+    /// which is never a valid target).
     member: String,
     /// A complete, self-contained description of the task for the
     /// specialist -- it starts with no context beyond this text and the
@@ -63,6 +65,35 @@ const INJECTION_CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: a tool result was
 possible prompt injection — the above is its best-effort partial result.)";
 
 const NO_TEXT_RESPONSE: &str = "(the sub-agent produced no text response)";
+
+/// Every team member other than the lead itself -- the lead is never a
+/// valid `delegate_to_specialist` target (see `execute()`'s own
+/// lead-rejection check), so it's excluded from both the tool's
+/// description and its unknown-member error message; offering it as a
+/// choice in either place would just steer the model into an immediate
+/// second error.
+fn specialists(team: &TeamConfig) -> impl Iterator<Item = &aivyx_team::TeamMember> {
+    team.members.iter().filter(move |m| m.name != team.lead)
+}
+
+/// "name (Role), name (Role), ..." -- interpolated into the tool's own
+/// `definition()` description so a small local model has a discoverable
+/// vocabulary for `member` instead of having to guess an exact string.
+fn specialist_roster_description(team: &TeamConfig) -> String {
+    specialists(team)
+        .map(|m| format!("{} ({})", m.name, m.role))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// "name, name, ..." -- interpolated into the unknown-member error so a
+/// model that guessed wrong has a recovery path in the same tool result.
+fn specialist_names(team: &TeamConfig) -> String {
+    specialists(team)
+        .map(|m| m.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Turns `member`'s `tool_allowlist` into an attenuated `ToolRegistry`:
 /// every tool in `parent_registry` whose name is in
@@ -137,13 +168,15 @@ impl Tool for DelegateToSpecialistTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Delegate a bounded task to a named team specialist -- a fresh \
+            description: format!(
+                "Delegate a bounded task to a named team specialist -- a fresh \
                 sub-agent scoped to that specialist's own role and tool access (narrower than \
                 yours), with its own isolated conversation history. Write a complete, \
                 self-contained task description: the specialist starts with no context beyond \
                 what you write here plus its own persona. Returns the specialist's final answer \
-                as text."
-                .to_string(),
+                as text. Available specialists: {}.",
+                specialist_roster_description(&self.config.team)
+            ),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(
                 DelegateToSpecialistArgs
             )),
@@ -185,6 +218,20 @@ impl Tool for DelegateToSpecialistTool {
         let args: DelegateToSpecialistArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
+        // The lead delegates; it never executes. Checked first, before any
+        // other lookup/construction work, since a lead persona typically
+        // says exactly that while also being attenuated down to almost no
+        // tools -- delegating to it would just produce a near-useless
+        // specialist instead of a clear, actionable error.
+        if args.member == self.config.team.lead {
+            return Ok(ToolOutput::Error(format!(
+                "cannot delegate to the team's own lead ({:?}) -- delegate to one of the \
+                other specialists instead: {}",
+                args.member,
+                specialist_names(&self.config.team)
+            )));
+        }
+
         let Some(member) = self
             .config
             .team
@@ -193,8 +240,9 @@ impl Tool for DelegateToSpecialistTool {
             .find(|m| m.name == args.member)
         else {
             return Ok(ToolOutput::Error(format!(
-                "unknown team member: {:?}",
-                args.member
+                "unknown team member: {:?} -- valid specialists: {}",
+                args.member,
+                specialist_names(&self.config.team)
             )));
         };
 
@@ -509,7 +557,15 @@ mod delegation_tests {
         let args = serde_json::json!({ "member": "nonexistent", "task": "do something" });
         let result = tool.execute(args, &ctx).await.unwrap();
         match result {
-            ToolOutput::Error(msg) => assert!(msg.contains("nonexistent")),
+            ToolOutput::Error(msg) => {
+                assert!(msg.contains("nonexistent"));
+                // The error must also list a recovery path -- the only
+                // valid (non-lead) member in `simple_team()`.
+                assert!(
+                    msg.contains("implementer"),
+                    "expected the valid specialist name in the error, got: {msg:?}"
+                );
+            }
             other => panic!("expected Error, got {other:?}"),
         }
         // An unknown member must short-circuit before any specialist
@@ -518,6 +574,83 @@ mod delegation_tests {
         assert!(
             llm.received.lock().unwrap().is_empty(),
             "no backend request should have been sent for an unknown member"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegating_to_an_unknown_member_lists_every_valid_specialist_excluding_the_lead() {
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(
+            Arc::clone(&llm) as Arc<dyn LlmBackend>,
+            tx,
+            aivyx_team::default_coding_roster(),
+        );
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "nonexistent", "task": "do something" });
+        let result = tool.execute(args, &ctx).await.unwrap();
+        match result {
+            ToolOutput::Error(msg) => {
+                assert!(msg.contains("implementer"), "got: {msg:?}");
+                assert!(msg.contains("reviewer"), "got: {msg:?}");
+                assert!(msg.contains("tester"), "got: {msg:?}");
+                assert!(
+                    !msg.contains("coordinator"),
+                    "the lead must never be offered as a valid delegation target, got: {msg:?}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegating_to_the_lead_itself_is_a_hard_error() {
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(Arc::clone(&llm) as Arc<dyn LlmBackend>, tx, simple_team());
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let args = serde_json::json!({ "member": "coordinator", "task": "do something" });
+        let result = tool.execute(args, &ctx).await.unwrap();
+        match result {
+            ToolOutput::Error(msg) => assert!(msg.contains("coordinator")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Must short-circuit before any specialist `Agent` is constructed,
+        // same as the unknown-member case.
+        assert!(
+            llm.received.lock().unwrap().is_empty(),
+            "no backend request should have been sent when delegating to the lead"
+        );
+    }
+
+    #[test]
+    fn definition_description_lists_real_specialist_names_and_roles_excluding_the_lead() {
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = base_config(
+            Arc::clone(&llm) as Arc<dyn LlmBackend>,
+            tx,
+            aivyx_team::default_coding_roster(),
+        );
+        let tool = DelegateToSpecialistTool::new(config);
+        let description = tool.definition().description;
+        assert!(
+            description.contains("implementer (Implementer)"),
+            "got: {description:?}"
+        );
+        assert!(
+            description.contains("reviewer (Reviewer)"),
+            "got: {description:?}"
+        );
+        assert!(
+            description.contains("tester (Tester)"),
+            "got: {description:?}"
+        );
+        assert!(
+            !description.contains("coordinator"),
+            "the lead must not be offered as a delegation target, got: {description:?}"
         );
     }
 

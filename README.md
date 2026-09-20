@@ -1234,6 +1234,7 @@ actually needs.
 | `go_to_definition` | resolve a symbol to its definition (via `rust-analyzer`) | none (auto-allowed) |
 | `find_references` | find every reference to a symbol across the workspace | none (auto-allowed) |
 | `delegate_task` | hand a bounded task to a fresh sub-agent | none (internal state only) |
+| `delegate_to_specialist` | delegate a bounded task to a named team specialist (off by default, see `[team]`) | none (internal state only) |
 | `list_mcp_resources` / `read_mcp_resource` | list/read resources from connected MCP servers | none (auto-allowed) |
 | `list_mcp_prompts` / `get_mcp_prompt` | list/get prompts from connected MCP servers | none (auto-allowed) |
 | `mcp__<server>__<tool>` | dynamically discovered tool from a connected MCP server | prompt (then cacheable) |
@@ -1564,6 +1565,12 @@ tail_budget_tokens = 3072  # recent-conversation digest members see
 #   { base_url = "http://localhost:11434/v1", model = "ornith:9b" },
 # ]
 # chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
+
+# Nonagon-style team delegation (delegate_to_specialist): lets the lead
+# delegate to a fixed specialist roster (implementer/reviewer/tester),
+# narrower-scoped than delegate_task's sub-agent. Off by default.
+[team]
+enabled = false
 ```
 
 ## Known limitations

@@ -639,15 +639,19 @@ pub(crate) async fn build_agent(
         },
     )));
 
-    // Nonagon-style team delegation (ROADMAP.md Phase 5): off by default,
-    // see TeamSettings' own doc comment. When enabled, the lead gains
-    // delegate_to_specialist as an ordinary tool -- no toggle, no
-    // keybinding, always available for the whole session once configured,
-    // exactly like delegate_task above. Registered *after* delegate_task
-    // (not before) so this tool's own name never appears in delegate_task's
-    // sub_agent_registry snapshot above -- matches that snapshot's own
-    // "clone before registering the delegation tool itself" recursion-
-    // prevention shape, applied here too via team_parent_registry below.
+    // Nonagon-style team delegation (see
+    // docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md):
+    // off by default, see TeamSettings' own doc comment. When enabled, the
+    // lead gains delegate_to_specialist as an ordinary tool -- no toggle,
+    // no keybinding, always available for the whole session once
+    // configured, exactly like delegate_task above. delegate_task's own
+    // sub_agent_registry (cloned above, well before delegate_task itself is
+    // registered) already excludes this tool's name by construction -- it's
+    // that early *snapshot point*, not the relative order in which
+    // delegate_task and delegate_to_specialist are themselves registered
+    // below, that guarantees neither delegation tool ever sees itself in a
+    // sub-agent's own tool list. team_parent_registry follows the identical
+    // clone-before-registering shape for the same reason.
     if settings.team.enabled {
         // Cloned *before* delegate_to_specialist itself is registered onto
         // `registry`, for the same structural reason sub_agent_registry/
@@ -655,8 +659,17 @@ pub(crate) async fn build_agent(
         // -- a specialist's own attenuated registry (computed per-call by
         // compute_specialist_registry from this snapshot) must never be
         // able to include delegate_to_specialist itself, or recursive
-        // delegation becomes possible.
-        let team_parent_registry = registry.clone();
+        // delegation becomes possible. Mirrors sub_agent_registry's own
+        // repl_start/repl_send/repl_stop exclusion, for the identical
+        // reason: a specialist sharing the parent's single global REPL
+        // session would break the isolated-history guarantee delegation is
+        // supposed to provide. Unlike sub_agent_registry, this does NOT
+        // exclude delegate_task itself or any MCP-bridged tools -- a
+        // specialist can still see/call those, so one-level-deep delegation
+        // isn't fully structural yet for specialists; that's accepted,
+        // current scope, not a bug to fix here.
+        let mut team_parent_registry = registry.clone();
+        team_parent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
                 llm: Arc::clone(&llm),
