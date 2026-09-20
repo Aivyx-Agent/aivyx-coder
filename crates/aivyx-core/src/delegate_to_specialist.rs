@@ -72,14 +72,14 @@ const NO_TEXT_RESPONSE: &str = "(the sub-agent produced no text response)";
 /// description and its unknown-member error message; offering it as a
 /// choice in either place would just steer the model into an immediate
 /// second error.
-fn specialists(team: &TeamConfig) -> impl Iterator<Item = &aivyx_team::TeamMember> {
+pub(crate) fn specialists(team: &TeamConfig) -> impl Iterator<Item = &aivyx_team::TeamMember> {
     team.members.iter().filter(move |m| m.name != team.lead)
 }
 
 /// "name (Role), name (Role), ..." -- interpolated into the tool's own
 /// `definition()` description so a small local model has a discoverable
 /// vocabulary for `member` instead of having to guess an exact string.
-fn specialist_roster_description(team: &TeamConfig) -> String {
+pub(crate) fn specialist_roster_description(team: &TeamConfig) -> String {
     specialists(team)
         .map(|m| format!("{} ({})", m.name, m.role))
         .collect::<Vec<_>>()
@@ -88,7 +88,7 @@ fn specialist_roster_description(team: &TeamConfig) -> String {
 
 /// "name, name, ..." -- interpolated into the unknown-member error so a
 /// model that guessed wrong has a recovery path in the same tool result.
-fn specialist_names(team: &TeamConfig) -> String {
+pub(crate) fn specialist_names(team: &TeamConfig) -> String {
     specialists(team)
         .map(|m| m.name.as_str())
         .collect::<Vec<_>>()
