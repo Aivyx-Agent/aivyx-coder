@@ -109,6 +109,41 @@ pub enum TaskStatus {
     Done,
 }
 
+/// A team mission's structured plan -- `decompose_task` creates one,
+/// `verify_output` updates individual steps' status, `synthesize_results`
+/// sets `summary`. Lives here (not `aivyx-core`) for the same reason
+/// `Task` does -- shared, zero-logic data multiple crates need, no
+/// `schemars`/`Tool` dependency required to define it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionPlan {
+    pub mission: String,
+    pub steps: Vec<MissionStep>,
+    /// Set by `synthesize_results` -- `None` until the lead has
+    /// explicitly synthesized a final deliverable.
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionStep {
+    pub id: u32,
+    /// A `TeamConfig` member's name (never the team's own lead --
+    /// enforced at `decompose_task` construction time, not here).
+    pub member: String,
+    pub task: String,
+    pub status: StepStatus,
+    /// Set by `verify_output` alongside its verdict -- `None` until a
+    /// step has been verified.
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Pending,
+    Verified,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -137,5 +172,42 @@ mod tests {
             tool_call_id: None,
         };
         assert_eq!(message.text_content(), "hello world");
+    }
+}
+
+#[cfg(test)]
+mod mission_plan_tests {
+    use super::*;
+
+    #[test]
+    fn mission_step_serializes_with_snake_case_status() {
+        let step = MissionStep {
+            id: 1,
+            member: "implementer".to_string(),
+            task: "write the fix".to_string(),
+            status: StepStatus::Pending,
+            notes: None,
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["status"], "pending");
+    }
+
+    #[test]
+    fn mission_plan_round_trips_through_json() {
+        let plan = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "write the fix".to_string(),
+                status: StepStatus::Verified,
+                notes: Some("looks good".to_string()),
+            }],
+            summary: None,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: MissionPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.steps[0].status, StepStatus::Verified);
+        assert_eq!(back.steps[0].notes, Some("looks good".to_string()));
     }
 }
