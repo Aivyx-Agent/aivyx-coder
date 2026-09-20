@@ -116,6 +116,23 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().max_concurrent
     }
 
+    /// A short `"<session_id> (<member>)"` listing of every currently-open
+    /// session, comma-separated -- interpolated into `spawn_specialist`'s
+    /// cap-exceeded error messages so a model that hits the cap can see
+    /// which sessions it could close, mirroring
+    /// `delegate_to_specialist.rs`'s own `specialist_names` convention of
+    /// giving a model that guessed wrong a recovery path in the same tool
+    /// result. Locks briefly, mirroring `max_concurrent()`'s own pattern.
+    fn open_sessions_description(&self) -> String {
+        let state = self.inner.lock().unwrap();
+        state
+            .sessions
+            .iter()
+            .map(|(id, session)| format!("{id} ({})", session.member))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Removes and returns a session so its turn can run WITHOUT holding
     /// the pool's lock -- the whole point of this method existing
     /// instead of a borrow-returning accessor. `None` if the id doesn't
@@ -243,10 +260,18 @@ async fn run_bounded_exchange(
         let _ = reply_rx.await;
     }
 
+    // Drained unconditionally, before branching on `result`: a failed turn
+    // can still have emitted `TextDelta` text before it errored (e.g. a
+    // stream that yields partial text then an error event), and the
+    // session is put back into the pool on both success AND failure --
+    // leaving `accumulated` undrained on the `Err` arm would leak this
+    // exchange's partial text into the next exchange's output the next
+    // time this function runs on the same session.
+    let drained = std::mem::take(&mut *accumulated.lock().unwrap());
     match result {
         Err(err) => ToolOutput::Error(format!("specialist turn failed: {err}")),
         Ok(()) => {
-            let mut text = std::mem::take(&mut *accumulated.lock().unwrap());
+            let mut text = drained;
             if injection_hit {
                 text.push_str(INJECTION_CUTOFF_NOTICE);
             } else if cap_hit {
@@ -462,9 +487,10 @@ impl Tool for SpawnSpecialistTool {
 
         if !self.config.pool.has_room() {
             return Ok(ToolOutput::Error(format!(
-                "cannot open a new specialist session: {} are already open -- close one with \
-                close_specialist first",
-                self.config.pool.max_concurrent()
+                "cannot open a new specialist session: {} are already open ({}) -- close one \
+                with close_specialist first",
+                self.config.pool.max_concurrent(),
+                self.config.pool.open_sessions_description()
             )));
         }
 
@@ -497,8 +523,9 @@ impl Tool for SpawnSpecialistTool {
         };
         if let Err(max) = self.config.pool.insert_new(session_id.clone(), session) {
             return Ok(ToolOutput::Error(format!(
-                "cannot open a new specialist session: {max} are already open -- close one \
-                with close_specialist first"
+                "cannot open a new specialist session: {max} are already open ({}) -- close \
+                one with close_specialist first",
+                self.config.pool.open_sessions_description()
             )));
         }
 
@@ -670,12 +697,33 @@ mod specialist_session_tests {
     use tokio_util::sync::CancellationToken;
 
     struct MockBackend {
-        responses: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        // Each queued response is itself a sequence of results, not just
+        // events: `a_failed_exchange_does_not_leak_text_into_the_next_successful_one`
+        // needs a stream that yields a real `TextDelta` and THEN an error,
+        // to reproduce a turn that partially streams text before failing
+        // (the exact shape `run_turn_inner` hits when a stream's `Err`
+        // event arrives after some `Ok(StreamEvent::TextDelta(_))`s).
+        responses: Mutex<std::collections::VecDeque<Vec<Result<StreamEvent, String>>>>,
         received: Mutex<Vec<ChatRequest>>,
     }
 
     impl MockBackend {
         fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|events| events.into_iter().map(Ok).collect())
+                        .collect(),
+                ),
+                received: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Like `new`, but each queued response is a pre-built sequence of
+        /// `Ok`/`Err` results, so a response can yield partial text before
+        /// failing mid-stream.
+        fn new_with_mixed_results(responses: Vec<Vec<Result<StreamEvent, String>>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
                 received: Mutex::new(Vec::new()),
@@ -700,7 +748,10 @@ mod specialist_session_tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default();
-            Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
+            Ok(
+                futures::stream::iter(events.into_iter().map(|r| r.map_err(LlmError::Parse)))
+                    .boxed(),
+            )
         }
     }
 
@@ -1044,5 +1095,99 @@ mod specialist_session_tests {
             .await
             .unwrap();
         assert!(matches!(query_result, ToolOutput::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_exchange_does_not_leak_text_into_the_next_successful_one() {
+        // Regression test for the "shared text accumulator isn't drained
+        // on a failed turn" bug: `run_bounded_exchange`'s `Err` arm used to
+        // return without draining `accumulated`, so any `TextDelta` text a
+        // specialist streamed before a turn failed stayed in the buffer --
+        // and since `QuerySpecialistTool::execute` puts the session back
+        // into the pool unconditionally even after an error, the NEXT
+        // exchange on that session would silently get the failed turn's
+        // leftover text concatenated in front of its own real response.
+        let llm = Arc::new(MockBackend::new_with_mixed_results(vec![
+            // Exchange 1 (via spawn_specialist): succeeds cleanly.
+            vec![
+                Ok(StreamEvent::TextDelta("first: got the task".to_string())),
+                Ok(StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            // Exchange 2 (via query_specialist): streams partial text,
+            // then the stream itself errors -- the exact shape that used
+            // to leak into exchange 3 below.
+            vec![
+                Ok(StreamEvent::TextDelta(
+                    "second: PARTIAL TEXT THAT MUST NOT LEAK".to_string(),
+                )),
+                Err("simulated backend failure".to_string()),
+            ],
+            // Exchange 3 (via query_specialist): succeeds cleanly and must
+            // NOT carry any trace of exchange 2's partial text.
+            vec![
+                Ok(StreamEvent::TextDelta("third: clean response".to_string())),
+                Ok(StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+        ]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm.clone(), tx, simple_team(), pool);
+        let spawn_tool = SpawnSpecialistTool::new(cfg.clone());
+        let query_tool = QuerySpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let spawn_result = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "first task" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(spawn_text) = spawn_result else {
+            panic!("expected Ok from spawn_specialist");
+        };
+        let session_id = spawn_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        let second_result = query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "second message" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(second_result, ToolOutput::Error(_)),
+            "expected the second exchange to fail, got: {second_result:?}"
+        );
+
+        let third_result = query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "third message" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(third_text) = third_result else {
+            panic!("expected Ok from the third exchange, got an Error");
+        };
+        assert!(
+            third_text.contains("third: clean response"),
+            "expected the third exchange's own text, got: {third_text}"
+        );
+        assert!(
+            !third_text.contains("PARTIAL TEXT THAT MUST NOT LEAK"),
+            "the second (failed) exchange's partial text leaked into the third exchange's \
+             output: {third_text}"
+        );
     }
 }

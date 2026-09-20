@@ -1239,8 +1239,8 @@ actually needs.
 | `verify_output` | record a pass/fail verdict for one step of the current mission plan (off by default, see `[team]`) | none (internal state only) |
 | `synthesize_results` | record the final synthesized deliverable for the current mission (off by default, see `[team]`) | none (internal state only) |
 | `spawn_specialist` | start a resumable session with a team specialist (off by default, see `[team]`) | none (internal state only) |
-| `query_specialist` | send a follow-up to an open specialist session | none (internal state only) |
-| `close_specialist` | end an open specialist session | none (internal state only) |
+| `query_specialist` | send a follow-up to an open specialist session (off by default, see `[team]`) | none (internal state only) |
+| `close_specialist` | end an open specialist session (off by default, see `[team]`) | none (internal state only) |
 | `list_mcp_resources` / `read_mcp_resource` | list/read resources from connected MCP servers | none (auto-allowed) |
 | `list_mcp_prompts` / `get_mcp_prompt` | list/get prompts from connected MCP servers | none (auto-allowed) |
 | `mcp__<server>__<tool>` | dynamically discovered tool from a connected MCP server | prompt (then cacheable) |
@@ -1584,7 +1584,7 @@ tail_budget_tokens = 3072  # recent-conversation digest members see
 [team]
 enabled = false
 # max_concurrent_specialist_sessions = 3  # spawn_specialist sessions open at once
-# specialist_session_idle_timeout_secs = 600  # auto-close an idle session after this long
+# specialist_session_idle_timeout_secs = 600  # drop an idle session on the next specialist-session tool call made after this long
 ```
 
 ## Known limitations

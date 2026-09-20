@@ -457,10 +457,15 @@ pub struct CouncilMember {
 /// explicitly enabled -- a feature that grants the lead a new tool with
 /// real (attenuated, but real) file/command access
 /// should not be live out of the box, matching `[council]`/`[architect]`'s
-/// own "off until configured" posture. Deliberately minimal this phase:
-/// just a switch, no custom-roster config -- when enabled, the lead's
-/// specialist team is always `aivyx_team::default_coding_roster()`. See
-/// `docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md`.
+/// own "off until configured" posture. When enabled, the lead's specialist
+/// team is always `aivyx_team::default_coding_roster()` -- there's still no
+/// custom-roster config -- but this struct is no longer just a switch: it
+/// also carries the concurrent-session cap and idle-timeout knobs for the
+/// resumable `spawn_specialist`/`query_specialist`/`close_specialist`
+/// sessions added alongside it. See
+/// `docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md`
+/// and
+/// `docs/superpowers/specs/2026-09-20-nonagon-team-specialist-sessions-design.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TeamSettings {
@@ -472,10 +477,14 @@ pub struct TeamSettings {
     /// Default matches `default_coding_roster()`'s exact non-lead
     /// specialist count (implementer/reviewer/tester).
     pub max_concurrent_specialist_sessions: usize,
-    /// Auto-close a specialist session with no `query_specialist`
-    /// activity for this long, in seconds -- a safety net against a
-    /// model that spawns sessions and forgets to close them, matching
-    /// `ReplSettings.idle_timeout_secs`'s own precedent and default.
+    /// How long, in seconds, a specialist session may sit with no
+    /// `query_specialist` activity before it's considered stale -- a
+    /// safety net against a model that spawns sessions and forgets to
+    /// close them, matching `ReplSettings.idle_timeout_secs`'s own
+    /// precedent and default. Eviction is lazy, not a background timer:
+    /// a stale session is only actually dropped on the next
+    /// `spawn_specialist`/`query_specialist`/`close_specialist` call that
+    /// touches the pool after this long has elapsed.
     pub specialist_session_idle_timeout_secs: u64,
 }
 
