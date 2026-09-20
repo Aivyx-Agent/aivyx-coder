@@ -179,7 +179,7 @@ deferred, see Out of Scope).
 | `AgentEvent::ReasoningDelta` | `agent_thought_chunk` session update |
 | `AgentEvent::ToolCallDetected` / `ToolResult` + `DiffContent` | `tool_call` / `tool_call_update`, with existing old/new content as the ACP diff payload |
 | `ConfirmationGate` interactive tier | `session/request_permission` via `AcpPrompter` (replaces `TuiPrompter` for this frontend); Allow/Deny/Always-Allow map directly onto ACP's permission options |
-| `AgentEvent::TasksUpdated` (`set_tasks`) | ACP plan/todo entries |
+| `AgentEvent::TasksUpdated` (`set_tasks`) | ACP plan/todo entries (superseded: as of the missions-surface work these are merged with mission-step and specialist-session entries into one prefixed `Plan` -- see `docs/superpowers/specs/2026-09-21-nonagon-team-acp-missions-surface-design.md` for the current behavior) |
 | Plan mode (`Ctrl+P` in the TUI) | an ACP session mode toggle, backed by the same `Arc<AtomicBool>` `PlanMode` the gate already reads — `aivyx-acp` becomes a second writer alongside the TUI's Ctrl+P handler |
 | `AgentEvent::CouncilNote` / `ArchitectNote` / `SubAgentActivity` | plain `agent_message_chunk` text — no new ACP semantics invented, matching how the TUI already renders these as transcript lines |
 | `editor_context.rs` polling | not used in `--acp` mode; ACP clients supply current-file/selection context natively |

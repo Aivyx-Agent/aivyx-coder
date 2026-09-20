@@ -41,7 +41,16 @@ fn text_chunk(text: String) -> ContentChunk {
 /// since ACP has no dedicated "mission" slot (only `Plan`, which is
 /// whole-list-replace). See `docs/superpowers/specs/
 /// 2026-09-21-nonagon-team-acp-missions-surface-design.md`.
-pub(crate) fn build_merged_plan(
+///
+/// A `MissionPlan` that is `Some` always contributes a leading
+/// `"[Mission] {mission}"` entry, even when `steps` is empty --
+/// `decompose_task` can legitimately produce a zero-step plan, and
+/// without this leading entry a Zed user would get no signal a mission
+/// was ever created. This mirrors the TUI's own equivalent fix (Phase
+/// 6a, `mission_panel_height` in `aivyx-tui/src/app.rs`): that panel is
+/// shown whenever `self.mission_plan` is `Some` at all, not gated on a
+/// non-empty step count.
+fn build_merged_plan(
     tasks: &[Task],
     mission_plan: Option<&MissionPlan>,
     open_specialist_sessions: &[SpecialistSessionSummary],
@@ -60,6 +69,15 @@ pub(crate) fn build_merged_plan(
         ));
     }
     if let Some(plan) = mission_plan {
+        entries.push(PlanEntry::new(
+            format!("[Mission] {}", plan.mission),
+            PlanEntryPriority::Medium,
+            if plan.summary.is_some() {
+                PlanEntryStatus::Completed
+            } else {
+                PlanEntryStatus::InProgress
+            },
+        ));
         for step in &plan.steps {
             let (content, status) = match step.status {
                 StepStatus::Pending => (
@@ -149,6 +167,11 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         AgentEvent::TurnComplete
         | AgentEvent::TurnPaused(_)
         | AgentEvent::ContextUsage { .. }
+        // `Session` now owns display state (`tasks`/`mission_plan`/
+        // `open_specialist_sessions`) that `ConversationCleared` does not
+        // reset -- currently latent since ACP never receives this event
+        // today (only the TUI's `/clear` interception emits it), but
+        // worth revisiting if `/clear` is ever wired into ACP.
         | AgentEvent::ConversationCleared
         // Tasks/mission/specialist-session state all feed a single,
         // merged ACP Plan (see `build_merged_plan`) -- handled
@@ -156,7 +179,15 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // last-known state and rebuilds the union on every change. This
         // stateless function must never handle any of the three, or a
         // direct call here would silently bypass the merge and produce
-        // an un-prefixed, single-source Plan.
+        // an un-prefixed, single-source Plan. This also covers a
+        // sub-agent's own wrapped `SubAgentActivity(TasksUpdated(...))`/
+        // etc. (see the `SubAgentActivity` arm above, which recurses into
+        // this stateless function, not `translate_event_with_state`): a
+        // sub-agent's task/mission/session events are deliberately not
+        // merged into the parent's tracked state either, for the same
+        // reason the TUI never lets sub-agent activity update its own
+        // task/mission panels -- only the top-level lead's own tool calls
+        // should update what the editor's Plan panel shows.
         | AgentEvent::TasksUpdated(_)
         | AgentEvent::MissionsUpdated(_)
         | AgentEvent::SpecialistSessionsUpdated(_) => return None,
@@ -182,32 +213,18 @@ pub(crate) fn translate_event_with_state(
     event: &AgentEvent,
 ) -> Option<SessionUpdate> {
     match event {
-        AgentEvent::TasksUpdated(new_tasks) => {
-            *tasks = new_tasks.clone();
-            Some(SessionUpdate::Plan(build_merged_plan(
-                tasks,
-                mission_plan.as_ref(),
-                open_specialist_sessions,
-            )))
-        }
-        AgentEvent::MissionsUpdated(plan) => {
-            *mission_plan = Some(plan.clone());
-            Some(SessionUpdate::Plan(build_merged_plan(
-                tasks,
-                mission_plan.as_ref(),
-                open_specialist_sessions,
-            )))
-        }
+        AgentEvent::TasksUpdated(new_tasks) => *tasks = new_tasks.clone(),
+        AgentEvent::MissionsUpdated(plan) => *mission_plan = Some(plan.clone()),
         AgentEvent::SpecialistSessionsUpdated(sessions) => {
             *open_specialist_sessions = sessions.clone();
-            Some(SessionUpdate::Plan(build_merged_plan(
-                tasks,
-                mission_plan.as_ref(),
-                open_specialist_sessions,
-            )))
         }
-        other => translate_event(session_id, other),
+        other => return translate_event(session_id, other),
     }
+    Some(SessionUpdate::Plan(build_merged_plan(
+        tasks,
+        mission_plan.as_ref(),
+        open_specialist_sessions,
+    )))
 }
 
 pub(crate) fn terminal_stop_reason(event: &AgentEvent) -> Option<StopReason> {
@@ -367,12 +384,13 @@ mod tests {
             summary: None,
         };
         let plan = build_merged_plan(&[], Some(&mission), &[]);
-        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries[0].content, "[Mission] fix the bug");
         assert_eq!(
-            plan.entries[0].content,
+            plan.entries[1].content,
             "[Mission: implementer] write the fix"
         );
-        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::Pending);
     }
 
     #[test]
@@ -389,13 +407,13 @@ mod tests {
             summary: None,
         };
         let plan = build_merged_plan(&[], Some(&mission), &[]);
-        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries.len(), 2);
         assert_eq!(
-            plan.entries[0].content,
+            plan.entries[1].content,
             "[Mission: implementer] (FAILED) write the fix"
         );
         // Never Completed -- a failed step must never look like a success.
-        assert_eq!(plan.entries[0].status, PlanEntryStatus::Pending);
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::Pending);
     }
 
     #[test]
@@ -413,10 +431,10 @@ mod tests {
         };
         let plan = build_merged_plan(&[], Some(&mission), &[]);
         assert_eq!(
-            plan.entries[0].content,
+            plan.entries[1].content,
             "[Mission: implementer] write the fix"
         );
-        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+        assert_eq!(plan.entries[1].status, PlanEntryStatus::Completed);
     }
 
     #[test]
@@ -457,10 +475,14 @@ mod tests {
             member: "reviewer".to_string(),
         }];
         let plan = build_merged_plan(&tasks, Some(&mission), &sessions);
-        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.entries.len(), 4);
         assert!(plan.entries[0].content.starts_with("[Task]"));
-        assert!(plan.entries[1].content.starts_with("[Mission:"));
-        assert!(plan.entries[2].content.starts_with("[Specialist:"));
+        // The mission's own leading summary entry comes before its steps
+        // (Fix 1: a MissionPlan always contributes at least one entry,
+        // even with zero steps -- see `build_merged_plan`'s doc comment).
+        assert_eq!(plan.entries[1].content, "[Mission] fix the bug");
+        assert!(plan.entries[2].content.starts_with("[Mission:"));
+        assert!(plan.entries[3].content.starts_with("[Specialist:"));
     }
 
     #[test]
@@ -534,9 +556,10 @@ mod tests {
         let SessionUpdate::Plan(plan) = update else {
             panic!("expected Plan");
         };
-        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.entries.len(), 3);
         assert!(plan.entries[0].content.starts_with("[Task]"));
-        assert!(plan.entries[1].content.starts_with("[Mission:"));
+        assert_eq!(plan.entries[1].content, "[Mission] fix the bug");
+        assert!(plan.entries[2].content.starts_with("[Mission:"));
     }
 
     #[test]
@@ -584,6 +607,99 @@ mod tests {
         .unwrap();
 
         assert!(matches!(update, SessionUpdate::AgentMessageChunk(_)));
+    }
+
+    #[test]
+    fn merged_plan_for_a_zero_step_mission_still_emits_a_leading_entry() {
+        // Fix 1: `decompose_task` can legitimately produce a `MissionPlan`
+        // with `steps: vec![]` -- without a leading entry, a Zed user gets
+        // no signal a mission was ever created at all.
+        let mission = MissionPlan {
+            mission: "investigate the flaky test".to_string(),
+            steps: vec![],
+            summary: None,
+        };
+        let plan = build_merged_plan(&[], Some(&mission), &[]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].content,
+            "[Mission] investigate the flaky test"
+        );
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
+    }
+
+    #[test]
+    fn merged_plan_for_a_zero_step_mission_with_a_summary_is_completed() {
+        let mission = MissionPlan {
+            mission: "investigate the flaky test".to_string(),
+            steps: vec![],
+            summary: Some("root-caused: a timing race".to_string()),
+        };
+        let plan = build_merged_plan(&[], Some(&mission), &[]);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].status, PlanEntryStatus::Completed);
+    }
+
+    #[test]
+    fn sub_agent_wrapped_task_events_are_not_merged_into_the_parent_state() {
+        // Fix 2: `SubAgentActivity`'s `translate_event` arm recurses into
+        // the stateless `translate_event`, never `translate_event_with_state`
+        // -- so a sub-agent's own `TasksUpdated` must be silently dropped
+        // and must never mutate the parent session's tracked `tasks`.
+        let mut tasks = Vec::new();
+        let mut mission_plan = None;
+        let mut open_specialist_sessions = Vec::new();
+        let wrapped =
+            AgentEvent::SubAgentActivity(Box::new(AgentEvent::TasksUpdated(vec![Task {
+                id: 1,
+                text: "sub-agent's own task".to_string(),
+                status: TaskStatus::Done,
+            }])));
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &wrapped,
+        );
+
+        assert!(update.is_none());
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn a_second_tasks_updated_replaces_rather_than_accumulates() {
+        // Fix 3: an empty `TasksUpdated` must replace the tracked task
+        // list, not merge with it -- and pre-existing mission state must
+        // survive untouched.
+        let mut tasks = vec![Task {
+            id: 1,
+            text: "old task".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        let mut mission_plan = Some(MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![],
+            summary: None,
+        });
+        let mut open_specialist_sessions = Vec::new();
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::TasksUpdated(vec![]),
+        )
+        .unwrap();
+
+        assert!(tasks.is_empty());
+        let SessionUpdate::Plan(plan) = update else {
+            panic!("expected Plan");
+        };
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].content, "[Mission] fix the bug");
     }
 
     #[test]

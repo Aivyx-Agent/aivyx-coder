@@ -121,9 +121,11 @@ struct Session {
     session_id: SessionId,
     /// Last-known state from each of the three sources
     /// `translate::build_merged_plan` unions into one ACP `Plan` --
-    /// updated by `translate_and_merge` below. Not persisted across
-    /// process restart (in-memory only, same as the TUI's own equivalent
-    /// fields from Phase 6a).
+    /// updated by `translate_and_merge` below (and, during an active
+    /// turn, by the same underlying free function called directly at the
+    /// `select!` loop's call site -- see that call site's own comment for
+    /// why). Not persisted across process restart (in-memory only, same
+    /// as the TUI's own equivalent fields from Phase 6a).
     tasks: Vec<Task>,
     mission_plan: Option<MissionPlan>,
     open_specialist_sessions: Vec<SpecialistSessionSummary>,
