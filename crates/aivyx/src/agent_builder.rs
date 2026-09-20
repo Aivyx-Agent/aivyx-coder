@@ -670,6 +670,7 @@ pub(crate) async fn build_agent(
         // current scope, not a bug to fix here.
         let mut team_parent_registry = registry.clone();
         team_parent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
+        let team = aivyx_team::default_coding_roster();
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
                 llm: Arc::clone(&llm),
@@ -679,7 +680,7 @@ pub(crate) async fn build_agent(
                 repo_map: repo_map.clone(),
                 events_tx: events_tx.clone(),
                 parent_registry: team_parent_registry,
-                team: aivyx_team::default_coding_roster(),
+                team: team.clone(),
                 plan_mode: plan_mode.clone(),
                 autonomous_mode: autonomous_mode.clone(),
                 injection_taint: injection_taint.clone(),
@@ -689,6 +690,35 @@ pub(crate) async fn build_agent(
                 max_iterations: settings.sub_agent.max_iterations,
                 broker_mode,
             },
+        )));
+
+        // Nonagon-style mission structure (see
+        // docs/superpowers/specs/2026-09-20-nonagon-team-mission-structure-design.md):
+        // decompose_task/verify_output/synthesize_results, gated behind the
+        // same [team] enabled flag as delegate_to_specialist above -- no new
+        // config knob. All three are lightweight, state-recording tools
+        // (none call an LLM or construct a sub-agent), so unlike
+        // delegate_to_specialist/team_parent_registry above, there's no
+        // recursion-prevention exclusion to worry about here; they're
+        // registered directly onto `registry`, sharing one
+        // `Arc<Mutex<MissionPlan>>` across the whole mission.
+        let mission_plan = Arc::new(std::sync::Mutex::new(aivyx_types::MissionPlan {
+            mission: String::new(),
+            steps: vec![],
+            summary: None,
+        }));
+        let mission_tools_config = aivyx_core::MissionToolsConfig {
+            team: team.clone(),
+            plan: Arc::clone(&mission_plan),
+        };
+        registry.register(Arc::new(aivyx_core::DecomposeTaskTool::new(
+            mission_tools_config.clone(),
+        )));
+        registry.register(Arc::new(aivyx_core::VerifyOutputTool::new(
+            mission_tools_config.clone(),
+        )));
+        registry.register(Arc::new(aivyx_core::SynthesizeResultsTool::new(
+            mission_tools_config,
         )));
     }
 

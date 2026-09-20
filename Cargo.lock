@@ -114,6 +114,7 @@ dependencies = [
  "aivyx-team",
  "aivyx-tools",
  "aivyx-tui",
+ "aivyx-types",
  "aivyx-vision-core",
  "aivyx-vision-mold",
  "aivyx-vision-svg",
