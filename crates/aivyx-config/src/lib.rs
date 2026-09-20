@@ -46,6 +46,7 @@ pub struct Settings {
     pub verification: VerificationSettings,
     pub autonomous: AutonomousSettings,
     pub sub_agent: SubAgentSettings,
+    pub team: TeamSettings,
     pub mcp_server: McpServerSettings,
     pub lsp: LspSettings,
     pub agents_file: AgentsFileSettings,
@@ -450,6 +451,21 @@ pub struct CouncilMember {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// `delegate_to_specialist` (Nonagon-style team delegation, ROADMAP.md
+/// Phase 5): off until explicitly enabled -- a feature that grants the
+/// lead a new tool with real (attenuated, but real) file/command access
+/// should not be live out of the box, matching `[council]`/`[architect]`'s
+/// own "off until configured" posture. Deliberately minimal this phase:
+/// just a switch, no custom-roster config -- when enabled, the lead's
+/// specialist team is always `aivyx_team::default_coding_roster()`. See
+/// `docs/superpowers/specs/2026-09-20-nonagon-team-entry-point-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TeamSettings {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Architect/editor model-pairing (`/architect <task>`, ROADMAP.md Phase 9):
@@ -2136,5 +2152,23 @@ mod tests {
         let settings: Settings = toml::from_str(toml_str).expect("parse must succeed");
         assert_eq!(settings.backend.kind, BackendKind::MistralRs);
         assert!(settings.backend.mistralrs_model_path.is_none());
+    }
+
+    #[test]
+    fn team_settings_defaults_to_disabled() {
+        assert!(!TeamSettings::default().enabled);
+    }
+
+    #[test]
+    fn team_settings_round_trips_through_toml_when_enabled() {
+        let toml_str = "[team]\nenabled = true\n";
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert!(settings.team.enabled);
+    }
+
+    #[test]
+    fn team_settings_defaults_when_section_omitted() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.team.enabled);
     }
 }
