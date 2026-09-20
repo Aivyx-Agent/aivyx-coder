@@ -191,6 +191,7 @@ dependencies = [
  "aivyx-llm",
  "aivyx-repomap",
  "aivyx-sandbox",
+ "aivyx-team",
  "aivyx-tools",
  "aivyx-types",
  "async-trait",
