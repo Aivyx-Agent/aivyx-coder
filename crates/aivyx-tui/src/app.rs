@@ -644,23 +644,8 @@ impl App {
         // (`panel_index`) rather than hardcoded, unlike the Tasks panel's
         // own pre-existing `layout[1]` (safe there only because Tasks was
         // always the sole optional row before this panel existed).
-        let mission_step_count = self
-            .mission_plan
-            .as_ref()
-            .map(|p| p.steps.len())
-            .unwrap_or(0);
-        let mission_height = if mission_step_count == 0 && self.open_specialist_sessions.is_empty()
-        {
-            0
-        } else {
-            let step_rows = mission_step_count.min(MAX_VISIBLE_MISSION_STEPS) as u16;
-            let sessions_row: u16 = if self.open_specialist_sessions.is_empty() {
-                0
-            } else {
-                1
-            };
-            step_rows + sessions_row + 2 // + borders
-        };
+        let mission_height =
+            mission_panel_height(self.mission_plan.as_ref(), &self.open_specialist_sessions);
         let mut constraints = vec![Constraint::Min(1)];
         if tasks_height > 0 {
             constraints.push(Constraint::Length(tasks_height));
@@ -916,6 +901,30 @@ fn task_line(task: &Task) -> Line<'static> {
         TaskStatus::Done => ("[x]", Style::default().fg(Color::DarkGray)),
     };
     Line::from(format!("{marker} {}. {}", task.id, task.text)).style(style)
+}
+
+/// Height (in rows, including borders) of the Mission panel, or 0 to hide
+/// it entirely. The panel must be visible whenever there's a mission plan
+/// at all — even one with zero steps, an edge case `decompose_task` can hit
+/// — or whenever there are open specialist sessions, independent of step
+/// count. Checking `mission_plan.is_some()` rather than `steps.len() != 0`
+/// is what makes that true; see the regression tests below for the bug
+/// this guards against.
+fn mission_panel_height(
+    mission_plan: Option<&MissionPlan>,
+    open_specialist_sessions: &[SpecialistSessionSummary],
+) -> u16 {
+    if mission_plan.is_none() && open_specialist_sessions.is_empty() {
+        return 0;
+    }
+    let step_count = mission_plan.map(|p| p.steps.len()).unwrap_or(0);
+    let step_rows = step_count.min(MAX_VISIBLE_MISSION_STEPS) as u16;
+    let sessions_row: u16 = if open_specialist_sessions.is_empty() {
+        0
+    } else {
+        1
+    };
+    step_rows + sessions_row + 2 // + borders
 }
 
 fn mission_step_window(steps: &[MissionStep], max: usize) -> &[MissionStep] {
@@ -1528,6 +1537,35 @@ mod tests {
 
         assert_eq!(app.mission_plan, None);
         assert!(app.open_specialist_sessions.is_empty());
+    }
+
+    #[test]
+    fn mission_panel_height_is_zero_with_no_plan_and_no_sessions() {
+        assert_eq!(mission_panel_height(None, &[]), 0);
+    }
+
+    #[test]
+    fn mission_panel_height_is_nonzero_for_a_plan_with_zero_steps() {
+        // Regression test: `decompose_task` can produce a `MissionPlan`
+        // whose `steps` is empty (an edge case), which previously hid the
+        // panel entirely because the old condition checked step count
+        // rather than `Option` presence. `mission_plan.is_some()` must be
+        // enough to show the panel, independent of how many steps it has.
+        let plan = MissionPlan {
+            mission: "fix the bug".to_string(),
+            steps: vec![],
+            summary: None,
+        };
+        assert!(mission_panel_height(Some(&plan), &[]) > 0);
+    }
+
+    #[test]
+    fn mission_panel_height_is_nonzero_for_open_sessions_with_no_plan() {
+        let sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "implementer".to_string(),
+        }];
+        assert!(mission_panel_height(None, &sessions) > 0);
     }
 
     #[test]
