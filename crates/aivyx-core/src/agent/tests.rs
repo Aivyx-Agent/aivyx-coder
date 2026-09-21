@@ -8,12 +8,15 @@ use aivyx_sandbox::{
     PermissionDecision, PermissionGate, PermissionPrompter, PermissionRequest, PermissionTarget,
     PlanMode, UserResponse,
 };
+use aivyx_team::{TeamConfig, TeamMember};
 use aivyx_tools::{
     CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry,
 };
 use aivyx_types::{MissionStep, StepStatus, ToolCallId, ToolCallSource, ToolDefinition};
 use futures::stream::BoxStream;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+use crate::specialist_sessions::{SpawnSpecialistTool, SpecialistSessionsConfig};
 
 /// Scriptable `LlmBackend`: each `stream_chat` pops the next scripted
 /// response (a whole `Vec<StreamEvent>`) and streams it, and records the
@@ -63,6 +66,19 @@ struct AllowAllGate;
 impl PermissionGate for AllowAllGate {
     async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
         PermissionDecision::Allow
+    }
+}
+
+/// Prompter that always allows -- mirrors `specialist_sessions.rs`'s own
+/// test-only `AlwaysAllowPrompter`. Needed to build a real
+/// `SpecialistEnforcementIngredients` for spawning a genuine specialist
+/// session below, without pulling in that module's private test helpers.
+struct AlwaysAllowPrompter;
+
+#[async_trait::async_trait]
+impl PermissionPrompter for AlwaysAllowPrompter {
+    async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
+        UserResponse::Allow
     }
 }
 
@@ -5265,6 +5281,96 @@ fn clear_conversation_is_a_no_op_when_no_mission_plan_handle_is_set() {
     // mission_plan stays None, clear_conversation must simply skip it.
     let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
     agent.clear_conversation();
+}
+
+#[tokio::test]
+async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_set() {
+    // Real pool, real spawned session -- proves clear_conversation reaches
+    // through Agent::set_specialist_session_pool_handle to the same shared
+    // SpecialistSessionPool and actually closes what's open in it, not a
+    // disconnected copy (mirrors specialist_sessions.rs's own
+    // close_all_removes_every_open_session, but drives the close through
+    // Agent::clear_conversation instead of pool.close_all() directly).
+    let specialist_llm: Arc<dyn LlmBackend> =
+        Arc::new(MockBackend::new(vec![text_response("on it")]));
+    let (specialist_tx, _specialist_rx) = unbounded_channel();
+    let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+    let team = TeamConfig {
+        lead: "coordinator".to_string(),
+        members: vec![
+            TeamMember {
+                name: "coordinator".to_string(),
+                role: "Lead".to_string(),
+                persona: "You delegate.".to_string(),
+                tool_allowlist: vec![],
+                extra_deny_paths: vec![],
+            },
+            TeamMember {
+                name: "implementer".to_string(),
+                role: "Implementer".to_string(),
+                persona: "You are the implementer specialist. You write code.".to_string(),
+                tool_allowlist: vec![],
+                extra_deny_paths: vec![],
+            },
+        ],
+    };
+    let cfg = SpecialistSessionsConfig {
+        llm: specialist_llm,
+        enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients {
+            prompter: Arc::new(AlwaysAllowPrompter),
+            base_deny_paths: vec![],
+            pre_approved_commands: vec![],
+            plan_mode: PlanMode::new(),
+            autonomous_mode: AutonomousMode::new(),
+            editor_approval_enabled: false,
+            injection_taint: InjectionTaint::new(),
+            extra_read_paths: vec![],
+            require_enforcement: false,
+        },
+        checkpointer: None,
+        repo_map: None,
+        events_tx: specialist_tx,
+        parent_registry: ToolRegistry::new(),
+        team,
+        plan_mode: PlanMode::new(),
+        autonomous_mode: AutonomousMode::new(),
+        injection_taint: InjectionTaint::new(),
+        context_tokens: 8192,
+        edit_format: EditFormat::Native,
+        verification: None,
+        max_iterations: 3,
+        broker_mode: false,
+        pool: pool.clone(),
+    };
+    let spawn_tool = SpawnSpecialistTool::new(cfg);
+    let ctx = ToolExecutionContext {
+        cwd: Path::new(".").to_path_buf(),
+        confiner: Arc::new(NoopConfiner),
+        cancellation: CancellationToken::new(),
+    };
+    spawn_tool
+        .execute(
+            serde_json::json!({ "member": "implementer", "task": "do something" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pool.open_sessions().len(),
+        1,
+        "the spawned session should be open before clear_conversation"
+    );
+
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.set_specialist_session_pool_handle(pool.clone());
+
+    agent.clear_conversation();
+
+    assert!(
+        pool.open_sessions().is_empty(),
+        "clear_conversation must reach the shared pool and close every open session"
+    );
 }
 
 #[test]
