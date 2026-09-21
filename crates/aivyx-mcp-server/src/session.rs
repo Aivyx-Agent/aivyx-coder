@@ -286,16 +286,21 @@ pub async fn run_bounded_turn(
             next_input = Some("continue".to_string());
         }
     }
-    let paused = result.is_ok() && agent.last_turn_paused();
+    let would_have_continued = result.is_ok() && agent.last_turn_paused();
     let injection_tainted = agent.injection_taint().current().is_some();
+    let cancelled = cancellation.is_cancelled();
 
-    if paused && injection_tainted {
+    if cancelled {
+        accumulated.push_str(
+            "\n\n(session stopped: cancelled by the client -- the above is its best-effort partial result.)",
+        );
+    } else if would_have_continued && injection_tainted {
         accumulated.push_str(
             "\n\n(session stopped: a tool result was flagged as a possible prompt injection -- \
              the above is its best-effort partial result; further mutating tool calls will keep \
              being denied for the rest of this session.)",
         );
-    } else if paused {
+    } else if would_have_continued && iterations_used >= max_iterations {
         accumulated.push_str(
             "\n\n(session stopped: reached its iteration budget before finishing -- the above is its best-effort partial result.)",
         );
@@ -310,8 +315,8 @@ mod tests {
     use aivyx_sandbox::NoopConfiner;
     use aivyx_tools::{ReadFileTool, RunCommandTool, RunShellTool, WriteFileTool};
     use async_trait::async_trait;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use std::sync::Mutex;
 
     struct MockBackend {
@@ -335,7 +340,9 @@ mod tests {
                     // `aivyx-core/src/delegate.rs`'s own precedent test
                     // and this same file's `LoopingBackend` test below) --
                     // dropped to match the real type.
-                    StreamEvent::Done { finish_reason: FinishReason::Stop },
+                    StreamEvent::Done {
+                        finish_reason: FinishReason::Stop,
+                    },
                 ]])),
                 received: Mutex::new(Vec::new()),
             })
@@ -359,7 +366,9 @@ mod tests {
                         arguments,
                         source: ToolCallSource::Native,
                     }),
-                    StreamEvent::Done { finish_reason: FinishReason::ToolCalls },
+                    StreamEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                    },
                 ]])),
                 received: Mutex::new(Vec::new()),
             })
@@ -375,7 +384,12 @@ mod tests {
             request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
             self.received.lock().unwrap().push(request);
-            let events = self.responses.lock().unwrap().pop_front().unwrap_or_default();
+            let events = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
             Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
         }
     }
@@ -400,7 +414,8 @@ mod tests {
     /// pulling in a `tempfile` dev-dependency (not already declared for
     /// this crate) just for these two tests; `uuid` already is.
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivyx-mcp-test-{label}-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("aivyx-mcp-test-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -451,21 +466,46 @@ mod tests {
         base.register(Arc::new(RunShellTool));
 
         let names = |level: AccessLevel| -> Vec<String> {
-            tier_registry(&base, level).definitions().into_iter().map(|d| d.name).collect()
+            tier_registry(&base, level)
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
         };
 
         let plan_names = names(AccessLevel::Plan);
-        assert!(plan_names.contains(&"read_file".to_string()), "plan must include read_file");
-        assert!(!plan_names.contains(&"write_file".to_string()), "plan must exclude write_file");
-        assert!(!plan_names.contains(&"run_shell".to_string()), "plan must exclude run_shell");
+        assert!(
+            plan_names.contains(&"read_file".to_string()),
+            "plan must include read_file"
+        );
+        assert!(
+            !plan_names.contains(&"write_file".to_string()),
+            "plan must exclude write_file"
+        );
+        assert!(
+            !plan_names.contains(&"run_shell".to_string()),
+            "plan must exclude run_shell"
+        );
 
         let edit_names = names(AccessLevel::Edit);
-        assert!(edit_names.contains(&"write_file".to_string()), "edit must include write_file");
-        assert!(!edit_names.contains(&"run_shell".to_string()), "edit must exclude run_shell");
+        assert!(
+            edit_names.contains(&"write_file".to_string()),
+            "edit must include write_file"
+        );
+        assert!(
+            !edit_names.contains(&"run_shell".to_string()),
+            "edit must exclude run_shell"
+        );
 
         let execute_names = names(AccessLevel::Execute);
-        assert!(execute_names.contains(&"write_file".to_string()), "execute must include write_file");
-        assert!(execute_names.contains(&"run_shell".to_string()), "execute must include run_shell");
+        assert!(
+            execute_names.contains(&"write_file".to_string()),
+            "execute must include write_file"
+        );
+        assert!(
+            execute_names.contains(&"run_shell".to_string()),
+            "execute must include run_shell"
+        );
     }
 
     #[tokio::test]
@@ -516,7 +556,9 @@ mod tests {
         assert!(result.is_ok());
 
         let received = mock.received.lock().unwrap();
-        let request = received.last().expect("the session must have sent a request");
+        let request = received
+            .last()
+            .expect("the session must have sent a request");
         assert!(
             request.slot_hint.is_some(),
             "the session's Agent must attach a slot_hint when SessionConfig.broker_mode is true"
@@ -543,7 +585,9 @@ mod tests {
         assert!(result.is_ok());
 
         let received = mock.received.lock().unwrap();
-        let request = received.last().expect("the session must have sent a request");
+        let request = received
+            .last()
+            .expect("the session must have sent a request");
         assert!(
             request.slot_hint.is_none(),
             "the session's Agent must not attach a slot_hint when SessionConfig.broker_mode is \
@@ -569,9 +613,13 @@ mod tests {
         let mut agent = build_session_agent(&cfg, AccessLevel::Execute, tx).await;
 
         let (result, events) =
-            run_turn_collecting_events(&mut agent, &mut rx, "run a command".to_string(), &cwd).await;
+            run_turn_collecting_events(&mut agent, &mut rx, "run a command".to_string(), &cwd)
+                .await;
 
-        assert!(result.is_ok(), "a denied tool call must not surface as an AgentError");
+        assert!(
+            result.is_ok(),
+            "a denied tool call must not surface as an AgentError"
+        );
         let denied = events.iter().any(|event| {
             matches!(
                 event,
@@ -609,7 +657,10 @@ mod tests {
         let (result, events) =
             run_turn_collecting_events(&mut agent, &mut rx, "write a file".to_string(), &cwd).await;
 
-        assert!(result.is_ok(), "a denied tool call must not surface as an AgentError");
+        assert!(
+            result.is_ok(),
+            "a denied tool call must not surface as an AgentError"
+        );
         let denied = events.iter().any(|event| {
             matches!(
                 event,
@@ -624,7 +675,10 @@ mod tests {
             "a write outside the session's cwd must be denied once AutonomousMode is really \
              active, got: {events:?}"
         );
-        assert!(!target.exists(), "the out-of-worktree file must never actually be written");
+        assert!(
+            !target.exists(),
+            "the out-of-worktree file must never actually be written"
+        );
     }
 
     #[test]
@@ -641,7 +695,10 @@ mod tests {
             preview: None,
             diff: None,
         };
-        let denied = PermissionRequest { tool_name: "run_command".to_string(), ..allowed.clone() };
+        let denied = PermissionRequest {
+            tool_name: "run_command".to_string(),
+            ..allowed.clone()
+        };
         // PermissionRequest has no #[derive(Clone)] guarantee beyond what
         // aivyx-sandbox already declares (Debug, Clone -- confirmed in
         // lib.rs) so `..allowed.clone()` above is valid; if a future
@@ -653,6 +710,42 @@ mod tests {
         assert_eq!(deny, UserResponse::Deny);
     }
 
+    // Every response is a tool call with no final answer, so the agent
+    // pauses every single iteration and never finishes naturally -- lets
+    // both `run_bounded_turn_appends_a_cutoff_notice_on_budget_exhaustion`
+    // and `run_bounded_turn_distinguishes_cancellation_from_budget_exhaustion`
+    // below drive `run_bounded_turn`'s outer loop until something other
+    // than the agent itself stops it (the iteration cap in one case, a
+    // pre-cancelled token in the other). Module-scoped (not nested inside
+    // either test fn) so both can construct one.
+    struct LoopingBackend;
+    #[async_trait]
+    impl aivyx_llm::LlmBackend for LoopingBackend {
+        fn model_id(&self) -> &str {
+            "looping"
+        }
+        async fn stream_chat(
+            &self,
+            _request: aivyx_llm::ChatRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, aivyx_llm::LlmError>>,
+            aivyx_llm::LlmError,
+        > {
+            Ok(futures::stream::iter([
+                Ok(StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                    id: aivyx_types::ToolCallId("c".to_string()),
+                    name: "nonexistent_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    source: aivyx_types::ToolCallSource::Native,
+                })),
+                Ok(StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                }),
+            ])
+            .boxed())
+        }
+    }
+
     #[tokio::test]
     async fn run_bounded_turn_appends_a_cutoff_notice_on_budget_exhaustion() {
         // Mirrors aivyx-core/src/delegate.rs's own
@@ -662,33 +755,6 @@ mod tests {
         // naturally -- proving run_bounded_turn's outer loop actually
         // stops at max_iterations and appends the cutoff notice, the same
         // behavior delegate_task's own outer loop has.
-        use aivyx_llm::FinishReason;
-        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
-
-        struct LoopingBackend;
-        #[async_trait]
-        impl aivyx_llm::LlmBackend for LoopingBackend {
-            fn model_id(&self) -> &str {
-                "looping"
-            }
-            async fn stream_chat(
-                &self,
-                _request: aivyx_llm::ChatRequest,
-            ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, aivyx_llm::LlmError>>, aivyx_llm::LlmError>
-            {
-                Ok(futures::stream::iter([
-                    Ok(StreamEvent::ToolCallComplete(ToolCall {
-                        id: ToolCallId("c".to_string()),
-                        name: "nonexistent_tool".to_string(),
-                        arguments: serde_json::json!({}),
-                        source: ToolCallSource::Native,
-                    })),
-                    Ok(StreamEvent::Done { finish_reason: FinishReason::ToolCalls }),
-                ])
-                .boxed())
-            }
-        }
-
         let mut cfg = config(full_registry());
         cfg.llm = std::sync::Arc::new(LoopingBackend);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -702,10 +768,57 @@ mod tests {
             CancellationToken::new(),
         )
         .await;
-        assert!(result.is_ok(), "budget exhaustion must return Ok, not an error");
+        assert!(
+            result.is_ok(),
+            "budget exhaustion must return Ok, not an error"
+        );
         assert!(
             text.contains("reached its iteration budget"),
             "expected a cutoff notice, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_turn_distinguishes_cancellation_from_budget_exhaustion() {
+        // `cancellation` is now checked independently of
+        // `agent.last_turn_paused()` (see run_bounded_turn's own comment on
+        // the `cancelled` branch): `run_turn_inner`'s very first
+        // cancellation checkpoint fires before any LLM call is even made,
+        // so a plain MockBackend (never actually invoked) is sufficient --
+        // no need for LoopingBackend's tool-call-pause behavior to prove
+        // this branch fires. A pre-cancelled token with a generous
+        // max_iterations (10) proves the loop stops on iteration 1
+        // specifically because of cancellation, not because the budget was
+        // exhausted (iterations_used == 1, far below max_iterations), and
+        // that `accumulated` is empty apart from the notice since the
+        // backend never streamed any text.
+        let mut cfg = config(full_registry());
+        cfg.llm = MockBackend::says("should never be seen");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Plan, tx).await;
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (result, text) = run_bounded_turn(
+            &mut agent,
+            &mut rx,
+            "do the thing".to_string(),
+            &std::env::temp_dir(),
+            10,
+            cancellation,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cancellation must return Ok, not an error: got {result:?}"
+        );
+        assert!(
+            text.contains("session stopped: cancelled by the client"),
+            "a pre-cancelled token must produce the cancellation notice, not the budget-exhausted \
+             one: got {text:?}"
+        );
+        assert!(
+            !text.contains("reached its iteration budget"),
+            "must not also claim budget exhaustion when the real reason was cancellation: got {text:?}"
         );
     }
 
@@ -737,7 +850,9 @@ mod tests {
                         arguments: serde_json::json!({ "path": "tainted.txt" }),
                         source: ToolCallSource::Native,
                     }),
-                    StreamEvent::Done { finish_reason: FinishReason::ToolCalls },
+                    StreamEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                    },
                 ],
                 vec![
                     StreamEvent::ToolCallComplete(ToolCall {
@@ -746,7 +861,9 @@ mod tests {
                         arguments: serde_json::json!({ "path": "harmless.txt" }),
                         source: ToolCallSource::Native,
                     }),
-                    StreamEvent::Done { finish_reason: FinishReason::ToolCalls },
+                    StreamEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                    },
                 ],
             ])),
             received: Mutex::new(Vec::new()),

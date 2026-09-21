@@ -11,12 +11,12 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{build_session_agent, run_bounded_turn, SessionConfig};
+use crate::session::{SessionConfig, build_session_agent, run_bounded_turn};
 use crate::tiers::AccessLevel;
 
 pub struct McpServerRunConfig {
@@ -51,7 +51,11 @@ struct SessionMap {
 
 impl SessionMap {
     fn new(ttl: Duration, max_concurrent: usize) -> Self {
-        Self { sessions: HashMap::new(), ttl, max_concurrent }
+        Self {
+            sessions: HashMap::new(),
+            ttl,
+            max_concurrent,
+        }
     }
 
     /// Removes every session idle longer than `ttl`. Call before every
@@ -85,7 +89,14 @@ impl SessionMap {
         agent: Agent,
         events_rx: tokio::sync::mpsc::UnboundedReceiver<aivyx_core::AgentEvent>,
     ) {
-        self.sessions.insert(id, StoredSession { agent, events_rx, last_active: Instant::now() });
+        self.sessions.insert(
+            id,
+            StoredSession {
+                agent,
+                events_rx,
+                last_active: Instant::now(),
+            },
+        );
     }
 
     /// Removes and returns the session, so its turn can run WITHOUT
@@ -118,8 +129,8 @@ mod session_map_tests {
     use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent};
     use aivyx_sandbox::NoopConfiner;
     use aivyx_tools::ToolRegistry;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
 
     struct MockBackend;
     #[async_trait::async_trait]
@@ -209,7 +220,10 @@ mod session_map_tests {
         // 10ms since the touch above -- still under the 15ms TTL relative
         // to that touch, even though 20ms have passed since insertion.
         map.evict_stale();
-        assert!(map.take("s").is_some(), "the touch above must have reset the TTL clock");
+        assert!(
+            map.take("s").is_some(),
+            "the touch above must have reset the TTL clock"
+        );
     }
 
     #[tokio::test]
@@ -225,7 +239,10 @@ mod session_map_tests {
         );
 
         map.put_back("s".to_string(), checked_out);
-        assert!(map.take("s").is_some(), "put_back must make the session available again");
+        assert!(
+            map.take("s").is_some(),
+            "put_back must make the session available again"
+        );
     }
 }
 
@@ -269,20 +286,26 @@ impl AivyxCoderMcpServer {
     fn new(config: McpServerRunConfig) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            sessions: Arc::new(Mutex::new(SessionMap::new(config.session_ttl, config.max_concurrent_sessions))),
+            sessions: Arc::new(Mutex::new(SessionMap::new(
+                config.session_ttl,
+                config.max_concurrent_sessions,
+            ))),
             session_config: Arc::new(config.session_config),
             max_access_level: config.max_access_level,
             max_iterations: config.max_iterations,
         }
     }
 
-    #[tool(description = "Delegate a bounded coding task to aivyx-coder. access_level is \
+    #[tool(
+        description = "Delegate a bounded coding task to aivyx-coder. access_level is \
         \"plan\" (read-only), \"edit\" (file writes, no shell), or \"execute\" (full tool \
         access, still sandboxed) -- rejected if it exceeds this server's configured ceiling. \
-        Returns a session_id for use with code_reply, plus the session's final answer.")]
+        Returns a session_id for use with code_reply, plus the session's final answer."
+    )]
     async fn code(
         &self,
         Parameters(params): Parameters<CodeParams>,
+        cancellation: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let level = AccessLevel::parse(&params.access_level).map_err(mcp_error)?;
         if !level.at_most(&self.max_access_level) {
@@ -300,7 +323,7 @@ impl AivyxCoderMcpServer {
             params.task,
             &self.session_config.cwd,
             self.max_iterations,
-            CancellationToken::new(),
+            cancellation,
         )
         .await;
         // Intentional asymmetry with code_reply below: a turn failure here
@@ -321,16 +344,22 @@ impl AivyxCoderMcpServer {
             sessions.insert(session_id.clone(), agent, events_rx);
         }
 
-        let content = Content::json(CodeOutcome { session_id, result: text })
-            .map_err(|e| mcp_error(format!("failed to encode result: {e}")))?;
+        let content = Content::json(CodeOutcome {
+            session_id,
+            result: text,
+        })
+        .map_err(|e| mcp_error(format!("failed to encode result: {e}")))?;
         Ok(CallToolResult::success(vec![content]))
     }
 
-    #[tool(description = "Continue a session started by code, with a follow-up message. The \
-        access level chosen at session start is not renegotiable here.")]
+    #[tool(
+        description = "Continue a session started by code, with a follow-up message. The \
+        access level chosen at session start is not renegotiable here."
+    )]
     async fn code_reply(
         &self,
         Parameters(params): Parameters<CodeReplyParams>,
+        cancellation: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         let mut session = {
             let mut sessions = self.sessions.lock().await;
@@ -355,7 +384,7 @@ impl AivyxCoderMcpServer {
             params.message,
             &self.session_config.cwd,
             self.max_iterations,
-            CancellationToken::new(),
+            cancellation,
         )
         .await;
 
@@ -372,8 +401,11 @@ impl AivyxCoderMcpServer {
         }
 
         result.map_err(|e| mcp_error(e.to_string()))?;
-        let content = Content::json(CodeOutcome { session_id: params.session_id, result: text })
-            .map_err(|e| mcp_error(format!("failed to encode result: {e}")))?;
+        let content = Content::json(CodeOutcome {
+            session_id: params.session_id,
+            result: text,
+        })
+        .map_err(|e| mcp_error(format!("failed to encode result: {e}")))?;
         Ok(CallToolResult::success(vec![content]))
     }
 }
@@ -409,8 +441,8 @@ mod tests {
     use aivyx_llm::{ChatRequest, FinishReason, LlmBackend, LlmError, StreamEvent};
     use aivyx_sandbox::NoopConfiner;
     use aivyx_tools::ToolRegistry;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
     use std::sync::Mutex as StdMutex;
 
     /// Scripted responses, one Vec<StreamEvent> per call -- proves
@@ -435,7 +467,9 @@ mod tests {
             let text = self.responses.lock().unwrap().pop_front().unwrap_or("");
             Ok(futures::stream::iter([
                 Ok(StreamEvent::TextDelta(text.to_string())),
-                Ok(StreamEvent::Done { finish_reason: FinishReason::Stop }),
+                Ok(StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
             ])
             .boxed())
         }
@@ -444,7 +478,10 @@ mod tests {
     fn server_with_ceiling(ceiling: AccessLevel) -> AivyxCoderMcpServer {
         let session_config = SessionConfig {
             llm: Arc::new(ScriptedBackend {
-                responses: StdMutex::new(std::collections::VecDeque::from(vec!["first answer", "second answer"])),
+                responses: StdMutex::new(std::collections::VecDeque::from(vec![
+                    "first answer",
+                    "second answer",
+                ])),
             }),
             confiner: Arc::new(NoopConfiner),
             checkpointer: None,
@@ -470,18 +507,36 @@ mod tests {
     async fn code_then_code_reply_round_trips_real_conversation_state() {
         let server = server_with_ceiling(AccessLevel::Execute);
         let first = server
-            .code(Parameters(CodeParams { task: "start".to_string(), access_level: "plan".to_string() }))
+            .code(
+                Parameters(CodeParams {
+                    task: "start".to_string(),
+                    access_level: "plan".to_string(),
+                }),
+                CancellationToken::new(),
+            )
             .await
             .expect("code call should succeed");
         let CallToolResult { content, .. } = first;
-        let first_json: serde_json::Value = content[0].raw.as_text().unwrap().text.parse().unwrap_or_else(|_| {
-            serde_json::from_str(&content[0].raw.as_text().unwrap().text).unwrap()
-        });
+        let first_json: serde_json::Value = content[0]
+            .raw
+            .as_text()
+            .unwrap()
+            .text
+            .parse()
+            .unwrap_or_else(|_| {
+                serde_json::from_str(&content[0].raw.as_text().unwrap().text).unwrap()
+            });
         let session_id = first_json["session_id"].as_str().unwrap().to_string();
         assert_eq!(first_json["result"], "first answer");
 
         let second = server
-            .code_reply(Parameters(CodeReplyParams { session_id: session_id.clone(), message: "continue".to_string() }))
+            .code_reply(
+                Parameters(CodeReplyParams {
+                    session_id: session_id.clone(),
+                    message: "continue".to_string(),
+                }),
+                CancellationToken::new(),
+            )
             .await
             .expect("code_reply should succeed");
         let second_json: serde_json::Value =
@@ -498,19 +553,31 @@ mod tests {
     async fn code_call_above_the_ceiling_is_rejected_before_any_agent_is_built() {
         let server = server_with_ceiling(AccessLevel::Plan);
         let outcome = server
-            .code(Parameters(CodeParams { task: "do something".to_string(), access_level: "execute".to_string() }))
+            .code(
+                Parameters(CodeParams {
+                    task: "do something".to_string(),
+                    access_level: "execute".to_string(),
+                }),
+                CancellationToken::new(),
+            )
             .await;
-        assert!(outcome.is_err(), "execute must be rejected when the ceiling is plan");
+        assert!(
+            outcome.is_err(),
+            "execute must be rejected when the ceiling is plan"
+        );
     }
 
     #[tokio::test]
     async fn code_reply_against_an_unknown_session_id_fails_clearly() {
         let server = server_with_ceiling(AccessLevel::Execute);
         let outcome = server
-            .code_reply(Parameters(CodeReplyParams {
-                session_id: "does-not-exist".to_string(),
-                message: "hi".to_string(),
-            }))
+            .code_reply(
+                Parameters(CodeReplyParams {
+                    session_id: "does-not-exist".to_string(),
+                    message: "hi".to_string(),
+                }),
+                CancellationToken::new(),
+            )
             .await;
         assert!(outcome.is_err());
     }
