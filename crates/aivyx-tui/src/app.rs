@@ -35,10 +35,13 @@ const MAX_VISIBLE_MISSION_STEPS: usize = 6;
 /// The autonomous driver's goal-achieved signal, combining three
 /// independent sources: the `set_tasks` list, `MissionPlan` (Nonagon team
 /// missions), and open specialist sessions. Each of the first two
-/// contributes a signal only if it was ever *used* — an empty task list or
-/// a `None` mission plan means that surface was never engaged, so it must
-/// not count as "nothing to do, stop immediately" (an unused signal is a
-/// no-op, not a blocker). An open specialist session always blocks
+/// contributes a signal only if it was ever *used* — an empty task list, a
+/// `None` mission plan, or a `Some(MissionPlan)` whose `mission` and `steps`
+/// are both empty (the eager placeholder `agent_builder.rs` constructs
+/// whenever `[team] enabled = true`, regardless of whether `decompose_task`
+/// was ever called this run) all mean that surface was never engaged, so it
+/// must not count as "nothing to do, stop immediately" (an unused signal is
+/// a no-op, not a blocker). An open specialist session always blocks
 /// completion outright, regardless of the other two — a live, un-closed
 /// specialist session is inherently evidence of unfinished business. When
 /// neither tasks nor a mission were ever used, this is `false` — matching
@@ -54,7 +57,9 @@ fn goal_achieved(
     }
     let tasks_signal =
         (!tasks.is_empty()).then(|| tasks.iter().all(|t| t.status == TaskStatus::Done));
-    let mission_signal = mission_plan.map(|p| p.summary.is_some());
+    let mission_signal = mission_plan
+        .filter(|p| !p.mission.is_empty() || !p.steps.is_empty())
+        .map(|p| p.summary.is_some());
     match (tasks_signal, mission_signal) {
         (None, None) => false,
         _ => tasks_signal.unwrap_or(true) && mission_signal.unwrap_or(true),
@@ -1822,6 +1827,26 @@ mod tests {
         assert!(!goal_achieved(&[], None, &[]));
         assert!(!goal_achieved(&[done_task(1), pending_task(2)], None, &[]));
         assert!(goal_achieved(&[done_task(1), done_task(2)], None, &[]));
+    }
+
+    #[test]
+    fn goal_achieved_ignores_a_never_decomposed_pristine_mission_plan() {
+        // [team] enabled = true constructs a placeholder MissionPlan eagerly,
+        // even if decompose_task is never called this run -- must not be
+        // mistaken for "mission used but incomplete."
+        let pristine = MissionPlan {
+            mission: String::new(),
+            steps: vec![],
+            summary: None,
+        };
+        assert!(
+            goal_achieved(&[done_task(1)], Some(&pristine), &[]),
+            "a never-decomposed MissionPlan must not block a tasks-only completion"
+        );
+        assert!(
+            !goal_achieved(&[], Some(&pristine), &[]),
+            "still correctly not done with no tasks and no real mission either"
+        );
     }
 
     // The driver loop that actually calls `agent.notify(...)` lives inside a
