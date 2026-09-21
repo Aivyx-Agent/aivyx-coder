@@ -8,6 +8,7 @@ pub mod edit_blocks;
 pub mod editor_context;
 pub mod mission_tools;
 pub mod session;
+pub mod specialist_enforcement;
 pub mod specialist_sessions;
 pub mod wiki;
 
