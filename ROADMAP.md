@@ -697,21 +697,35 @@ findings from that same review are logged here rather than fixed ad hoc:
 "MCP-server frontend — shipped" above for the two Important findings
 that WERE fixed before merge; these Minor ones were deliberately
 deferred, not overlooked):
-- `code`/`code_reply` construct a fresh `CancellationToken::new()` per
+- ~~`code`/`code_reply` construct a fresh `CancellationToken::new()` per
   call that nothing ever cancels — an MCP `notifications/cancelled` or a
   client disconnect currently cannot stop a runaway turn early;
-  `max_iterations` is the only real bound. A per-session token, wired to
-  `rmcp`'s own cancellation surface, would close this. Related: if a
-  `code_reply` future is dropped mid-turn (e.g. the same disconnect),
-  the session was already checked out via `take()` and `put_back` never
-  runs — graceful (the session is simply gone, the next call gets a
-  clear "no session" error) but silent.
-- `run_bounded_turn`'s `cap_hit` (`session.rs`) is `result.is_ok() &&
+  `max_iterations` is the only real bound.~~ — **Fixed 2026-09-21.** Both
+  tools now accept a `CancellationToken` parameter, auto-injected by
+  `rmcp`'s own `#[tool]` macro system per-request (via its
+  `FromContextPart` extractor — no manual `request_id` tracking needed),
+  threaded straight into `run_bounded_turn`. Confirmed the request-handling
+  task itself isn't forcibly dropped on cancellation — only the token
+  flips — so the earlier "`code_reply` future dropped mid-turn, `put_back`
+  never runs" worry doesn't materialize for a graceful MCP-level cancel;
+  it remains a real risk only for an actual raw connection/process death,
+  out of reach of any code-level fix here.
+- ~~`run_bounded_turn`'s `cap_hit` (`session.rs`) is `result.is_ok() &&
   agent.last_turn_paused()`, which is also true if a turn stopped via
   cancellation rather than genuinely exhausting `max_iterations` — today
   unreachable (see above), but would mislabel a cancelled turn as
   "reached its iteration budget" the moment real cancellation is wired
-  in. Distinguish via `iterations_used >= max_iterations` instead.
+  in. Distinguish via `iterations_used >= max_iterations` instead.~~ —
+  **Fixed 2026-09-21**, alongside the item above (the two were always
+  coupled: this one only became a reachable bug once real cancellation
+  existed). The stop-reason check is now a 3-way, explicitly-ordered
+  chain: cancellation is checked first and unconditionally (found mid-fix
+  to need this — gating it on `agent.last_turn_paused()`, as this entry
+  originally proposed, turned out to make that branch structurally
+  unreachable, since `run_turn_inner`'s own cancellation checkpoints
+  always fire before the code that could set that flag), then
+  injection-taint, then genuine budget exhaustion via
+  `iterations_used >= max_iterations` as originally proposed.
 - ~~`[mcp_server].session_ttl_secs`/`max_concurrent_sessions` accept `0`
   with no startup validation~~ — **Fixed 2026-08-26.**
   `validate_mcp_server_session_limits` in `crates/aivyx/src/main.rs` now
