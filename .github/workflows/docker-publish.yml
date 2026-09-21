@@ -20,7 +20,7 @@ jobs:
       - name: Determine image tags
         id: tags
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
             echo "primary_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
             echo "push_latest=true" >> "$GITHUB_OUTPUT"
           else
