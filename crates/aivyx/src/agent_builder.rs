@@ -1051,6 +1051,12 @@ pub(crate) async fn build_agent(
         events_tx,
     );
     agent.set_injection_taint(injection_taint.clone());
+    if let Some(mission_plan_handle) = &mission_plan {
+        agent.set_mission_plan_handle(Arc::clone(mission_plan_handle));
+    }
+    if let Some(pool) = &specialist_session_pool {
+        agent.set_specialist_session_pool_handle(pool.clone());
+    }
 
     if let Some((pool, store, build_hash)) = &kv_cache_handles {
         agent.set_kv_cache(

@@ -11,8 +11,8 @@ use aivyx_sandbox::{AutonomousMode, ExecutionConfiner, InjectionTaint, PlanMode}
 use aivyx_tools::ToolExecutor;
 use aivyx_tools::wiki::StalePage;
 use aivyx_types::{
-    ContentBlock, Message, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition, ToolOutput,
-    ToolResult,
+    ContentBlock, Message, MissionPlan, Role, ToolCall, ToolCallId, ToolCallSource, ToolDefinition,
+    ToolOutput, ToolResult,
 };
 use futures::StreamExt;
 use time::OffsetDateTime;
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::edit_blocks::{self, BlockParse};
 use crate::editor_context;
 use crate::session::{self, SessionState, Task};
+use crate::specialist_sessions::SpecialistSessionPool;
 
 #[cfg(test)]
 mod tests;
@@ -175,6 +176,20 @@ pub struct Agent {
     /// mutates it); the agent reads it to emit `TasksUpdated` events and to
     /// persist it with the session.
     tasks: Arc<Mutex<Vec<Task>>>,
+    /// The same `Arc` handed to `decompose_task`/`verify_output`/
+    /// `synthesize_results` (via `MissionToolsConfig`), when `[team]
+    /// enabled = true` -- `None` otherwise. `clear_conversation` resets it
+    /// to a pristine `MissionPlan` so a later mission-tool call after
+    /// `/clear` never resurrects stale pre-clear content. Set via
+    /// `set_mission_plan_handle`, not the constructor, matching
+    /// `set_repo_map`'s own optional-state convention.
+    mission_plan: Option<Arc<Mutex<MissionPlan>>>,
+    /// The same pool handed to `spawn_specialist`/`query_specialist`/
+    /// `close_specialist` (via `SpecialistSessionsConfig`), when `[team]
+    /// enabled = true` -- `None` otherwise. `clear_conversation` calls
+    /// `close_all()` on it for the identical reason `mission_plan` above
+    /// is reset. Set via `set_specialist_session_pool_handle`.
+    specialist_session_pool: Option<SpecialistSessionPool>,
     /// Where the session is persisted after each turn; `None` disables it.
     session_path: Option<PathBuf>,
     /// Read at every request assembly (tool list + system-prompt note); the
@@ -347,6 +362,8 @@ impl Agent {
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             history_truncated: false,
             tasks,
+            mission_plan: None,
+            specialist_session_pool: None,
             session_path: None,
             plan_mode,
             autonomous_mode,
@@ -422,6 +439,16 @@ impl Agent {
     pub fn clear_conversation(&mut self) {
         self.history.clear();
         self.tasks.lock().unwrap().clear();
+        if let Some(mission_plan) = &self.mission_plan {
+            *mission_plan.lock().unwrap() = MissionPlan {
+                mission: String::new(),
+                steps: vec![],
+                summary: None,
+            };
+        }
+        if let Some(pool) = &self.specialist_session_pool {
+            pool.close_all();
+        }
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
     }
@@ -688,6 +715,21 @@ impl Agent {
     /// above for why this must be the same instance.
     pub fn set_injection_taint(&mut self, injection_taint: InjectionTaint) {
         self.injection_taint = injection_taint;
+    }
+
+    /// Attaches the shared `MissionPlan` handle `decompose_task`/
+    /// `verify_output`/`synthesize_results` also hold. See the field doc
+    /// comment above for why `clear_conversation` needs this.
+    pub fn set_mission_plan_handle(&mut self, mission_plan: Arc<Mutex<MissionPlan>>) {
+        self.mission_plan = Some(mission_plan);
+    }
+
+    /// Attaches the shared `SpecialistSessionPool` handle
+    /// `spawn_specialist`/`query_specialist`/`close_specialist` also hold.
+    /// See the field doc comment above for why `clear_conversation` needs
+    /// this.
+    pub fn set_specialist_session_pool_handle(&mut self, pool: SpecialistSessionPool) {
+        self.specialist_session_pool = Some(pool);
     }
 
     /// Re-reads the editor-context file (if configured) and stores a

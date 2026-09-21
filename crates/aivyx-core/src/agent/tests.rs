@@ -11,7 +11,7 @@ use aivyx_sandbox::{
 use aivyx_tools::{
     CommandSpec, RunCommandTool, Tool, ToolError, ToolExecutionContext, ToolRegistry,
 };
-use aivyx_types::{ToolCallId, ToolCallSource, ToolDefinition};
+use aivyx_types::{MissionStep, StepStatus, ToolCallId, ToolCallSource, ToolDefinition};
 use futures::stream::BoxStream;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -5233,6 +5233,38 @@ async fn clear_conversation_empties_history_and_tasks_and_emits_one_event() {
         matches!(events.as_slice(), [AgentEvent::ConversationCleared]),
         "expected exactly one ConversationCleared event, got: {events:?}"
     );
+}
+
+#[test]
+fn clear_conversation_resets_the_real_mission_plan_when_set() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    let mission_plan = Arc::new(Mutex::new(MissionPlan {
+        mission: "do the thing".to_string(),
+        steps: vec![MissionStep {
+            id: 1,
+            member: "implementer".to_string(),
+            task: "part one".to_string(),
+            status: StepStatus::Verified,
+            notes: None,
+        }],
+        summary: Some("done".to_string()),
+    }));
+    agent.set_mission_plan_handle(Arc::clone(&mission_plan));
+
+    agent.clear_conversation();
+
+    let cleared = mission_plan.lock().unwrap();
+    assert_eq!(cleared.mission, "");
+    assert!(cleared.steps.is_empty());
+    assert_eq!(cleared.summary, None);
+}
+
+#[test]
+fn clear_conversation_is_a_no_op_when_no_mission_plan_handle_is_set() {
+    // Must not panic when [team] enabled = false (the common case) --
+    // mission_plan stays None, clear_conversation must simply skip it.
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.clear_conversation();
 }
 
 #[test]
