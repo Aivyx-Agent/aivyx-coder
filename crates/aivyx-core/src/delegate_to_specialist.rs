@@ -590,6 +590,7 @@ mod delegation_tests {
         // The specialist's own extra_deny_paths, not the lead's -- proves
         // this is genuinely per-member, not just a copy of the lead's list.
         config.team.members[1].extra_deny_paths = vec![denied.to_string_lossy().to_string()];
+        config.team.members[1].tool_allowlist = vec!["write_file".to_string()];
         config.parent_registry = {
             let mut registry = ToolRegistry::new();
             registry.register(Arc::new(WriteFileTool));
@@ -621,6 +622,65 @@ mod delegation_tests {
             !denied.join("secret.txt").exists(),
             "the write must have been blocked by the specialist's own scoped gate -- if this \
              file exists, extra_deny_paths was not actually enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_extra_deny_paths_the_specialist_can_write_freely() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+
+        let mock = Arc::new(MockBackend::new(vec![vec![
+            StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                id: aivyx_types::ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "hello",
+                }),
+                source: aivyx_types::ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]]));
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let team = simple_team();
+        let mut config = base_config(mock, events_tx, team);
+        config.enforcement.base_deny_paths = vec![];
+        // Deliberately NO extra_deny_paths set on the member this time --
+        // this is the control proving the previous test's assertion is
+        // genuinely driven by extra_deny_paths, not some other reason
+        // (e.g. the tool simply not existing).
+        config.team.members[1].tool_allowlist = vec!["write_file".to_string()];
+        config.parent_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(WriteFileTool));
+            registry
+        };
+
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = ToolExecutionContext {
+            cwd: dir.path().to_path_buf(),
+            confiner: Arc::new(NoopConfiner),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "write the file" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ToolOutput::Ok(_)),
+            "expected Ok, got {result:?}"
+        );
+        assert!(
+            target.exists(),
+            "without extra_deny_paths, the write must genuinely succeed -- if this fails, the \
+             previous test (with extra_deny_paths) may not actually be testing what it claims"
         );
     }
 

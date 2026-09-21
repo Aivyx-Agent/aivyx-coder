@@ -132,12 +132,21 @@ silently transfer to a narrower-scoped specialist.
   `exclude()`-by-name logic) — already correct, untouched.
 - Reconstructing `GrepTool`/`GlobTool`/`RepoMap` with the specialist's own
   narrower `deny_paths` — confirmed with the project owner as
-  deliberately out of scope for this pass: a specialist's search/listing
-  results may still reveal matches inside an extra-denied path (a lesser
-  leak — file *existence*/matched lines, not content), but any actual
+  deliberately out of scope for this pass, but the residual exposure here
+  is real, not cosmetic: a specialist holding `grep`/`glob` in its
+  `tool_allowlist` still runs against the *lead's* `deny_paths`, not its
+  own narrower union, and `GrepTool` (`crates/aivyx-tools/src/tools/
+  grep.rs`) returns full matched line text
+  (`format!("{display_path}:{line_number}:{line}")`) up to
+  `MAX_MATCHES = 200`. For any file under 200 lines inside a specialist's
+  own `extra_deny_paths` — a `.env`, an `id_rsa`, a small credentials
+  file — `grep(pattern=".", path=<extra-denied dir>)` returns the
+  **complete file content**, not merely evidence that the file exists.
+  This is a real, accepted residual gap for this pass, not just a lesser
+  existence/match-count leak; any actual
   `read_file`/`write_file`/`edit_file`/`move_file`/`delete_file`/
-  `run_command`/`run_shell` targeting that path is genuinely blocked by
-  the scoped gate and confiner this spec adds.
+  `run_command`/`run_shell` targeting that path is still genuinely
+  blocked by the scoped gate and confiner this spec adds.
 - Any change to `aivyx_team::effective_deny_paths` itself, or to
   `TeamMember`'s schema — both already correct and unchanged; this spec
   only wires the union logic's *intent* into the real enforcement path

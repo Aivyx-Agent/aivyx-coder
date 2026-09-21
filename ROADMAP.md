@@ -544,6 +544,28 @@ silently discarded instead of falling through to re-warm (leaving a key
 stuck cold forever), and a slot-pool leak if the warm-up future was
 dropped mid-flight before the checked-out id was recorded.
 
+**Specialist deny-paths attenuation — shipped (2026-09-21).** Previously,
+a delegated "specialist" sub-agent (`delegate_to_specialist`/
+`spawn_specialist`) ran under the exact same, unattenuated
+`ConfirmationGate`/`ExecutionConfiner` instances as the lead — only which
+*tools* were visible to it was scoped, not which paths those tools could
+touch. Fixed with a new `crates/aivyx-core/src/specialist_enforcement.rs`
+(`scoped_gate_and_confiner`, `SpecialistEnforcementIngredients`), which
+builds each specialist its own gate/confiner from the lead's
+`deny_paths` unioned with that member's own `TeamMember.extra_deny_paths`
+(`aivyx_team::effective_deny_paths`); wired into both delegation paths
+(`delegate_to_specialist.rs`, `specialist_sessions.rs`) and constructed
+in `crates/aivyx/src/agent_builder.rs`. A no-op for the shipped default
+roster today — no member in `aivyx_team::default_coding_roster()` sets
+`extra_deny_paths` yet — but the enforcement path is real and proven: a
+specialist's own `extra_deny_paths` genuinely blocks a `write_file` the
+lead itself could do, confirmed by both a real test (and its positive
+control, proving the same test fails for the right reason when
+`extra_deny_paths` is absent) and by hand-tracing confiner propagation
+and `MoveFileTool`'s both-endpoint check. See
+`docs/superpowers/specs/2026-09-21-specialist-deny-paths-attenuation-design.md`.
+Deferred follow-ups from the final review are tracked below.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
@@ -833,3 +855,32 @@ deferred, not overlooked):
   end-to-end test of `build_agent`'s entire block would need a complete
   `Settings`/`Cli` fixture this crate has no harness for, left as a
   heavier follow-up. All three new tests mutation-proofed.
+
+**New backlog, from specialist deny-paths attenuation's
+(`crates/aivyx-core/src/specialist_enforcement.rs`,
+`delegate_to_specialist.rs`, `specialist_sessions.rs`,
+`crates/aivyx/src/agent_builder.rs`) own final review** — deliberately
+deferred, not overlooked:
+- `scoped_gate_and_confiner` does a real (potentially slow) filesystem
+  walk to build the Landlock ruleset on *every* `delegate_to_specialist`/
+  `spawn_specialist` call, unlike the lead's own gate/confiner, built
+  once per process — synchronous inside an async fn, no `spawn_blocking`.
+  Memoizing the `(gate, confiner)` pair per `(member name, cwd)` would
+  fix this and also fix the next item in one change.
+- A specialist's Always-Allow cache resets on every delegation call, not
+  just once per session, since a fresh `ConfirmationGate` is built each
+  time — meaning the same command re-prompts (interactive mode) or gets
+  denied (autonomous mode, since a previously-lead-earned approval no
+  longer applies) on every single delegation, not just the first.
+- No test exercises the confiner (OS-level Landlock) side of this
+  feature directly — only the gate side, via `write_file`. A Linux-gated
+  test asserting a specialist's `run_command` genuinely cannot read/write
+  a file under its own `extra_deny_paths` would be the highest-value
+  addition.
+- `GrepTool`/`GlobTool`/`RepoMap` still carry the lead's `deny_paths`,
+  not the specialist's narrower union — and this is a real content leak,
+  not just an existence leak: `GrepTool` returns full matched line text,
+  so a specialist holding `grep` in its `tool_allowlist` can read the
+  complete content of any small file (under `MAX_MATCHES = 200` lines)
+  inside its own `extra_deny_paths`. See the design spec's "What this
+  spec does not decide" section for the corrected severity writeup.

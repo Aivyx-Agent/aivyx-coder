@@ -310,6 +310,11 @@ pub(crate) async fn build_agent(
         settings.sandbox.require_enforcement,
     );
 
+    // On a build compiled without `sandbox-backend` (see the warning just
+    // below), a specialist's `extra_deny_paths` still protects direct
+    // file-tool calls via the gate half of `scoped_gate_and_confiner`, but
+    // gives zero protection against that specialist's `run_command`/
+    // `run_shell`, since the confiner half is `NoopConfiner` there too.
     let specialist_enforcement_ingredients =
         aivyx_core::specialist_enforcement::SpecialistEnforcementIngredients {
             prompter: Arc::clone(&prompter),

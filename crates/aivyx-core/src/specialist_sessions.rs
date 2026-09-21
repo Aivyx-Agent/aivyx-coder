@@ -1374,4 +1374,65 @@ mod specialist_session_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn a_specialists_own_extra_deny_paths_blocks_a_write_via_spawn_specialist() {
+        // Mirrors delegate_to_specialist.rs's own
+        // `a_specialists_own_extra_deny_paths_blocks_a_write_the_lead_could_do`
+        // -- proves the identical scoped gate/confiner wiring
+        // (`build_specialist_agent` -> `scoped_gate_and_confiner`) is
+        // genuinely enforced on the `spawn_specialist` path too, not just
+        // `delegate_to_specialist`'s.
+        let dir = tempfile::tempdir().unwrap();
+        let denied = dir.path().join("denied");
+        std::fs::create_dir_all(&denied).unwrap();
+
+        let mock = Arc::new(MockBackend::new(vec![vec![
+            StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                id: aivyx_types::ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": denied.join("secret.txt").to_string_lossy(),
+                    "content": "leaked",
+                }),
+                source: aivyx_types::ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]]));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let mut cfg = config(mock, tx, simple_team(), pool);
+        cfg.enforcement.base_deny_paths = vec![];
+        // The specialist's own extra_deny_paths, not the lead's -- proves
+        // this is genuinely per-member, not just a copy of the lead's list.
+        cfg.team.members[1].extra_deny_paths = vec![denied.to_string_lossy().to_string()];
+        cfg.team.members[1].tool_allowlist = vec!["write_file".to_string()];
+        cfg.parent_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(aivyx_tools::WriteFileTool));
+            registry
+        };
+
+        let tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(dir.path());
+        let result = tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "write the secret" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ToolOutput::Ok(_)),
+            "expected Ok, got {result:?}"
+        );
+        assert!(
+            !denied.join("secret.txt").exists(),
+            "the write must have been blocked by the specialist's own scoped gate -- if this \
+             file exists, extra_deny_paths was not actually enforced via spawn_specialist"
+        );
+    }
 }
