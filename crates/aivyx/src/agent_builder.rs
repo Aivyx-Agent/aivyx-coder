@@ -108,6 +108,34 @@ pub(crate) struct BuiltAgent {
     pub(crate) specialist_session_pool: Option<aivyx_core::SpecialistSessionPool>,
 }
 
+/// Resolves the effective team roster -- a custom one loaded from
+/// `[team] roster_path` if set, otherwise `aivyx_team::default_coding_roster()`
+/// -- and validates it against `available_tools` unconditionally (even
+/// the default roster, previously never validated in production code).
+/// Extracted from `build_agent`, mirroring `build_llm_backend`'s own
+/// extraction rationale just below: directly testable without building a
+/// full `BuiltAgent`. Any failure (unreadable file, unparseable TOML, or
+/// a real `TeamConfigError`) is an `Err` -- the caller fails closed by
+/// propagating it with `?`, refusing to start rather than silently
+/// falling back to the default roster or running with a broken one.
+fn resolve_team_config(
+    settings: &Settings,
+    available_tools: &[&str],
+) -> anyhow::Result<aivyx_team::TeamConfig> {
+    let team = match settings.team.resolved_roster_path() {
+        Some(path) => {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("failed to read [team] roster_path {path:?}: {e}"))?;
+            toml::from_str::<aivyx_team::TeamConfig>(&raw)
+                .map_err(|e| anyhow::anyhow!("failed to parse roster file {path:?}: {e}"))?
+        }
+        None => aivyx_team::default_coding_roster(),
+    };
+    team.validate(available_tools)
+        .map_err(|e| anyhow::anyhow!("[team] roster is invalid: {e}"))?;
+    Ok(team)
+}
+
 /// Constructs the configured `LlmBackend`. Extracted from `build_agent`
 /// so the dispatch itself -- including its error path when a required
 /// mistral.rs config field is missing -- is directly testable without
@@ -737,7 +765,18 @@ pub(crate) async fn build_agent(
         // registered later in this same block, need their own copy.
         let mut team_parent_registry = registry.clone();
         team_parent_registry.exclude(&["repl_start", "repl_send", "repl_stop"]);
-        let team = aivyx_team::default_coding_roster();
+        // Snapshot at this exact point (before decompose_task/verify_output/
+        // synthesize_results/spawn_specialist/query_specialist/close_specialist
+        // are registered further down) -- see team_parent_registry's own
+        // comment just above this block for why a custom roster's
+        // tool_allowlist can never validate-pass naming any of those six
+        // tools, by construction, not by this check alone.
+        let team_registry_definitions = registry.definitions();
+        let available_tools: Vec<&str> = team_registry_definitions
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        let team = resolve_team_config(settings, &available_tools)?;
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
                 llm: Arc::clone(&llm),
@@ -1317,5 +1356,132 @@ mod tests {
             err.to_string().contains("provider-mistral-rs"),
             "error should name the missing feature, got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_team_config_uses_the_default_roster_when_unset() {
+        let settings = Settings::default();
+        // Must cover every tool any default_coding_roster() member's
+        // tool_allowlist names (implementer/reviewer/tester need more
+        // than just read_file/write_file/set_tasks), since
+        // resolve_team_config validates the default roster too.
+        let available = [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "grep",
+            "glob",
+            "run_command",
+            "run_shell",
+            "git_read",
+            "set_tasks",
+        ];
+        let team = resolve_team_config(&settings, &available).unwrap();
+        assert_eq!(team.lead, aivyx_team::default_coding_roster().lead);
+    }
+
+    #[test]
+    fn resolve_team_config_loads_and_validates_a_custom_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let roster_path = dir.path().join("roster.toml");
+        std::fs::write(
+            &roster_path,
+            r#"
+lead = "coordinator"
+
+[[members]]
+name = "coordinator"
+role = "Lead"
+persona = "You delegate."
+tool_allowlist = ["set_tasks"]
+
+[[members]]
+name = "implementer"
+role = "Implementer"
+persona = "You implement."
+tool_allowlist = ["read_file", "write_file"]
+extra_deny_paths = ["secrets/"]
+"#,
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some(roster_path.to_string_lossy().to_string());
+        let available = ["read_file", "write_file", "set_tasks"];
+        let team = resolve_team_config(&settings, &available).unwrap();
+        assert_eq!(team.lead, "coordinator");
+        assert_eq!(team.members.len(), 2);
+        assert_eq!(
+            team.members[1].extra_deny_paths,
+            vec!["secrets/".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_team_config_fails_closed_on_a_missing_file() {
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some("/tmp/definitely-does-not-exist-roster.toml".to_string());
+        let available = ["read_file"];
+        let err = resolve_team_config(&settings, &available).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to read"),
+            "error should name the read failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_team_config_fails_closed_on_unparseable_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let roster_path = dir.path().join("broken.toml");
+        std::fs::write(&roster_path, "this is not valid toml [[[").unwrap();
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some(roster_path.to_string_lossy().to_string());
+        let available = ["read_file"];
+        let err = resolve_team_config(&settings, &available).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "error should name the parse failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_team_config_fails_closed_on_a_real_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let roster_path = dir.path().join("bad-lead.toml");
+        std::fs::write(
+            &roster_path,
+            r#"
+lead = "nobody"
+
+[[members]]
+name = "someone"
+role = "Specialist"
+persona = "..."
+tool_allowlist = []
+"#,
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some(roster_path.to_string_lossy().to_string());
+        let available = ["read_file"];
+        let err = resolve_team_config(&settings, &available).unwrap_err();
+        assert!(
+            err.to_string().contains("roster is invalid"),
+            "error should name the validation failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_team_config_validates_the_default_roster_too() {
+        // The default roster is already known-valid, so this should
+        // simply succeed -- proving validate() is genuinely called
+        // unconditionally, not skipped when roster_path is unset.
+        let settings = Settings::default();
+        let default_roster = aivyx_team::default_coding_roster();
+        let default_roster_tools: Vec<&str> = default_roster
+            .members
+            .iter()
+            .flat_map(|m| m.tool_allowlist.iter().map(|s| s.as_str()))
+            .collect();
+        assert!(resolve_team_config(&settings, &default_roster_tools).is_ok());
     }
 }

@@ -486,6 +486,18 @@ pub struct TeamSettings {
     /// `spawn_specialist`/`query_specialist`/`close_specialist` call that
     /// touches the pool after this long has elapsed.
     pub specialist_session_idle_timeout_secs: u64,
+    /// Path to a TOML file deserializing as `aivyx_team::TeamConfig`
+    /// (`{ lead: String, members: [TeamMember] }`), used instead of
+    /// `aivyx_team::default_coding_roster()` when set. Tilde-expanded and
+    /// symlink-canonicalized the same way as `BackendSettings
+    /// ::kvcache_store_path` (see `resolved_roster_path` below). `None`
+    /// (the default) means the fixed default roster, unchanged from
+    /// before this field existed. Validated at startup
+    /// (`TeamConfig::validate`) against the real registered tool list --
+    /// any failure (missing file, unparseable TOML, or a real validation
+    /// error) refuses to start rather than silently falling back or
+    /// running with a broken roster.
+    pub roster_path: Option<String>,
 }
 
 impl Default for TeamSettings {
@@ -494,6 +506,7 @@ impl Default for TeamSettings {
             enabled: false,
             max_concurrent_specialist_sessions: 3,
             specialist_session_idle_timeout_secs: 600,
+            roster_path: None,
         }
     }
 }
@@ -642,6 +655,22 @@ impl BackendSettings {
                 None => std::env::temp_dir().join("aivyx-coder").join("kvcache"),
             },
         }
+    }
+}
+
+impl TeamSettings {
+    /// The custom roster file path this run actually uses, tilde-expanded
+    /// and symlink-canonicalized the same way as
+    /// `BackendSettings::resolved_kvcache_store_path` -- `None` when
+    /// `roster_path` itself is unset, meaning "use
+    /// `aivyx_team::default_coding_roster()`" (no path to resolve).
+    pub fn resolved_roster_path(&self) -> Option<PathBuf> {
+        self.roster_path.as_ref().map(|raw| {
+            resolve_tilde_paths(std::slice::from_ref(raw))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| PathBuf::from(raw))
+        })
     }
 }
 
@@ -2216,5 +2245,33 @@ mod tests {
         assert!(settings.team.enabled);
         assert_eq!(settings.team.max_concurrent_specialist_sessions, 5);
         assert_eq!(settings.team.specialist_session_idle_timeout_secs, 120);
+    }
+
+    #[test]
+    fn team_settings_roster_path_defaults_to_none() {
+        assert_eq!(TeamSettings::default().roster_path, None);
+        assert_eq!(TeamSettings::default().resolved_roster_path(), None);
+    }
+
+    #[test]
+    fn team_settings_roster_path_round_trips_through_toml() {
+        let toml_str = "[team]\nenabled = true\nroster_path = \"/tmp/my-roster.toml\"\n";
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            settings.team.roster_path,
+            Some("/tmp/my-roster.toml".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_roster_path_leaves_a_non_tilde_path_unchanged() {
+        let settings = TeamSettings {
+            roster_path: Some("/tmp/my-roster.toml".to_string()),
+            ..TeamSettings::default()
+        };
+        assert_eq!(
+            settings.resolved_roster_path(),
+            Some(PathBuf::from("/tmp/my-roster.toml"))
+        );
     }
 }
