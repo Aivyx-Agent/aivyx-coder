@@ -127,6 +127,22 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().max_concurrent
     }
 
+    /// Drops every currently-parked session at once, closing each one's
+    /// underlying `Agent`. Unlike `CloseSpecialistTool`'s own
+    /// single-session close path (which explicitly `.await`s the closed
+    /// session's `forward_task` before reporting success to the model),
+    /// this doesn't await anything: dropping a parked session's `Agent`
+    /// closes the event channel its background forwarding task reads
+    /// from, so that task's next `.recv()` call returns `None` and it
+    /// ends on its own -- correct without needing an `async` signature
+    /// here, which matters since this is called from
+    /// `Agent::clear_conversation`, a synchronous method. Used by
+    /// `/clear` so a specialist session never stays queryable against a
+    /// lead conversation that's just been wiped.
+    pub fn close_all(&self) {
+        self.inner.lock().unwrap().sessions.clear();
+    }
+
     /// A snapshot of every currently-open session's id and member, evicting
     /// stale (idle-timed-out) entries first -- mirroring `take`'s/
     /// `insert_new`'s own pattern, so this really is "every currently-open
@@ -1110,6 +1126,41 @@ mod specialist_session_tests {
             .await
             .unwrap();
         assert!(matches!(second, ToolOutput::Ok(_)));
+    }
+
+    #[tokio::test]
+    async fn close_all_removes_every_open_session() {
+        let llm = Arc::new(MockBackend::new(vec![
+            text_response("session one"),
+            text_response("session two"),
+        ]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm, tx, simple_team(), pool.clone());
+        let spawn_tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        for _ in 0..2 {
+            spawn_tool
+                .execute(
+                    serde_json::json!({ "member": "implementer", "task": "do something" }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            pool.open_sessions().len(),
+            2,
+            "both sessions should be open before close_all"
+        );
+
+        pool.close_all();
+
+        assert!(
+            pool.open_sessions().is_empty(),
+            "close_all must remove every open session"
+        );
     }
 
     #[tokio::test]
