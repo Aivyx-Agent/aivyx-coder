@@ -402,16 +402,19 @@ deliberate, justified duplicate this time, since the crate's real
 architectural boundary (zero dependency on *other workspace crates*, not
 zero external dependencies at all) stays intact.
 
-**Docker Model Runner serving support — documented, pending live
-verification.** A new `README.md` "Serving" subsection covers Docker
-Model Runner (DMR) as another local-LLM backend option — no code
-changes needed, since `base_url` already targets any OpenAI-compatible
-endpoint generically. Unlike every other backend documented in this
-project, none of this subsection's technical claims (the exact `base_url`
-path, the context-window default behavior, whether tool-calling works
-end-to-end through aivyx's native edit format) have been confirmed
-against a real running instance yet — see `docs/HISTORY.md` for the full
-account of what's confirmed vs. still open.
+**Docker Model Runner serving support — partially live-verified,
+container connectivity also shipped.** Base URL, model-naming
+convention, and basic chat completions confirmed live 2026-09-21 against
+a real DMR instance (both from a native `aivyx-coder` and, new this
+entry, from inside `aivyx-coder`'s own Docker container via
+`host.docker.internal:12434/engines/v1` — including a real host-firewall
+hairpin-NAT fix required to make that path work at all). Still open: the
+context-window runtime default (a real pulled model's GGUF metadata
+shows 8192, a different fact from the actual serving-time default, which
+remains unconfirmed) and whether tool-calling works end-to-end through
+aivyx's native edit format. `probe.rs`'s DMR extension is now confirmed
+blocked, not just deferred — no diagnostic endpoint exists at either
+shape checked. See `docs/HISTORY.md` for the full account.
 
 **`wiki_pointer_lines` `deny_paths` enforcement — shipped.** Found at the
 Landlock + `aivyx-repomap` basename-glob enforcement feature's own final

@@ -742,6 +742,45 @@ probe confirming a Landlock grant scoped to a bind-mounted directory
 correctly allows reads/writes within it (visible on the real host
 filesystem) while denying reads outside it.
 
+**Connecting to Docker Model Runner (DMR).** If the LLM backend is DMR
+instead of Ollama/llama-server, the same `--add-host` flag above is
+required, but the `base_url` path differs — DMR serves its
+OpenAI-compatible API under `/engines/v1`, not bare `/v1`:
+
+```toml
+[backend]
+base_url = "http://host.docker.internal:12434/engines/v1"
+model = "ai/smollm2:135M-Q4_K_M"
+```
+
+Confirmed live end-to-end (2026-09-21): a real chat completion
+round-trip through this exact path from inside a container, against a
+real DMR instance running on the host.
+
+**Troubleshooting: container can't reach DMR (or any host-published
+service) even with `--add-host` set.** Symptom: `curl` from inside the
+container times out against `host.docker.internal:<port>`, while the
+same address works fine from the host itself. Cause, confirmed on one
+real machine: a host firewall (`iptables`/`ufw`) with a default-deny
+`INPUT` policy blocks the container→host-gateway path even though
+Docker's own port-publish networking is correctly configured — Docker's
+port-publish DNAT rule deliberately excludes traffic *originating from*
+the bridge network (`docker0`) to avoid a hairpin-NAT loop, so the
+packet is delivered locally instead of NAT'd, and a strict host firewall
+then drops it with no matching rule. Fix (scoped to exactly this
+traffic, on Linux):
+
+```
+sudo iptables -I INPUT -i docker0 -p tcp --dport <port> -j ACCEPT
+```
+
+This is a property of the host's own firewall configuration, not
+something `aivyx-coder`'s `Dockerfile` or config can detect or fix — if
+a `host.docker.internal`-based connection times out (not "connection
+refused"), check the host firewall before assuming the backend is
+misconfigured. See `docs/HISTORY.md`'s Docker Model Runner chapter for
+the full diagnosis.
+
 ## Serving
 
 aivyx speaks the OpenAI-compatible `/v1` API, so any local server works.
@@ -882,12 +921,10 @@ benchmark reproduced the native 9/9 / prompted 6/9 result exactly against
 a Lemonade-managed `qwen3.5:9b`.
 
 **Docker Model Runner (Docker Desktop/Engine's built-in local model
-runner).** ⚠️ **Not yet live-verified** — everything in this subsection
-comes from Docker's own documentation and third-party write-ups
-gathered during research, not from a real running instance (unlike
-every other backend above, which was confirmed live before being
-written down). Treat the specifics here as a starting point, not a
-guarantee, until someone runs it.
+runner).** Base URL, model-naming convention, and basic chat completions
+confirmed live 2026-09-21 against a real running instance (see
+`docs/HISTORY.md`). ⚠️ **The context-window default and end-to-end
+tool-calling below are still unverified.**
 
 Docker Model Runner (DMR) serves local models through an
 OpenAI-compatible API, integrated into the normal Docker workflow —
@@ -910,14 +947,22 @@ explicitly configured. Set it with `docker model configure
 --context-size N <model>` (or a `context_size:` key under `models:` in
 a Docker Compose file) before pointing aivyx at it — and note that
 aivyx's own startup probe (which catches this automatically for Ollama)
-does **not** currently detect it for DMR, since DMR's diagnostic
-endpoint shape isn't confirmed yet (see `probe.rs`). Until that's
-extended, confirm your configured context size manually rather than
-relying on a truncation warning. One third-party report (recent, but not
-precisely dated) found a specific Docker CUDA runtime image that
-hard-coded `--ctx-size 4096` regardless of the `configure` setting —
-worth checking for on whatever version you actually install, not
-assumed fixed or still-broken.
+does **not** detect it for DMR: confirmed 2026-09-21 that no
+`/props`-equivalent diagnostic endpoint exists at either
+`.../engines/v1/props` or `.../engines/llama.cpp/v1/props` (both return
+`not found`), so a `probe.rs` extension for DMR stays blocked, not just
+unimplemented. Until DMR ships some other diagnostic shape, confirm your
+configured context size manually rather than relying on a truncation
+warning. **The 4096-default claim itself is still unconfirmed** — a real
+pulled model's own GGUF metadata (`docker model inspect`,
+`llama.context_length`) reports its trained/max context (8192 for the
+model tested), but that is a different, weaker fact than the actual
+*runtime serving* default DMR applies, which wasn't directly tested (no
+diagnostic endpoint to read it from, and no large-prompt truncation test
+was run). One third-party report (recent, but not precisely dated) found
+a specific Docker CUDA runtime image that hard-coded `--ctx-size 4096`
+regardless of the `configure` setting — worth checking for on whatever
+version you actually install, not assumed fixed or still-broken.
 
 Tool/function calling is documented as supported (backed by llama.cpp),
 but hasn't been checked end-to-end through aivyx's own native edit

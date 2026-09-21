@@ -3310,7 +3310,7 @@ narrow race window.
 With this shipped, the entire 2026-07-28 capability-audit backlog
 lineage is closed — no tracked items remain in `ROADMAP.md`.
 
-### Docker Model Runner serving support — documented, live verification pending
+### Docker Model Runner serving support — base connectivity verified 2026-09-21, container support added
 
 Originally raised as part of a larger idea — packaging aivyx-coder
 itself as a Docker/container-based distribution, with Docker Model
@@ -3351,48 +3351,86 @@ an opaque prefix and appends `/chat/completions` directly, so pointing
 it at DMR needed zero code changes — the same "no new config surface
 needed" shape as the earlier vLLM compat pass.
 
-**Everything in the new subsection is honestly flagged as unverified**,
-a deliberate departure from how every other backend in this project has
-been documented — Ollama, llama-server, Lemonade, and vLLM were each
-confirmed against a real running instance (live E2E tests, acceptance
-benchmarks, or at minimum a manual compat check) before being written
-into `README.md`. For DMR: no running Docker daemon was accessible
-during this chapter's research, so the base URL
-(`http://localhost:12434/engines/v1`), the model-naming convention
-(`namespace/name[:tag]`), the reported hidden-context-window default
-(4096, unless set via `docker model configure --context-size N`), and
-whether tool/function calling actually works end-to-end through aivyx's
-native edit format are all drawn from Docker's own docs and third-party
-write-ups, not confirmed firsthand. One specific claim worth
-double-checking on a real install: a third-party report found a Docker
-CUDA runtime image that hard-coded `--ctx-size 4096` regardless of the
-`configure` setting — possibly since fixed, possibly not.
+**Live-verified 2026-09-21, correcting the original "everything
+unverified" framing below.** DMR was installed for real on this
+session's own machine (CachyOS/Arch, Docker CE v29.7.2, no Docker
+Desktop) via the `docker-model-plugin` AUR package, `docker model
+install-runner` (which itself runs DMR as a real Docker container,
+`docker/model-runner:latest-cuda` — not a bare host process, correcting
+Docker's own marketing description of "host-native" inference), and
+`docker model pull ai/smollm2:135M-Q4_K_M`. Confirmed against a real
+running instance: the base URL (`http://localhost:12434/engines/v1`),
+the model-naming convention (`namespace/name[:tag]`), and a real chat
+completion request/response round-trip with usage/timing stats. **Still
+unconfirmed**: the reported hidden-context-window default (4096, unless
+set via `docker model configure --context-size N`) — a pulled model's
+own GGUF metadata (`docker model inspect`) reports `llama.context_length:
+8192`, but that's the model's trained/max context, a different and
+weaker fact than the actual runtime serving default, which no available
+diagnostic endpoint could confirm (see below) and no large-prompt
+truncation test was run to check directly — and whether tool/function
+calling actually works end-to-end through aivyx's native edit format,
+still not exercised. The specific third-party report of a Docker CUDA
+runtime image hard-coding `--ctx-size 4096` regardless of the
+`configure` setting also remains unchecked on the version installed
+here.
 
-**`probe.rs`'s automatic context-window detection was deliberately not
-extended for DMR in this chapter.** Its origin-derivation logic
-(`base_url.trim_end_matches('/').trim_end_matches("/v1")`) only strips a
-trailing `/v1`; for DMR's `.../engines/v1` base URL this leaves
-`.../engines` as the computed origin, an assumption not confirmed to
-line up with wherever DMR's actual diagnostic endpoint (if one even
-exists in an Ollama-`/api/show`-compatible shape) actually lives.
+**`probe.rs`'s automatic context-window detection stays unextended for
+DMR — now confirmed blocked, not just deferred.** Its origin-derivation
+logic (`base_url.trim_end_matches('/').trim_end_matches("/v1")`) only
+strips a trailing `/v1`; for DMR's `.../engines/v1` base URL this leaves
+`.../engines` as the computed origin. Checked directly 2026-09-21
+against a real running DMR instance: neither
+`.../engines/v1/props` nor `.../engines/llama.cpp/v1/props` exist (both
+return `not found`) — there is no Ollama-`/api/show`-compatible
+diagnostic endpoint at either shape a reasonable guess would produce.
 Shipping a guessed implementation would have been shipping unverified
-parsing logic — low-risk, since both existing parsers fail safe to
-`ServedContext::Unknown` on any shape mismatch rather than misreporting
-a wrong number, but still speculative code with no way to confirm it
-helps anyone until tested live. **General lesson, consistent with this
+parsing logic against an endpoint now confirmed not to exist at the
+locations checked — low-risk either way, since both existing parsers
+fail safe to `ServedContext::Unknown` on any shape mismatch rather than
+misreporting a wrong number. **General lesson, consistent with this
 project's established practice** (see the `diffy` and `cargo test`
 path-filtering findings elsewhere in this history): verify a
 dependency's or service's actual behavior before writing code against
 assumptions about it — documentation with an honest "unverified" label
 is more useful than code that quietly might not work.
 
-**Still open, the actual next step for this chapter**: a live check
-against a real Docker Model Runner instance — confirming the base URL
-and model-naming convention actually work, confirming or correcting the
-context-window default behavior on whatever version is actually
-installed, checking tool-calling end-to-end through aivyx's native edit
-format, and — if a real diagnostic endpoint is found — a follow-up
-`probe.rs` extension using the now-confirmed shape.
+**Still open**: confirming or correcting the context-window runtime
+default (as distinct from the model's own trained/max context, which
+*is* now confirmed via `docker model inspect`), and checking
+tool-calling end-to-end through aivyx's native edit format. The
+`probe.rs` extension is not "still open" in the original sense — it's
+confirmed blocked absent DMR shipping some other diagnostic endpoint
+shape in a future version.
+
+**New this update: container connectivity, verified end-to-end.**
+`aivyx-coder`'s own Docker container distribution (see this file's
+"Docker container distribution" coverage and `README.md`'s "Docker"
+section) can reach a host-run DMR via the same
+`--add-host=host.docker.internal:host-gateway` mechanism already
+documented for Ollama/llama-server, with a different `base_url` path
+(`/engines/v1` instead of bare `/v1`). `docker inspect` on the running
+`docker-model-runner` container shows it publishes port 12434 bound to
+both `127.0.0.1` and the bridge gateway IP (`172.17.0.1` on this
+machine) — a deliberate choice enabling exactly this
+`host.docker.internal` path. Initial testing from inside a real
+container timed out (`HTTP 000`) against `host.docker.internal:12434`
+despite the same address working from the host itself. Root-caused by
+hand through `iptables`: `FORWARD` policy `DROP`, then confirmed the
+`DOCKER`-chain DNAT rule for port 12434 explicitly excludes
+`docker0`-sourced traffic (`!docker0` in its match — Docker's own
+anti-hairpin-loop default), so the packet is delivered locally instead
+of NAT'd to the actual `docker-model-runner` container, and the host's
+`INPUT` chain (also policy `DROP` here, via a persisted `iptables`/`ufw`
+ruleset) drops it with no matching ACCEPT rule. Fixed with a single
+scoped rule (`iptables -I INPUT -i docker0 -p tcp --dport 12434 -j
+ACCEPT`); re-tested afterward — both a plain HTTP request and a real
+chat completion round-trip through
+`host.docker.internal:12434/engines/v1/chat/completions` succeeded from
+inside a container. This firewall dependency is host-specific, not a
+DMR or `aivyx-coder` defect — documented as a named troubleshooting item
+in `README.md`'s "Docker" section rather than something this project can
+detect or fix in code.
 
 ### `wiki_pointer_lines` `deny_paths` enforcement — ✅ shipped
 
