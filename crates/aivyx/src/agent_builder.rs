@@ -287,6 +287,10 @@ pub(crate) async fn build_agent(
         );
     }
 
+    // Cloned before the move below -- also seeds every specialist's own
+    // scoped gate (see `specialist_enforcement_ingredients` further down),
+    // which needs its own copy of the same config-level trust list.
+    let specialist_pre_approved_commands = pre_approved_commands.clone();
     let gate: Arc<dyn PermissionGate> = Arc::new(
         ConfirmationGate::new(
             Arc::clone(&prompter),
@@ -305,6 +309,19 @@ pub(crate) async fn build_agent(
         &deny_paths,
         settings.sandbox.require_enforcement,
     );
+
+    let specialist_enforcement_ingredients =
+        aivyx_core::specialist_enforcement::SpecialistEnforcementIngredients {
+            prompter: Arc::clone(&prompter),
+            base_deny_paths: deny_paths.clone(),
+            pre_approved_commands: specialist_pre_approved_commands,
+            plan_mode: plan_mode.clone(),
+            autonomous_mode: autonomous_mode.clone(),
+            editor_approval_enabled: settings.editor_approval.enabled,
+            injection_taint: injection_taint.clone(),
+            extra_read_paths: settings.sandbox.resolved_extra_read_paths(),
+            require_enforcement: settings.sandbox.require_enforcement,
+        };
     // This build has no `sandbox-backend` compiled in (e.g. a macOS
     // binary, where landlock/seccompiler don't exist), so `default_confiner`
     // above always returns the `NoopConfiner` fallback — real OS-level
@@ -719,8 +736,7 @@ pub(crate) async fn build_agent(
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
                 llm: Arc::clone(&llm),
-                gate: Arc::clone(&gate),
-                confiner: Arc::clone(&confiner),
+                enforcement: specialist_enforcement_ingredients.clone(),
                 checkpointer: checkpointer.clone(),
                 repo_map: repo_map.clone(),
                 events_tx: events_tx.clone(),
@@ -784,8 +800,7 @@ pub(crate) async fn build_agent(
         specialist_session_pool = Some(specialist_session_pool_handle.clone());
         let specialist_sessions_config = aivyx_core::SpecialistSessionsConfig {
             llm: Arc::clone(&llm),
-            gate: Arc::clone(&gate),
-            confiner: Arc::clone(&confiner),
+            enforcement: specialist_enforcement_ingredients,
             checkpointer: checkpointer.clone(),
             repo_map: repo_map.clone(),
             events_tx: events_tx.clone(),

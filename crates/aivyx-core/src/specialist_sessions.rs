@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 use aivyx_llm::LlmBackend;
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{
-    ActionKind, AutonomousMode, ExecutionConfiner, InjectionTaint, PermissionGate,
-    PermissionRequest, PermissionTarget, PlanMode,
+    ActionKind, AutonomousMode, InjectionTaint, PermissionRequest, PermissionTarget, PlanMode,
 };
 use aivyx_team::TeamConfig;
 use aivyx_tools::{
@@ -206,8 +205,7 @@ impl SpecialistSessionPool {
 #[derive(Clone)]
 pub struct SpecialistSessionsConfig {
     pub llm: Arc<dyn LlmBackend>,
-    pub gate: Arc<dyn PermissionGate>,
-    pub confiner: Arc<dyn ExecutionConfiner>,
+    pub enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients,
     pub checkpointer: Option<Arc<GitCheckpointer>>,
     pub repo_map: Option<(Arc<RepoMap>, u32)>,
     pub events_tx: UnboundedSender<AgentEvent>,
@@ -331,6 +329,7 @@ async fn run_bounded_exchange(
 fn build_specialist_agent(
     member: &aivyx_team::TeamMember,
     config: &SpecialistSessionsConfig,
+    cwd: &std::path::Path,
 ) -> (
     Agent,
     tokio::task::JoinHandle<()>,
@@ -338,11 +337,9 @@ fn build_specialist_agent(
     BarrierSender,
 ) {
     let specialist_registry = compute_specialist_registry(member, &config.parent_registry);
-    let mut sub_executor = ToolExecutor::new(
-        specialist_registry,
-        Arc::clone(&config.gate),
-        Arc::clone(&config.confiner),
-    );
+    let (gate, confiner) =
+        crate::specialist_enforcement::scoped_gate_and_confiner(&config.enforcement, member, cwd);
+    let mut sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
     if let Some(checkpointer) = &config.checkpointer {
         sub_executor.set_checkpointer(Arc::clone(checkpointer));
     }
@@ -529,7 +526,7 @@ impl Tool for SpawnSpecialistTool {
         }
 
         let (mut agent, forward_task, accumulated, barrier_tx) =
-            build_specialist_agent(member, &self.config);
+            build_specialist_agent(member, &self.config, &ctx.cwd);
         let output = run_bounded_exchange(
             &mut agent,
             args.task,
@@ -738,7 +735,7 @@ impl Tool for CloseSpecialistTool {
 mod specialist_session_tests {
     use super::*;
     use aivyx_llm::{ChatRequest, FinishReason, LlmError, StreamEvent};
-    use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+    use aivyx_sandbox::NoopConfiner;
     use aivyx_team::TeamMember;
     use futures::StreamExt;
     use futures::stream::BoxStream;
@@ -804,11 +801,11 @@ mod specialist_session_tests {
         }
     }
 
-    struct AllowAllGate;
+    struct AlwaysAllowPrompter;
     #[async_trait]
-    impl PermissionGate for AllowAllGate {
-        async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
-            PermissionDecision::Allow
+    impl aivyx_sandbox::PermissionPrompter for AlwaysAllowPrompter {
+        async fn prompt(&self, _request: &PermissionRequest) -> aivyx_sandbox::UserResponse {
+            aivyx_sandbox::UserResponse::Allow
         }
     }
 
@@ -859,8 +856,17 @@ mod specialist_session_tests {
     ) -> SpecialistSessionsConfig {
         SpecialistSessionsConfig {
             llm,
-            gate: Arc::new(AllowAllGate),
-            confiner: Arc::new(NoopConfiner),
+            enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients {
+                prompter: Arc::new(AlwaysAllowPrompter),
+                base_deny_paths: vec![],
+                pre_approved_commands: vec![],
+                plan_mode: PlanMode::new(),
+                autonomous_mode: AutonomousMode::new(),
+                editor_approval_enabled: false,
+                injection_taint: InjectionTaint::new(),
+                extra_read_paths: vec![],
+                require_enforcement: false,
+            },
             checkpointer: None,
             repo_map: None,
             events_tx,

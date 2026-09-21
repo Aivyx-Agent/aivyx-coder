@@ -20,8 +20,7 @@ use std::sync::Arc;
 use aivyx_llm::LlmBackend;
 use aivyx_repomap::RepoMap;
 use aivyx_sandbox::{
-    ActionKind, AutonomousMode, ExecutionConfiner, InjectionTaint, PermissionGate,
-    PermissionRequest, PermissionTarget, PlanMode,
+    ActionKind, AutonomousMode, InjectionTaint, PermissionRequest, PermissionTarget, PlanMode,
 };
 use aivyx_team::TeamConfig;
 use aivyx_tools::{
@@ -125,8 +124,7 @@ pub fn compute_specialist_registry(
 
 pub struct DelegateToSpecialistConfig {
     pub llm: Arc<dyn LlmBackend>,
-    pub gate: Arc<dyn PermissionGate>,
-    pub confiner: Arc<dyn ExecutionConfiner>,
+    pub enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients,
     pub checkpointer: Option<Arc<GitCheckpointer>>,
     pub repo_map: Option<(Arc<RepoMap>, u32)>,
     pub events_tx: UnboundedSender<AgentEvent>,
@@ -247,11 +245,12 @@ impl Tool for DelegateToSpecialistTool {
         };
 
         let specialist_registry = compute_specialist_registry(member, &self.config.parent_registry);
-        let mut sub_executor = ToolExecutor::new(
-            specialist_registry,
-            Arc::clone(&self.config.gate),
-            Arc::clone(&self.config.confiner),
+        let (gate, confiner) = crate::specialist_enforcement::scoped_gate_and_confiner(
+            &self.config.enforcement,
+            member,
+            &ctx.cwd,
         );
+        let mut sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
         if let Some(checkpointer) = &self.config.checkpointer {
             sub_executor.set_checkpointer(Arc::clone(checkpointer));
         }
@@ -415,8 +414,9 @@ mod delegation_tests {
     use super::test_support::registry_with;
     use super::*;
     use aivyx_llm::{ChatRequest, FinishReason, LlmError, StreamEvent};
-    use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+    use aivyx_sandbox::NoopConfiner;
     use aivyx_team::TeamMember;
+    use aivyx_tools::WriteFileTool;
     use async_trait::async_trait;
     use futures::StreamExt;
     use futures::stream::BoxStream;
@@ -458,11 +458,11 @@ mod delegation_tests {
         }
     }
 
-    struct AllowAllGate;
+    struct AlwaysAllowPrompter;
     #[async_trait]
-    impl PermissionGate for AllowAllGate {
-        async fn check(&self, _request: &PermissionRequest) -> PermissionDecision {
-            PermissionDecision::Allow
+    impl aivyx_sandbox::PermissionPrompter for AlwaysAllowPrompter {
+        async fn prompt(&self, _request: &PermissionRequest) -> aivyx_sandbox::UserResponse {
+            aivyx_sandbox::UserResponse::Allow
         }
     }
 
@@ -512,8 +512,17 @@ mod delegation_tests {
     ) -> DelegateToSpecialistConfig {
         DelegateToSpecialistConfig {
             llm,
-            gate: Arc::new(AllowAllGate),
-            confiner: Arc::new(NoopConfiner),
+            enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients {
+                prompter: Arc::new(AlwaysAllowPrompter),
+                base_deny_paths: vec![],
+                pre_approved_commands: vec![],
+                plan_mode: PlanMode::new(),
+                autonomous_mode: AutonomousMode::new(),
+                editor_approval_enabled: false,
+                injection_taint: InjectionTaint::new(),
+                extra_read_paths: vec![],
+                require_enforcement: false,
+            },
             checkpointer: None,
             repo_map: None,
             events_tx,
@@ -545,6 +554,74 @@ mod delegation_tests {
             ToolOutput::Ok(text) => assert!(text.contains("done: the fix is applied")),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_specialists_own_extra_deny_paths_blocks_a_write_the_lead_could_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let denied = dir.path().join("denied");
+        std::fs::create_dir_all(&denied).unwrap();
+
+        // finish_reason: Stop (not ToolCalls) so the specialist's turn
+        // completes naturally after this one round -- the outer
+        // "continue" loop never needs a second mock response, which
+        // keeps this test focused purely on whether the write is
+        // actually blocked, not on simulating a realistic multi-round
+        // model conversation.
+        let mock = Arc::new(MockBackend::new(vec![vec![
+            StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                id: aivyx_types::ToolCallId("c1".to_string()),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": denied.join("secret.txt").to_string_lossy(),
+                    "content": "leaked",
+                }),
+                source: aivyx_types::ToolCallSource::Native,
+            }),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]]));
+
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let team = simple_team();
+        let mut config = base_config(mock, events_tx, team);
+        config.enforcement.base_deny_paths = vec![];
+        // The specialist's own extra_deny_paths, not the lead's -- proves
+        // this is genuinely per-member, not just a copy of the lead's list.
+        config.team.members[1].extra_deny_paths = vec![denied.to_string_lossy().to_string()];
+        config.parent_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(WriteFileTool));
+            registry
+        };
+
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = ToolExecutionContext {
+            cwd: dir.path().to_path_buf(),
+            confiner: Arc::new(NoopConfiner),
+            cancellation: CancellationToken::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "write the secret" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        // Structural check only (not the specialist's exact synthesized
+        // text, which depends on mock-backend round-tripping details not
+        // relevant to what this test is actually proving) -- the real
+        // proof is the filesystem assertion below.
+        assert!(
+            matches!(result, ToolOutput::Ok(_)),
+            "expected Ok, got {result:?}"
+        );
+        assert!(
+            !denied.join("secret.txt").exists(),
+            "the write must have been blocked by the specialist's own scoped gate -- if this \
+             file exists, extra_deny_paths was not actually enforced"
+        );
     }
 
     #[tokio::test]
