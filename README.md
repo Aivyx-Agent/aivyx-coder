@@ -709,6 +709,39 @@ with running commands). The shipped macOS release binary (see "Platform
 support" above) *is* exactly this `--no-default-features` build — it's not
 a hypothetical, it's what actually ships there today.
 
+**Docker.** A secondary, optional way to run `aivyx-coder` — the native
+`x86_64-linux-musl`/`darwin-aarch64` binaries above stay the primary,
+recommended distribution. Build and run:
+
+```bash
+docker build -t aivyx-coder .
+docker run -it --rm \
+  --add-host=host.docker.internal:host-gateway \
+  -v "$(pwd)":/workspace -w /workspace \
+  -v "$HOME/.config/aivyx-coder":/root/.config/aivyx-coder \
+  -v "$HOME/.local/state/aivyx-coder":/root/.local/state/aivyx-coder \
+  aivyx-coder
+```
+
+The three `-v` flags bind-mount the project directory being worked on,
+plus `aivyx-coder`'s own config and session-state directories, so
+`config.toml` and session history survive across separate `docker run`
+invocations rather than being lost every time the container exits (each
+run is otherwise a fresh, ephemeral container). If the LLM backend
+(Ollama, llama-server, etc.) runs on the host rather than inside another
+container, set `base_url` in `config.toml` to
+`http://host.docker.internal:<port>/v1` — the `--add-host` flag above is
+required for that hostname to resolve on Linux (confirmed: it does
+**not** resolve by default there, unlike Docker Desktop on Mac/Windows).
+
+The real OS-level sandbox (Linux Landlock + seccomp) is on by default
+inside the container exactly as on a bare host — confirmed directly
+(not assumed) via `aivyx-confine`'s own test suite passing inside a
+real container built from this same `Dockerfile`, and via a standalone
+probe confirming a Landlock grant scoped to a bind-mounted directory
+correctly allows reads/writes within it (visible on the real host
+filesystem) while denying reads outside it.
+
 ## Serving
 
 aivyx speaks the OpenAI-compatible `/v1` API, so any local server works.
