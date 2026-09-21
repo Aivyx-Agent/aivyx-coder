@@ -239,6 +239,7 @@ dependencies = [
  "aivyx-types",
  "async-trait",
  "eventsource-stream",
+ "fs2",
  "futures",
  "mistralrs",
  "reqwest 0.13.4",

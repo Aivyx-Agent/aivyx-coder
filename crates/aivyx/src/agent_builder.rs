@@ -886,11 +886,46 @@ pub(crate) async fn build_agent(
                                     // just /slots/{id}?action=save)
                                     settings.backend.kvcache_max_bytes,
                                 ) {
-                                    Ok(store) => Some((
-                                        Arc::new(aivyx_llm::KvSlotPool::new(info.total_slots)),
-                                        Arc::new(store),
-                                        info.build_info,
-                                    )),
+                                    Ok(store) => {
+                                        // Scoped by origin (not just store_path, which
+                                        // defaults to one global directory regardless of
+                                        // which llama-server is configured) -- two
+                                        // processes pointed at different, unrelated
+                                        // llama-server instances must not contend with
+                                        // each other for an offset neither can use to
+                                        // help the other.
+                                        let lock_dir = store_path.join("locks").join(format!(
+                                            "{:016x}",
+                                            aivyx_llm::fnv1a(origin.as_bytes())
+                                        ));
+                                        let offset = match aivyx_llm::SlotPoolLock::acquire(
+                                            &lock_dir,
+                                            info.total_slots,
+                                        ) {
+                                            Ok(lock) => {
+                                                let offset = lock.offset();
+                                                // Held for the process's lifetime --
+                                                // dropping it early would release the
+                                                // claim while this process is still
+                                                // running. See SlotPoolLock's own doc
+                                                // comment.
+                                                Box::leak(Box::new(lock));
+                                                offset
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(error = %err, "kvcache: failed to acquire a slot-pool lock; using offset 0");
+                                                0
+                                            }
+                                        };
+                                        Some((
+                                            Arc::new(aivyx_llm::KvSlotPool::with_offset(
+                                                info.total_slots,
+                                                offset,
+                                            )),
+                                            Arc::new(store),
+                                            info.build_info,
+                                        ))
+                                    }
                                     Err(err) => {
                                         tracing::warn!(error = %err, "kvcache: failed to open store; disabled for this run");
                                         None

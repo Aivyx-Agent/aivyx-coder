@@ -8,6 +8,7 @@ license.workspace = true
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
 async-trait = "0.1.89"
 eventsource-stream = "0.2.3"
+fs2 = "0.4.3"
 futures = "0.3.32"
 mistralrs = { version = "=0.8.*", default-features = false, optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
