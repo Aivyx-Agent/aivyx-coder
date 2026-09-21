@@ -1672,16 +1672,17 @@ tail_budget_tokens = 3072  # recent-conversation digest members see
 # Nonagon-style team delegation, mission structure, and specialist
 # sessions (delegate_to_specialist, decompose_task, verify_output,
 # synthesize_results, spawn_specialist, query_specialist,
-# close_specialist): lets the lead delegate to a fixed specialist roster
-# (implementer/reviewer/tester), narrower-scoped than delegate_task's
-# sub-agent; record a mission plan / verification verdicts / a final
-# synthesis against it; and open a resumable multi-exchange session with
-# one specialist instead of a single delegate_to_specialist exchange. Off
-# by default.
+# close_specialist): lets the lead delegate to a specialist roster
+# (implementer/reviewer/tester by default, or your own -- see roster_path
+# below), narrower-scoped than delegate_task's sub-agent; record a mission
+# plan / verification verdicts / a final synthesis against it; and open a
+# resumable multi-exchange session with one specialist instead of a single
+# delegate_to_specialist exchange. Off by default.
 [team]
 enabled = false
 # max_concurrent_specialist_sessions = 3  # spawn_specialist sessions open at once
 # specialist_session_idle_timeout_secs = 600  # drop an idle session on the next specialist-session tool call made after this long
+# roster_path = "~/my-team.toml"  # a custom roster (TOML: {lead, members: [{name, role, persona, tool_allowlist, extra_deny_paths}]}) instead of the built-in implementer/reviewer/tester roster; validated at startup (unknown lead/duplicate member/unknown tool all refuse to start rather than run with a broken roster)
 ```
 
 ## Known limitations

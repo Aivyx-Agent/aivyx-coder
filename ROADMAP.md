@@ -566,6 +566,26 @@ and `MoveFileTool`'s both-endpoint check. See
 `docs/superpowers/specs/2026-09-21-specialist-deny-paths-attenuation-design.md`.
 Deferred follow-ups from the final review are tracked below.
 
+**Custom roster loading — shipped (2026-09-22).** `[team] roster_path`
+lets a user point at a TOML file (`{lead, members: [{name, role, persona,
+tool_allowlist, extra_deny_paths}]}`, `aivyx_team::TeamConfig`'s existing
+schema) instead of always using the fixed `default_coding_roster()` — the
+piece that makes the just-shipped `extra_deny_paths` attenuation above
+actually reachable/configurable. Loaded and validated once, in a new,
+directly-testable `resolve_team_config` (`crates/aivyx/src/agent_builder.rs`,
+mirroring `build_llm_backend`'s own extraction precedent in that file),
+against the real registered tool-name snapshot — the same one
+`team_parent_registry` is itself cloned from, so a custom roster's
+`tool_allowlist` still can't name any of the six mission/specialist-session
+tools, unchanged from before this feature existed. Any failure (missing
+file, unparseable TOML, or a real `TeamConfigError` — unknown lead,
+duplicate member, unknown tool) refuses to start rather than silently
+falling back to the default roster or running with a broken one.
+`TeamConfig::validate` is now also called for the *default* roster,
+closing a real, previously-latent gap where nothing in production code
+ever validated it. See
+`docs/superpowers/specs/2026-09-22-custom-roster-loading-design.md`.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
