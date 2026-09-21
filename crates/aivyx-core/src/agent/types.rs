@@ -46,17 +46,16 @@ pub enum AgentEvent {
     /// `events_tx`), not polled/emitted by `Agent`'s own turn loop -- see
     /// `docs/superpowers/specs/2026-09-20-nonagon-team-tui-missions-surface-design.md`.
     ///
-    /// Note: `Agent::clear_conversation` (`/clear`) only resets the TUI's
-    /// *displayed* `mission_plan` (see `ConversationCleared`'s own doc
-    /// comment) -- the underlying `Arc<Mutex<MissionPlan>>` inside
-    /// `MissionToolsConfig` is owned by the mission tools, not by `Agent`,
-    /// and is untouched by `/clear`. A subsequent `verify_output`/
-    /// `synthesize_results` call against that pre-clear plan will still
-    /// emit a fresh `MissionsUpdated` carrying the OLD (pre-clear) plan,
-    /// resurrecting the panel with stale content. This is a known, accepted
-    /// display-only limitation for this phase, not something `/clear`
-    /// itself is expected to fix -- noted here so a future phase (e.g.
-    /// Phase 6b) doesn't assume the reset is authoritative.
+    /// Note: `Agent::clear_conversation` (`/clear`) now resets the shared
+    /// `Arc<Mutex<MissionPlan>>` itself to a pristine default (and calls
+    /// `close_all()` on the specialist session pool), when both are
+    /// attached via `set_mission_plan_handle`/
+    /// `set_specialist_session_pool_handle` -- i.e. whenever `[team]
+    /// enabled = true` (they're `None`, and `clear_conversation` a no-op
+    /// for them, otherwise). So a later `verify_output`/
+    /// `synthesize_results`/`spawn_specialist` call after `/clear` operates
+    /// on genuinely fresh state, and the display reset and the real
+    /// backing state agree.
     MissionsUpdated(MissionPlan),
     /// The set of open specialist sessions changed (`spawn_specialist` or
     /// `close_specialist` was called -- not `query_specialist`, which only

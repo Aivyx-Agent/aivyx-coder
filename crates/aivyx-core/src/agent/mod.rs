@@ -428,6 +428,9 @@ impl Agent {
     /// list, persists the now-empty session (so a crash immediately after
     /// doesn't reload the old conversation via `--resume`), and emits
     /// `ConversationCleared` so the frontend resets its own display state.
+    /// Also resets the `mission_plan` handle to a pristine `MissionPlan` and
+    /// calls `close_all()` on the `specialist_session_pool`, when either is
+    /// set (`[team] enabled = true`) — see those fields' own doc comments.
     /// Never calls the model — this is the `AgentState`-tier `/clear`
     /// command's entire implementation. `plan_mode` is deliberately
     /// untouched: it's a mode setting, not conversation content.
