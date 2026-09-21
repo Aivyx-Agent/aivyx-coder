@@ -858,6 +858,14 @@ pub(crate) async fn build_agent(
             .base_url
             .trim_end_matches('/')
             .trim_end_matches("/v1");
+        // Pre-existing limitation, not introduced or fixed by this scoping:
+        // `origin` is compared/hashed as a plain string, so two different-
+        // looking `base_url` values that resolve to the same real
+        // llama-server (e.g. `http://127.0.0.1:8080/v1` vs
+        // `http://localhost:8080/v1`) hash to different lock directories
+        // (and different kvcache store keys) and will NOT coordinate with
+        // each other -- the on-disk kvcache store already has this same
+        // limitation.
         let props_url = format!("{origin}/props");
         let built_client = kv_cache_props_client();
         if let Err(err) = &built_client {
@@ -913,8 +921,24 @@ pub(crate) async fn build_agent(
                                                 offset
                                             }
                                             Err(err) => {
-                                                tracing::warn!(error = %err, "kvcache: failed to acquire a slot-pool lock; using offset 0");
-                                                0
+                                                tracing::warn!(error = %err, "kvcache: failed to acquire a slot-pool lock; spreading via PID-derived offset");
+                                                // Spread independently-failing processes across
+                                                // slots by their own PID instead of every one of
+                                                // them dogpiling onto offset 0 -- which was
+                                                // today's exact bug. Guarded against
+                                                // total_slots == 0 here because `%` on it would
+                                                // panic; KvSlotPool::with_offset has its own
+                                                // separate internal guard for the same case, but
+                                                // that doesn't protect this computation, which
+                                                // runs before with_offset ever sees the value.
+                                                if info.total_slots == 0 {
+                                                    0
+                                                } else {
+                                                    (aivyx_llm::fnv1a(
+                                                        &std::process::id().to_le_bytes(),
+                                                    ) % info.total_slots as u64)
+                                                        as u32
+                                                }
                                             }
                                         };
                                         Some((

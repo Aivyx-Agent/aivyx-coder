@@ -1038,16 +1038,35 @@ see correspondingly lower hit rates.
 If the `/props` probe at startup can't confirm a real `llama-server`
 instance, or the store fails to open, KV-cache persistence is silently
 disabled for that run (a `warn`-level log line, nothing else) — aivyx
-never fails to start because of it.
+never fails to start because of it. Likewise, if the multi-process slot
+lock (below) can't be acquired for any reason, this process falls back to
+starting from slot 0 rather than failing to start.
+
+**Multi-process slot coordination.** When more than one `aivyx-coder`
+process points at the same `llama-server`, each claims a distinct starting
+slot via a real OS-level advisory file lock (`<store-path>/locks/`,
+scoped by a stable hash of the `llama-server`'s own base URL) instead of
+every process defaulting to slot 0 — no daemon or extra configuration
+needed. The lock is held for the process's whole lifetime and releases
+automatically on exit or crash. This is a cache-*efficiency* optimization,
+not a correctness guarantee: once concurrent process count reaches the
+server's real slot count, the overflow still contends (no worse than
+before this existed), and it only coordinates `aivyx-coder` processes
+against each other — see "Multi-process GPU sharing" below for what it
+does not cover.
 
 ## Multi-process GPU sharing (`aivyx-broker`)
 
 A single `llama-server` process only ever serves one GPU-resident model at
 a time, and its `/slots` KV-cache mechanism (see "KV-cache persistence"
-above) assumes one process is deciding which slot to use. If you run more
-than one local process against the same `llama-server` at once (multiple
-`aivyx-coder` sessions, or `aivyx-coder` alongside `aivyx-pa`), they'll fight
-over slots without coordination.
+above) assumes one process is deciding which slot to use. Multiple
+`aivyx-coder` processes pointed at the same `llama-server` now coordinate
+their *starting* slot automatically (via a real OS-level file lock, no
+daemon needed — see "KV-cache persistence" above), so they no longer both
+default to slot 0. This does **not** extend across products: `aivyx-coder`
+alongside `aivyx-pa` (or any other unrelated process using `llama-server`'s
+`/slots` mechanism) still fights over slots uncoordinated, since only
+`aivyx-coder` itself participates in this locking scheme.
 
 [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker) is a
 standalone daemon that sits in front of a single shared `llama-server` and

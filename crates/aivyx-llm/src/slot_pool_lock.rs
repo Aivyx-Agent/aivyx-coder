@@ -76,21 +76,10 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "aivyx-slot-pool-lock-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
     #[test]
     fn first_claim_gets_offset_zero() {
-        let dir = unique_temp_dir("first");
-        let lock = SlotPoolLock::acquire(&dir, 4).expect("first claim must succeed");
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let lock = SlotPoolLock::acquire(dir.path(), 4).expect("first claim must succeed");
         assert_eq!(lock.offset(), 0);
     }
 
@@ -103,20 +92,20 @@ mod tests {
         // project's real supported platforms); if this test fails, that
         // assumption -- not the test itself -- is the first thing to
         // re-check.
-        let dir = unique_temp_dir("second");
-        let first = SlotPoolLock::acquire(&dir, 4).expect("first claim must succeed");
-        let second = SlotPoolLock::acquire(&dir, 4).expect("second claim must succeed");
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let first = SlotPoolLock::acquire(dir.path(), 4).expect("first claim must succeed");
+        let second = SlotPoolLock::acquire(dir.path(), 4).expect("second claim must succeed");
         assert_eq!(first.offset(), 0);
         assert_eq!(second.offset(), 1);
     }
 
     #[test]
     fn releasing_a_claim_frees_its_offset_for_reuse() {
-        let dir = unique_temp_dir("release");
-        let first = SlotPoolLock::acquire(&dir, 2).expect("first claim must succeed");
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let first = SlotPoolLock::acquire(dir.path(), 2).expect("first claim must succeed");
         assert_eq!(first.offset(), 0);
         drop(first);
-        let second = SlotPoolLock::acquire(&dir, 2).expect("second claim must succeed");
+        let second = SlotPoolLock::acquire(dir.path(), 2).expect("second claim must succeed");
         assert_eq!(
             second.offset(),
             0,
@@ -126,9 +115,9 @@ mod tests {
 
     #[test]
     fn errors_once_every_index_is_already_claimed() {
-        let dir = unique_temp_dir("exhausted");
-        let _first = SlotPoolLock::acquire(&dir, 1).expect("first claim must succeed");
-        let second = SlotPoolLock::acquire(&dir, 1);
+        let dir = tempfile::tempdir().expect("must create temp dir");
+        let _first = SlotPoolLock::acquire(dir.path(), 1).expect("first claim must succeed");
+        let second = SlotPoolLock::acquire(dir.path(), 1);
         assert!(
             second.is_err(),
             "with slot_count 1, a second concurrent claim must fail, not silently reuse offset 0"

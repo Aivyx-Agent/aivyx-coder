@@ -18,6 +18,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time"], optional = true }
 tokio-stream = "0.1.18"
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [features]
 provider-mistral-rs = ["dep:mistralrs", "dep:tokio"]
 provider-mistral-rs-cuda = ["provider-mistral-rs", "mistralrs?/cuda"]

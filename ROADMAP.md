@@ -771,12 +771,29 @@ deferred, not overlooked):
   logs whether the feature was silently never engaging. **Fixed
   2026-08-26.** `ensure_kv_slot_checked_out` now logs `info` on hit, miss,
   and successful save, each carrying `prefix_hash`/`slot_id`.
-- Multi-process contention: `KvSlotPool`'s deterministic lowest-first
+- ~~Multi-process contention: `KvSlotPool`'s deterministic lowest-first
   checkout means two concurrent `aivyx-coder` processes against one
   shared `llama-server` both check out slot 0 first, pinning both
   sessions to the same physical slot and mutually invalidating each
   other's cache. A lock file or a per-process pool-index offset would
-  fix this.
+  fix this.~~ — **Fixed 2026-09-21.** `SlotPoolLock`
+  (`crates/aivyx-llm/src/slot_pool_lock.rs`) claims a distinct starting
+  offset per process via a real OS-level advisory file lock, scoped by a
+  stable hash of the `llama-server` origin, held for the process's
+  lifetime (auto-released on exit or crash). Falls back to offset 0 on
+  any lock-acquisition failure — confirmed at final review to be a
+  strict improvement over the old behavior even in that fallback case,
+  never a regression (the overflow subset beyond real slot count still
+  contends, which is unavoidable once genuinely oversubscribed).
+  **Known real gap, not fixable in this repo**: this only coordinates
+  `aivyx-coder` processes against each other — `aivyx-pa`, which
+  `README.md`'s "KV-cache persistence" section explicitly documents as
+  able to share the same store and `llama-server`, has no equivalent
+  locking and will still default to slot 0, so the exact collision this
+  fix targets can still occur in that specific cross-product scenario.
+  The natural fix is lifting `SlotPoolLock` into the shared
+  `aivyx-kvcache` crate both products already depend on — cross-repo
+  follow-up, not scoped here.
 - Cache-key volatility: any repo-map/tool-set/system-prompt change mints
   a new, potentially hundreds-of-MB cache entry, so real-world hit rates
   depend heavily on how stable a given project's own context is — a
