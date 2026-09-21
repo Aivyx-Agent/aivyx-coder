@@ -16,7 +16,9 @@ use aivyx_config::{BackendKind, Settings};
 // fully-qualified as `aivyx_core::DelegateTaskTool::new(aivyx_core::DelegateTaskConfig { .. })`
 // (main.rs:439-455), so no import is needed and no edit to that call
 // site is needed either.
-use aivyx_core::{Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilSeat, EditFormat, session};
+use aivyx_core::{
+    Agent, AgentConfig, Architect, ArchitectSeat, Council, CouncilSeat, EditFormat, session,
+};
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{
     AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
@@ -34,7 +36,7 @@ use aivyx_tools::{
 use tokio::sync::mpsc;
 
 use crate::{
-    Cli, COUNCIL_IDLE_TIMEOUT, DEFAULT_COMMAND_TIMEOUT_SECS, base_url_looks_local,
+    COUNCIL_IDLE_TIMEOUT, Cli, DEFAULT_COMMAND_TIMEOUT_SECS, base_url_looks_local,
     build_system_prompt,
 };
 
@@ -91,6 +93,19 @@ pub(crate) struct BuiltAgent {
     /// which could silently diverge if this function's own local
     /// `deny_paths` is ever augmented further.
     pub(crate) deny_paths: Vec<PathBuf>,
+    /// The live, shared mission-plan state `decompose_task`/`verify_output`/
+    /// `synthesize_results` write into, when `[team] enabled = true` --
+    /// `None` when the team feature is off (mirrors `tasks` above, but
+    /// `Option`-wrapped since this state doesn't exist at all in that
+    /// configuration). Lets a frontend's autonomous driver loop poll
+    /// mission-completion state directly, without going through the
+    /// `AgentEvent::MissionsUpdated`/TUI-mirror path.
+    pub(crate) mission_plan: Option<Arc<std::sync::Mutex<aivyx_types::MissionPlan>>>,
+    /// The live, shared specialist-session pool `spawn_specialist`/
+    /// `query_specialist`/`close_specialist` operate on, when `[team]
+    /// enabled = true` -- `None` when the team feature is off. Cheap to
+    /// clone (internally `Arc`-wrapped) and query via `.open_sessions()`.
+    pub(crate) specialist_session_pool: Option<aivyx_core::SpecialistSessionPool>,
 }
 
 /// Constructs the configured `LlmBackend`. Extracted from `build_agent`
@@ -130,7 +145,11 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             let backend = aivyx_llm::mistral_rs::MistralRsBackend::new(
                 PathBuf::from(model_path),
                 settings.backend.mistralrs_model_file.clone(),
-                settings.backend.mistralrs_chat_template_path.clone().map(PathBuf::from),
+                settings
+                    .backend
+                    .mistralrs_chat_template_path
+                    .clone()
+                    .map(PathBuf::from),
                 settings.backend.mistralrs_constrain_tool_calls,
                 settings.backend.model.clone(),
             )
@@ -197,6 +216,13 @@ pub(crate) async fn build_agent(
     // One handle shared between the `set_tasks` tool (the model-facing
     // mutator) and the agent (which renders and persists the list).
     let tasks: Arc<std::sync::Mutex<Vec<session::Task>>> = Arc::default();
+
+    // Populated below inside `if settings.team.enabled`, stay `None`
+    // otherwise -- surfaced on `BuiltAgent` so a frontend's autonomous
+    // driver loop can poll real mission/specialist-session state (see
+    // `goal_achieved` in `aivyx-tui/src/app.rs`).
+    let mut mission_plan: Option<Arc<std::sync::Mutex<aivyx_types::MissionPlan>>> = None;
+    let mut specialist_session_pool: Option<aivyx_core::SpecialistSessionPool> = None;
 
     // Each configured command is pre-approved in two forms: the direct
     // `(program, args)` invocation `run_command` uses, and the `sh -c
@@ -315,12 +341,13 @@ pub(crate) async fn build_agent(
     // call site, as before) so `delegate_task`'s sub-agent can share the
     // exact same `Arc<RepoMap>` — a fresh second `RepoMap` would duplicate
     // the parse cache for no benefit, since both agents walk the same cwd.
-    let repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)> = settings.repo_map.enabled.then(|| {
-        (
-            Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
-            settings.repo_map.budget_tokens,
-        )
-    });
+    let repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)> =
+        settings.repo_map.enabled.then(|| {
+            (
+                Arc::new(aivyx_repomap::RepoMap::new(cwd.clone(), deny_paths.clone())),
+                settings.repo_map.budget_tokens,
+            )
+        });
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
 
@@ -381,7 +408,9 @@ pub(crate) async fn build_agent(
     registry.register(Arc::new(GitPushTool::new()));
     registry.register(Arc::new(GitPrTool::new()));
 
-    let lsp_client = Arc::new(LspClient::new(Duration::from_secs(settings.lsp.timeout_secs)));
+    let lsp_client = Arc::new(LspClient::new(Duration::from_secs(
+        settings.lsp.timeout_secs,
+    )));
     registry.register(Arc::new(GoToDefinitionTool::new(Arc::clone(&lsp_client))));
     registry.register(Arc::new(FindReferencesTool::new(Arc::clone(&lsp_client))));
 
@@ -607,7 +636,12 @@ pub(crate) async fn build_agent(
         .command
         .as_ref()
         .filter(|command| command_specs.iter().any(|spec| &spec.name == *command))
-        .map(|command| (command.clone(), settings.verification.max_auto_verify_retries));
+        .map(|command| {
+            (
+                command.clone(),
+                settings.verification.max_auto_verify_retries,
+            )
+        });
     // Computed once and reused for both the `delegate_task` sub-agent
     // (below) and the top-level `agent.set_broker_mode` call further down
     // — both must agree on whether this process is talking to
@@ -713,14 +747,15 @@ pub(crate) async fn build_agent(
         // recursion-prevention exclusion to worry about here; they're
         // registered directly onto `registry`, sharing one
         // `Arc<Mutex<MissionPlan>>` across the whole mission.
-        let mission_plan = Arc::new(std::sync::Mutex::new(aivyx_types::MissionPlan {
+        let mission_plan_handle = Arc::new(std::sync::Mutex::new(aivyx_types::MissionPlan {
             mission: String::new(),
             steps: vec![],
             summary: None,
         }));
+        mission_plan = Some(Arc::clone(&mission_plan_handle));
         let mission_tools_config = aivyx_core::MissionToolsConfig {
             team: team.clone(),
-            plan: mission_plan,
+            plan: mission_plan_handle,
             events_tx: events_tx.clone(),
         };
         registry.register(Arc::new(aivyx_core::DecomposeTaskTool::new(
@@ -742,10 +777,11 @@ pub(crate) async fn build_agent(
         // delegate_to_specialist, not a replacement -- see that spec's
         // Decision 1. `team` and `team_parent_registry` get their final
         // move here -- nothing below this point reuses them.
-        let specialist_session_pool = aivyx_core::SpecialistSessionPool::new(
+        let specialist_session_pool_handle = aivyx_core::SpecialistSessionPool::new(
             settings.team.max_concurrent_specialist_sessions,
             std::time::Duration::from_secs(settings.team.specialist_session_idle_timeout_secs),
         );
+        specialist_session_pool = Some(specialist_session_pool_handle.clone());
         let specialist_sessions_config = aivyx_core::SpecialistSessionsConfig {
             llm: Arc::clone(&llm),
             gate: Arc::clone(&gate),
@@ -763,7 +799,7 @@ pub(crate) async fn build_agent(
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
-            pool: specialist_session_pool,
+            pool: specialist_session_pool_handle,
         };
         registry.register(Arc::new(aivyx_core::SpawnSpecialistTool::new(
             specialist_sessions_config.clone(),
@@ -817,7 +853,11 @@ pub(crate) async fn build_agent(
     // save lifecycle for that backend kind, so this process must not also
     // attempt its own.
     let kv_cache_handles = if settings.backend.kind == aivyx_config::BackendKind::LlamaServer {
-        let origin = settings.backend.base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let origin = settings
+            .backend
+            .base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1");
         let props_url = format!("{origin}/props");
         let built_client = kv_cache_props_client();
         if let Err(err) = &built_client {
@@ -826,46 +866,48 @@ pub(crate) async fn build_agent(
         match built_client.ok() {
             None => None,
             Some(props_client) => match props_client.get(&props_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-                Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
-                    Some(info) => {
-                        // Single source of truth for the effective path
-                        // (configured override, or the historical
-                        // ProjectDirs-derived default) — see
-                        // BackendSettings::resolved_kvcache_store_path in
-                        // aivyx-config, also reused by Settings::effective_deny_paths
-                        // below so the two can never silently diverge.
-                        let store_path = settings.backend.resolved_kvcache_store_path();
-                        match aivyx_kvcache::LlamaServerSlotStore::open(
-                            &store_path,
-                            origin, // NOT settings.backend.base_url -- /slots is a native
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => match aivyx_llm::probe::parse_llama_slots_info(&json) {
+                            Some(info) => {
+                                // Single source of truth for the effective path
+                                // (configured override, or the historical
+                                // ProjectDirs-derived default) — see
+                                // BackendSettings::resolved_kvcache_store_path in
+                                // aivyx-config, also reused by Settings::effective_deny_paths
+                                // below so the two can never silently diverge.
+                                let store_path = settings.backend.resolved_kvcache_store_path();
+                                match aivyx_kvcache::LlamaServerSlotStore::open(
+                                    &store_path,
+                                    origin, // NOT settings.backend.base_url -- /slots is a native
                                     // llama-server endpoint at the origin, not under /v1
                                     // (confirmed live: a /v1-prefixed base_url 404s on
                                     // /v1/slots/{id}?action=save, since the real path is
                                     // just /slots/{id}?action=save)
-                            settings.backend.kvcache_max_bytes,
-                        ) {
-                            Ok(store) => Some((
-                                Arc::new(aivyx_llm::KvSlotPool::new(info.total_slots)),
-                                Arc::new(store),
-                                info.build_info,
-                            )),
-                            Err(err) => {
-                                tracing::warn!(error = %err, "kvcache: failed to open store; disabled for this run");
+                                    settings.backend.kvcache_max_bytes,
+                                ) {
+                                    Ok(store) => Some((
+                                        Arc::new(aivyx_llm::KvSlotPool::new(info.total_slots)),
+                                        Arc::new(store),
+                                        info.build_info,
+                                    )),
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "kvcache: failed to open store; disabled for this run");
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "kvcache: [backend] kind = \"llama_server\" but /props didn't look like a real \
+                             llama-server response; disabled for this run"
+                                );
                                 None
                             }
-                        }
+                        },
+                        Err(_) => None,
                     }
-                    None => {
-                        tracing::warn!(
-                            "kvcache: [backend] kind = \"llama_server\" but /props didn't look like a real \
-                             llama-server response; disabled for this run"
-                        );
-                        None
-                    }
-                },
-                Err(_) => None,
-            },
+                }
                 _ => {
                     tracing::warn!("kvcache: /props probe failed; disabled for this run");
                     None
@@ -916,7 +958,11 @@ pub(crate) async fn build_agent(
     // when the user explicitly disables it via [agents_file] enabled.
     if settings.agents_file.enabled {
         let global_path = aivyx_config::Settings::agents_file_path().ok();
-        agent.set_agents_file(global_path, settings.agents_file.budget_tokens, deny_paths.clone());
+        agent.set_agents_file(
+            global_path,
+            settings.agents_file.budget_tokens,
+            deny_paths.clone(),
+        );
     }
 
     // Absence of a context file is not an error — the feature is off only
@@ -1051,6 +1097,8 @@ pub(crate) async fn build_agent(
         kv_cache_handles,
         mcp_registry,
         deny_paths: deny_paths.clone(),
+        mission_plan,
+        specialist_session_pool,
     })
 }
 
@@ -1150,7 +1198,10 @@ mod tests {
         settings.backend.kind = BackendKind::LlamaServerBroker;
         settings.backend.broker_base_url = Some("http://127.0.0.1:8899".to_string());
         let result = build_llm_backend(&settings).await;
-        assert!(result.is_ok(), "should construct successfully once broker_base_url is set");
+        assert!(
+            result.is_ok(),
+            "should construct successfully once broker_base_url is set"
+        );
     }
 
     #[tokio::test]

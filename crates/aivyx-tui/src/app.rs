@@ -32,24 +32,51 @@ const MAX_VISIBLE_TASKS: usize = 6;
 /// `MAX_VISIBLE_TASKS`.
 const MAX_VISIBLE_MISSION_STEPS: usize = 6;
 
-/// The autonomous driver's goal-achieved signal: every task in the list is
-/// `Done`, and there is at least one task — an empty list means the model
-/// never called `set_tasks` at all, which must not be misread as "nothing
-/// to do, stop immediately." See ROADMAP.md Phase 11c.
-fn goal_achieved(tasks: &[Task]) -> bool {
-    !tasks.is_empty() && tasks.iter().all(|t| t.status == TaskStatus::Done)
+/// The autonomous driver's goal-achieved signal, combining three
+/// independent sources: the `set_tasks` list, `MissionPlan` (Nonagon team
+/// missions), and open specialist sessions. Each of the first two
+/// contributes a signal only if it was ever *used* — an empty task list or
+/// a `None` mission plan means that surface was never engaged, so it must
+/// not count as "nothing to do, stop immediately" (an unused signal is a
+/// no-op, not a blocker). An open specialist session always blocks
+/// completion outright, regardless of the other two — a live, un-closed
+/// specialist session is inherently evidence of unfinished business. When
+/// neither tasks nor a mission were ever used, this is `false` — matching
+/// the original single-signal behavior exactly. See ROADMAP.md Phase 11c
+/// and `docs/superpowers/specs/2026-09-21-autonomous-goal-achieved-team-awareness-design.md`.
+fn goal_achieved(
+    tasks: &[Task],
+    mission_plan: Option<&MissionPlan>,
+    open_specialist_sessions: &[SpecialistSessionSummary],
+) -> bool {
+    if !open_specialist_sessions.is_empty() {
+        return false;
+    }
+    let tasks_signal =
+        (!tasks.is_empty()).then(|| tasks.iter().all(|t| t.status == TaskStatus::Done));
+    let mission_signal = mission_plan.map(|p| p.summary.is_some());
+    match (tasks_signal, mission_signal) {
+        (None, None) => false,
+        _ => tasks_signal.unwrap_or(true) && mission_signal.unwrap_or(true),
+    }
 }
 
 /// What the autonomous driver sends next, given whether the turn that just
-/// finished paused (Phase 12A) and the current task list. `None` means
-/// stop the loop (goal achieved) — the caller is responsible for the
-/// separate budget-exhaustion and cancellation stop conditions, which this
-/// function doesn't know about.
-fn next_autonomous_message(last_turn_paused: bool, tasks: &[Task]) -> Option<String> {
+/// finished paused (Phase 12A), the current task list, the current mission
+/// plan (if any), and any open specialist sessions. `None` means stop the
+/// loop (goal achieved) — the caller is responsible for the separate
+/// budget-exhaustion and cancellation stop conditions, which this function
+/// doesn't know about.
+fn next_autonomous_message(
+    last_turn_paused: bool,
+    tasks: &[Task],
+    mission_plan: Option<&MissionPlan>,
+    open_specialist_sessions: &[SpecialistSessionSummary],
+) -> Option<String> {
     if last_turn_paused {
         return Some("continue".to_string());
     }
-    if goal_achieved(tasks) {
+    if goal_achieved(tasks, mission_plan, open_specialist_sessions) {
         return None;
     }
     Some("continue working toward the goal".to_string())
@@ -61,7 +88,10 @@ fn next_autonomous_message(last_turn_paused: bool, tasks: &[Task]) -> Option<Str
 /// driver loop itself lives inside a spawned task in `run()` and isn't a
 /// pure function, so it can't be exercised directly in a unit test.
 fn budget_exhausted_notice(iterations_used: u32, tasks: &[Task]) -> String {
-    let done_count = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
+    let done_count = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Done)
+        .count();
     format!(
         "autonomous run stopped: budget exhausted after {iterations_used} iteration(s) \
          ({done_count}/{} tasks done)",
@@ -145,6 +175,12 @@ pub struct AutonomousRun {
     pub max_duration: Duration,
     pub tasks: Arc<Mutex<Vec<Task>>>,
     pub injection_taint: InjectionTaint,
+    /// `None` when `[team] enabled = false` (see `agent_builder.rs`'s
+    /// `BuiltAgent.mission_plan`, which this is threaded from directly).
+    pub mission_plan: Option<Arc<Mutex<MissionPlan>>>,
+    /// `None` when `[team] enabled = false` (see `agent_builder.rs`'s
+    /// `BuiltAgent.specialist_session_pool`, threaded from directly).
+    pub specialist_session_pool: Option<aivyx_core::SpecialistSessionPool>,
 }
 
 /// A brief startup banner, printed to plain stdout before the TUI takes
@@ -186,10 +222,7 @@ fn startup_banner() -> String {
     let line1_plain = format!("{title}  {version}");
     let line2_plain = "\u{25cf} local models only".to_string();
 
-    let interior_width = line1_plain
-        .chars()
-        .count()
-        .max(line2_plain.chars().count());
+    let interior_width = line1_plain.chars().count().max(line2_plain.chars().count());
     let line1_pad = " ".repeat(interior_width - line1_plain.chars().count());
     let line2_pad = " ".repeat(interior_width - line2_plain.chars().count());
     let border = "\u{2500}".repeat(interior_width + 4);
@@ -282,7 +315,21 @@ pub async fn run(
                     break;
                 }
                 let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
-                next_message = next_autonomous_message(agent.last_turn_paused(), &tasks_snapshot);
+                let mission_plan_snapshot = autonomous
+                    .mission_plan
+                    .as_ref()
+                    .map(|p| p.lock().unwrap().clone());
+                let open_specialist_sessions = autonomous
+                    .specialist_session_pool
+                    .as_ref()
+                    .map(|pool| pool.open_sessions())
+                    .unwrap_or_default();
+                next_message = next_autonomous_message(
+                    agent.last_turn_paused(),
+                    &tasks_snapshot,
+                    mission_plan_snapshot.as_ref(),
+                    &open_specialist_sessions,
+                );
                 if next_message.is_none() {
                     agent.notify(goal_achieved_notice(iterations_used));
                 }
@@ -624,7 +671,8 @@ impl App {
                 self.transcript.push(ChatLine::Architect(text));
             }
             AgentEvent::SubAgentActivity(inner) => {
-                self.transcript.push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
+                self.transcript
+                    .push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
         }
     }
@@ -1158,7 +1206,11 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             if text.is_empty() {
                 return Vec::new();
             }
-            prefixed_lines(text, "  sub-agent> ", Style::default().fg(Color::LightYellow))
+            prefixed_lines(
+                text,
+                "  sub-agent> ",
+                Style::default().fg(Color::LightYellow),
+            )
         }
         ChatLine::Reasoning(text) => prefixed_lines(
             text,
@@ -1303,7 +1355,10 @@ mod tests {
 
         let lines = target_lines(&target);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), "Move: /project/old.rs -> /project/new.rs");
+        assert_eq!(
+            lines[0].to_string(),
+            "Move: /project/old.rs -> /project/new.rs"
+        );
     }
 
     fn task(id: u32, text: &str, status: TaskStatus) -> Task {
@@ -1667,32 +1722,106 @@ mod tests {
 
     #[test]
     fn goal_achieved_requires_at_least_one_task_and_all_done() {
-        assert!(!goal_achieved(&[]), "no tasks ever set means never done");
-        assert!(!goal_achieved(&[done_task(1), pending_task(2)]));
-        assert!(goal_achieved(&[done_task(1), done_task(2)]));
+        assert!(
+            !goal_achieved(&[], None, &[]),
+            "no tasks ever set means never done"
+        );
+        assert!(!goal_achieved(&[done_task(1), pending_task(2)], None, &[]));
+        assert!(goal_achieved(&[done_task(1), done_task(2)], None, &[]));
     }
 
     #[test]
     fn next_autonomous_message_chooses_correctly() {
         assert_eq!(
-            next_autonomous_message(true, &[]),
+            next_autonomous_message(true, &[], None, &[]),
             Some("continue".to_string()),
             "a paused turn always continues, regardless of task state"
         );
         assert_eq!(
-            next_autonomous_message(false, &[done_task(1)]),
+            next_autonomous_message(false, &[done_task(1)], None, &[]),
             None,
             "goal achieved -> stop"
         );
         assert_eq!(
-            next_autonomous_message(false, &[pending_task(1)]),
+            next_autonomous_message(false, &[pending_task(1)], None, &[]),
             Some("continue working toward the goal".to_string())
         );
         assert_eq!(
-            next_autonomous_message(false, &[]),
+            next_autonomous_message(false, &[], None, &[]),
             Some("continue working toward the goal".to_string()),
             "no tasks ever set -> keep going until budget exhausts, not stuck forever"
         );
+    }
+
+    fn mission_with_summary(summary: Option<&str>) -> MissionPlan {
+        MissionPlan {
+            mission: "test mission".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "do the thing".to_string(),
+                status: StepStatus::Verified,
+                notes: None,
+            }],
+            summary: summary.map(|s| s.to_string()),
+        }
+    }
+
+    fn open_session(id: &str) -> SpecialistSessionSummary {
+        SpecialistSessionSummary {
+            session_id: id.to_string(),
+            member: "implementer".to_string(),
+        }
+    }
+
+    #[test]
+    fn goal_achieved_requires_synthesize_results_for_a_mission_only_run() {
+        let unsynthesized = mission_with_summary(None);
+        assert!(
+            !goal_achieved(&[], Some(&unsynthesized), &[]),
+            "a decomposed mission with no summary yet is not done"
+        );
+        let synthesized = mission_with_summary(Some("final deliverable"));
+        assert!(
+            goal_achieved(&[], Some(&synthesized), &[]),
+            "synthesize_results having been called is enough on its own, no set_tasks needed"
+        );
+    }
+
+    #[test]
+    fn goal_achieved_requires_both_tasks_and_mission_when_both_are_used() {
+        let synthesized = mission_with_summary(Some("final deliverable"));
+        assert!(
+            !goal_achieved(&[pending_task(1)], Some(&synthesized), &[]),
+            "mission synthesized but a set_tasks task is still pending -> not done"
+        );
+        assert!(
+            goal_achieved(&[done_task(1)], Some(&synthesized), &[]),
+            "both signals satisfied -> done"
+        );
+    }
+
+    #[test]
+    fn goal_achieved_blocks_on_any_open_specialist_session_regardless_of_other_signals() {
+        let synthesized = mission_with_summary(Some("final deliverable"));
+        assert!(
+            !goal_achieved(&[done_task(1)], Some(&synthesized), &[open_session("s1")]),
+            "an open specialist session always blocks completion"
+        );
+        assert!(
+            !goal_achieved(&[], None, &[open_session("s1")]),
+            "even with no tasks or mission ever used, an open session blocks"
+        );
+    }
+
+    #[test]
+    fn goal_achieved_team_disabled_matches_original_behavior_exactly() {
+        // [team] enabled = false means mission_plan is always None and
+        // open_specialist_sessions is always empty -- confirms the 3-arg
+        // function reduces to the original 1-arg behavior byte-for-byte.
+        assert!(!goal_achieved(&[], None, &[]));
+        assert!(!goal_achieved(&[done_task(1), pending_task(2)], None, &[]));
+        assert!(goal_achieved(&[done_task(1), done_task(2)], None, &[]));
     }
 
     // The driver loop that actually calls `agent.notify(...)` lives inside a
@@ -1805,7 +1934,10 @@ mod tests {
         );
     }
 
-    fn modal_request() -> (crate::permission::ModalRequest, oneshot::Receiver<UserResponse>) {
+    fn modal_request() -> (
+        crate::permission::ModalRequest,
+        oneshot::Receiver<UserResponse>,
+    ) {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = PermissionRequest {
             tool_name: "write_file".to_string(),
@@ -1855,7 +1987,8 @@ mod tests {
     fn conversation_cleared_event_resets_transcript_tasks_and_context_usage() {
         let mut app = App::new(None, PlanMode::new());
         app.transcript.push(ChatLine::User("hi".to_string()));
-        app.transcript.push(ChatLine::Assistant("hello".to_string()));
+        app.transcript
+            .push(ChatLine::Assistant("hello".to_string()));
         app.tasks.push(Task {
             id: 1,
             text: "a task".to_string(),
@@ -1893,10 +2026,16 @@ mod tests {
     #[test]
     fn command_hint_matches_narrows_as_the_user_types_and_stops_after_a_space() {
         let mut app = App::new(None, PlanMode::new());
-        assert!(app.command_hint_matches().is_empty(), "empty input has no hints");
+        assert!(
+            app.command_hint_matches().is_empty(),
+            "empty input has no hints"
+        );
 
         app.input.insert_str("/");
-        assert_eq!(app.command_hint_matches().len(), aivyx_core::commands::COMMANDS.len());
+        assert_eq!(
+            app.command_hint_matches().len(),
+            aivyx_core::commands::COMMANDS.len()
+        );
 
         app.input.insert_str("cl");
         let matches = app.command_hint_matches();
@@ -1919,7 +2058,12 @@ mod tests {
 
     #[test]
     fn command_hint_rect_sits_directly_above_the_input_area_and_never_goes_negative() {
-        let input_area = Rect { x: 0, y: 10, width: 80, height: 3 };
+        let input_area = Rect {
+            x: 0,
+            y: 10,
+            width: 80,
+            height: 3,
+        };
         let rect = command_hint_rect(input_area, 2);
         assert_eq!(rect.height, 4); // 2 matches + 2 borders
         assert_eq!(rect.y, 6); // 10 - 4
@@ -1927,7 +2071,12 @@ mod tests {
         assert_eq!(rect.width, input_area.width);
 
         // Near the top of the frame: must clamp, not underflow/panic.
-        let near_top = Rect { x: 0, y: 1, width: 80, height: 3 };
+        let near_top = Rect {
+            x: 0,
+            y: 1,
+            width: 80,
+            height: 3,
+        };
         let clamped = command_hint_rect(near_top, 6);
         assert_eq!(clamped.y, 0);
     }
