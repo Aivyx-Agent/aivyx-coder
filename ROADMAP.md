@@ -586,6 +586,54 @@ closing a real, previously-latent gap where nothing in production code
 ever validated it. See
 `docs/superpowers/specs/2026-09-22-custom-roster-loading-design.md`.
 
+**`/clear` resets real mission/specialist-session state — shipped
+(2026-09-22).** Previously, `Agent::clear_conversation()` (the real
+implementation behind the TUI's `/clear`) cleared `history` and the task
+list but had zero knowledge of `MissionPlan`/`SpecialistSessionPool` — the
+TUI's own displayed panels reset correctly, but the *real* shared
+`Arc<Mutex<MissionPlan>>` and `SpecialistSessionPool` a later
+`decompose_task`/`verify_output`/`synthesize_results`/`spawn_specialist`
+call actually reads/writes were untouched, so those calls could
+"resurrect" the panel with stale pre-clear content. Fixed: `Agent` gains
+two new optional fields (`mission_plan`, `specialist_session_pool`) with
+setters mirroring the existing `set_repo_map`/`set_injection_taint`
+convention, wired in `agent_builder.rs` from the same handles already
+threaded to `BuiltAgent`; `SpecialistSessionPool` gained a new synchronous
+`close_all()` (verified correct without awaiting `forward_task` — dropping
+a parked session's `Agent` closes the event channel either its own
+`sub_tx` or `barrier_tx` end reads from, so the forwarding task ends on
+its own either way); `clear_conversation()` now resets the `MissionPlan`
+to its pristine startup default and calls `close_all()`, both only when
+`[team] enabled = true` (both fields stay `None`, a genuine no-op,
+otherwise). Whole-branch review traced the handle-sharing end-to-end
+(`agent_builder.rs`'s `mission_plan`/`specialist_session_pool` locals are
+the *same* `Arc`/pool clones handed to `MissionToolsConfig`/
+`SpecialistSessionsConfig`, confirmed via `SpecialistSessionPool`'s
+`Clone`-over-`Arc<Mutex<_>>` derive) and caught a real, since-fixed issue:
+this branch's own bug description had been living as a doc comment on
+`AgentEvent::MissionsUpdated` (`agent/types.rs`), explicitly telling future
+maintainers the resurrection was a permanent, accepted limitation — now
+corrected to describe the actual, fixed behavior. See
+`docs/superpowers/specs/2026-09-22-clear-resets-real-mission-state-design.md`.
+Deferred follow-ups from the final review, none blocking: DRY the
+pristine-`MissionPlan` literal (now duplicated three ways —
+`agent_builder.rs`, `agent/mod.rs`, `mission_tools.rs` — behind
+`MissionPlan::default()`, once `MissionPlan` derives `Default`);
+`close_all()` drops parked sessions while holding the pool mutex, unlike
+`close_specialist`'s drop-outside-the-lock convention — harmless today
+since `Agent::drop` only releases a kv-cache slot, but worth aligning if a
+future `Drop` impl ever touches the pool; the `agent_builder.rs` wiring
+itself (the two `if let` setter calls) has no dedicated regression test —
+deleting them would silently no-op the whole fix while every
+`clear_conversation`-level test still passes, since those tests set the
+handles by hand; and a `/clear`-vs-in-flight-`query_specialist` race is
+structurally possible (`pool.take()` removes a session for a turn,
+`close_all()` runs, `put_back()` would resurrect it) but not reachable
+today since the TUI handles `/clear` and turns sequentially on one input
+loop — would need to cooperate with `take`/`put_back` if `/clear` is ever
+made concurrent with a running turn (e.g. a future cancel-and-clear
+affordance, or ACP wiring).
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
