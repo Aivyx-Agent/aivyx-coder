@@ -1,0 +1,45 @@
+name: Docker Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "primary_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "push_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "primary_tag=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "push_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: docker build -t "ghcr.io/aivyx-agent/aivyx-coder:${{ steps.tags.outputs.primary_tag }}" .
+
+      - name: Push primary tag
+        run: docker push "ghcr.io/aivyx-agent/aivyx-coder:${{ steps.tags.outputs.primary_tag }}"
+
+      - name: Tag and push latest
+        if: steps.tags.outputs.push_latest == 'true'
+        run: |
+          docker tag "ghcr.io/aivyx-agent/aivyx-coder:${{ steps.tags.outputs.primary_tag }}" "ghcr.io/aivyx-agent/aivyx-coder:latest"
+          docker push "ghcr.io/aivyx-agent/aivyx-coder:latest"
