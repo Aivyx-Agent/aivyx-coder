@@ -1473,8 +1473,9 @@ tool_allowlist = []
     #[test]
     fn resolve_team_config_validates_the_default_roster_too() {
         // The default roster is already known-valid, so this should
-        // simply succeed -- proving validate() is genuinely called
-        // unconditionally, not skipped when roster_path is unset.
+        // simply succeed against its own full required tool set --
+        // proving validate() is genuinely called unconditionally, not
+        // skipped when roster_path is unset.
         let settings = Settings::default();
         let default_roster = aivyx_team::default_coding_roster();
         let default_roster_tools: Vec<&str> = default_roster
@@ -1483,5 +1484,41 @@ tool_allowlist = []
             .flat_map(|m| m.tool_allowlist.iter().map(|s| s.as_str()))
             .collect();
         assert!(resolve_team_config(&settings, &default_roster_tools).is_ok());
+    }
+
+    #[test]
+    fn resolve_team_config_default_roster_branch_genuinely_calls_validate() {
+        // Discriminates a wrong implementation that skips validate() for
+        // the `roster_path` unset (default-roster) branch: an
+        // available_tools list deliberately missing a tool the default
+        // roster actually needs must make this fail, since a real
+        // implementation validates that branch too. If validate() were
+        // skipped for the None arm, this would wrongly return Ok.
+        //
+        // "git_read" is used only by the "reviewer" member (every other
+        // tool in the default roster is shared by 2+ members -- read_file/
+        // grep/glob in particular -- so simply popping one occurrence
+        // from a flattened list would leave the tool still "available"
+        // via another member's identical entry; git_read is the one name
+        // that genuinely disappears when excluded).
+        let settings = Settings::default();
+        let default_roster = aivyx_team::default_coding_roster();
+        let incomplete_tools: Vec<&str> = default_roster
+            .members
+            .iter()
+            .flat_map(|m| m.tool_allowlist.iter().map(|s| s.as_str()))
+            .filter(|t| *t != "git_read")
+            .collect();
+        assert!(
+            !incomplete_tools.contains(&"git_read"),
+            "test setup bug: git_read must be genuinely absent from the fixture"
+        );
+        let err = resolve_team_config(&settings, &incomplete_tools).unwrap_err();
+        assert!(
+            err.to_string().contains("roster is invalid"),
+            "excluding git_read from available_tools must make the default roster's own \
+             validate() call fail (the reviewer member names it), proving validate() is \
+             genuinely unconditional -- got: {err}"
+        );
     }
 }
