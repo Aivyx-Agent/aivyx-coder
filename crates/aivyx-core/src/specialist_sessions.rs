@@ -2319,6 +2319,78 @@ mod specialist_session_tests {
         );
     }
 
+    /// Mirrors `close_specialist_refuses_a_dehydrated_session_it_did_not_open_and_leaves_it_intact`
+    /// for the LIVE-session branch of `close_specialist`'s ownership
+    /// check -- the two branches are separate `if let` arms in
+    /// `CloseSpecialistTool::execute`, so a test covering only the
+    /// dehydrated arm leaves the live arm's ownership check completely
+    /// unverified (a caller could close ANY live peer session and every
+    /// other existing test would still pass).
+    #[tokio::test]
+    async fn close_specialist_refuses_a_live_session_it_did_not_open_and_leaves_it_intact() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+
+        // Spawn a session owned by a specialist (not the lead, and not the
+        // impostor below either).
+        let mut specialist_cfg = config(llm, tx, simple_team(), pool.clone());
+        specialist_cfg.caller = SessionOwner::Specialist("orchestrator-session".to_string());
+        let spawn_tool = SpawnSpecialistTool::new(specialist_cfg.clone());
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let spawn_result = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(spawn_text) = spawn_result else {
+            panic!("expected Ok from spawn_specialist");
+        };
+        let session_id = spawn_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        // A different specialist entirely -- not the lead, not the owner.
+        let mut impostor_cfg = specialist_cfg.clone();
+        impostor_cfg.caller = SessionOwner::Specialist("some-other-specialist-session".to_string());
+        let close_tool = CloseSpecialistTool::new(impostor_cfg);
+        let rejected = close_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id.clone() }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        match rejected {
+            ToolOutput::Error(msg) => assert!(msg.contains("was not opened by you")),
+            other => panic!("expected an ownership error, got {other:?}"),
+        }
+
+        // The session must survive: still open, and its real owner can
+        // still close it afterward.
+        assert_eq!(
+            pool.open_sessions().len(),
+            1,
+            "a rejected close from a non-owner, non-lead caller must not remove the session"
+        );
+        let close_tool_as_owner = CloseSpecialistTool::new(specialist_cfg);
+        let closed = close_tool_as_owner
+            .execute(serde_json::json!({ "session_id": session_id }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            matches!(closed, ToolOutput::Ok(_)),
+            "the session's real owner must still be able to close it after a rejected attempt \
+            from someone else, expected Ok got {closed:?}"
+        );
+    }
+
     /// Finding 1: the lead is the one caller allowed to bypass
     /// `close_specialist`'s ownership check entirely -- this is its
     /// recovery path for a specialist-owned session whose owning
