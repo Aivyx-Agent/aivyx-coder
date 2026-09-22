@@ -35,11 +35,11 @@ pub use tools::{
     CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GenerateImageTool,
     GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool, GitBranchTool, GitCommitTool, GitPrTool,
     GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
-    ListMcpResourcesTool, McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool,
-    MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool,
-    ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool, RunCommandTool, RunShellTool,
-    SetTasksTool, SharedReplSession, WebFetchTool, WebSearchTool, WriteFileTool,
-    new_shared_repl_session,
+    ListMcpResourcesTool, LoadSkillTool, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
+    MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
+    RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
+    RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool, WebSearchTool,
+    WriteFileTool, new_shared_repl_session,
 };
 
 #[derive(Debug, Error)]

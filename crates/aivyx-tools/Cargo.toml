@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 aivyx-checkpoint = { workspace = true }
 aivyx-recall = { workspace = true }
+aivyx-skills = { workspace = true }
 aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
 aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }

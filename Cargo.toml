@@ -37,6 +37,7 @@ aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", re
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e44314555ba94a8de5c0634b163ef9d425cf1164" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "ad9141c6ca242532db7b8e34eff423084e1eba4d" }
+aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "99a0298828d80bb18175671ef66b61d5e0133bf7" }
 # Not on crates.io -- pinned by commit SHA, same as aivyx-checkpoint/
 # aivyx-confine/aivyx-injection-guard above. No platform-specific
 # backend, so no target-gating needed. All three pinned to the same rev
