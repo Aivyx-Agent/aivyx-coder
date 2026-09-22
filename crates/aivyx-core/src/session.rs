@@ -12,18 +12,37 @@ use serde::{Deserialize, Serialize};
 /// as "no resumable session" (start fresh), not an error.
 const SESSION_VERSION: u32 = 1;
 
+/// Who opened a given specialist session -- the lead itself, or another
+/// specialist (identified by ITS OWN session_id in the same pool).
+/// `query_specialist`/`close_specialist` refuse to touch a session whose
+/// `owner` doesn't match the calling `SpecialistSessionsConfig.caller`.
+/// Defaults to `Lead` (via `#[serde(default)]` on the fields that use
+/// it) so a `PersistedSpecialistSession` written before this feature
+/// existed still loads correctly -- every session persisted then was
+/// necessarily lead-opened, since specialists couldn't open sessions
+/// before now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SessionOwner {
+    #[default]
+    Lead,
+    Specialist(String),
+}
+
 /// One parked specialist session's persisted state -- just enough to
-/// rebuild it: which member it is, and its own conversation history.
-/// Unlike `SessionState` (the lead's own persistence format), there's no
-/// `last_active`: a dehydrated session doesn't expire from inactivity,
-/// since nothing is consuming resources while it sits as inert JSON --
-/// only a *live* session (rebuilt via `query_specialist`) is subject to
-/// the idle-timeout eviction `SpecialistSessionPool` already has.
+/// rebuild it: which member it is, its own conversation history, and who
+/// opened it. Unlike `SessionState` (the lead's own persistence format),
+/// there's no `last_active`: a dehydrated session doesn't expire from
+/// inactivity, since nothing is consuming resources while it sits as
+/// inert JSON -- only a *live* session (rebuilt via `query_specialist`)
+/// is subject to the idle-timeout eviction `SpecialistSessionPool`
+/// already has.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSpecialistSession {
     pub session_id: String,
     pub member: String,
     pub history: Vec<Message>,
+    #[serde(default)]
+    pub owner: SessionOwner,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +227,7 @@ mod tests {
                 session_id: "abc-123".to_string(),
                 member: "implementer".to_string(),
                 history: vec![Message::text(Role::User, "implement the thing")],
+                owner: SessionOwner::Specialist("orchestrator-session-id".to_string()),
             }],
         );
 
@@ -226,6 +246,34 @@ mod tests {
             loaded.specialist_sessions[0].history[0].text_content(),
             "implement the thing"
         );
+        assert_eq!(
+            loaded.specialist_sessions[0].owner,
+            SessionOwner::Specialist("orchestrator-session-id".to_string())
+        );
+    }
+
+    #[test]
+    fn a_persisted_specialist_session_predating_owner_still_loads_as_lead_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 1,
+                "history": [],
+                "tasks": [],
+                "specialist_sessions": [
+                    { "session_id": "old-one", "member": "implementer", "history": [] }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).expect("pre-existing-field-free session should still load");
+
+        assert_eq!(loaded.specialist_sessions.len(), 1);
+        assert_eq!(loaded.specialist_sessions[0].owner, SessionOwner::Lead);
     }
 
     #[test]

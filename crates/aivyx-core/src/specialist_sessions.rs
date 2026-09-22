@@ -28,7 +28,7 @@ use aivyx_tools::{
 };
 use aivyx_types::{ToolDefinition, ToolOutput};
 
-use crate::session::PersistedSpecialistSession;
+use crate::session::{PersistedSpecialistSession, SessionOwner};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -64,6 +64,10 @@ struct ParkedSpecialistSession {
     /// `accumulated` is read.
     barrier_tx: BarrierSender,
     last_active: Instant,
+    /// Who opened this session -- the lead, or a specialist (by its own
+    /// session_id). `query_specialist`/`close_specialist` check this
+    /// against the calling `SpecialistSessionsConfig.caller`.
+    owner: SessionOwner,
 }
 
 /// A minimal snapshot of one open specialist session -- interpolated into
@@ -299,6 +303,7 @@ impl SpecialistSessionPool {
                     session_id: id.clone(),
                     member: session.member.clone(),
                     history: session.agent.history_snapshot(),
+                    owner: session.owner.clone(),
                 }),
         );
         out
@@ -326,6 +331,19 @@ pub struct SpecialistSessionsConfig {
     pub max_iterations: u32,
     pub broker_mode: bool,
     pub pool: SpecialistSessionPool,
+    /// How many specialist-initiated (not lead-initiated) spawn hops led
+    /// to this config being used -- `0` for the lead's own top-level
+    /// config. Only increments when a *specialist* does the spawning;
+    /// being spawned by the lead doesn't itself count as a hop. See
+    /// `build_specialist_agent`'s own doc comment for how this bounds
+    /// nesting.
+    pub spawn_depth: u32,
+    /// Who this config acts on behalf of -- `Lead` for the lead's own
+    /// top-level config, `Specialist(own_session_id)` for a specialist's
+    /// own child config. Tags every session this config's tools open,
+    /// and is checked against a target session's own `owner` before
+    /// `query_specialist`/`close_specialist` touch it.
+    pub caller: SessionOwner,
 }
 
 /// Runs one bounded exchange against `agent` (a `run_turn` call, then the
@@ -657,6 +675,7 @@ impl Tool for SpawnSpecialistTool {
             accumulated,
             barrier_tx,
             last_active: Instant::now(),
+            owner: self.config.caller.clone(),
         };
         if let Err(max) = self.config.pool.insert_new(session_id.clone(), session) {
             return Ok(ToolOutput::Error(format!(
@@ -764,6 +783,7 @@ impl Tool for QuerySpecialistTool {
                 accumulated,
                 barrier_tx,
                 last_active: Instant::now(),
+                owner: persisted.owner,
             }
         } else {
             return Ok(ToolOutput::Error(format!(
@@ -1024,6 +1044,8 @@ mod specialist_session_tests {
             max_iterations: 3,
             broker_mode: false,
             pool,
+            spawn_depth: 0,
+            caller: SessionOwner::Lead,
         }
     }
 
@@ -1305,6 +1327,7 @@ mod specialist_session_tests {
             session_id: "old-session".to_string(),
             member: "implementer".to_string(),
             history: vec![],
+            owner: SessionOwner::Lead,
         }]);
         assert_eq!(pool.snapshot_for_persistence().len(), 1);
 
@@ -1615,6 +1638,7 @@ mod specialist_session_tests {
                 aivyx_types::Role::User,
                 "from a previous run",
             )],
+            owner: SessionOwner::Lead,
         };
         pool.seed_dehydrated(vec![persisted]);
 
@@ -1635,6 +1659,7 @@ mod specialist_session_tests {
             session_id: "old-session".to_string(),
             member: "implementer".to_string(),
             history: vec![],
+            owner: SessionOwner::Lead,
         }]);
         let cfg = config(llm, tx, simple_team(), pool.clone());
         let spawn_tool = SpawnSpecialistTool::new(cfg);
@@ -1674,6 +1699,7 @@ mod specialist_session_tests {
                 aivyx_types::Role::User,
                 "earlier task from a previous run",
             )],
+            owner: SessionOwner::Lead,
         }]);
         let cfg = config(llm.clone(), tx, simple_team(), pool.clone());
         let query_tool = QuerySpecialistTool::new(cfg);
@@ -1714,6 +1740,7 @@ mod specialist_session_tests {
             session_id: "old-session".to_string(),
             member: "no-longer-on-the-roster".to_string(),
             history: vec![],
+            owner: SessionOwner::Lead,
         }]);
         let llm = Arc::new(MockBackend::new(vec![]));
         let cfg = config(llm, tx, simple_team(), pool.clone());
@@ -1749,6 +1776,7 @@ mod specialist_session_tests {
             session_id: "old-session".to_string(),
             member: "implementer".to_string(),
             history: vec![],
+            owner: SessionOwner::Lead,
         }]);
         let llm = Arc::new(MockBackend::new(vec![]));
         let cfg = config(llm, tx, simple_team(), pool.clone());

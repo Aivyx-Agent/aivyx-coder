@@ -20,7 +20,7 @@ pub use delegate_to_specialist::{DelegateToSpecialistConfig, DelegateToSpecialis
 pub use mission_tools::{
     DecomposeTaskTool, MissionToolsConfig, SynthesizeResultsTool, VerifyOutputTool,
 };
-pub use session::{SessionState, Task, TaskStatus};
+pub use session::{SessionOwner, SessionState, Task, TaskStatus};
 pub use specialist_sessions::{
     CloseSpecialistTool, QuerySpecialistTool, SpawnSpecialistTool, SpecialistSessionPool,
     SpecialistSessionSummary, SpecialistSessionsConfig,

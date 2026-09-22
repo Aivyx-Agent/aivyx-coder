@@ -5341,6 +5341,8 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
         max_iterations: 3,
         broker_mode: false,
         pool: pool.clone(),
+        spawn_depth: 0,
+        caller: crate::session::SessionOwner::Lead,
     };
     let spawn_tool = SpawnSpecialistTool::new(cfg);
     let ctx = ToolExecutionContext {
@@ -5390,6 +5392,7 @@ async fn persist_writes_the_specialist_pools_dehydrated_sessions_to_disk() {
         session_id: "old-session".to_string(),
         member: "implementer".to_string(),
         history: vec![Message::text(Role::User, "from a previous run")],
+        owner: crate::session::SessionOwner::Lead,
     }]);
 
     let (mut agent, _rx, _mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 5);
