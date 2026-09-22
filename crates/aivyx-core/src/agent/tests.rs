@@ -406,7 +406,7 @@ fn restore_turns_plan_mode_on_when_the_resumed_session_had_it_active_but_never_t
         tx,
     );
 
-    agent.restore(crate::session::SessionState::new(vec![], vec![], true));
+    agent.restore(crate::session::SessionState::new(vec![], vec![], true, vec![]));
     assert!(
         plan_mode.active(),
         "restoring a session saved in plan mode should switch plan mode on"
@@ -414,7 +414,7 @@ fn restore_turns_plan_mode_on_when_the_resumed_session_had_it_active_but_never_t
 
     // A session saved in Act mode must not clobber a plan mode already
     // turned on some other way (e.g. an explicit --plan flag).
-    agent.restore(crate::session::SessionState::new(vec![], vec![], false));
+    agent.restore(crate::session::SessionState::new(vec![], vec![], false, vec![]));
     assert!(
         plan_mode.active(),
         "restoring a session saved outside plan mode must not turn plan mode off"
@@ -5386,6 +5386,18 @@ fn system_prompt_text_excludes_history() {
         !text.contains("a real user message"),
         "system_prompt_text must never include conversation history"
     );
+}
+
+#[test]
+fn history_snapshot_and_restore_history_round_trip() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    assert!(agent.history_snapshot().is_empty());
+
+    agent.restore_history(vec![Message::text(Role::User, "hello")]);
+
+    let snapshot = agent.history_snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].text_content(), "hello");
 }
 
 #[test]

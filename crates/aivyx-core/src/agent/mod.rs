@@ -913,6 +913,26 @@ impl Agent {
         }
     }
 
+    /// A clone of the current conversation history. Used to persist a
+    /// *specialist's* own history (via
+    /// `SpecialistSessionPool::snapshot_for_persistence`) -- a different
+    /// actor's history than the lead's own `SessionState`-based
+    /// persistence this same struct also supports.
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.history.clone()
+    }
+
+    /// Replaces the current history wholesale. Used to rehydrate a
+    /// dehydrated specialist session's `Agent` (freshly built via
+    /// `build_specialist_agent`) with its persisted conversation before
+    /// parking it back into the live pool. Unlike `restore()` (the
+    /// lead's own `SessionState`-based resume path), this only ever
+    /// touches `history` -- a specialist has no tasks or Plan-mode state
+    /// of its own to restore.
+    pub fn restore_history(&mut self, history: Vec<Message>) {
+        self.history = history;
+    }
+
     /// Best-effort snapshot to disk. A persistence failure is logged, never
     /// propagated — losing a save must not fail the user's turn.
     fn persist(&self) {
@@ -920,7 +940,7 @@ impl Agent {
             return;
         };
         let tasks = self.tasks.lock().unwrap().clone();
-        let state = SessionState::new(self.history.clone(), tasks, self.plan_mode.active());
+        let state = SessionState::new(self.history.clone(), tasks, self.plan_mode.active(), vec![]);
         if let Err(err) = session::save(path, &state) {
             tracing::warn!(error = %err, "failed to persist session");
         }

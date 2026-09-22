@@ -12,6 +12,20 @@ use serde::{Deserialize, Serialize};
 /// as "no resumable session" (start fresh), not an error.
 const SESSION_VERSION: u32 = 1;
 
+/// One parked specialist session's persisted state -- just enough to
+/// rebuild it: which member it is, and its own conversation history.
+/// Unlike `SessionState` (the lead's own persistence format), there's no
+/// `last_active`: a dehydrated session doesn't expire from inactivity,
+/// since nothing is consuming resources while it sits as inert JSON --
+/// only a *live* session (rebuilt via `query_specialist`) is subject to
+/// the idle-timeout eviction `SpecialistSessionPool` already has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSpecialistSession {
+    pub session_id: String,
+    pub member: String,
+    pub history: Vec<Message>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub version: u32,
@@ -24,15 +38,31 @@ pub struct SessionState {
     /// existed still loads — as `false`, the only behavior possible then.
     #[serde(default)]
     pub plan_mode_active: bool,
+    /// Every specialist session that was open (live or already
+    /// dehydrated from an earlier restart) when this file was last
+    /// saved. `#[serde(default)]` so a session file written before this
+    /// field existed still loads -- as an empty list, the only behavior
+    /// possible then. Seeded into `SpecialistSessionPool`'s dehydrated
+    /// map at `--resume` time; each entry stays inert until
+    /// `query_specialist` rebuilds it, or `close_specialist` discards it
+    /// unused.
+    #[serde(default)]
+    pub specialist_sessions: Vec<PersistedSpecialistSession>,
 }
 
 impl SessionState {
-    pub fn new(history: Vec<Message>, tasks: Vec<Task>, plan_mode_active: bool) -> Self {
+    pub fn new(
+        history: Vec<Message>,
+        tasks: Vec<Task>,
+        plan_mode_active: bool,
+        specialist_sessions: Vec<PersistedSpecialistSession>,
+    ) -> Self {
         Self {
             version: SESSION_VERSION,
             history,
             tasks,
             plan_mode_active,
+            specialist_sessions,
         }
     }
 }
@@ -174,6 +204,11 @@ mod tests {
                 status: TaskStatus::InProgress,
             }],
             true,
+            vec![PersistedSpecialistSession {
+                session_id: "abc-123".to_string(),
+                member: "implementer".to_string(),
+                history: vec![Message::text(Role::User, "implement the thing")],
+            }],
         );
 
         save(&path, &state).unwrap();
@@ -183,6 +218,29 @@ mod tests {
         assert_eq!(loaded.history[0].text_content(), "hello");
         assert_eq!(loaded.tasks, state.tasks);
         assert!(loaded.plan_mode_active);
+        assert_eq!(loaded.specialist_sessions.len(), 1);
+        assert_eq!(loaded.specialist_sessions[0].session_id, "abc-123");
+        assert_eq!(loaded.specialist_sessions[0].member, "implementer");
+        assert_eq!(loaded.specialist_sessions[0].history.len(), 1);
+        assert_eq!(
+            loaded.specialist_sessions[0].history[0].text_content(),
+            "implement the thing"
+        );
+    }
+
+    #[test]
+    fn a_session_file_predating_specialist_sessions_still_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "version": 1, "history": [], "tasks": [] }).to_string(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).expect("pre-existing-field-free session should still load");
+
+        assert!(loaded.specialist_sessions.is_empty());
     }
 
     #[test]
@@ -266,7 +324,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
-        save(&path, &SessionState::new(vec![], vec![], false)).unwrap();
+        save(&path, &SessionState::new(vec![], vec![], false, vec![])).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
