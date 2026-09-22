@@ -776,9 +776,13 @@ pub(crate) async fn build_agent(
         // Snapshot at this exact point (before decompose_task/verify_output/
         // synthesize_results/spawn_specialist/query_specialist/close_specialist
         // are registered further down) -- see team_parent_registry's own
-        // comment just above this block for why a custom roster's
-        // tool_allowlist can never validate-pass naming any of those six
-        // tools, by construction, not by this check alone.
+        // comment just above this block for why decompose_task/
+        // verify_output/synthesize_results/delegate_to_specialist can
+        // never validate-pass naming in a custom roster's tool_allowlist,
+        // by construction, not by this check alone. spawn_specialist/
+        // query_specialist/close_specialist are the one exception --
+        // `available_tools` explicitly extends past this snapshot for
+        // those three, just below.
         let team_registry_definitions = registry.definitions();
         let mut available_tools: Vec<&str> = team_registry_definitions
             .iter()
