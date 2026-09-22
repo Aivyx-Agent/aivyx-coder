@@ -1701,8 +1701,9 @@ mod specialist_session_tests {
             }
             other => panic!("must fail closed when the member no longer exists, got {other:?}"),
         }
-        assert!(
-            pool.open_sessions().is_empty(),
+        assert_eq!(
+            pool.snapshot_for_persistence().len(),
+            0,
             "the stale dehydrated record must be discarded, not left around"
         );
     }
