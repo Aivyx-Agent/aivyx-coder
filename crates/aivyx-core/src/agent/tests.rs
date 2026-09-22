@@ -5373,6 +5373,48 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
     );
 }
 
+#[tokio::test]
+async fn persist_writes_the_specialist_pools_dehydrated_sessions_to_disk() {
+    // Proves Agent::persist() itself -- not just SpecialistSessionPool's
+    // own snapshot logic (already covered in specialist_sessions.rs) or
+    // the rehydration tool logic -- actually wires the pool into the
+    // saved SessionState. Seeding a dehydrated session directly (rather
+    // than spawning a real live one, as
+    // clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_set
+    // does above) is sufficient here and avoids re-testing spawn
+    // machinery: persist() reads snapshot_for_persistence(), which unions
+    // live and dehydrated sessions, so a dehydrated-only pool still
+    // proves persist() reads the pool and writes its contents to disk.
+    let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+    pool.seed_dehydrated(vec![crate::session::PersistedSpecialistSession {
+        session_id: "old-session".to_string(),
+        member: "implementer".to_string(),
+        history: vec![Message::text(Role::User, "from a previous run")],
+    }]);
+
+    let (mut agent, _rx, _mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 5);
+    agent.set_specialist_session_pool_handle(pool);
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.json");
+    agent.set_session_path(session_path.clone());
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let saved = crate::session::load(&session_path).expect("session should have been saved");
+    assert_eq!(saved.specialist_sessions.len(), 1);
+    assert_eq!(saved.specialist_sessions[0].session_id, "old-session");
+    assert_eq!(saved.specialist_sessions[0].member, "implementer");
+    assert_eq!(saved.specialist_sessions[0].history.len(), 1);
+    assert_eq!(
+        saved.specialist_sessions[0].history[0].text_content(),
+        "from a previous run"
+    );
+}
+
 #[test]
 fn system_prompt_text_excludes_history() {
     // build_agent (this file's real test constructor, see build_agent/

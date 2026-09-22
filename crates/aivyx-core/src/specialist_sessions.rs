@@ -150,7 +150,9 @@ impl SpecialistSessionPool {
     /// `/clear` so a specialist session never stays queryable against a
     /// lead conversation that's just been wiped.
     pub fn close_all(&self) {
-        self.inner.lock().unwrap().sessions.clear();
+        let mut state = self.inner.lock().unwrap();
+        state.sessions.clear();
+        state.dehydrated.clear();
     }
 
     /// A snapshot of every currently-open session's id and member, evicting
@@ -1280,6 +1282,32 @@ mod specialist_session_tests {
         assert!(
             pool.open_sessions().is_empty(),
             "close_all must remove every open session"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_all_also_clears_dehydrated_sessions() {
+        // Regression test: close_all used to clear only the live `sessions`
+        // map, leaving `dehydrated` untouched -- so a dehydrated session
+        // would survive `/clear` and get written right back to disk on the
+        // very next `persist()` (whose snapshot unions both maps). Checking
+        // `open_sessions()` alone (as `close_all_removes_every_open_session`
+        // above does) would NOT catch this, since it only ever looks at the
+        // live map -- `snapshot_for_persistence()` is what proves both maps
+        // were really cleared.
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![],
+        }]);
+        assert_eq!(pool.snapshot_for_persistence().len(), 1);
+
+        pool.close_all();
+
+        assert!(
+            pool.snapshot_for_persistence().is_empty(),
+            "close_all must also clear dehydrated sessions, not just live ones"
         );
     }
 
