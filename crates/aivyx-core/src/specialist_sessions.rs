@@ -730,7 +730,35 @@ impl Tool for QuerySpecialistTool {
         let args: QuerySpecialistArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
-        let Some(mut session) = self.config.pool.take(&args.session_id) else {
+        let mut session = if let Some(session) = self.config.pool.take(&args.session_id) {
+            session
+        } else if let Some(persisted) = self.config.pool.take_dehydrated(&args.session_id) {
+            let Some(member) = self
+                .config
+                .team
+                .members
+                .iter()
+                .find(|m| m.name == persisted.member)
+            else {
+                return Ok(ToolOutput::Error(format!(
+                    "cannot resume session_id {:?}: its specialist {:?} no longer exists in \
+                    the current team roster -- the session has been discarded; call \
+                    spawn_specialist with a valid member instead",
+                    args.session_id, persisted.member
+                )));
+            };
+            let (mut agent, forward_task, accumulated, barrier_tx) =
+                build_specialist_agent(member, &self.config, &ctx.cwd);
+            agent.restore_history(persisted.history);
+            ParkedSpecialistSession {
+                agent,
+                member: member.name.clone(),
+                forward_task,
+                accumulated,
+                barrier_tx,
+                last_active: Instant::now(),
+            }
+        } else {
             return Ok(ToolOutput::Error(format!(
                 "unknown session_id: {:?} -- it may not exist, may already be closed, or may \
                 have expired from inactivity; call spawn_specialist to start a new one",
@@ -806,25 +834,34 @@ impl Tool for CloseSpecialistTool {
         let args: CloseSpecialistArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
-        let Some(session) = self.config.pool.take(&args.session_id) else {
-            return Ok(ToolOutput::Error(format!(
-                "unknown session_id: {:?} -- it may not exist or may already be closed",
+        if let Some(session) = self.config.pool.take(&args.session_id) {
+            let member = session.member.clone();
+            drop(session.agent);
+            let _ = session.forward_task.await;
+
+            let _ = self
+                .config
+                .events_tx
+                .send(AgentEvent::SpecialistSessionsUpdated(
+                    self.config.pool.open_sessions(),
+                ));
+
+            return Ok(ToolOutput::Ok(format!(
+                "specialist session {:?} closed ({member})",
                 args.session_id
             )));
-        };
-        let member = session.member.clone();
-        drop(session.agent);
-        let _ = session.forward_task.await;
+        }
 
-        let _ = self
-            .config
-            .events_tx
-            .send(AgentEvent::SpecialistSessionsUpdated(
-                self.config.pool.open_sessions(),
-            ));
+        if let Some(persisted) = self.config.pool.take_dehydrated(&args.session_id) {
+            return Ok(ToolOutput::Ok(format!(
+                "specialist session {:?} closed ({}) -- it was dehydrated from a previous \
+                run and had not been resumed",
+                args.session_id, persisted.member
+            )));
+        }
 
-        Ok(ToolOutput::Ok(format!(
-            "specialist session {:?} closed ({member})",
+        Ok(ToolOutput::Error(format!(
+            "unknown session_id: {:?} -- it may not exist or may already be closed",
             args.session_id
         )))
     }
@@ -1590,6 +1627,107 @@ mod specialist_session_tests {
                  spawn with a cap-exceeded Error, got: {other:?}"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn query_specialist_rehydrates_a_dehydrated_session_and_completes_the_query() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hi again")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![aivyx_types::Message::text(
+                aivyx_types::Role::User,
+                "earlier task from a previous run",
+            )],
+        }]);
+        let cfg = config(llm.clone(), tx, simple_team(), pool.clone());
+        let query_tool = QuerySpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let output = query_tool
+            .execute(
+                serde_json::json!({ "session_id": "old-session", "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ToolOutput::Ok(_)));
+        assert_eq!(
+            pool.open_sessions().len(),
+            1,
+            "rehydration should move the session into the live pool"
+        );
+        let received = llm.received.lock().unwrap();
+        let last_request = received
+            .last()
+            .expect("the mock should have received a request");
+        assert!(
+            last_request.messages.iter().any(|m| m
+                .text_content()
+                .contains("earlier task from a previous run")),
+            "the rebuilt agent's request should include the restored history, not just the new \
+            follow-up message"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_specialist_fails_closed_when_the_dehydrated_members_no_longer_in_the_roster() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "no-longer-on-the-roster".to_string(),
+            history: vec![],
+        }]);
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let cfg = config(llm, tx, simple_team(), pool.clone());
+        let query_tool = QuerySpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let output = query_tool
+            .execute(
+                serde_json::json!({ "session_id": "old-session", "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        match output {
+            ToolOutput::Error(msg) => {
+                assert!(msg.contains("no-longer-on-the-roster"));
+            }
+            other => panic!("must fail closed when the member no longer exists, got {other:?}"),
+        }
+        assert!(
+            pool.open_sessions().is_empty(),
+            "the stale dehydrated record must be discarded, not left around"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_specialist_discards_a_dehydrated_only_session_without_building_an_agent() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![],
+        }]);
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let cfg = config(llm, tx, simple_team(), pool.clone());
+        let close_tool = CloseSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let output = close_tool
+            .execute(serde_json::json!({ "session_id": "old-session" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(matches!(output, ToolOutput::Ok(_)));
+        assert_eq!(pool.snapshot_for_persistence().len(), 0);
     }
 
     #[tokio::test]

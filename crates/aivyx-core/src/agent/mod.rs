@@ -940,7 +940,17 @@ impl Agent {
             return;
         };
         let tasks = self.tasks.lock().unwrap().clone();
-        let state = SessionState::new(self.history.clone(), tasks, self.plan_mode.active(), vec![]);
+        let specialist_sessions = self
+            .specialist_session_pool
+            .as_ref()
+            .map(SpecialistSessionPool::snapshot_for_persistence)
+            .unwrap_or_default();
+        let state = SessionState::new(
+            self.history.clone(),
+            tasks,
+            self.plan_mode.active(),
+            specialist_sessions,
+        );
         if let Err(err) = session::save(path, &state) {
             tracing::warn!(error = %err, "failed to persist session");
         }
