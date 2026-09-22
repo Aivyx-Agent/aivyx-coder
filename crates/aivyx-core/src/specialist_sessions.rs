@@ -48,6 +48,21 @@ const INJECTION_CUTOFF_NOTICE: &str = "\n\n(sub-agent stopped: a tool result was
 possible prompt injection — the above is its best-effort partial result.)";
 const NO_TEXT_RESPONSE: &str = "(the specialist produced no text response)";
 
+/// A specialist's own registry gets `spawn_specialist`/`query_specialist`/
+/// `close_specialist` (if its `tool_allowlist` names them) only when its
+/// own `SpecialistSessionsConfig.spawn_depth` is below this. Bounds
+/// specialist-initiated nesting to one hop: a specialist the lead spawns
+/// directly (depth 0) may spawn/query/close peers; a specialist spawned
+/// BY that specialist (depth 1) gets no such tools registered at all,
+/// regardless of its own `tool_allowlist`. Unlike `delegate_task`'s own
+/// recursion prevention (which works by never registering the tool at
+/// the top level, since a sub-agent's registry there is a one-shot
+/// snapshot), a specialist's own registry here is built once at spawn
+/// time and reused for its whole life, so the cap has to be a depth
+/// check at registration time rather than a structural absence from a
+/// shared snapshot.
+const MAX_SPECIALIST_SPAWN_DEPTH: u32 = 1;
+
 /// The barrier-sync channel `run_bounded_exchange` and `forward_task` use
 /// to agree the accumulator has caught up -- see `run_bounded_exchange`'s
 /// doc comment for the full rationale.
@@ -454,13 +469,51 @@ fn build_specialist_agent(
     member: &aivyx_team::TeamMember,
     config: &SpecialistSessionsConfig,
     cwd: &std::path::Path,
+    own_session_id: &str,
 ) -> (
     Agent,
     tokio::task::JoinHandle<()>,
     Arc<Mutex<String>>,
     BarrierSender,
 ) {
-    let specialist_registry = compute_specialist_registry(member, &config.parent_registry);
+    let mut specialist_registry = compute_specialist_registry(member, &config.parent_registry);
+    // `compute_specialist_registry`'s own snapshot (`config.parent_registry`)
+    // structurally excludes spawn_specialist/query_specialist/
+    // close_specialist/the three mission tools/delegate_to_specialist --
+    // that exclusion is unchanged. This is a SEPARATE, additive
+    // registration step: give the specialist fresh instances of the
+    // three session tools, bound to ITS OWN child config, only if its
+    // `tool_allowlist` names them and depth allows it. See
+    // `MAX_SPECIALIST_SPAWN_DEPTH`'s own doc comment for why this is a
+    // depth check here rather than a structural absence.
+    if config.spawn_depth < MAX_SPECIALIST_SPAWN_DEPTH {
+        let child_config = SpecialistSessionsConfig {
+            spawn_depth: config.spawn_depth + 1,
+            caller: SessionOwner::Specialist(own_session_id.to_string()),
+            ..config.clone()
+        };
+        if member
+            .tool_allowlist
+            .iter()
+            .any(|t| t == "spawn_specialist")
+        {
+            specialist_registry.register(Arc::new(SpawnSpecialistTool::new(child_config.clone())));
+        }
+        if member
+            .tool_allowlist
+            .iter()
+            .any(|t| t == "query_specialist")
+        {
+            specialist_registry.register(Arc::new(QuerySpecialistTool::new(child_config.clone())));
+        }
+        if member
+            .tool_allowlist
+            .iter()
+            .any(|t| t == "close_specialist")
+        {
+            specialist_registry.register(Arc::new(CloseSpecialistTool::new(child_config)));
+        }
+    }
     let (gate, confiner) =
         crate::specialist_enforcement::scoped_gate_and_confiner(&config.enforcement, member, cwd);
     let mut sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
@@ -649,8 +702,9 @@ impl Tool for SpawnSpecialistTool {
             )));
         }
 
+        let session_id = uuid::Uuid::new_v4().to_string();
         let (mut agent, forward_task, accumulated, barrier_tx) =
-            build_specialist_agent(member, &self.config, &ctx.cwd);
+            build_specialist_agent(member, &self.config, &ctx.cwd, &session_id);
         let output = run_bounded_exchange(
             &mut agent,
             args.task,
@@ -667,7 +721,6 @@ impl Tool for SpawnSpecialistTool {
             return Ok(output);
         };
 
-        let session_id = uuid::Uuid::new_v4().to_string();
         let session = ParkedSpecialistSession {
             agent,
             member: member.name.clone(),
@@ -774,7 +827,7 @@ impl Tool for QuerySpecialistTool {
                 )));
             };
             let (mut agent, forward_task, accumulated, barrier_tx) =
-                build_specialist_agent(member, &self.config, &ctx.cwd);
+                build_specialist_agent(member, &self.config, &ctx.cwd, &args.session_id);
             agent.restore_history(persisted.history);
             ParkedSpecialistSession {
                 agent,
@@ -1850,6 +1903,107 @@ mod specialist_session_tests {
             !denied.join("secret.txt").exists(),
             "the write must have been blocked by the specialist's own scoped gate -- if this \
              file exists, extra_deny_paths was not actually enforced via spawn_specialist"
+        );
+    }
+
+    fn team_with_spawn_specialist_allowlisted() -> TeamConfig {
+        use aivyx_team::TeamMember;
+        TeamConfig {
+            lead: "coordinator".to_string(),
+            members: vec![
+                TeamMember {
+                    name: "coordinator".to_string(),
+                    role: "Lead".to_string(),
+                    persona: "You delegate.".to_string(),
+                    tool_allowlist: vec![],
+                    extra_deny_paths: vec![],
+                },
+                TeamMember {
+                    name: "orchestrator".to_string(),
+                    role: "Orchestrator".to_string(),
+                    persona: "You coordinate peer specialists.".to_string(),
+                    tool_allowlist: vec!["spawn_specialist".to_string()],
+                    extra_deny_paths: vec![],
+                },
+                TeamMember {
+                    name: "worker".to_string(),
+                    role: "Worker".to_string(),
+                    persona: "You do focused work.".to_string(),
+                    tool_allowlist: vec!["spawn_specialist".to_string()],
+                    extra_deny_paths: vec![],
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_specialists_own_nesting_is_capped_at_one_hop() {
+        let mock = Arc::new(MockBackend::new(vec![
+            // orchestrator's own first exchange: spawns "worker" as a peer.
+            vec![
+                StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                    id: aivyx_types::ToolCallId("c1".to_string()),
+                    name: "spawn_specialist".to_string(),
+                    arguments: serde_json::json!({
+                        "member": "worker",
+                        "task": "try to spawn a third specialist",
+                    }),
+                    source: aivyx_types::ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            // worker's own first exchange: attempts to spawn ANOTHER peer.
+            // worker was itself spawned by a specialist (depth 1), so its
+            // own registry must not include spawn_specialist at all,
+            // regardless of its tool_allowlist naming it -- this call must
+            // fail as an unknown tool, not actually create a third session.
+            vec![
+                StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+                    id: aivyx_types::ToolCallId("c2".to_string()),
+                    name: "spawn_specialist".to_string(),
+                    arguments: serde_json::json!({
+                        "member": "orchestrator",
+                        "task": "this must never actually run",
+                    }),
+                    source: aivyx_types::ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        ]));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(5, Duration::from_secs(600));
+        let mut cfg = config(
+            mock,
+            tx,
+            team_with_spawn_specialist_allowlisted(),
+            pool.clone(),
+        );
+        cfg.max_iterations = 1;
+
+        let tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let result = tool
+            .execute(
+                serde_json::json!({ "member": "orchestrator", "task": "spawn a worker peer" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, ToolOutput::Ok(_)),
+            "expected Ok, got {result:?}"
+        );
+        assert_eq!(
+            pool.open_sessions().len(),
+            2,
+            "expected exactly 2 open sessions (orchestrator + worker) -- if this is 3, worker's \
+            own attempted nested spawn succeeded, violating the depth-1 cap"
         );
     }
 }
