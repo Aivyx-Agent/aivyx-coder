@@ -55,17 +55,32 @@ Read directly in the current codebase, not assumed:
   `PermissionTarget::Path`. Both `Internal` and `Read` auto-allow at the
   same gate tier, so this is a classification-honesty choice, not a
   behavioral one.
-- **`AGENTS.md` content — the closest existing analog to a skill
-  overlay (repo-sourced text, folded into the system prompt) — is
-  already run through `aivyx_sandbox::scan_for_injection_markers` before
-  use**, confirmed directly (`crates/aivyx-core/src/agent/mod.rs:851,868`,
-  both the user-level and project-level `AGENTS.md` paths), tagging the
-  shared `InjectionTaint` on a match exactly like the repo map and editor
-  context sources do. `aivyx-skills`'s own README explicitly flags that
-  overlay directories read untrusted local filesystem content and defers
-  the sanitization decision to whichever consumer integrates it — this
-  is that decision, and the precedent above makes it a direct
-  application of an already-established pattern, not a novel one.
+- **Two, DIFFERENT existing injection-scanning mechanisms, confirmed by
+  reading both, not assumed to be the same thing**:
+  1. `Agent::record_tool_result` (`crates/aivyx-core/src/agent/mod.rs:1144-1156`)
+     scans EVERY dispatched tool's `ToolOutput::Ok` content generically,
+     unconditionally, for ALL tools — confirmed via every call site
+     (`agent/mod.rs:1224,1293,2188`, the shared tail of the main
+     per-turn dispatch loop and `run_auto_verification`). No tool in
+     `aivyx-tools` does its own scanning (confirmed: `grep -rl
+     scan_for_injection_markers crates/aivyx-tools/src/tools/` returns
+     nothing) — because none of them need to; the framework already
+     does it for every tool result on their behalf. **This means
+     `load_skill`'s own returned body needs NO bespoke scanning code at
+     all** — it's a normal `ToolOutput::Ok`, automatically covered.
+  2. Content injected DIRECTLY into the system prompt (bypassing tool
+     dispatch entirely) is NOT covered by mechanism 1, and needs its own
+     explicit scan call at the point it's read — confirmed by reading
+     `AGENTS.md`'s own two call sites
+     (`agent/mod.rs:850-854,867-870`, inside `refresh_agents_files`,
+     which builds `agents_files_text` directly, never going through
+     `record_tool_result`), each scanning that one source's content and
+     tagging `self.injection_taint` on a match. The skill LISTING
+     (Decision 2's `skills_text`) follows this exact same path — folded
+     directly into `system_prompt_text()`, never a tool result — so an
+     overlay-sourced skill's `description` field appearing in that
+     listing needs the SAME explicit-scan treatment `AGENTS.md` gets,
+     for the identical reason.
 - **`aivyx-skills` has no GitHub remote at design time** — resolved
   during this same brainstorming session: a public
   `Aivyx-Agent/aivyx-skills` remote was created and the existing local
@@ -135,18 +150,24 @@ pinned git rev, not a version range — this project's established
 convention for its own small shared crates, which aren't published to
 crates.io).
 
-**5. `load_skill`'s tool result is scanned for injection markers when
-the matched skill did NOT come from the bundled set.** `Skill.source ==
-SkillSource::Bundled` (this crate's own shipped, reviewed content, never
-user-influenceable) skips the scan entirely — pure overhead with no
-security value, matching how the tool's own fixed prompt text is never
-scanned either. `Skill.source == SkillSource::User` or `Project` (both
-read from a real, external, potentially-untrusted filesystem location)
-runs `scan_for_injection_markers(&skill.body, "skill: <name>")` before
-returning the body as a tool result, tagging the agent's shared
-`InjectionTaint` on a match — exactly `AGENTS.md`'s own established
-two-tier treatment (project/user text scanned, the tool's own fixed
-content never is), applied here to a directly analogous threat shape.
+**5. The skill LISTING (`skills_text`, Decision 2) is scanned for
+injection markers at the point `agent_builder.rs` builds it — `load_skill`'s
+own tool result needs no bespoke scanning code at all.** `load_skill`
+returns a normal `ToolOutput::Ok`, which `Agent::record_tool_result`
+already scans unconditionally for every tool (Grounding); adding a second,
+tool-specific scan there would be pure redundant overhead with no security
+value. `skills_text`, by contrast, is folded directly into
+`system_prompt_text()` and never passes through `record_tool_result` —
+exactly `agents_files_text`'s own situation. So `agent_builder.rs`, when
+rendering the listing from `SkillLoader::list()`, runs
+`scan_for_injection_markers(&summary.description, "skill listing: <name>")`
+on each overlay-sourced (`SkillSource::User` or `Project`) entry's
+`description` before appending it to the listing, tagging the agent's
+shared `InjectionTaint` on a match — matching `AGENTS.md`'s own established
+two-tier treatment (project/user text scanned, bundled/fixed content never
+is) applied to the identical "system-prompt-injected, bypasses
+`record_tool_result`" threat shape. Bundled entries (`SkillSource::Bundled`)
+skip the scan entirely, same rationale as `AGENTS.md`'s own fixed text.
 
 ## What this spec does not decide
 
@@ -162,5 +183,9 @@ content never is), applied here to a directly analogous threat shape.
   returned verbatim, exactly as `aivyx-skills::Skill.body` provides it.
 - Any change to `aivyx-injection-guard`/`scan_for_injection_markers`
   itself, or to how `AGENTS.md`/repo-map/editor-context sources are
-  scanned — Decision 5 only adds a new call site using the existing,
-  unmodified mechanism.
+  scanned — Decision 5 only adds one new call site, in `agent_builder.rs`'s
+  skills-listing construction, using the existing, unmodified mechanism.
+- Any bespoke injection-scanning logic inside the `load_skill` tool itself
+  — its tool result is already covered by the generic, unconditional
+  `record_tool_result` scan every tool gets (Grounding), so adding a
+  second scan there would be redundant, not additive.
