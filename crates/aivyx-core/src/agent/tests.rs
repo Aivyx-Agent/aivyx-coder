@@ -5458,7 +5458,12 @@ fn set_skills_appends_the_listing_to_the_system_prompt() {
     let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
     agent.set_skills("Available skills:\n- systematic-debugging: ...".to_string());
     let text = agent.system_prompt_text();
-    assert!(text.contains("system"));
+    // The base prompt is always prepended first, so `starts_with` is a true
+    // structural guarantee that survives regardless of what the skills
+    // listing contains (unlike a `contains("system")` check, which would
+    // pass vacuously here since "systematic-debugging" itself contains
+    // "system").
+    assert!(text.starts_with("system"));
     assert!(text.contains("Available skills:"));
     assert!(text.contains("systematic-debugging"));
 }
