@@ -137,18 +137,23 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().max_concurrent
     }
 
-    /// Drops every currently-parked session at once, closing each one's
-    /// underlying `Agent`. Unlike `CloseSpecialistTool`'s own
-    /// single-session close path (which explicitly `.await`s the closed
-    /// session's `forward_task` before reporting success to the model),
-    /// this doesn't await anything: dropping a parked session's `Agent`
-    /// closes the event channel its background forwarding task reads
-    /// from, so that task's next `.recv()` call returns `None` and it
-    /// ends on its own -- correct without needing an `async` signature
-    /// here, which matters since this is called from
-    /// `Agent::clear_conversation`, a synchronous method. Used by
-    /// `/clear` so a specialist session never stays queryable against a
-    /// lead conversation that's just been wiped.
+    /// Drops every currently-parked LIVE session at once, closing each
+    /// one's underlying `Agent`, AND discards every still-dehydrated
+    /// session too -- both maps, not just the live one, since
+    /// `Agent::persist()` reads both via `snapshot_for_persistence` and
+    /// would otherwise immediately re-write a dehydrated session back to
+    /// disk right after this call, undoing the clear. Unlike
+    /// `CloseSpecialistTool`'s own single-session close path (which
+    /// explicitly `.await`s the closed session's `forward_task` before
+    /// reporting success to the model), this doesn't await anything:
+    /// dropping a parked session's `Agent` closes the event channel its
+    /// background forwarding task reads from, so that task's next
+    /// `.recv()` call returns `None` and it ends on its own -- correct
+    /// without needing an `async` signature here, which matters since
+    /// this is called from `Agent::clear_conversation`, a synchronous
+    /// method. Used by `/clear` so a specialist session -- live or
+    /// dehydrated -- never stays queryable against a lead conversation
+    /// that's just been wiped.
     pub fn close_all(&self) {
         let mut state = self.inner.lock().unwrap();
         state.sessions.clear();
