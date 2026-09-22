@@ -27,6 +27,8 @@ use aivyx_tools::{
     GitCheckpointer, Tool, ToolError, ToolExecutionContext, ToolExecutor, ToolRegistry,
 };
 use aivyx_types::{ToolDefinition, ToolOutput};
+
+use crate::session::PersistedSpecialistSession;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -78,6 +80,13 @@ pub struct SpecialistSessionSummary {
 
 struct SessionPoolState {
     sessions: HashMap<String, ParkedSpecialistSession>,
+    /// Sessions loaded from a persisted session file at `--resume` time
+    /// (via `seed_dehydrated`) that haven't been rebuilt into a live
+    /// session yet, plus any still-untouched entries carried forward by
+    /// `snapshot_for_persistence` on every later save. No `Agent` exists
+    /// for these -- `query_specialist` rebuilds one on first use;
+    /// `close_specialist` can also discard one unused.
+    dehydrated: HashMap<String, PersistedSpecialistSession>,
     max_concurrent: usize,
     idle_timeout: Duration,
 }
@@ -111,6 +120,7 @@ impl SpecialistSessionPool {
         Self {
             inner: Arc::new(Mutex::new(SessionPoolState {
                 sessions: HashMap::new(),
+                dehydrated: HashMap::new(),
                 max_concurrent,
                 idle_timeout,
             })),
@@ -120,7 +130,7 @@ impl SpecialistSessionPool {
     fn has_room(&self) -> bool {
         let mut state = self.inner.lock().unwrap();
         state.evict_stale();
-        state.sessions.len() < state.max_concurrent
+        state.sessions.len() + state.dehydrated.len() < state.max_concurrent
     }
 
     pub fn max_concurrent(&self) -> usize {
@@ -167,19 +177,45 @@ impl SpecialistSessionPool {
         sessions
     }
 
-    /// A short `"<session_id> (<member>)"` listing of every currently-open
-    /// session, comma-separated -- interpolated into `spawn_specialist`'s
-    /// cap-exceeded error messages so a model that hits the cap can see
-    /// which sessions it could close, mirroring
-    /// `delegate_to_specialist.rs`'s own `specialist_names` convention of
-    /// giving a model that guessed wrong a recovery path in the same tool
-    /// result.
+    /// A grouped `"N live: <id> (<member>), ...; M dehydrated from a
+    /// previous run: <id> (<member>), ..."` listing of every session
+    /// counting against the concurrent-session cap -- interpolated into
+    /// `spawn_specialist`'s cap-exceeded error messages so a model that
+    /// hits the cap can see exactly which `session_id` to
+    /// `close_specialist`, including a dehydrated session it hasn't
+    /// touched yet this run. Either group is omitted entirely when
+    /// empty. Mirrors `delegate_to_specialist.rs`'s own `specialist_names`
+    /// convention of giving a model that hit a limit a recovery path in
+    /// the same tool result.
     fn open_sessions_description(&self) -> String {
-        self.open_sessions()
+        let mut state = self.inner.lock().unwrap();
+        state.evict_stale();
+        let mut live: Vec<String> = state
+            .sessions
             .iter()
-            .map(|s| format!("{} ({})", s.session_id, s.member))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|(id, s)| format!("{id} ({})", s.member))
+            .collect();
+        live.sort();
+        let mut dehydrated: Vec<String> = state
+            .dehydrated
+            .iter()
+            .map(|(id, s)| format!("{id} ({})", s.member))
+            .collect();
+        dehydrated.sort();
+        drop(state);
+
+        let mut parts = Vec::new();
+        if !live.is_empty() {
+            parts.push(format!("{} live: {}", live.len(), live.join(", ")));
+        }
+        if !dehydrated.is_empty() {
+            parts.push(format!(
+                "{} dehydrated from a previous run: {}",
+                dehydrated.len(),
+                dehydrated.join(", ")
+            ));
+        }
+        parts.join("; ")
     }
 
     /// Removes and returns a session so its turn can run WITHOUT holding
@@ -207,11 +243,58 @@ impl SpecialistSessionPool {
     fn insert_new(&self, id: String, session: ParkedSpecialistSession) -> Result<(), usize> {
         let mut state = self.inner.lock().unwrap();
         state.evict_stale();
-        if state.sessions.len() >= state.max_concurrent {
+        if state.sessions.len() + state.dehydrated.len() >= state.max_concurrent {
             return Err(state.max_concurrent);
         }
         state.sessions.insert(id, session);
         Ok(())
+    }
+
+    /// Loads a previously-persisted set of specialist sessions into the
+    /// dehydrated map, called once at `--resume` time (only when a
+    /// resumable session was actually found) before any tool call runs.
+    /// Each entry stays inert -- no `Agent` is built -- until
+    /// `query_specialist` rehydrates it on first use, or
+    /// `close_specialist` discards it unused.
+    pub fn seed_dehydrated(&self, sessions: Vec<PersistedSpecialistSession>) {
+        let mut state = self.inner.lock().unwrap();
+        for session in sessions {
+            state.dehydrated.insert(session.session_id.clone(), session);
+        }
+    }
+
+    /// Removes and returns a dehydrated session record so it can be
+    /// rebuilt into a live one, mirroring `take`'s remove-and-return
+    /// shape.
+    fn take_dehydrated(&self, id: &str) -> Option<PersistedSpecialistSession> {
+        self.inner.lock().unwrap().dehydrated.remove(id)
+    }
+
+    /// A snapshot of every session that should survive a restart --
+    /// every currently-live session's `(id, member, history)` PLUS every
+    /// still-dehydrated entry, carried forward unchanged. Both maps MUST
+    /// be unioned: snapshotting only live sessions would let a
+    /// dehydrated session survive exactly one restart and then silently
+    /// vanish on the very next save, since nothing else carries it
+    /// forward -- unioning both means a dehydrated session survives
+    /// indefinitely, across any number of restarts, until it's either
+    /// resumed (moves into the live map from then on) or explicitly
+    /// closed. Called from `Agent::persist()`.
+    pub fn snapshot_for_persistence(&self) -> Vec<PersistedSpecialistSession> {
+        let mut state = self.inner.lock().unwrap();
+        state.evict_stale();
+        let mut out: Vec<PersistedSpecialistSession> = state.dehydrated.values().cloned().collect();
+        out.extend(
+            state
+                .sessions
+                .iter()
+                .map(|(id, session)| PersistedSpecialistSession {
+                    session_id: id.clone(),
+                    member: session.member.clone(),
+                    history: session.agent.history_snapshot(),
+                }),
+        );
+        out
     }
 }
 
@@ -1423,6 +1506,89 @@ mod specialist_session_tests {
                 !matches!(event, AgentEvent::SpecialistSessionsUpdated(_)),
                 "query_specialist must not emit SpecialistSessionsUpdated"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_persistence_includes_a_live_sessions_current_history() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let cfg = config(llm, tx, simple_team(), pool.clone());
+        let spawn_tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = pool.snapshot_for_persistence();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].member, "implementer");
+        assert!(
+            !snapshot[0].history.is_empty(),
+            "a live session's snapshot must carry its real conversation history"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_persistence_carries_dehydrated_sessions_forward_unchanged() {
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let persisted = PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![aivyx_types::Message::text(
+                aivyx_types::Role::User,
+                "from a previous run",
+            )],
+        };
+        pool.seed_dehydrated(vec![persisted]);
+
+        let snapshot = pool.snapshot_for_persistence();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].session_id, "old-session");
+        assert_eq!(snapshot[0].member, "implementer");
+        assert_eq!(snapshot[0].history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dehydrated_sessions_count_against_the_concurrent_session_cap() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(1, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![],
+        }]);
+        let cfg = config(llm, tx, simple_team(), pool.clone());
+        let spawn_tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let output = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something else" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        match output {
+            ToolOutput::Error(msg) => {
+                assert!(
+                    msg.contains("dehydrated from a previous run"),
+                    "cap-exceeded message should mention the dehydrated session blocking room: {msg}"
+                );
+            }
+            other => panic!(
+                "a dehydrated session should count against max_concurrent=1, blocking this \
+                 spawn with a cap-exceeded Error, got: {other:?}"
+            ),
         }
     }
 
