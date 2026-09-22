@@ -5454,6 +5454,22 @@ fn system_prompt_text_includes_repo_map_when_set() {
 }
 
 #[test]
+fn set_skills_appends_the_listing_to_the_system_prompt() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.set_skills("Available skills:\n- systematic-debugging: ...".to_string());
+    let text = agent.system_prompt_text();
+    assert!(text.contains("system"));
+    assert!(text.contains("Available skills:"));
+    assert!(text.contains("systematic-debugging"));
+}
+
+#[test]
+fn without_set_skills_the_system_prompt_has_no_skills_block() {
+    let (agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    assert_eq!(agent.system_prompt_text(), "system");
+}
+
+#[test]
 fn compute_prefix_hash_is_stable_for_identical_inputs() {
     let tools = vec![ToolDefinition {
         name: "read_file".to_string(),

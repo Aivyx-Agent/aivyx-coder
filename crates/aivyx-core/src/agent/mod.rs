@@ -270,6 +270,13 @@ pub struct Agent {
     /// see the module doc on `editor_context` for why file content never
     /// flows through this field.
     editor_context_text: Option<String>,
+    /// The rendered skill-discovery listing appended to the system
+    /// prompt, set once at startup by `agent_builder.rs` via
+    /// `set_skills` (not re-rendered per turn, unlike `repo_map_text`/
+    /// `agents_files_text`/`editor_context_text` -- the skill library is
+    /// effectively static for the lifetime of one process run). `None`
+    /// when `[skills] enabled = false`.
+    skills_text: Option<String>,
     edit_format: EditFormat,
     /// Monotonic id source for tool calls synthesized from SEARCH/REPLACE
     /// blocks — they need ids that can't collide with the backend's.
@@ -378,6 +385,7 @@ impl Agent {
             repo_map_text: None,
             agents_files_text: None,
             editor_context_text: None,
+            skills_text: None,
             edit_format: config.edit_format,
             synthetic_seq: 0,
             council: None,
@@ -511,6 +519,18 @@ impl Agent {
     /// system prompt within `budget_tokens`.
     pub fn set_repo_map(&mut self, map: Arc<RepoMap>, budget_tokens: u32) {
         self.repo_map = Some((map, budget_tokens));
+    }
+
+    /// Sets the skill-discovery listing appended to the system prompt.
+    /// `agent_builder.rs` computes `listing` once, at startup, from
+    /// `aivyx_skills::SkillLoader::list()` -- `Agent` itself has no
+    /// dependency on or awareness of the `aivyx-skills` crate, it only
+    /// ever sees this pre-rendered `String`. Any overlay-sourced skill's
+    /// description has already been scanned for injection markers by the
+    /// caller before reaching this setter (see `agent_builder.rs`'s
+    /// `render_skills_listing`) -- this method does no scanning itself.
+    pub fn set_skills(&mut self, listing: String) {
+        self.skills_text = Some(listing);
     }
 
     /// Opts this `Agent` into KV-cache persistence against a llama-server
@@ -1003,6 +1023,10 @@ impl Agent {
             system.push_str("\n\n");
             system.push_str(text);
         }
+        if let Some(text) = &self.skills_text {
+            system.push_str("\n\n");
+            system.push_str(text);
+        }
         system
     }
 
@@ -1028,6 +1052,7 @@ impl Agent {
                 .editor_context_text
                 .as_ref()
                 .map_or(0, |m| m.chars().count())
+            + self.skills_text.as_ref().map_or(0, |m| m.chars().count())
     }
 
     /// Rough token estimate for the current prompt, using the
