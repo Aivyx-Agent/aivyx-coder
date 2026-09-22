@@ -606,6 +606,15 @@ fn internal_permission_request(tool_name: &str) -> Result<PermissionRequest, Too
     })
 }
 
+/// Shared by `query_specialist`/`close_specialist`'s ownership checks --
+/// a session's `owner` not matching the calling config's `caller`.
+fn ownership_error(session_id: &str) -> ToolOutput {
+    ToolOutput::Error(format!(
+        "session_id {session_id:?} was not opened by you -- only its own opener can query or \
+        close it"
+    ))
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct SpawnSpecialistArgs {
     /// The name of a `TeamConfig` member to spawn a session with -- must
@@ -810,8 +819,16 @@ impl Tool for QuerySpecialistTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
         let mut session = if let Some(session) = self.config.pool.take(&args.session_id) {
+            if session.owner != self.config.caller {
+                self.config.pool.put_back(args.session_id.clone(), session);
+                return Ok(ownership_error(&args.session_id));
+            }
             session
         } else if let Some(persisted) = self.config.pool.take_dehydrated(&args.session_id) {
+            if persisted.owner != self.config.caller {
+                self.config.pool.seed_dehydrated(vec![persisted]);
+                return Ok(ownership_error(&args.session_id));
+            }
             let Some(member) = self
                 .config
                 .team
@@ -915,6 +932,10 @@ impl Tool for CloseSpecialistTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
         if let Some(session) = self.config.pool.take(&args.session_id) {
+            if session.owner != self.config.caller {
+                self.config.pool.put_back(args.session_id.clone(), session);
+                return Ok(ownership_error(&args.session_id));
+            }
             let member = session.member.clone();
             drop(session.agent);
             let _ = session.forward_task.await;
@@ -933,6 +954,10 @@ impl Tool for CloseSpecialistTool {
         }
 
         if let Some(persisted) = self.config.pool.take_dehydrated(&args.session_id) {
+            if persisted.owner != self.config.caller {
+                self.config.pool.seed_dehydrated(vec![persisted]);
+                return Ok(ownership_error(&args.session_id));
+            }
             return Ok(ToolOutput::Ok(format!(
                 "specialist session {:?} closed ({}) -- it was dehydrated from a previous \
                 run and had not been resumed",
@@ -2004,6 +2029,101 @@ mod specialist_session_tests {
             2,
             "expected exactly 2 open sessions (orchestrator + worker) -- if this is 3, worker's \
             own attempted nested spawn succeeded, violating the depth-1 cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_specialist_refuses_a_live_session_it_did_not_open_and_leaves_it_intact() {
+        let llm = Arc::new(MockBackend::new(vec![
+            text_response("hello"),
+            text_response("hi again"),
+        ]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let lead_cfg = config(llm.clone(), tx.clone(), simple_team(), pool.clone());
+        let spawn_tool = SpawnSpecialistTool::new(lead_cfg.clone());
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let spawn_output = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(text) = spawn_output else {
+            panic!("expected Ok, got {spawn_output:?}");
+        };
+        let session_id = text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        let mut impostor_cfg = lead_cfg.clone();
+        impostor_cfg.caller = SessionOwner::Specialist("some-other-specialist".to_string());
+        let query_tool = QuerySpecialistTool::new(impostor_cfg);
+        let rejected = query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        match rejected {
+            ToolOutput::Error(msg) => assert!(msg.contains("was not opened by you")),
+            other => panic!("expected an ownership error, got {other:?}"),
+        }
+
+        // The session must survive the rejected attempt: its real owner (the
+        // lead) can still query it afterward.
+        let query_tool_as_owner = QuerySpecialistTool::new(lead_cfg);
+        let allowed = query_tool_as_owner
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(allowed, ToolOutput::Ok(_)),
+            "the session's real owner must still be able to query it after a rejected attempt \
+            from someone else, expected Ok got {allowed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_specialist_refuses_a_dehydrated_session_it_did_not_open_and_leaves_it_intact() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![],
+            owner: SessionOwner::Specialist("orchestrator-session".to_string()),
+        }]);
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let mut impostor_cfg = config(llm, tx, simple_team(), pool.clone());
+        impostor_cfg.caller = SessionOwner::Lead;
+        let close_tool = CloseSpecialistTool::new(impostor_cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let rejected = close_tool
+            .execute(serde_json::json!({ "session_id": "old-session" }), &ctx)
+            .await
+            .unwrap();
+        match rejected {
+            ToolOutput::Error(msg) => assert!(msg.contains("was not opened by you")),
+            other => panic!("expected an ownership error, got {other:?}"),
+        }
+
+        // The record must survive the rejected attempt.
+        assert_eq!(
+            pool.snapshot_for_persistence().len(),
+            1,
+            "a rejected close must not discard the dehydrated record"
         );
     }
 }
