@@ -685,6 +685,62 @@ including eventual removal from disk if left untouched afterward — correct
 per the design, but a sharp edge not written down anywhere a future
 maintainer would find it without reading the source.
 
+**Specialist-to-specialist messaging — shipped (2026-09-22).** Previously,
+only the lead could ever call `spawn_specialist`/`query_specialist`/
+`close_specialist` — a specialist's own tool registry structurally could
+never include them (the same snapshot-taken-before-registration mechanism
+that keeps `delegate_task`/`delegate_to_specialist` non-recursive). If
+specialist A's work needed to inform specialist B, the lead had to
+manually relay text between two separate `query_specialist` calls, even
+though nothing in this codebase's dispatch model is actually concurrent.
+Fixed: a specialist whose own `tool_allowlist` names the three session
+tools now gets fresh instances of them registered onto its own registry —
+bound to a child `SpecialistSessionsConfig` with `spawn_depth:
+parent_depth + 1` and `caller: SessionOwner::Specialist(its_own_session_id)`
+— letting it open, query, and close sessions with peer specialists
+directly. Nesting is capped at exactly one hop (`MAX_SPECIALIST_SPAWN_DEPTH
+= 1`, a depth check at registration time, not a structural registry
+omission, since a specialist's registry is built once at spawn and reused
+for its whole life unlike `delegate_task`'s one-shot snapshot). Every
+session now records its `owner: SessionOwner` (`Lead` or
+`Specialist(session_id)`); `query_specialist`/`close_specialist` refuse to
+touch a session they don't own, always restoring it untouched on
+rejection (including via a new `restore_untouched` pool method that,
+unlike the pre-existing `put_back`, does NOT refresh the idle-eviction
+timer — an unauthorized, always-rejected caller must not be able to pin a
+session alive forever just by repeatedly querying it). `decompose_task`/
+`verify_output`/`synthesize_results`/`delegate_to_specialist` remain
+fully, structurally excluded from every specialist's registry, unchanged.
+The default roster is a true no-op (no member names any of the three
+tools); a custom roster (`[team] roster_path`) opts in per member. See
+`docs/superpowers/specs/2026-09-22-specialist-to-specialist-messaging-design.md`.
+
+**Real, empirically-verified security properties, not just design
+claims**: the final whole-branch review built an actual end-to-end
+scenario (a custom roster granting a specialist the three tools, that
+specialist spawning a peer) and confirmed the peer's `owner` was
+genuinely `Specialist(the_spawning_specialist's_own_session_id)`, that
+the LEAD was correctly rejected when trying to query that peer directly
+(bypassing the spawning specialist), and that the depth cap has no
+bypass via the pre-existing, still-fully-available `delegate_to_specialist`
+tool (bounded one-level by its own separate, unrelated mechanism).
+
+**A real availability bug caught only at final review, since it only
+manifests when reasoning about the whole session lifecycle, not any one
+task's own tests**: strict ownership plus dehydrated sessions never
+expiring (by design, from the immediately-prior restart-persistence
+phase) meant a specialist-owned session could become permanently
+orphaned and uncloseable if its owning specialist's own session ever
+stopped existing (closed, idle-evicted, or dropped if the pool filled
+mid-spawn) — nothing could ever again construct a caller identity
+matching that owner, silently consuming a concurrency-cap slot forever
+with no recovery but `/clear`. Fixed: the lead may `close_specialist`
+(never `query_specialist` — confidentiality stays strict) ANY session
+regardless of ownership, as a supervisory recovery override. A follow-up
+review pass then found this exact fix's own live-session code path had
+zero test coverage (deleting the check left every existing test green);
+closed with a dedicated non-vacuous test.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
