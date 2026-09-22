@@ -261,6 +261,21 @@ impl SpecialistSessionPool {
         self.inner.lock().unwrap().sessions.insert(id, session);
     }
 
+    /// Re-inserts a session exactly as it was, WITHOUT refreshing
+    /// `last_active`. Used specifically by the ownership-rejection paths
+    /// in `QuerySpecialistTool::execute` and `CloseSpecialistTool::execute`
+    /// -- when `query_specialist`/`close_specialist` reject a caller that
+    /// doesn't own the session, the session must be restored exactly as it
+    /// was found, not treated as if a legitimate exchange just completed.
+    /// Refreshing `last_active` on a rejected attempt would let an
+    /// unauthorized caller repeatedly reset the target session's
+    /// idle-eviction timer just by querying it with the wrong owner,
+    /// indefinitely preventing it from being evicted as idle even though
+    /// that caller was never authorized to touch it.
+    fn restore_untouched(&self, id: String, session: ParkedSpecialistSession) {
+        self.inner.lock().unwrap().sessions.insert(id, session);
+    }
+
     /// Inserts a brand-new session, enforcing the concurrent-session cap.
     /// `Err(max_concurrent)` if the pool is already full at the moment of
     /// insertion -- callers should prefer checking `has_room()` first to
@@ -820,7 +835,9 @@ impl Tool for QuerySpecialistTool {
 
         let mut session = if let Some(session) = self.config.pool.take(&args.session_id) {
             if session.owner != self.config.caller {
-                self.config.pool.put_back(args.session_id.clone(), session);
+                self.config
+                    .pool
+                    .restore_untouched(args.session_id.clone(), session);
                 return Ok(ownership_error(&args.session_id));
             }
             session
@@ -933,7 +950,9 @@ impl Tool for CloseSpecialistTool {
 
         if let Some(session) = self.config.pool.take(&args.session_id) {
             if session.owner != self.config.caller {
-                self.config.pool.put_back(args.session_id.clone(), session);
+                self.config
+                    .pool
+                    .restore_untouched(args.session_id.clone(), session);
                 return Ok(ownership_error(&args.session_id));
             }
             let member = session.member.clone();
@@ -2091,6 +2110,83 @@ mod specialist_session_tests {
             matches!(allowed, ToolOutput::Ok(_)),
             "the session's real owner must still be able to query it after a rejected attempt \
             from someone else, expected Ok got {allowed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_ownership_check_does_not_refresh_the_idle_timer() {
+        // Regression test: a caller that does NOT own a live session must
+        // not be able to keep it alive indefinitely just by repeatedly
+        // querying it with the wrong owner. Each such attempt is rejected,
+        // but `put_back` (used by the legitimate "exchange completed"
+        // path) unconditionally refreshes `last_active` -- if the
+        // ownership-rejection path reused `put_back` instead of
+        // `restore_untouched`, a rejected attempt would silently reset the
+        // idle-eviction clock, letting an unauthorized caller pin the
+        // session in memory forever.
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_millis(50));
+        let lead_cfg = config(llm, tx, simple_team(), pool);
+        let spawn_tool = SpawnSpecialistTool::new(lead_cfg.clone());
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let spawn_output = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(text) = spawn_output else {
+            panic!("expected Ok, got {spawn_output:?}");
+        };
+        let session_id = text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        // Well under the idle timeout -- the session is still fresh.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut impostor_cfg = lead_cfg.clone();
+        impostor_cfg.caller = SessionOwner::Specialist("some-other-specialist".to_string());
+        let impostor_query_tool = QuerySpecialistTool::new(impostor_cfg);
+        let rejected = impostor_query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "follow up" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(rejected, ToolOutput::Error(_)),
+            "expected the impostor's query to be rejected, got {rejected:?}"
+        );
+
+        // Total elapsed time since the session was spawned now exceeds the
+        // 50ms idle timeout. If the rejected query above had refreshed
+        // `last_active` (the bug), the session would still look fresh
+        // (only ~40ms since that refresh) and this next real-owner query
+        // would succeed. With the fix, `last_active` is untouched by the
+        // rejection, so the session is now stale and must be evicted.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let owner_query_tool = QuerySpecialistTool::new(lead_cfg);
+        let result = owner_query_tool
+            .execute(
+                serde_json::json!({ "session_id": session_id, "message": "still there?" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ToolOutput::Error(_)),
+            "the session should have been evicted as idle -- a rejected ownership check must \
+            not have refreshed its last_active timer, got {result:?}"
         );
     }
 
