@@ -57,6 +57,7 @@ pub struct Settings {
     pub mcp: McpSettings,
     pub persona: PersonaSettings,
     pub repl: ReplSettings,
+    pub skills: SkillsSettings,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -666,6 +667,62 @@ impl TeamSettings {
     /// `aivyx_team::default_coding_roster()`" (no path to resolve).
     pub fn resolved_roster_path(&self) -> Option<PathBuf> {
         self.roster_path.as_ref().map(|raw| {
+            resolve_tilde_paths(std::slice::from_ref(raw))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| PathBuf::from(raw))
+        })
+    }
+}
+
+/// `[skills]` -- wiring for the shared `aivyx-skills` default skill
+/// library (Part 2 of the cross-repo Aivyx-Skills initiative; see
+/// `docs/superpowers/specs/2026-09-23-aivyx-skills-integration-design.md`).
+/// Deliberately on by default (`enabled: true`) -- the one exception to
+/// this project's usual "off until configured" posture for a new feature
+/// section (contrast `TeamSettings`/`CouncilSettings`/`ArchitectSettings`),
+/// since "default, system-level" is the whole point of `aivyx-skills`'s
+/// own framing: a fresh install should get real skill guidance with zero
+/// setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsSettings {
+    pub enabled: bool,
+    /// Optional project-level skill overlay directory, tilde-resolved via
+    /// `resolved_project_skills_dir()`. Must directly contain one
+    /// `<skill-name>/SKILL.md` subdirectory per skill -- see
+    /// `aivyx_skills::SkillLoader::with_project_dir`'s own doc comment for
+    /// the exact required shape. `None` (the default) means no project
+    /// overlay.
+    pub project_dir: Option<String>,
+    /// Optional user-level skill overlay directory, tilde-resolved via
+    /// `resolved_user_skills_dir()`. Same required shape as `project_dir`.
+    /// `None` (the default) means no user overlay.
+    pub user_dir: Option<String>,
+}
+
+impl Default for SkillsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            project_dir: None,
+            user_dir: None,
+        }
+    }
+}
+
+impl SkillsSettings {
+    pub fn resolved_project_skills_dir(&self) -> Option<PathBuf> {
+        self.project_dir.as_ref().map(|raw| {
+            resolve_tilde_paths(std::slice::from_ref(raw))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| PathBuf::from(raw))
+        })
+    }
+
+    pub fn resolved_user_skills_dir(&self) -> Option<PathBuf> {
+        self.user_dir.as_ref().map(|raw| {
             resolve_tilde_paths(std::slice::from_ref(raw))
                 .into_iter()
                 .next()
@@ -2273,5 +2330,62 @@ mod tests {
             settings.resolved_roster_path(),
             Some(PathBuf::from("/tmp/my-roster.toml"))
         );
+    }
+
+    #[test]
+    fn skills_settings_defaults_to_enabled_with_no_overlay_dirs() {
+        let settings = SkillsSettings::default();
+        assert!(settings.enabled);
+        assert_eq!(settings.project_dir, None);
+        assert_eq!(settings.user_dir, None);
+    }
+
+    #[test]
+    fn settings_with_no_skills_section_at_all_still_parses_as_enabled() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(settings.skills.enabled);
+    }
+
+    #[test]
+    fn skills_enabled_can_be_turned_off_via_toml() {
+        let toml = r#"
+            [skills]
+            enabled = false
+        "#;
+        let settings: Settings = toml::from_str(toml).unwrap();
+        assert!(!settings.skills.enabled);
+    }
+
+    #[test]
+    fn resolved_project_skills_dir_leaves_a_non_tilde_path_unchanged() {
+        let settings = SkillsSettings {
+            project_dir: Some("/tmp/my-skills".to_string()),
+            ..SkillsSettings::default()
+        };
+        assert_eq!(
+            settings.resolved_project_skills_dir(),
+            Some(PathBuf::from("/tmp/my-skills"))
+        );
+    }
+
+    #[test]
+    fn resolved_user_skills_dir_expands_a_bare_tilde() {
+        let home = directories::UserDirs::new()
+            .unwrap()
+            .home_dir()
+            .canonicalize()
+            .expect("$HOME must exist");
+        let settings = SkillsSettings {
+            user_dir: Some("~".to_string()),
+            ..SkillsSettings::default()
+        };
+        assert_eq!(settings.resolved_user_skills_dir(), Some(home));
+    }
+
+    #[test]
+    fn resolved_dirs_are_none_when_unset() {
+        let settings = SkillsSettings::default();
+        assert_eq!(settings.resolved_project_skills_dir(), None);
+        assert_eq!(settings.resolved_user_skills_dir(), None);
     }
 }
