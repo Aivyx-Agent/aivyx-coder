@@ -1193,6 +1193,9 @@ pub(crate) async fn build_agent(
             };
             if let Some(state) = &restored {
                 agent.restore(state.clone());
+                if let Some(pool) = &specialist_session_pool {
+                    pool.seed_dehydrated(state.specialist_sessions.clone());
+                }
             }
             agent.set_session_path(path);
             restored
