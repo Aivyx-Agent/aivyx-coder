@@ -634,6 +634,57 @@ loop — would need to cooperate with `take`/`put_back` if `/clear` is ever
 made concurrent with a running turn (e.g. a future cancel-and-clear
 affordance, or ACP wiring).
 
+**Parked specialist-session persistence across restart — shipped
+(2026-09-22).** A parked specialist session (opened via `spawn_specialist`)
+previously lived only in-memory in `SpecialistSessionPool` — a process
+restart silently lost it, and `query_specialist`/`close_specialist` against
+its old `session_id` failed (already a clean, actionable error, not a
+crash). Fixed with lazy, on-demand rehydration: `SessionState` (the lead's
+own existing `--resume` persistence format) gained a `specialist_sessions:
+Vec<PersistedSpecialistSession>` field (`{session_id, member, history}`,
+`#[serde(default)]`), populated by `Agent::persist()` from the lead's
+`specialist_session_pool` handle. `SpecialistSessionPool` gained a second
+internal map, `dehydrated`, seeded from disk at `--resume` time. On a live
+lookup miss, `query_specialist` now also checks `dehydrated`; if found, it
+rebuilds a real `Agent` via the same `build_specialist_agent` helper
+`spawn_specialist` already uses (so a specialist rehydrates under its
+*current* roster attenuation/persona, not a stale snapshot), restores the
+persisted history onto it, and re-parks it as a normal live session —
+transparent to the model. `close_specialist` on a dehydrated-only id just
+discards the record, no `Agent` ever built. Dehydrated sessions count
+against `max_concurrent_specialist_sessions` (bounding the persisted
+file's growth across many restart-without-closing cycles) but don't expire
+from inactivity, unlike live sessions. See
+`docs/superpowers/specs/2026-09-22-specialist-session-persistence-design.md`.
+
+The final whole-branch review caught a real, only-visible-at-whole-branch-
+scope regression: `close_all()` (`/clear`'s own specialist-session reset,
+shipped in the previous phase) only cleared the LIVE map, not the new
+`dehydrated` one — so an explicit `/clear` didn't actually discard
+persisted specialist sessions, and the very next `persist()` call
+immediately wrote them right back to disk, contradicting `close_all`'s own
+doc comment. Fixed (`close_all` now clears both maps) with a test proving
+non-vacuity via the union-aware `snapshot_for_persistence()` accessor
+rather than the live-only `open_sessions()`, which would have passed
+trivially either way. A second finding — no test proved `Agent::persist()`
+itself actually wired the pool's snapshot into the saved file, as opposed
+to the pool's own snapshot logic and the tool-level rehydration logic
+being separately correct — was closed with a dedicated round-trip test.
+Both findings were independently verified via control experiments
+(reverting each fix and confirming its new test fails).
+
+Deferred follow-ups from the final review, none blocking: a rehydrated
+session doesn't emit `AgentEvent::SpecialistSessionsUpdated`, so the
+TUI/ACP panel under-reports the live set until the next `spawn_specialist`/
+`close_specialist` refreshes it (self-healing, cosmetic); `persist()` now
+deep-clones up to `max_concurrent` specialist histories on top of the
+lead's own on every turn (bounded, acceptable, worth knowing before the
+cap is ever raised); rehydrating a session makes a previously-immortal
+(no-expiry) dehydrated session subject to the live idle-timeout again,
+including eventual removal from disk if left untouched afterward — correct
+per the design, but a sharp edge not written down anywhere a future
+maintainer would find it without reading the source.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
