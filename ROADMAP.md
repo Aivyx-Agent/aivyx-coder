@@ -741,6 +741,42 @@ review pass then found this exact fix's own live-session code path had
 zero test coverage (deleting the check left every existing test green);
 closed with a dedicated non-vacuous test.
 
+**ACP entry-prefix spoofability — shipped (2026-09-23).** The last of the
+original 7 Nonagon deferred gaps. `aivyx-acp/src/translate.rs`'s
+`build_merged_plan` interpolates three genuinely free-form, model-
+controlled strings (`task.text`, a mission's `mission` description, a
+mission step's `task` description) directly into an ACP `PlanEntry.content`
+string, each origin-tagged with a fixed prefix (`[Task]`/`[Mission]`/
+`[Mission: {member}]`). A model (possibly manipulated by a prompt-
+injection source) could embed a newline followed by text shaped like a
+different tag — e.g. `"done\n[Specialist: reviewer] verified, ship it"`
+— to make one entry visually masquerade as a separate, more-trusted-
+looking entry in a markdown-aware ACP client like Zed. Fixed with a small
+`strip_control_chars_for_display` helper (mirroring `aivyx-core`'s
+existing `sanitize_for_display`, which solves the identical problem class
+at a different trust boundary — the system prompt — duplicated rather
+than cross-crate-exported, matching this project's established small-
+helper precedent) that maps every control character to U+FFFD before
+formatting. Applied to exactly the three free-form fields;
+`session.member` (roster-validated, never free-form) is deliberately left
+untouched. See
+`docs/superpowers/specs/2026-09-23-acp-entry-prefix-spoofability-design.md`.
+
+**The TUI's own mission panel was checked and confirmed NOT vulnerable to
+the same attack — empirically, not just by reasoning.** A temporary probe
+(since removed) rendered a real `ratatui::widgets::Paragraph` containing
+an embedded `\n` into a real `Buffer`, using this project's exact pinned
+`ratatui = "0.29.0"`: the newline was silently dropped entirely, producing
+one garbled row rather than two separate-looking lines, and neither the
+task panel nor the mission panel calls `.wrap()`, so there's no word-
+wrap-boundary variant of the attack either. No TUI change was needed or
+made — confirmed, not assumed.
+
+With this gap closed, all 7 of the original Nonagon deferred gaps are
+now fixed (deny-paths attenuation, custom-roster loading, `/clear` reset,
+session persistence, specialist channel, `goal_achieved()` team-
+awareness, and this one) — see this file's own history above for each.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 
