@@ -755,12 +755,20 @@ pub(crate) async fn build_agent(
         // accepted, current scope, not a bug to fix here. Because this
         // snapshot is taken before decompose_task/verify_output/
         // synthesize_results/spawn_specialist/query_specialist/
-        // close_specialist are registered further down, a specialist's
-        // own attenuated registry can never include any of those six
-        // tools either, even if a future custom roster's tool_allowlist
-        // tried to name them -- a phase adding custom rosters will need
-        // to revisit where this snapshot is taken if specialists should
-        // ever be granted them. Cloned (not moved) at each use below
+        // close_specialist are registered further down, a specialist's own
+        // attenuated registry can never include any of those six tools
+        // either via THIS snapshot -- decompose_task/verify_output/
+        // synthesize_results/delegate_to_specialist stay fully excluded this
+        // way. spawn_specialist/query_specialist/close_specialist are the
+        // one exception: `build_specialist_agent` (specialist_sessions.rs)
+        // separately, additively registers fresh instances of those three
+        // directly onto a specialist's own registry -- bound to a
+        // depth-incremented child config, gated on the member's own
+        // tool_allowlist and a hop-count cap -- see that function's own doc
+        // comment and
+        // docs/superpowers/specs/2026-09-22-specialist-to-specialist-messaging-design.md.
+        // This snapshot itself is untouched by that; it's a second,
+        // independent mechanism layered on top. Cloned (not moved) at each use below
         // since both delegate_to_specialist and spawn_specialist,
         // registered later in this same block, need their own copy.
         let mut team_parent_registry = registry.clone();
@@ -772,10 +780,23 @@ pub(crate) async fn build_agent(
         // tool_allowlist can never validate-pass naming any of those six
         // tools, by construction, not by this check alone.
         let team_registry_definitions = registry.definitions();
-        let available_tools: Vec<&str> = team_registry_definitions
+        let mut available_tools: Vec<&str> = team_registry_definitions
             .iter()
             .map(|d| d.name.as_str())
             .collect();
+        // spawn_specialist/query_specialist/close_specialist aren't
+        // registered on `registry` until further down (see
+        // team_parent_registry's own comment above), but this feature
+        // makes them legitimately assignable to a specialist's own
+        // tool_allowlist (see
+        // docs/superpowers/specs/2026-09-22-specialist-to-specialist-messaging-design.md)
+        // -- added here explicitly so they validate-pass even though
+        // they're not literally present in this snapshot.
+        available_tools.extend_from_slice(&[
+            "spawn_specialist",
+            "query_specialist",
+            "close_specialist",
+        ]);
         let team = resolve_team_config(settings, &available_tools)?;
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
@@ -859,6 +880,8 @@ pub(crate) async fn build_agent(
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
             pool: specialist_session_pool_handle,
+            spawn_depth: 0,
+            caller: aivyx_core::SessionOwner::Lead,
         };
         registry.register(Arc::new(aivyx_core::SpawnSpecialistTool::new(
             specialist_sessions_config.clone(),
