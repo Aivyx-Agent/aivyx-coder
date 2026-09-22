@@ -49,12 +49,17 @@ possible prompt injection — the above is its best-effort partial result.)";
 const NO_TEXT_RESPONSE: &str = "(the specialist produced no text response)";
 
 /// A specialist's own registry gets `spawn_specialist`/`query_specialist`/
-/// `close_specialist` (if its `tool_allowlist` names them) only when its
-/// own `SpecialistSessionsConfig.spawn_depth` is below this. Bounds
-/// specialist-initiated nesting to one hop: a specialist the lead spawns
-/// directly (depth 0) may spawn/query/close peers; a specialist spawned
-/// BY that specialist (depth 1) gets no such tools registered at all,
-/// regardless of its own `tool_allowlist`. Unlike `delegate_task`'s own
+/// `close_specialist` (if its `tool_allowlist` names them) only when the
+/// SPAWNER's own `SpecialistSessionsConfig.spawn_depth` is below this.
+/// `spawn_depth` counts how many `build_specialist_agent` calls produced
+/// a config: `0` only for the lead's own top-level config, `1` for any
+/// specialist the lead spawns directly. Bounds specialist-initiated
+/// nesting to one hop: a specialist the lead spawns directly (its own
+/// config has `spawn_depth: 1`) may itself spawn/query/close peers,
+/// because ITS spawner (the lead) had `spawn_depth: 0`; a specialist
+/// spawned BY that specialist gets no such tools registered at all,
+/// regardless of its own `tool_allowlist`, because ITS spawner already
+/// had `spawn_depth: 1` (== `MAX_SPECIALIST_SPAWN_DEPTH`). Unlike `delegate_task`'s own
 /// recursion prevention (which works by never registering the tool at
 /// the top level, since a sub-agent's registry there is a one-shot
 /// snapshot), a specialist's own registry here is built once at spawn
@@ -81,7 +86,9 @@ struct ParkedSpecialistSession {
     last_active: Instant,
     /// Who opened this session -- the lead, or a specialist (by its own
     /// session_id). `query_specialist`/`close_specialist` check this
-    /// against the calling `SpecialistSessionsConfig.caller`.
+    /// against the calling `SpecialistSessionsConfig.caller` -- except
+    /// `close_specialist` lets the lead close ANY session regardless of
+    /// this field, as a supervisory override (see its own doc comment).
     owner: SessionOwner,
 }
 
@@ -361,10 +368,10 @@ pub struct SpecialistSessionsConfig {
     pub max_iterations: u32,
     pub broker_mode: bool,
     pub pool: SpecialistSessionPool,
-    /// How many specialist-initiated (not lead-initiated) spawn hops led
-    /// to this config being used -- `0` for the lead's own top-level
-    /// config. Only increments when a *specialist* does the spawning;
-    /// being spawned by the lead doesn't itself count as a hop. See
+    /// How many `build_specialist_agent` calls produced this config --
+    /// `0` only for the lead's own top-level config (never built via
+    /// `build_specialist_agent`), `1` for any specialist the lead spawns
+    /// directly, and so on for each further hop. See
     /// `build_specialist_agent`'s own doc comment for how this bounds
     /// nesting.
     pub spawn_depth: u32,
@@ -372,7 +379,11 @@ pub struct SpecialistSessionsConfig {
     /// top-level config, `Specialist(own_session_id)` for a specialist's
     /// own child config. Tags every session this config's tools open,
     /// and is checked against a target session's own `owner` before
-    /// `query_specialist`/`close_specialist` touch it.
+    /// `query_specialist`/`close_specialist` touch it -- except
+    /// `close_specialist` skips this check entirely when `caller` is
+    /// `Lead`, letting the lead reclaim any session (including one it
+    /// didn't open) as a supervisory override; `query_specialist` never
+    /// gets this exception.
     pub caller: SessionOwner,
 }
 
@@ -626,7 +637,8 @@ fn internal_permission_request(tool_name: &str) -> Result<PermissionRequest, Too
 fn ownership_error(session_id: &str) -> ToolOutput {
     ToolOutput::Error(format!(
         "session_id {session_id:?} was not opened by you -- only its own opener can query or \
-        close it"
+        close it (the lead may also close, but not query, any session as a supervisory \
+        override)"
     ))
 }
 
@@ -901,6 +913,19 @@ struct CloseSpecialistArgs {
     session_id: String,
 }
 
+/// Ends a specialist session, freeing its slot against `max_concurrent`.
+/// Ownership-gated like `QuerySpecialistTool`, but with one deliberate
+/// exception: when `self.config.caller` is `SessionOwner::Lead`, the
+/// ownership check is skipped entirely and the lead can close ANY
+/// session, live or dehydrated, regardless of who opened it. This is the
+/// lead's only recovery path for a specialist-owned session whose owning
+/// specialist's own session has itself gone away (closed, idle-evicted,
+/// or evicted by pool pressure) -- without it, such a session could never
+/// again be queried OR closed by anyone, permanently consuming a slot.
+/// `query_specialist` intentionally has no equivalent exception: letting
+/// the lead close a session it doesn't own is a supervisory-recovery
+/// action, not a confidentiality breach, but letting it *read* a peer
+/// specialist's conversation would be.
 pub struct CloseSpecialistTool {
     config: SpecialistSessionsConfig,
 }
@@ -949,7 +974,7 @@ impl Tool for CloseSpecialistTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
         if let Some(session) = self.config.pool.take(&args.session_id) {
-            if session.owner != self.config.caller {
+            if session.owner != self.config.caller && self.config.caller != SessionOwner::Lead {
                 self.config
                     .pool
                     .restore_untouched(args.session_id.clone(), session);
@@ -973,7 +998,7 @@ impl Tool for CloseSpecialistTool {
         }
 
         if let Some(persisted) = self.config.pool.take_dehydrated(&args.session_id) {
-            if persisted.owner != self.config.caller {
+            if persisted.owner != self.config.caller && self.config.caller != SessionOwner::Lead {
                 self.config.pool.seed_dehydrated(vec![persisted]);
                 return Ok(ownership_error(&args.session_id));
             }
@@ -2028,6 +2053,10 @@ mod specialist_session_tests {
             pool.clone(),
         );
         cfg.max_iterations = 1;
+        // A separate lead-caller config, cloned before `cfg` is moved into
+        // `tool` below, used later to prove the lead can't bypass
+        // ownership by going around orchestrator directly.
+        let lead_cfg = cfg.clone();
 
         let tool = SpawnSpecialistTool::new(cfg);
         let ctx = exec_ctx(std::path::Path::new("."));
@@ -2048,6 +2077,69 @@ mod specialist_session_tests {
             2,
             "expected exactly 2 open sessions (orchestrator + worker) -- if this is 3, worker's \
             own attempted nested spawn succeeded, violating the depth-1 cap"
+        );
+
+        // Finding 4: assert ownership was attributed correctly through a
+        // REAL nested spawn -- not a hand-forged impostor config -- so
+        // this test would actually fail if `build_specialist_agent` ever
+        // set a wrong/hardcoded owner on the specialist-initiated path.
+        let ToolOutput::Ok(result_text) = result else {
+            unreachable!("checked by the assert! above");
+        };
+        let orchestrator_session_id = result_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        let snapshot = pool.snapshot_for_persistence();
+        let orchestrator_record = snapshot
+            .iter()
+            .find(|s| s.member == "orchestrator")
+            .expect("orchestrator's own session should be present in the snapshot");
+        assert_eq!(
+            orchestrator_record.session_id, orchestrator_session_id,
+            "sanity check: the snapshot's orchestrator record should be the same session \
+            spawn_specialist just returned"
+        );
+        assert_eq!(
+            orchestrator_record.owner,
+            SessionOwner::Lead,
+            "orchestrator was spawned by the lead's own top-level config, so its owner must \
+            be Lead"
+        );
+
+        let worker_record = snapshot
+            .iter()
+            .find(|s| s.member == "worker")
+            .expect("worker's own session should be present in the snapshot");
+        assert_eq!(
+            worker_record.owner,
+            SessionOwner::Specialist(orchestrator_session_id.clone()),
+            "worker was spawned by orchestrator (a specialist), so its owner must be \
+            Specialist(orchestrator's own session_id) -- not Lead, and not any other value"
+        );
+
+        // The lead cannot bypass ownership by going around orchestrator
+        // directly: a lead-caller query_specialist against worker's own
+        // session_id must be genuinely rejected.
+        let query_tool = QuerySpecialistTool::new(lead_cfg);
+        let query_result = query_tool
+            .execute(
+                serde_json::json!({
+                    "session_id": worker_record.session_id,
+                    "message": "show me your conversation",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(query_result, ToolOutput::Error(_)),
+            "expected the lead's query_specialist against worker's session (owned by \
+            orchestrator, not the lead) to be rejected, got {query_result:?}"
         );
     }
 
@@ -2190,6 +2282,10 @@ mod specialist_session_tests {
         );
     }
 
+    /// Someone who is NOT the lead and NOT the owner (a different
+    /// specialist entirely) must still be rejected -- the lead-override
+    /// added for Finding 1 is deliberately narrow: it only exempts the
+    /// LEAD from the ownership check, not just any caller.
     #[tokio::test]
     async fn close_specialist_refuses_a_dehydrated_session_it_did_not_open_and_leaves_it_intact() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2202,7 +2298,7 @@ mod specialist_session_tests {
         }]);
         let llm = Arc::new(MockBackend::new(vec![]));
         let mut impostor_cfg = config(llm, tx, simple_team(), pool.clone());
-        impostor_cfg.caller = SessionOwner::Lead;
+        impostor_cfg.caller = SessionOwner::Specialist("some-other-specialist-session".to_string());
         let close_tool = CloseSpecialistTool::new(impostor_cfg);
         let ctx = exec_ctx(std::path::Path::new("."));
 
@@ -2220,6 +2316,102 @@ mod specialist_session_tests {
             pool.snapshot_for_persistence().len(),
             1,
             "a rejected close must not discard the dehydrated record"
+        );
+    }
+
+    /// Finding 1: the lead is the one caller allowed to bypass
+    /// `close_specialist`'s ownership check entirely -- this is its
+    /// recovery path for a specialist-owned session whose owning
+    /// specialist's own session has itself gone away, which would
+    /// otherwise orphan the slot forever (nothing else can ever again
+    /// construct a config with a matching `caller`).
+    #[tokio::test]
+    async fn lead_can_close_a_live_session_it_does_not_own() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("hello")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+
+        // Spawn a session owned by a specialist (not the lead), the same
+        // way a specialist-initiated spawn would.
+        let mut specialist_cfg = config(llm, tx, simple_team(), pool.clone());
+        specialist_cfg.caller = SessionOwner::Specialist("orchestrator-session".to_string());
+        let spawn_tool = SpawnSpecialistTool::new(specialist_cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+        let spawn_result = spawn_tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "do something" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(spawn_text) = spawn_result else {
+            panic!("expected Ok from spawn_specialist");
+        };
+        let session_id = spawn_text
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("session_id: ")
+            .unwrap()
+            .to_string();
+
+        // The lead, despite not being the owner, can still close it.
+        let lead_cfg = config(
+            Arc::new(MockBackend::new(vec![])),
+            tokio::sync::mpsc::unbounded_channel().0,
+            simple_team(),
+            pool.clone(),
+        );
+        assert_eq!(lead_cfg.caller, SessionOwner::Lead);
+        let close_tool = CloseSpecialistTool::new(lead_cfg);
+        let close_result = close_tool
+            .execute(serde_json::json!({ "session_id": session_id }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(close_result, ToolOutput::Ok(_)),
+            "expected the lead to be able to close a session it doesn't own, got {close_result:?}"
+        );
+        assert_eq!(
+            pool.open_sessions().len(),
+            0,
+            "the session should actually be gone after the lead's close"
+        );
+    }
+
+    /// Same lead-override, but for a dehydrated (not-yet-rehydrated)
+    /// session -- the other code path Finding 1's fix touches.
+    #[tokio::test]
+    async fn lead_can_close_a_dehydrated_session_it_does_not_own() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        pool.seed_dehydrated(vec![PersistedSpecialistSession {
+            session_id: "old-session".to_string(),
+            member: "implementer".to_string(),
+            history: vec![],
+            owner: SessionOwner::Specialist("orchestrator-session".to_string()),
+        }]);
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let lead_cfg = config(llm, tx, simple_team(), pool.clone());
+        assert_eq!(lead_cfg.caller, SessionOwner::Lead);
+        let close_tool = CloseSpecialistTool::new(lead_cfg);
+        let ctx = exec_ctx(std::path::Path::new("."));
+
+        let result = close_tool
+            .execute(serde_json::json!({ "session_id": "old-session" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, ToolOutput::Ok(_)),
+            "expected the lead to be able to close a dehydrated session it doesn't own, got \
+            {result:?}"
+        );
+        assert_eq!(
+            pool.snapshot_for_persistence().len(),
+            0,
+            "the dehydrated record must actually be discarded by the lead's close"
         );
     }
 }

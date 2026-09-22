@@ -1683,6 +1683,18 @@ enabled = false
 # max_concurrent_specialist_sessions = 3  # spawn_specialist sessions open at once
 # specialist_session_idle_timeout_secs = 600  # drop an idle session on the next specialist-session tool call made after this long
 # roster_path = "~/my-team.toml"  # a custom roster (TOML: {lead, members: [{name, role, persona, tool_allowlist, extra_deny_paths}]}) instead of the built-in implementer/reviewer/tester roster; validated at startup (unknown lead/duplicate member/unknown tool all refuse to start rather than run with a broken roster)
+#
+# spawn_specialist/query_specialist/close_specialist are normally
+# lead-facing, but a roster member's own tool_allowlist may name them too
+# -- doing so lets that specialist open/query/close sessions directly
+# with PEER specialists, not just the lead. Nesting is capped at one hop:
+# a specialist the lead spawns may spawn peers of its own, but a
+# specialist spawned BY another specialist cannot spawn further. A
+# session can only be queried or closed by whoever opened it, with one
+# exception -- the lead can still close (but not query) any session as a
+# supervisory override, so a specialist-owned session doesn't get
+# permanently stranded if its owning specialist's own session ever goes
+# away.
 ```
 
 ## Known limitations

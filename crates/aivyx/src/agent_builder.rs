@@ -1453,6 +1453,58 @@ extra_deny_paths = ["secrets/"]
     }
 
     #[test]
+    fn resolve_team_config_accepts_a_custom_roster_naming_spawn_specialist() {
+        // Before specialist-to-specialist messaging, naming
+        // spawn_specialist/query_specialist/close_specialist in a
+        // non-lead member's own tool_allowlist would fail closed with
+        // UnknownTool, since `build_agent` only ever extended
+        // `available_tools` with the tools already registered on
+        // `registry` at that snapshot point (see that call site's own
+        // comment in `build_agent`) -- those three tools are registered
+        // later, and never onto the top-level registry at all. This
+        // proves resolve_team_config's own validation genuinely accepts
+        // a member naming one of the three, given an `available_tools`
+        // list that includes it -- exactly what `build_agent` now passes
+        // (it explicitly extends `available_tools` with the three
+        // literal tool-name strings for this reason).
+        let dir = tempfile::tempdir().unwrap();
+        let roster_path = dir.path().join("roster.toml");
+        std::fs::write(
+            &roster_path,
+            r#"
+lead = "coordinator"
+
+[[members]]
+name = "coordinator"
+role = "Lead"
+persona = "You delegate."
+tool_allowlist = ["set_tasks"]
+
+[[members]]
+name = "orchestrator"
+role = "Orchestrator"
+persona = "You coordinate peer specialists."
+tool_allowlist = ["spawn_specialist", "query_specialist", "close_specialist"]
+"#,
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some(roster_path.to_string_lossy().to_string());
+        let available = [
+            "set_tasks",
+            "spawn_specialist",
+            "query_specialist",
+            "close_specialist",
+        ];
+        let team = resolve_team_config(&settings, &available).unwrap();
+        assert_eq!(team.members[1].name, "orchestrator");
+        assert_eq!(
+            team.members[1].tool_allowlist,
+            vec!["spawn_specialist", "query_specialist", "close_specialist"]
+        );
+    }
+
+    #[test]
     fn resolve_team_config_fails_closed_on_a_missing_file() {
         let mut settings = Settings::default();
         settings.team.roster_path = Some("/tmp/definitely-does-not-exist-roster.toml".to_string());
