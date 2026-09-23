@@ -777,6 +777,30 @@ now fixed (deny-paths attenuation, custom-roster loading, `/clear` reset,
 session persistence, specialist channel, `goal_achieved()` team-
 awareness, and this one) — see this file's own history above for each.
 
+**`aivyx-skills` integration — shipped (2026-09-23).** A new `[skills]`
+config section (`enabled = true` by default — the one exception to this
+project's usual "off until configured" posture for a new feature
+section, since a fresh install should get real skill guidance with zero
+setup) wires the shared `Aivyx-Agent/aivyx-skills` crate (a pinned
+external dependency, Part 1 of the cross-repo Aivyx-Skills initiative,
+already shipped standalone) into this project's agent. `Agent::set_skills`
+folds a skill-discovery listing (name + one-line description per skill)
+into the system prompt every turn, the same persistent-block shape
+`repo_map_text`/`agents_files_text` already use — no separate discovery
+tool call needed. A new `load_skill` tool (`ActionKind::Internal`,
+following `spawn_specialist`'s own precedent for a non-filesystem-path
+target) reads a named skill's full body on demand from the crate's 5
+bundled default skills (`systematic-debugging`,
+`brainstorming-and-scoping`, `writing-plans`, `self-review-before-done`,
+`clear-communication`), plus optional `[skills] project_dir`/`user_dir`
+overlay directories for project- or user-supplied skills. Overlay-sourced
+skill *names*, not just descriptions, are scanned for injection markers
+before being folded into the discovery listing — a real gap caught and
+fixed mid-branch, since a skill's frontmatter name (required to match its
+directory name, and POSIX directory names may contain spaces) is equally
+overlay-controlled and prompt-visible as its description. See
+`docs/superpowers/specs/2026-09-23-aivyx-skills-integration-design.md`.
+
 See `docs/HISTORY.md` for the full phase-by-phase narrative behind
 every item above.
 

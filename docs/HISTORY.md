@@ -4131,3 +4131,47 @@ simulating the exact packaging commands locally, that they produce the
 SVGs at the same relative path the packaged README expects.
 
 Also 2026-09-13: added `CONTRIBUTING.md`.
+
+### `aivyx-skills` integration (2026-09-23) — ✅ shipped
+
+**What shipped**: Part 2 of the three-part cross-repo Aivyx-Skills
+initiative (Part 1, the shared `Aivyx-Agent/aivyx-skills` crate itself —
+5 bundled default skills: `systematic-debugging`,
+`brainstorming-and-scoping`, `writing-plans`, `self-review-before-done`,
+`clear-communication` — already shipped standalone; Part 3, `aivyx-pa`'s
+own integration, is separate, later, unstarted scope in that other repo).
+Wires the crate into this project's agent as a new `[skills]` config
+section, pinned as an external dependency and on by default. A grounding
+pass confirmed this project had no pre-existing "skill" concept of any
+kind to reconcile — a clean slate, unlike `aivyx-pa`'s own unrelated,
+pre-existing agent-learned `Skill`/`LearnedSkill` system.
+
+`Agent::set_skills` folds a skill-discovery listing (name + one-line
+description per skill) into `system_prompt_text()` every turn, the same
+persistent-block shape `repo_map_text`/`agents_files_text` already use —
+no separate discovery tool call needed, mirroring why neither of those
+has a `list_*` tool either. A new `load_skill` tool reads a named skill's
+full body on demand, classified `ActionKind::Internal` +
+`PermissionTarget::Other` (the `spawn_specialist`/`query_specialist`
+precedent for a tool whose target isn't a real filesystem path), and its
+own `definition()` interpolates the live skill-name list the same way
+`spawn_specialist`'s interpolates the live roster. Beyond the 5 bundled
+defaults, `[skills] project_dir`/`user_dir` let a project or user supply
+their own overlay skills (tilde-expanded, `<skill-name>/SKILL.md`
+subdirectories).
+
+A real, since-fixed finding from mid-branch review: `render_skills_listing`
+scanned an overlay skill's *description* for injection markers before
+folding it into the prompt, but not its *name* — even though the crate
+requires a skill's frontmatter name to match its directory name (POSIX
+directory names may contain spaces) and the name is exactly as
+prompt-visible and overlay-controlled as the description. It also
+interpolated the attacker-influenceable name into the scan's own
+provenance label, which is shown verbatim to the operator as a
+security-finding source — letting a malicious overlay skill spoof where
+a flagged injection attempt appeared to come from. Fixed by scanning the
+composed name+description entry as one unit and using a fixed `"skill
+listing"` label instead, with a regression test proving a marker in the
+name alone (not the description) now flags the taint. `README.md`'s
+`[skills]` section and `load_skill` tool-table row were documented in a
+prior commit on this same branch.
