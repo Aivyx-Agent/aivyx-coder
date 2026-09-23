@@ -1347,6 +1347,7 @@ actually needs.
 | `memory_read` | recall entries saved under a topic (`global:`/`project:` scoped) | none (auto-allowed) |
 | `memory_write` | persist a fact/note under a topic for future recall | prompt (then cacheable per topic) |
 | `memory_forget` | delete every entry saved under a topic | prompt (then cacheable per topic) |
+| `load_skill` | load a named skill's full body from the default/project/user skill library (see `[skills]`) | none (internal state only) |
 
 `run_command` and `run_shell` are only useful once you configure them (see
 `allowed_commands` below); `run_shell` is always registered but every command
@@ -1472,9 +1473,10 @@ Every tool call passes through the gate before it runs:
    current for anything sensitive outside the default list. (But note: read
    output re-enters the model's context — see "Known limitations".)
    `Internal` actions (`set_tasks`, which mutates only
-   the agent's own session state) are auto-allowed on the same basis, but are
-   a distinct action kind so audit logs never record a state change as a
-   "read" — and so a tool that touches the outside world can't honestly
+   the agent's own session state, and `load_skill`, which only reads from the
+   skill library and returns its content) are auto-allowed on the same basis,
+   but are a distinct action kind so audit logs never record a state change as
+   a "read" — and so a tool that touches the outside world can't honestly
    describe itself as internal.
 3. **Plan mode** (when active) → every remaining action is denied outright,
    with a reason the model can read. This check deliberately sits *before*
@@ -1668,6 +1670,19 @@ tail_budget_tokens = 3072  # recent-conversation digest members see
 #   { base_url = "http://localhost:11434/v1", model = "ornith:9b" },
 # ]
 # chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
+
+# Shared skill library (load_skill tool + a skill-discovery listing
+# folded into the system prompt): step-by-step process guidance (e.g.
+# systematic debugging, writing a plan, brainstorming and scoping) from
+# the aivyx-skills crate's bundled skills, plus optional project/user
+# overlay directories. On by default -- the one exception to this
+# project's usual "off until configured" posture for a new feature
+# section, since a fresh install should get real skill guidance with
+# zero setup.
+[skills]
+enabled = true
+# project_dir = ".aivyx/skills"  # optional project-level overlay; tilde-expanded, must directly contain <skill-name>/SKILL.md subdirectories, one per skill
+# user_dir = "~/.config/aivyx-coder/skills"  # optional user-level overlay; same required shape as project_dir
 
 # Nonagon-style team delegation, mission structure, and specialist
 # sessions (delegate_to_specialist, decompose_task, verify_output,
