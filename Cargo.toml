@@ -33,20 +33,20 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # exactly one place to bump: aivyx-kvcache and aivyx-recall previously
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
-aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "f158d957d69f2d4eb95298c5c95b29379406153a", default-features = false }
-aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "37b0ebf200eaf5b31bcb795dfb1beb3356cd12a3" }
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "e44314555ba94a8de5c0634b163ef9d425cf1164" }
-aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "e22e28ac9dbcc051b9564c690d5082f79a51cf03" }
-aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "ad9141c6ca242532db7b8e34eff423084e1eba4d" }
-aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "99a0298828d80bb18175671ef66b61d5e0133bf7" }
+aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "fd9f1b4b825641e3ed9d3f4f7532e44dee8a5d6b", default-features = false }
+aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "f3faa026bdedc3e6810e69035efc350675d1da90" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "02d96f05aa3a5655a7e59b92d17c1ca19b27c4cb" }
+aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "a98bdc96bfeb1221b40014cf268469ed511e9d88" }
+aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "bcd98e98f3b6aaa4c09dee50c56b2d00230d0e4a" }
+aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "78779dbfced43fcfbeee869a0a0f385f89a51e72" }
 # Not on crates.io -- pinned by commit SHA, same as aivyx-checkpoint/
 # aivyx-confine/aivyx-injection-guard above. No platform-specific
 # backend, so no target-gating needed. All three pinned to the same rev
 # (Milestone 2 Pass A's merge commit in that repo) so they never drift
 # out of lockstep with each other.
-aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "caed4c0875a19ef5c7f4059ddda8cd6364f9fda4" }
-aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "caed4c0875a19ef5c7f4059ddda8cd6364f9fda4" }
-aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "caed4c0875a19ef5c7f4059ddda8cd6364f9fda4" }
+aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "1a09b6a1d978ae789edb5a25523fa7580fa80714" }
+aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "1a09b6a1d978ae789edb5a25523fa7580fa80714" }
+aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "1a09b6a1d978ae789edb5a25523fa7580fa80714" }
 
 [profile.release]
 strip = true
