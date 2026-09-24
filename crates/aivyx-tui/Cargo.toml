@@ -3,6 +3,7 @@ name = "aivyx-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }

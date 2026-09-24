@@ -3,6 +3,7 @@ name = "aivyx-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 aivyx-types = { version = "0.1.0", path = "../aivyx-types" }

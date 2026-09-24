@@ -3,6 +3,7 @@ name = "aivyx-acp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 # unstable_auth_methods enables AuthMethod::Terminal -- see this crate's
