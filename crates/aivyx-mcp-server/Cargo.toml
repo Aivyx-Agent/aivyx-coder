@@ -7,12 +7,12 @@ publish.workspace = true
 
 [dependencies]
 rmcp = { version = "0.11.0", features = ["transport-io"] }
-aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
+aivyx-core = { version = "0.2.0", path = "../aivyx-core", default-features = false }
 aivyx-kvcache = { workspace = true }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
-aivyx-tools = { version = "0.1.0", path = "../aivyx-tools", default-features = false }
-aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
-aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
+aivyx-sandbox = { version = "0.2.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-tools = { version = "0.2.0", path = "../aivyx-tools", default-features = false }
+aivyx-llm = { version = "0.2.0", path = "../aivyx-llm" }
+aivyx-repomap = { version = "0.2.0", path = "../aivyx-repomap" }
 anyhow = "1.0.103"
 async-trait = "0.1.89"
 schemars = "1.0"
@@ -64,4 +64,4 @@ aivyx-vision-svg = { workspace = true }
 # (ToolCall/ToolCallId/ToolCallSource) -- Cargo requires this be a direct
 # dependency of this crate even though aivyx-core already depends on it;
 # a transitive dependency's types are not importable without it.
-aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+aivyx-types = { version = "0.2.0", path = "../aivyx-types" }

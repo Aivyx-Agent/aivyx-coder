@@ -6,9 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
-aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+aivyx-core = { version = "0.2.0", path = "../aivyx-core", default-features = false }
+aivyx-sandbox = { version = "0.2.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-types = { version = "0.2.0", path = "../aivyx-types" }
 anyhow = "1.0.103"
 async-trait = "0.1.89"
 crossterm = { version = "0.28.1", features = ["event-stream"] }

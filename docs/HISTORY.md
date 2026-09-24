@@ -4175,3 +4175,53 @@ listing"` label instead, with a regression test proving a marker in the
 name alone (not the description) now flags the taint. `README.md`'s
 `[skills]` section and `load_skill` tool-table row were documented in a
 prior commit on this same branch.
+
+### BUSL-1.1 relicense + v0.2.0 (2026-09-24) — ✅ shipped
+
+**What shipped**: aivyx-coder moves from the dual MIT OR Apache-2.0
+license to the Business Source License 1.1 — source-available, free for
+personal/non-commercial use, a paid commercial license for business/
+production use, converting to MIT four years after each release's
+Change Date. This is Part 1 of an ecosystem-wide relicense rollout,
+reusing the canonical CLA/COMMERCIAL/TRADEMARK templates
+`aivyx-ecosystem`'s own Part 0 groundwork already shipped rather than
+drafting new ones from scratch.
+
+Six tasks landed in sequence on one branch. First, a permanent
+`cargo-deny` license gate (`deny.toml`) — added *before* the relicense
+itself specifically so its result could be checked as real evidence
+rather than assumed after the fact. The all-features dependency graph
+came back clean against `aivyx-pa`'s own established permissive
+allow-list: no GPL/AGPL/copyleft-only dependency anywhere, unlike
+`aivyx-pa`'s own relicense history. Second, the actual license swap:
+`LICENSE` is now the filled BUSL-1.1 text (Change License = MIT,
+preserved verbatim at `LICENSES/MIT.txt`; a four-year per-release Change
+Date), `LICENSE-APACHE` is gone since Apache-2.0 stops being an option
+going forward, and `Cargo.toml` gained `license = "BUSL-1.1"` plus
+`publish = false` workspace-wide — verified directly that `cargo-deny`'s
+`private.ignore` still correctly skips our own now-BUSL crates while
+still catching a real third-party copyleft/BUSL dependency, so the gate
+from the first task stayed green through the swap. Third, physical
+copies of `CLA.md`, `COMMERCIAL.md`, and a new `TRADEMARK.md` (new
+because aivyx-coder ships a consumer-facing product name, unlike the
+nine shared subsystem crates, which don't get one). Fourth,
+`CONTRIBUTING.md` traded its now-incorrect dual Apache-2.0/MIT license
+section for a CLA-gate section plus a Developer Certificate of Origin
+section at the end — `git commit -s` now certifies both, the same
+mechanism `CLA.md`'s own "How to accept" section describes. Fifth, the
+README license badge was corrected to BUSL-1.1.
+
+The sixth and final task closes the loop: the workspace version moves to
+`0.2.0`, along with every one of the 7 crate manifests' hardcoded
+`version = "0.1.0"` sibling-path-dependency pins (verified directly
+during planning that skipping those breaks `cargo check` with `failed to
+select a version for the requirement 'aivyx-acp = "^0.1.0"'` — a real,
+non-obvious gotcha distinct from the workspace-inherited
+`version.workspace = true` each crate's own `[package]` block already
+uses correctly). `cargo check --workspace`, `cargo test --workspace`,
+and a final `cargo deny --all-features check licenses` all confirmed
+clean post-bump — no application logic changed anywhere in this plan,
+only manifests and docs, so no test's behavior moved. A local, unpushed
+`v0.2.0` tag marks the release; pushing it to fire the real
+`release.yml` GitHub Actions workflow is left for explicit separate
+operator confirmation.

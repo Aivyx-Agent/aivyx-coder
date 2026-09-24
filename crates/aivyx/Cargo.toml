@@ -10,20 +10,20 @@ name = "aivyx-coder"
 path = "src/main.rs"
 
 [dependencies]
-aivyx-acp = { version = "0.1.0", path = "../aivyx-acp", default-features = false }
-aivyx-config = { version = "0.1.0", path = "../aivyx-config" }
-aivyx-core = { version = "0.1.0", path = "../aivyx-core", default-features = false }
+aivyx-acp = { version = "0.2.0", path = "../aivyx-acp", default-features = false }
+aivyx-config = { version = "0.2.0", path = "../aivyx-config" }
+aivyx-core = { version = "0.2.0", path = "../aivyx-core", default-features = false }
 aivyx-kvcache = { workspace = true }
-aivyx-llm = { version = "0.1.0", path = "../aivyx-llm" }
-aivyx-mcp-server = { version = "0.1.0", path = "../aivyx-mcp-server", default-features = false }
+aivyx-llm = { version = "0.2.0", path = "../aivyx-llm" }
+aivyx-mcp-server = { version = "0.2.0", path = "../aivyx-mcp-server", default-features = false }
 aivyx-recall = { workspace = true }
-aivyx-repomap = { version = "0.1.0", path = "../aivyx-repomap" }
-aivyx-sandbox = { version = "0.1.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-repomap = { version = "0.2.0", path = "../aivyx-repomap" }
+aivyx-sandbox = { version = "0.2.0", path = "../aivyx-sandbox", default-features = false }
 aivyx-skills = { workspace = true }
-aivyx-team = { version = "0.1.0", path = "../aivyx-team" }
-aivyx-tools = { version = "0.1.0", path = "../aivyx-tools", default-features = false }
-aivyx-tui = { version = "0.1.0", path = "../aivyx-tui", default-features = false }
-aivyx-types = { version = "0.1.0", path = "../aivyx-types" }
+aivyx-team = { version = "0.2.0", path = "../aivyx-team" }
+aivyx-tools = { version = "0.2.0", path = "../aivyx-tools", default-features = false }
+aivyx-tui = { version = "0.2.0", path = "../aivyx-tui", default-features = false }
+aivyx-types = { version = "0.2.0", path = "../aivyx-types" }
 aivyx-vision-svg = { workspace = true }
 aivyx-vision-core = { workspace = true }
 aivyx-vision-mold = { workspace = true }
