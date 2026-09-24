@@ -1,10 +1,10 @@
 {
   "id": "aivyx-coder",
   "name": "aivyx-coder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A terminal coding agent for local LLMs only (Ollama, vLLM, llama.cpp) -- never calls a cloud API.",
   "repository": "https://github.com/Aivyx-Agent/aivyx-coder",
-  "license": "MIT OR Apache-2.0",
+  "license": "BUSL-1.1",
   "license_url": "https://github.com/Aivyx-Agent/aivyx-coder/blob/main/LICENSE",
   "distribution": {
     "binary": {
