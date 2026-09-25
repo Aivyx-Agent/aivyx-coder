@@ -6,12 +6,25 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use aivyx_route::{ModelKey, ModelProfile, Policy, Requirements, TaskKind, TaskOverrides, select};
+use aivyx_route::{
+    Availability, ModelKey, ModelProfile, Policy, Requirements, TaskKind, TaskOverrides, find,
+    select, unmet_needs,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::backend::{ChatRequest, LlmBackend, LlmError, RouteHint, StreamEvent};
+
+/// How long a model that failed to answer is skipped.
+pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Re-reads the candidate list (discovery + roster) for `/models refresh`.
+#[async_trait]
+pub trait ProfileRefresher: Send + Sync {
+    async fn refresh(&self) -> Vec<ModelProfile>;
+}
 
 /// Builds the backend serving one model. The error is a human sentence.
 pub type BackendFactory =
@@ -31,6 +44,8 @@ pub struct RoutedBackend {
     default_backend: Arc<dyn LlmBackend>,
     factory: BackendFactory,
     tasks: TaskOverrides,
+    cooldown: Duration,
+    refresher: Option<Arc<dyn ProfileRefresher>>,
     state: Mutex<State>,
 }
 
@@ -41,6 +56,10 @@ struct State {
     /// Session → the model its main thread is on.
     sticky: HashMap<String, ModelKey>,
     last: HashMap<String, RouteRecord>,
+    /// Session → an explicit `/model` pin.
+    pins: HashMap<String, ModelKey>,
+    /// Model → when its cooldown (from a retryable failure) expires.
+    cooling: HashMap<ModelKey, Instant>,
 }
 
 /// The ordered models to try for one call, and why.
@@ -64,6 +83,8 @@ impl RoutedBackend {
             default_backend,
             factory,
             tasks,
+            cooldown: DEFAULT_COOLDOWN,
+            refresher: None,
             state: Mutex::new(State {
                 profiles,
                 ..State::default()
@@ -88,6 +109,63 @@ impl RoutedBackend {
         self.state.lock().unwrap().last.get(session).cloned()
     }
 
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    pub fn with_refresher(mut self, refresher: Arc<dyn ProfileRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// Re-runs discovery + merge. Returns the new candidate count.
+    pub async fn refresh(&self) -> Result<usize, String> {
+        let refresher = self
+            .refresher
+            .as_ref()
+            .ok_or_else(|| "this router has no discovery configured".to_string())?;
+        let profiles = refresher.refresh().await;
+        let count = profiles.len();
+        let mut state = self.state.lock().unwrap();
+        state.profiles = profiles;
+        state.cooling.clear();
+        Ok(count)
+    }
+
+    /// Pins `session`'s main thread (sticky task kinds) to `key`.
+    pub fn pin(&self, session: &str, key: ModelKey) {
+        self.state
+            .lock()
+            .unwrap()
+            .pins
+            .insert(session.to_string(), key);
+    }
+
+    pub fn unpin(&self, session: &str) {
+        self.state.lock().unwrap().pins.remove(session);
+    }
+
+    pub fn pinned(&self, session: &str) -> Option<ModelKey> {
+        self.state.lock().unwrap().pins.get(session).cloned()
+    }
+
+    /// A new conversation: drop the sticky model and last decision, keep
+    /// any `/model` pin (an explicit operator choice).
+    pub fn forget_session(&self, session: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.sticky.remove(session);
+        state.last.remove(session);
+    }
+
+    fn cool(&self, key: &ModelKey) {
+        self.state
+            .lock()
+            .unwrap()
+            .cooling
+            .insert(key.clone(), Instant::now() + self.cooldown);
+    }
+
     fn plan(&self, request: &ChatRequest, hint: &RouteHint) -> Result<Plan, LlmError> {
         let mut builder = Requirements::builder().task(&hint.task, &self.tasks);
         if !request.tools.is_empty() {
@@ -98,7 +176,40 @@ impl RoutedBackend {
         }
         let req = builder.build();
         let sticky_session = hint.session.clone().filter(|_| hint.task.is_sticky());
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.cooling.retain(|_, until| *until > now);
+        if let Some(session) = &sticky_session
+            && let Some(pin) = state.pins.get(session).cloned()
+        {
+            let mut reason = format!("pinned with /model to `{pin}`");
+            if let Some(profile) = find(&state.profiles, &pin) {
+                let unmet: Vec<String> = unmet_needs(&req, profile)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                if !unmet.is_empty() {
+                    tracing::warn!(model = %pin, unmet = %unmet.join(", "), "pinned model may lack a hard requirement");
+                    reason.push_str(&format!("; warning: it may lack {}", unmet.join(", ")));
+                }
+            }
+            return Ok(Plan {
+                chain: vec![pin],
+                reason,
+                sticky_session,
+            });
+        }
+        let profiles: Vec<ModelProfile> = state
+            .profiles
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if state.cooling.contains_key(&p.key()) {
+                    p.availability = Availability::Unavailable;
+                }
+                p
+            })
+            .collect();
         let policy = Policy {
             sticky_model: sticky_session
                 .as_ref()
@@ -106,7 +217,7 @@ impl RoutedBackend {
             allow_cloud: false,
             exclude: Vec::new(),
         };
-        let decision = select(&req, &state.profiles, &policy).map_err(|e| {
+        let decision = select(&req, &profiles, &policy).map_err(|e| {
             LlmError::Routing(format!(
                 "{e} — add a capable model to [[routing.models]] (see /models)"
             ))
@@ -166,18 +277,55 @@ impl LlmBackend for RoutedBackend {
             return self.default_backend.stream_chat(request).await;
         };
         let plan = self.plan(&request, &hint)?;
-        let key = &plan.chain[0];
-        let backend = self.backend_for(key).map_err(LlmError::Routing)?;
-        let mut attempt = request;
-        if *key != self.default_key {
-            // Slot ids/hints describe the default server's KV cache.
-            attempt.id_slot = None;
-            attempt.slot_hint = None;
+        let mut failures: Vec<String> = Vec::new();
+        for key in &plan.chain {
+            let backend = match self.backend_for(key) {
+                Ok(backend) => backend,
+                Err(why) => {
+                    self.cool(key);
+                    failures.push(format!("`{key}` ({why})"));
+                    continue;
+                }
+            };
+            let mut attempt = request.clone();
+            if *key != self.default_key {
+                // Slot ids/hints describe the default server's KV cache.
+                attempt.id_slot = None;
+                attempt.slot_hint = None;
+            }
+            match backend.stream_chat(attempt).await {
+                Ok(stream) => {
+                    let mut reason = plan.reason.clone();
+                    if !failures.is_empty() {
+                        reason
+                            .push_str(&format!("; fell back after {} failed", failures.join(", ")));
+                    }
+                    tracing::info!(model = %key, task = hint.task.name(), %reason, "routed model call");
+                    self.record(&plan, &hint, key, reason);
+                    return Ok(stream);
+                }
+                Err(err) if is_retryable(&err) => {
+                    self.cool(key);
+                    failures.push(format!("`{key}` ({err})"));
+                }
+                Err(err) => return Err(err),
+            }
         }
-        let stream = backend.stream_chat(attempt).await?;
-        tracing::info!(model = %key, task = hint.task.name(), reason = %plan.reason, "routed model call");
-        self.record(&plan, &hint, key, plan.reason.clone());
-        Ok(stream)
+        Err(LlmError::Routing(format!(
+            "every candidate failed: {}",
+            failures.join(", ")
+        )))
+    }
+}
+
+/// Connection trouble, a missing/unloadable model, or a server error: try
+/// the next candidate. Anything else (a 400, a parse error) would fail the
+/// same way on every model.
+fn is_retryable(err: &LlmError) -> bool {
+    match err {
+        LlmError::Request(_) | LlmError::Timeout => true,
+        LlmError::BackendError { status, .. } => matches!(status, 404 | 408 | 500..=599),
+        _ => false,
     }
 }
 
@@ -474,5 +622,197 @@ mod tests {
         }
         assert_eq!(f.built.load(Ordering::SeqCst), 1);
         assert_eq!(f.calls("gpu", "big"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_falls_back_and_cools_down() {
+        let f = fixture(
+            vec![profile("gpu", "big", Tier::Large, &[])],
+            &[("gpu", "big", 503)],
+        );
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "big"), 1);
+        assert_eq!(f.default.calls(), 1);
+        let record = f.router.last_decision("s").unwrap();
+        assert_eq!(record.model, key("backend", "default"));
+        assert!(
+            record.reason.contains("fell back after `big@gpu`"),
+            "{}",
+            record.reason
+        );
+        // The session sticks to the model that actually answered.
+        assert_eq!(f.router.current("s"), Some(key("backend", "default")));
+        // Cooling down: the next call doesn't retry big.
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, None))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "big"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zero_cooldown_retries_the_failed_model() {
+        let mut f = fixture(
+            vec![profile("gpu", "big", Tier::Large, &[])],
+            &[("gpu", "big", 503)],
+        );
+        f.router = f.router.with_cooldown(Duration::ZERO);
+        for _ in 0..2 {
+            let _ = f
+                .router
+                .stream_chat(routed(TaskKind::CodeEdit, None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(f.calls("gpu", "big"), 2);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_errors_are_returned_without_fallback() {
+        let f = fixture(
+            vec![profile("gpu", "big", Tier::Large, &[])],
+            &[("gpu", "big", 400)],
+        );
+        let Err(err) = f.router.stream_chat(routed(TaskKind::CodeEdit, None)).await else {
+            panic!("expected the 400 back");
+        };
+        assert!(matches!(err, LlmError::BackendError { status: 400, .. }));
+        assert_eq!(f.default.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn exhausting_every_candidate_names_the_chain() {
+        let f = fixture(
+            vec![
+                profile("gpu", "big", Tier::Large, &[]),
+                profile("gpu", "mid", Tier::Medium, &[]),
+            ],
+            &[("gpu", "big", 503), ("gpu", "mid", 404)],
+        );
+        // Make the default model ineligible so only big and mid remain.
+        f.router.state.lock().unwrap().profiles[0].availability =
+            aivyx_route::Availability::Unavailable;
+        let Err(err) = f.router.stream_chat(routed(TaskKind::CodeEdit, None)).await else {
+            panic!("expected every candidate to fail");
+        };
+        let text = err.to_string();
+        assert!(text.contains("every candidate failed"), "{text}");
+        assert!(
+            text.contains("`big@gpu`") && text.contains("`mid@gpu`"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_factory_error_falls_back() {
+        let f = fixture(vec![], &[]);
+        // In the candidate list but the factory has no backend for it.
+        f.router
+            .state
+            .lock()
+            .unwrap()
+            .profiles
+            .push(profile("gpu", "ghost", Tier::Large, &[]));
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.default.calls(), 1);
+        assert!(
+            f.router
+                .last_decision("s")
+                .unwrap()
+                .reason
+                .contains("ghost@gpu")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pin_overrides_selection_and_warns_on_unmet_needs() {
+        let f = fixture(
+            vec![
+                profile("gpu", "big", Tier::Large, &[Capability::Tools]),
+                profile("gpu", "tiny", Tier::Small, &[]),
+            ],
+            &[],
+        );
+        f.router.pin("s", key("gpu", "tiny"));
+        assert_eq!(f.router.pinned("s"), Some(key("gpu", "tiny")));
+        let mut r = routed(TaskKind::CodeEdit, Some("s"));
+        r.tools = vec![a_tool()];
+        let _ = f.router.stream_chat(r.clone()).await.unwrap();
+        assert_eq!(f.calls("gpu", "tiny"), 1);
+        let reason = f.router.last_decision("s").unwrap().reason;
+        assert!(reason.contains("pinned with /model"), "{reason}");
+        assert!(reason.contains("may lack tool calling"), "{reason}");
+
+        f.router.unpin("s");
+        f.router.forget_session("s");
+        let _ = f.router.stream_chat(r).await.unwrap();
+        assert_eq!(f.calls("gpu", "big"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pin_does_not_capture_side_calls() {
+        let f = fixture(
+            vec![
+                profile("gpu", "big", Tier::Large, &[]),
+                profile("gpu", "tiny", Tier::Small, &[]),
+            ],
+            &[],
+        );
+        f.router.pin("s", key("gpu", "big"));
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::Summarize, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "tiny"), 1);
+        assert_eq!(f.calls("gpu", "big"), 0);
+    }
+
+    #[tokio::test]
+    async fn forget_session_clears_stickiness_but_keeps_the_pin() {
+        let f = fixture(vec![profile("gpu", "big", Tier::Large, &[])], &[]);
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        f.router.pin("s", key("gpu", "big"));
+        f.router.forget_session("s");
+        assert_eq!(f.router.current("s"), None);
+        assert!(f.router.last_decision("s").is_none());
+        assert_eq!(f.router.pinned("s"), Some(key("gpu", "big")));
+    }
+
+    struct FixedRefresher(Vec<ModelProfile>);
+
+    #[async_trait]
+    impl ProfileRefresher for FixedRefresher {
+        async fn refresh(&self) -> Vec<ModelProfile> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_the_candidates() {
+        let f = fixture(vec![], &[]);
+        assert!(f.router.refresh().await.is_err(), "no refresher configured");
+        let fresh = vec![
+            profile("backend", "default", Tier::Medium, &[]),
+            profile("gpu", "new", Tier::Large, &[]),
+        ];
+        let router = f
+            .router
+            .with_refresher(Arc::new(FixedRefresher(fresh.clone())));
+        assert_eq!(router.refresh().await, Ok(2));
+        assert_eq!(router.profiles(), fresh);
     }
 }
