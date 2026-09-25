@@ -68,6 +68,10 @@ struct Plan {
     reason: String,
     /// `Some` only for a sticky task kind with a session.
     sticky_session: Option<String>,
+    /// Whether answering from `chain[0]` may move the session there. False
+    /// while any candidate is cooling down: a choice made around a
+    /// temporarily failing model must not outlive its cooldown.
+    may_stick: bool,
 }
 
 impl RoutedBackend {
@@ -197,9 +201,14 @@ impl RoutedBackend {
                 chain: vec![pin],
                 reason,
                 sticky_session,
+                may_stick: true,
             });
         }
-        let profiles: Vec<ModelProfile> = state
+        let any_cooling = state
+            .profiles
+            .iter()
+            .any(|p| state.cooling.contains_key(&p.key()));
+        let without_cooling: Vec<ModelProfile> = state
             .profiles
             .iter()
             .cloned()
@@ -217,17 +226,35 @@ impl RoutedBackend {
             allow_cloud: false,
             exclude: Vec::new(),
         };
-        let decision = select(&req, &profiles, &policy).map_err(|e| {
-            LlmError::Routing(format!(
-                "{e} — add a capable model to [[routing.models]] (see /models)"
-            ))
-        })?;
+        // Cooling models are a last resort, never a reason to fail: if
+        // nothing else qualifies, try them anyway.
+        let (decision, retrying_cooled) = match select(&req, &without_cooling, &policy) {
+            Ok(decision) => (decision, false),
+            Err(_) if any_cooling => {
+                let decision = select(&req, &state.profiles, &policy).map_err(|e| {
+                    LlmError::Routing(format!(
+                        "{e} — add a capable model to [[routing.models]] (see /models)"
+                    ))
+                })?;
+                (decision, true)
+            }
+            Err(e) => {
+                return Err(LlmError::Routing(format!(
+                    "{e} — add a capable model to [[routing.models]] (see /models)"
+                )));
+            }
+        };
         let mut chain = vec![decision.model.key()];
         chain.extend(decision.fallbacks.iter().map(ModelProfile::key));
+        let mut reason = decision.to_string();
+        if retrying_cooled {
+            reason.push_str("; retrying a model still cooling down after a failure");
+        }
         Ok(Plan {
             chain,
-            reason: decision.to_string(),
+            reason,
             sticky_session,
+            may_stick: !any_cooling,
         })
     }
 
@@ -246,7 +273,12 @@ impl RoutedBackend {
 
     fn record(&self, plan: &Plan, hint: &RouteHint, model: &ModelKey, reason: String) {
         let mut state = self.state.lock().unwrap();
-        if let Some(session) = &plan.sticky_session {
+        // Only a clean first choice moves the session; a fallback or a
+        // choice made around a cooling model is temporary.
+        if let Some(session) = &plan.sticky_session
+            && plan.may_stick
+            && *model == plan.chain[0]
+        {
             state.sticky.insert(session.clone(), model.clone());
         }
         if let Some(session) = &hint.session {
@@ -644,8 +676,8 @@ mod tests {
             "{}",
             record.reason
         );
-        // The session sticks to the model that actually answered.
-        assert_eq!(f.router.current("s"), Some(key("backend", "default")));
+        // A fallback is temporary: the session is not moved onto it.
+        assert_eq!(f.router.current("s"), None);
         // Cooling down: the next call doesn't retry big.
         let _ = f
             .router
@@ -814,5 +846,63 @@ mod tests {
             .with_refresher(Arc::new(FixedRefresher(fresh.clone())));
         assert_eq!(router.refresh().await, Ok(2));
         assert_eq!(router.profiles(), fresh);
+    }
+
+    #[tokio::test]
+    async fn cooling_models_are_retried_when_nothing_else_qualifies() {
+        let f = fixture(
+            vec![profile("gpu", "big", Tier::Large, &[])],
+            &[("gpu", "big", 503)],
+        );
+        f.router.state.lock().unwrap().profiles[0].availability =
+            aivyx_route::Availability::Unavailable;
+        for attempt in 1..=2 {
+            let Err(err) = f.router.stream_chat(routed(TaskKind::CodeEdit, None)).await else {
+                panic!("big always fails");
+            };
+            let text = err.to_string();
+            assert!(text.contains("every candidate failed"), "{text}");
+            assert!(!text.contains("[[routing.models]]"), "{text}");
+            assert_eq!(f.calls("gpu", "big"), attempt);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_returns_to_its_model_once_the_cooldown_ends() {
+        let f = fixture(
+            vec![profile("gpu", "big", Tier::Large, &[])],
+            &[("gpu", "big", 503)],
+        );
+        // The session is on big (as if an earlier call chose it).
+        f.router
+            .state
+            .lock()
+            .unwrap()
+            .sticky
+            .insert("s".into(), key("gpu", "big"));
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.default.calls(), 1);
+        // While big cools down, calls go to the default model without
+        // moving the session.
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.default.calls(), 2);
+        assert_eq!(f.calls("gpu", "big"), 1);
+        assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
+        // Cooldown over: the session's own model is tried again.
+        f.router.state.lock().unwrap().cooling.clear();
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "big"), 2);
     }
 }
