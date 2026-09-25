@@ -1239,7 +1239,22 @@ summarize = { tier = "small" }
   section itself. `[routing.endpoints.backend]` is a reserved name and is
   rejected at startup. The default endpoint is never auto-discovered.
 - The `[backend] model` is always a candidate: if no `[[routing.models]]`
-  entry names it, it is added as an implicit entry on `backend`.
+  entry names it, it is added as an implicit entry on `backend`. **Declare
+  it yourself.** The implicit entry has unknown capabilities and an unknown
+  context window, and routing ranks those below known ones, so it loses
+  every main-loop call (which needs tools and a minimum window) to any
+  discovered tool-capable model. Startup logs a warning when this happens.
+  Add an entry like this, with the window your server actually serves:
+
+  ```toml
+  [[routing.models]]
+  id = "qwen3.5:9b"                 # your [backend] model
+  capabilities = ["tools"]
+  context_window = 32768
+  ```
+- Every model discovery finds becomes a candidate, even without a
+  `[[routing.models]]` entry. Such a model is `medium` tier with no
+  strengths.
 - Only local endpoint kinds are accepted. `kind = "anthropic"` or
   `kind = "openai"` stops startup with an error; `aivyx-coder` never calls
   a cloud API.
@@ -1250,8 +1265,17 @@ summarize = { tier = "small" }
   `[routing.endpoints.*]` at startup (Ollama `/api/tags` + `/api/show`,
   llama-server router mode `/models`, or `/v1/models`) with a 5 s timeout
   per request. An unreachable endpoint therefore slows startup by up to
-  that timeout per probe. `discover = false` skips probing and uses only
-  the roster. `/models refresh` re-runs discovery later.
+  that timeout per probe, and its models stay unavailable until
+  `/models refresh`. `discover = false` skips probing and uses only the
+  roster. `/models refresh` re-runs discovery later.
+- **Ollama's discovered context window is the model's trained maximum**,
+  not the window Ollama serves by default (often 4096, see "Serving").
+  Declare `context_window` for every Ollama model you route to.
+- **Don't point a routing endpoint at the `[backend]` server** unless you
+  mean to. The same model is then listed twice (`id@gpu` and
+  `id@backend`), and the discovered copy wins unless the `backend` one is
+  declared as above. KV-cache slot pinning only applies to the `@backend`
+  copy.
 - Tiers and strengths only ever come from the roster; no server reports
   model quality.
 
@@ -1270,17 +1294,19 @@ the roster entry to make them known either way.
 |---|---|---|
 | Main agent loop | `code_edit` | Sticky per conversation: once a model is chosen it is kept while it still meets every hard need. The first call is chosen by ranking. |
 | `/architect` | `plan` | Only when no `[architect]` section is configured. A configured `[architect]` is used as-is (an explicit pin) and is not a routing candidate. |
-| Team specialists | `code_edit`, or the member's `task` | A roster member (`[team] roster_path`) may set `task = "judge"`, `"plan"`, or a custom `[routing.tasks]` name. |
+| Team specialists | `code_edit`, or the member's `task` | A roster member (`[team] roster_path`) may set `task = "judge"`, `"plan"`, or a custom `[routing.tasks]` name. Only `code_edit` and `chat` are sticky: a member with any other `task` is routed per call, so a multi-round specialist session may switch models. The team lead's `task` is not applied to the main agent, which stays `code_edit`. |
+| `delegate_task` sub-agents, MCP-server sessions | `code_edit` | Each has its own sticky session, separate from the main conversation. `/models` and `/model` are not available to them. |
 
-Everything else (KV-cache warm-up, council members, SVG generation, and
-other side calls) is not tagged and goes to the `[backend]` model exactly
-as before.
+Other calls (KV-cache warm-up, council members, SVG generation, and other
+side calls) are not tagged and go to the `[backend]` model exactly as
+before.
 
 ### Failures and fallback
 
 A call that fails with a retryable error (connection error, timeout, or
 HTTP 404, 408, or 5xx) moves on to the next candidate, and the failed
-model is skipped for 60 seconds. If nothing else qualifies while a model
+model is skipped for 60 seconds. A model whose backend can't be built
+(for example, its endpoint has no `base_url`) is skipped the same way. If nothing else qualifies while a model
 is cooling down, the cooling models are retried anyway rather than the
 call failing outright. Other errors (a 400, a malformed response) are
 returned as-is, since they would fail the same way on any model. A
@@ -1295,18 +1321,19 @@ ends. A `/model` pin has no fallback.
 | Command | What it does |
 |---|---|
 | `/models` | Lists the candidates: `id@endpoint`, tier, capabilities (unknown ones marked `?`), context window, availability. `*` marks this conversation's current model; a pin is marked `(pinned)`. |
-| `/models refresh` | Re-runs discovery and rebuilds the candidate list. |
+| `/models refresh` | Re-runs discovery, rebuilds the candidate list, and clears every cooldown. |
 | `/models why` | The last routing decision in this conversation and its reason. |
 | `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. |
 | `/model auto` | Clears the pin; routing chooses this conversation's model again on the next call. `/model` alone shows the current pin. |
 
-With routing off, these commands reply that routing is off. They are
-handled inside the agent, so they work in both the TUI and ACP.
+With routing off, these commands reply that they need
+`[routing] enabled = true` and the interactive session. They are handled
+inside the agent, so they work in both the TUI and ACP.
 `/clear` forgets the conversation's current model but keeps a `/model`
 pin.
 
-When the conversation moves to a different model, the TUI prints a
-`routing → <model>: <reason>` notice and the status line shows
+On the conversation's first routed call, and whenever it moves to a
+different model, the TUI prints a `routing → <model>: <reason>` notice and the status line shows
 `model <id@endpoint>`.
 
 ### Interactions with other settings
@@ -1502,8 +1529,9 @@ shows a small hint listing matching commands and their descriptions —
 purely visual, keep typing and press Enter as normal. `/help`/`/clear`/
 `/quit` and the hint are TUI-only; the ACP editor-integration frontend
 doesn't wire them up (an editor hosting ACP has its own UI for
-equivalent actions), though `/council`/`/wiki`/`/architect` work there
-too since they flow through the same `Agent::run_turn` path either way.
+equivalent actions), though `/council`/`/wiki`/`/architect`/`/models`/
+`/model` work there too since they flow through the same
+`Agent::run_turn` path either way.
 
 ## Council mode
 
