@@ -8,7 +8,7 @@ pub mod probe;
 mod slot_pool_lock;
 
 pub use backend::{
-    ChatRequest, FinishReason, LlmBackend, LlmError, SlotHint, StreamEvent, ToolChoice,
+    ChatRequest, FinishReason, LlmBackend, LlmError, RouteHint, SlotHint, StreamEvent, ToolChoice,
 };
 pub use kv_slot_pool::KvSlotPool;
 pub use openai_compat::OpenAiCompatBackend;

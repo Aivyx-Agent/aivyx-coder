@@ -238,6 +238,7 @@ dependencies = [
 name = "aivyx-llm"
 version = "0.2.0"
 dependencies = [
+ "aivyx-route",
  "aivyx-types",
  "async-trait",
  "eventsource-stream",
@@ -251,6 +252,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -304,6 +306,14 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "aivyx-route"
+version = "0.1.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=4219b98521b0f474ef440ce2e557610d960fe1d7#4219b98521b0f474ef440ce2e557610d960fe1d7"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

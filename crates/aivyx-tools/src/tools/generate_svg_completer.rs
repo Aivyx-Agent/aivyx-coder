@@ -34,6 +34,7 @@ impl TextCompleter for CoderTextCompleter {
             max_tokens: Some(self.max_tokens),
             id_slot: None,
             slot_hint: None,
+            route: None,
         };
         let mut stream = self
             .backend

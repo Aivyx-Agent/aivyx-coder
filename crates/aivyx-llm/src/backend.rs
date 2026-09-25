@@ -39,6 +39,11 @@ pub struct ChatRequest {
     /// other backend. Unlike `id_slot`, this process never picks the
     /// slot itself -- the broker, not this client, owns that decision.
     pub slot_hint: Option<SlotHint>,
+    /// Routing metadata for `RoutedBackend` (`routed.rs`); every other
+    /// backend ignores it. `None` (an untagged call site) means a
+    /// `RoutedBackend` forwards the request to the configured `[backend]`
+    /// model unchanged.
+    pub route: Option<RouteHint>,
 }
 
 /// See `ChatRequest::slot_hint`'s doc comment.
@@ -46,6 +51,18 @@ pub struct ChatRequest {
 pub struct SlotHint {
     pub prefix_hash: String,
     pub preferred_slot: Option<u32>,
+}
+
+/// See `ChatRequest::route`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHint {
+    pub task: aivyx_route::TaskKind,
+    /// Stickiness key: calls sharing a session with a sticky task kind
+    /// (`Chat`/`CodeEdit`) stay on one model. `None` for side calls.
+    pub session: Option<String>,
+    /// The caller's prompt-size estimate; becomes the minimum context
+    /// window. `0` = no requirement.
+    pub estimated_prompt_tokens: u32,
 }
 
 impl ChatRequest {
@@ -58,6 +75,7 @@ impl ChatRequest {
             max_tokens: None,
             id_slot: None,
             slot_hint: None,
+            route: None,
         }
     }
 }
@@ -110,4 +128,24 @@ pub enum LlmError {
     Timeout,
     #[error("backend response exceeded the maximum allowed size and was aborted")]
     ResponseTooLarge,
+    #[error("model routing: {0}")]
+    Routing(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_requests_are_untagged() {
+        assert!(ChatRequest::new(Vec::new()).route.is_none());
+    }
+
+    #[test]
+    fn routing_errors_explain_themselves() {
+        assert_eq!(
+            LlmError::Routing("no model has tool calling".into()).to_string(),
+            "model routing: no model has tool calling"
+        );
+    }
 }
