@@ -1192,6 +1192,135 @@ point `mistralrs_model_path` at it:
   validated against a real model in this environment (which has neither
   a GPU nor a downloaded GGUF file to test against).
 
+## Model routing
+
+With several local models available, `aivyx-coder` can pick one per call
+instead of sending everything to the `[backend]` model. Selection is done
+by the shared [`aivyx-route`](https://github.com/Aivyx-Agent/aivyx-route)
+crate: hard needs (tool calling, a context window large enough for the
+prompt) filter the candidates, then the call's task kind ranks them by
+tier and strengths, and every choice comes with a stated reason.
+
+Routing is **off by default**. With `[routing]` absent or
+`enabled = false`, nothing changes: the agent holds exactly the backend
+built from `[backend]`, with no wrapper in between.
+
+### Configuration
+
+```toml
+[routing]
+enabled = true
+discover = true           # default; probe each [routing.endpoints.*] at startup
+
+[routing.endpoints.gpu]
+kind = "ollama"           # ollama | llama_router | openai_compat
+base_url = "http://localhost:11434"
+
+[[routing.models]]
+id = "qwen3-coder:30b"
+endpoint = "gpu"          # omitted ⇒ "backend", i.e. the [backend] section
+tier = "large"            # small | medium | large
+strengths = ["code", "reasoning"]
+priority = 10
+
+[[routing.models]]
+id = "llava:13b"
+endpoint = "gpu"
+tier = "small"
+capabilities = ["vision"]        # added to what discovery found
+capabilities_deny = ["tools"]    # removed from discovered and declared
+# context_window = 16384         # the window the server actually serves
+
+[routing.tasks]
+summarize = { tier = "small" }
+```
+
+- The default endpoint is called **`backend`** and is the `[backend]`
+  section itself. `[routing.endpoints.backend]` is a reserved name and is
+  rejected at startup. The default endpoint is never auto-discovered.
+- The `[backend] model` is always a candidate: if no `[[routing.models]]`
+  entry names it, it is added as an implicit entry on `backend`.
+- Only local endpoint kinds are accepted. `kind = "anthropic"` or
+  `kind = "openai"` stops startup with an error; `aivyx-coder` never calls
+  a cloud API.
+- Endpoints are configured as discovery sees them
+  (`http://localhost:11434`); chat requests go to their
+  OpenAI-compatible `/v1` path.
+- **Discovery** (`discover`, default `true`) probes every
+  `[routing.endpoints.*]` at startup (Ollama `/api/tags` + `/api/show`,
+  llama-server router mode `/models`, or `/v1/models`) with a 5 s timeout
+  per request. An unreachable endpoint therefore slows startup by up to
+  that timeout per probe. `discover = false` skips probing and uses only
+  the roster. `/models refresh` re-runs discovery later.
+- Tiers and strengths only ever come from the roster; no server reports
+  model quality.
+
+### Unknown capabilities
+
+Some sources can't say what a model supports (`/v1/models` lists ids only;
+a roster-only model has nothing discovered). Those capabilities are
+*unknown*, not absent: the model can still be chosen for a call that needs
+them, but ranks below any model known to have them, and the reason says
+"assumed but unverified". Declare `capabilities` / `capabilities_deny` on
+the roster entry to make them known either way.
+
+### Which calls are routed
+
+| Call | Task kind | Notes |
+|---|---|---|
+| Main agent loop | `code_edit` | Sticky per conversation: once a model is chosen it is kept while it still meets every hard need. The first call is chosen by ranking. |
+| `/architect` | `plan` | Only when no `[architect]` section is configured. A configured `[architect]` is used as-is (an explicit pin) and is not a routing candidate. |
+| Team specialists | `code_edit`, or the member's `task` | A roster member (`[team] roster_path`) may set `task = "judge"`, `"plan"`, or a custom `[routing.tasks]` name. |
+
+Everything else (KV-cache warm-up, council members, SVG generation, and
+other side calls) is not tagged and goes to the `[backend]` model exactly
+as before.
+
+### Failures and fallback
+
+A call that fails with a retryable error (connection error, timeout, or
+HTTP 404, 408, or 5xx) moves on to the next candidate, and the failed
+model is skipped for 60 seconds. If nothing else qualifies while a model
+is cooling down, the cooling models are retried anyway rather than the
+call failing outright. Other errors (a 400, a malformed response) are
+returned as-is, since they would fail the same way on any model. A
+failure after the response has started streaming is not retried.
+
+A fallback, or a choice made while some model was cooling down, is
+temporary: the conversation returns to its own model once the cooldown
+ends. A `/model` pin has no fallback.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `/models` | Lists the candidates: `id@endpoint`, tier, capabilities (unknown ones marked `?`), context window, availability. `*` marks this conversation's current model; a pin is marked `(pinned)`. |
+| `/models refresh` | Re-runs discovery and rebuilds the candidate list. |
+| `/models why` | The last routing decision in this conversation and its reason. |
+| `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. |
+| `/model auto` | Clears the pin. `/model` alone shows the current pin. |
+
+With routing off, these commands reply that routing is off. They are
+handled inside the agent, so they work in both the TUI and ACP.
+`/clear` forgets the conversation's current model but keeps a `/model`
+pin.
+
+When the conversation moves to a different model, the TUI prints a
+`routing → <model>: <reason>` notice and the status line shows
+`model <id@endpoint>`.
+
+### Interactions with other settings
+
+- **KV-cache slot pinning** (`id_slot`) and broker slot hints apply only
+  to the `[backend]` model. A call routed to any other model is sent
+  without them.
+- **`[backend] context_tokens` still drives compaction** and the status
+  line's context budget for every model. Set it to the smallest context
+  window you route to, or declare `context_window` per roster entry so
+  routing avoids models whose window is smaller than the prompt.
+- With the embedded mistral.rs backend, the `backend` endpoint serves only
+  the configured model.
+
 ## Editor integration (ACP)
 
 `aivyx-coder --acp` runs as an [Agent Client Protocol](https://agentclientprotocol.com)
@@ -1363,6 +1492,7 @@ below for exact forms):
 | `/council` | needs the model | Convenes the configured council on a subject, or the last assistant message if bare. See "Council mode" below. |
 | `/wiki` | needs the model | Regenerates stale wiki pages, or `/wiki <page>` forces one named page. |
 | `/architect` | needs the model | Has the configured architect model produce a plan for `/architect <task>`, then hands it to the primary model to execute. |
+| `/models`, `/model` | agent state, no model call | Model routing: list candidates, refresh, explain the last choice, pin or unpin a model. See "Model routing" above. |
 | `/clear` | agent state, no model call | Starts a fresh conversation — clears history and the task list, keeps plan mode as-is. |
 | `/help` | frontend only | Lists all of the above. |
 | `/quit` | frontend only | Exits `aivyx-coder` (same as Ctrl+C). |
@@ -1697,7 +1827,7 @@ enabled = true
 enabled = false
 # max_concurrent_specialist_sessions = 3  # spawn_specialist sessions open at once
 # specialist_session_idle_timeout_secs = 600  # drop an idle session on the next specialist-session tool call made after this long
-# roster_path = "~/my-team.toml"  # a custom roster (TOML: {lead, members: [{name, role, persona, tool_allowlist, extra_deny_paths}]}) instead of the built-in implementer/reviewer/tester roster; validated at startup (unknown lead/duplicate member/unknown tool all refuse to start rather than run with a broken roster)
+# roster_path = "~/my-team.toml"  # a custom roster (TOML: {lead, members: [{name, role, persona, tool_allowlist, extra_deny_paths, task}]}; `task` is an optional model-routing task kind, see "Model routing") instead of the built-in implementer/reviewer/tester roster; validated at startup (unknown lead/duplicate member/unknown tool all refuse to start rather than run with a broken roster)
 #
 # spawn_specialist/query_specialist/close_specialist are normally
 # lead-facing, but a roster member's own tool_allowlist may name them too
