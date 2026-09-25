@@ -151,6 +151,7 @@ mod tests {
 
     fn member(name: &str, extra_deny_paths: &[&str]) -> aivyx_team::TeamMember {
         aivyx_team::TeamMember {
+            task: None,
             name: name.to_string(),
             role: "Specialist".to_string(),
             persona: "You specialize.".to_string(),

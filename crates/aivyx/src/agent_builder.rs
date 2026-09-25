@@ -1235,6 +1235,21 @@ pub(crate) async fn build_agent(
         });
     }
 
+    // Routing on and no explicit [architect]: `/architect` asks the router
+    // for a planning model (TaskKind::Plan) instead of explaining that no
+    // architect is configured. An explicit [architect] stays a pin.
+    if !settings.architect.configured()
+        && let Some(router) = &router
+    {
+        agent.set_architect(Architect {
+            seat: ArchitectSeat {
+                model: "the model router".to_string(),
+                backend: Arc::clone(router) as Arc<dyn LlmBackend>,
+            },
+            tail_budget_tokens: settings.architect.tail_budget_tokens,
+        });
+    }
+
     // Enforced verification (ROADMAP.md Phase 12 Part B): configuring the
     // command alone is the opt-in, no separate enable flag. The name must
     // match an `allowed_commands` entry (the same trust tier `run_command`

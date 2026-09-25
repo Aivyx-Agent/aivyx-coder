@@ -87,10 +87,18 @@ pub(crate) async fn plan(
     user_prompt.push_str("The task to plan:\n");
     user_prompt.push_str(subject);
 
-    let request = ChatRequest::new(vec![
+    // A routed seat picks a planning model; a pinned [architect] backend
+    // ignores the hint. Rough estimate: 4 characters per token.
+    let chars = ARCHITECT_PROMPT.chars().count() + user_prompt.chars().count();
+    let mut request = ChatRequest::new(vec![
         Message::text(Role::System, ARCHITECT_PROMPT),
         Message::text(Role::User, user_prompt),
     ]);
+    request.route = Some(aivyx_llm::RouteHint {
+        task: aivyx_route::TaskKind::Plan,
+        session: None,
+        estimated_prompt_tokens: (chars / 4) as u32,
+    });
 
     match crate::council::collect_text(seat.backend.as_ref(), request, cancellation).await {
         Ok(text) => {
@@ -123,6 +131,45 @@ pub(crate) async fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use aivyx_llm::{LlmError, StreamEvent};
+    use futures::stream::{BoxStream, StreamExt};
+
+    struct Recording(Mutex<Vec<ChatRequest>>);
+
+    #[async_trait::async_trait]
+    impl LlmBackend for Recording {
+        fn model_id(&self) -> &str {
+            "architect"
+        }
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+            self.0.lock().unwrap().push(request);
+            Ok(futures::stream::iter(vec![Ok(StreamEvent::TextDelta(
+                "1. Change the parser to accept the new token format everywhere.".into(),
+            ))])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_planning_call_is_tagged_plan() {
+        let backend = Arc::new(Recording(Mutex::new(Vec::new())));
+        let seat = ArchitectSeat {
+            model: "architect".into(),
+            backend: backend.clone(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        plan(&seat, "add TokenV2", None, &tx, &CancellationToken::new()).await;
+        let hint = backend.0.lock().unwrap()[0].route.clone().unwrap();
+        assert_eq!(hint.task, aivyx_route::TaskKind::Plan);
+        assert_eq!(hint.session, None);
+        assert!(hint.estimated_prompt_tokens > 0);
+    }
 
     #[test]
     fn parse_command_recognizes_bare_and_task_forms() {

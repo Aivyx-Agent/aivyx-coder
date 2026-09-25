@@ -292,6 +292,9 @@ impl Tool for DelegateToSpecialistTool {
             self.config.autonomous_mode.clone(),
             sub_tx,
         );
+        if let Some(task) = &member.task {
+            specialist.set_route_task(task.parse().unwrap_or_else(|never| match never {}));
+        }
         if let Some((map, budget)) = &self.config.repo_map {
             specialist.set_repo_map(Arc::clone(map), *budget);
         }
@@ -488,6 +491,7 @@ mod delegation_tests {
             lead: "coordinator".to_string(),
             members: vec![
                 TeamMember {
+                    task: None,
                     name: "coordinator".to_string(),
                     role: "Lead".to_string(),
                     persona: "You delegate.".to_string(),
@@ -495,6 +499,7 @@ mod delegation_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "implementer".to_string(),
                     role: "Implementer".to_string(),
                     persona: "You are the implementer specialist. You write code.".to_string(),
@@ -839,6 +844,7 @@ mod delegation_tests {
             lead: "coordinator".to_string(),
             members: vec![
                 TeamMember {
+                    task: None,
                     name: "coordinator".to_string(),
                     role: "Lead".to_string(),
                     persona: "You delegate.".to_string(),
@@ -846,6 +852,7 @@ mod delegation_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "implementer".to_string(),
                     role: "Implementer".to_string(),
                     persona: "You are the implementer specialist. You write code.".to_string(),
@@ -887,6 +894,7 @@ mod registry_attenuation_tests {
 
     fn member(tool_allowlist: &[&str]) -> TeamMember {
         TeamMember {
+            task: None,
             name: "implementer".to_string(),
             role: "Implementer".to_string(),
             persona: "You write code.".to_string(),

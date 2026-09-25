@@ -357,6 +357,7 @@ mod mission_tools_tests {
             lead: "coordinator".to_string(),
             members: vec![
                 TeamMember {
+                    task: None,
                     name: "coordinator".to_string(),
                     role: "Lead".to_string(),
                     persona: "You delegate.".to_string(),
@@ -364,6 +365,7 @@ mod mission_tools_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "implementer".to_string(),
                     role: "Implementer".to_string(),
                     persona: "You write code.".to_string(),

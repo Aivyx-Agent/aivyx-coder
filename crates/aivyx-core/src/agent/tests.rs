@@ -5299,6 +5299,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
         lead: "coordinator".to_string(),
         members: vec![
             TeamMember {
+                task: None,
                 name: "coordinator".to_string(),
                 role: "Lead".to_string(),
                 persona: "You delegate.".to_string(),
@@ -5306,6 +5307,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
                 extra_deny_paths: vec![],
             },
             TeamMember {
+                task: None,
                 name: "implementer".to_string(),
                 role: "Implementer".to_string(),
                 persona: "You are the implementer specialist. You write code.".to_string(),

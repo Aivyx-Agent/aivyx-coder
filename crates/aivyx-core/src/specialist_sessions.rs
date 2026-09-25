@@ -609,6 +609,9 @@ fn build_specialist_agent(
         config.autonomous_mode.clone(),
         sub_tx,
     );
+    if let Some(task) = &member.task {
+        agent.set_route_task(task.parse().unwrap_or_else(|never| match never {}));
+    }
     if let Some((map, budget)) = &config.repo_map {
         agent.set_repo_map(Arc::clone(map), *budget);
     }
@@ -1116,6 +1119,7 @@ mod specialist_session_tests {
             lead: "coordinator".to_string(),
             members: vec![
                 TeamMember {
+                    task: None,
                     name: "coordinator".to_string(),
                     role: "Lead".to_string(),
                     persona: "You delegate.".to_string(),
@@ -1123,6 +1127,7 @@ mod specialist_session_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "implementer".to_string(),
                     role: "Implementer".to_string(),
                     persona: "You are the implementer specialist. You write code.".to_string(),
@@ -1981,6 +1986,7 @@ mod specialist_session_tests {
             lead: "coordinator".to_string(),
             members: vec![
                 TeamMember {
+                    task: None,
                     name: "coordinator".to_string(),
                     role: "Lead".to_string(),
                     persona: "You delegate.".to_string(),
@@ -1988,6 +1994,7 @@ mod specialist_session_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "orchestrator".to_string(),
                     role: "Orchestrator".to_string(),
                     persona: "You coordinate peer specialists.".to_string(),
@@ -1995,6 +2002,7 @@ mod specialist_session_tests {
                     extra_deny_paths: vec![],
                 },
                 TeamMember {
+                    task: None,
                     name: "worker".to_string(),
                     role: "Worker".to_string(),
                     persona: "You do focused work.".to_string(),

@@ -23,6 +23,11 @@ pub struct TeamMember {
     pub tool_allowlist: Vec<String>,
     #[serde(default)]
     pub extra_deny_paths: Vec<String>,
+    /// Routing task kind for this member's calls when model routing is on
+    /// (`"plan"`, `"judge"`, … or a custom `[routing.tasks]` name). Unset =
+    /// `code_edit`, like the lead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -195,6 +200,7 @@ pub fn default_coding_roster() -> TeamConfig {
                     .to_string(),
                 tool_allowlist: vec!["set_tasks".to_string()],
                 extra_deny_paths: vec![],
+                task: None,
             },
             TeamMember {
                 name: "implementer".to_string(),
@@ -211,6 +217,7 @@ pub fn default_coding_roster() -> TeamConfig {
                     "glob".to_string(),
                 ],
                 extra_deny_paths: vec![],
+                task: None,
             },
             TeamMember {
                 name: "reviewer".to_string(),
@@ -226,6 +233,7 @@ pub fn default_coding_roster() -> TeamConfig {
                     "git_read".to_string(),
                 ],
                 extra_deny_paths: vec![],
+                task: None,
             },
             TeamMember {
                 name: "tester".to_string(),
@@ -241,6 +249,7 @@ pub fn default_coding_roster() -> TeamConfig {
                     "grep".to_string(),
                 ],
                 extra_deny_paths: vec![],
+                task: None,
             },
         ],
     }
@@ -249,6 +258,19 @@ pub fn default_coding_roster() -> TeamConfig {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn a_member_may_declare_a_routing_task() {
+        let m: TeamMember = toml::from_str(
+            "name = \"r\"\nrole = \"reviewer\"\npersona = \"p\"\ntool_allowlist = []\ntask = \"judge\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.task.as_deref(), Some("judge"));
+        let m: TeamMember =
+            toml::from_str("name = \"r\"\nrole = \"x\"\npersona = \"p\"\ntool_allowlist = []\n")
+                .unwrap();
+        assert_eq!(m.task, None);
+    }
 
     #[test]
     fn team_config_round_trips_through_toml() {
@@ -309,6 +331,7 @@ mod validation_tests {
                     persona: "You delegate.".to_string(),
                     tool_allowlist: vec!["set_tasks".to_string()],
                     extra_deny_paths: vec![],
+                    task: None,
                 },
                 TeamMember {
                     name: "implementer".to_string(),
@@ -316,6 +339,7 @@ mod validation_tests {
                     persona: "You write code.".to_string(),
                     tool_allowlist: vec!["read_file".to_string(), "write_file".to_string()],
                     extra_deny_paths: vec![],
+                    task: None,
                 },
             ],
         }
@@ -378,6 +402,7 @@ mod attenuation_tests {
             persona: "You write code.".to_string(),
             tool_allowlist: tool_allowlist.iter().map(|s| s.to_string()).collect(),
             extra_deny_paths: extra_deny_paths.iter().map(|s| s.to_string()).collect(),
+            task: None,
         }
     }
 
