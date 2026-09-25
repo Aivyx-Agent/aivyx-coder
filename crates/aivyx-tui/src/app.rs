@@ -1276,6 +1276,19 @@ mod tests {
     /// so joining cells naively across rows without a row-boundary marker
     /// risks two real words merging into one and silently passing a
     /// substring assertion that should have failed.
+    fn render_to_string(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let mut rendered = String::new();
+        for (i, cell) in buffer.content().iter().enumerate() {
+            if i > 0 && i % width == 0 {
+                rendered.push('\n');
+            }
+            rendered.push_str(cell.symbol());
+        }
+        rendered
+    }
+
     #[test]
     fn the_status_line_shows_the_routed_model() {
         let mut app = App::new(None, PlanMode::new());
@@ -1297,19 +1310,6 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         assert!(!render_to_string(&terminal).contains("model qwen3-coder"));
-    }
-
-    fn render_to_string(terminal: &Terminal<TestBackend>) -> String {
-        let buffer = terminal.backend().buffer();
-        let width = buffer.area.width as usize;
-        let mut rendered = String::new();
-        for (i, cell) in buffer.content().iter().enumerate() {
-            if i > 0 && i % width == 0 {
-                rendered.push('\n');
-            }
-            rendered.push_str(cell.symbol());
-        }
-        rendered
     }
 
     #[test]

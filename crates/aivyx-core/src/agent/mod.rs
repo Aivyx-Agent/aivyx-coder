@@ -606,6 +606,7 @@ impl Agent {
         self.router = Some(router);
     }
 
+    /// This conversation's router session id (stickiness, pins, `/models why`).
     pub fn route_session(&self) -> &str {
         &self.route_session
     }
@@ -1446,7 +1447,7 @@ impl Agent {
         // Routing commands never reach the model or the history.
         if let Some(text) = crate::routing_commands::run(
             self.router().map(|r| r.as_ref()),
-            &self.route_session.clone(),
+            &self.route_session,
             &user_input,
         )
         .await

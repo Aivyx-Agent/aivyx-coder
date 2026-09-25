@@ -10,8 +10,10 @@
 pub enum CommandTier {
     /// Goes through `Agent::run_turn` as today — needs the model.
     AgentTurn,
-    /// Touches real `Agent` state directly, bypassing `run_turn` and the
-    /// model entirely.
+    /// Touches real `Agent` state directly without reaching the model or
+    /// the history — either through a dedicated `Agent` method (e.g.
+    /// `/clear`) or intercepted at the top of `run_turn` (`/models`,
+    /// `/model`).
     AgentState,
     /// Needs nothing from `Agent` at all — handled entirely by the
     /// frontend.
