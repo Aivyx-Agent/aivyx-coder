@@ -7,8 +7,9 @@ use aivyx_route::{Availability, ModelKey, ModelProfile, find};
 
 use crate::commands::parse_slash_command;
 
-const ROUTING_OFF: &str =
-    "Model routing is off — set [routing] enabled = true in config.toml to use /models and /model.";
+/// Shown when this agent has no router: routing is off, or this is not the
+/// interactive session (sub-agents and MCP sessions never get one).
+const ROUTING_OFF: &str = "Model routing commands are not available here — they need [routing] enabled = true and the interactive session.";
 
 /// `None` when `input` is not a routing command.
 pub async fn run(router: Option<&RoutedBackend>, session: &str, input: &str) -> Option<String> {
@@ -42,11 +43,15 @@ pub async fn run(router: Option<&RoutedBackend>, session: &str, input: &str) -> 
     Some(match arg {
         "" => match router.pinned(session) {
             Some(k) => format!("Pinned to `{k}`. Use /model auto to let routing choose again."),
-            None => "Not pinned; routing picks per call. Use /model <id> to pin.".to_string(),
+            None => {
+                "Not pinned; routing chooses this conversation's model. Use /model <id> to pin."
+                    .to_string()
+            }
         },
         "auto" => {
             router.unpin(session);
-            "Pin cleared; routing picks per call again.".to_string()
+            "Pin cleared; routing chooses this conversation's model again on the next call."
+                .to_string()
         }
         arg => match resolve(&router.profiles(), arg) {
             Ok(k) => {
@@ -123,6 +128,7 @@ pub fn format_models(
     }
     out
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +231,10 @@ mod tests {
     async fn routing_off_explains_itself() {
         let text = run(None, "s", "/models").await.unwrap();
         assert!(text.contains("[routing] enabled = true"), "{text}");
+        // Also shown to agents without a router while routing is on
+        // (sub-agents, MCP sessions), so it must not claim routing is off.
+        assert!(!text.contains("routing is off"), "{text}");
+        assert!(text.contains("interactive session"), "{text}");
     }
 
     #[tokio::test]
@@ -233,8 +243,17 @@ mod tests {
         let text = run(Some(&r), "s", "/model coder").await.unwrap();
         assert!(text.contains("coder@a-gpu"), "{text}");
         assert_eq!(r.pinned("s"), Some(key("a-gpu", "coder")));
-        run(Some(&r), "s", "/model auto").await.unwrap();
+        let text = run(Some(&r), "s", "/model auto").await.unwrap();
+        assert_eq!(
+            text,
+            "Pin cleared; routing chooses this conversation's model again on the next call."
+        );
         assert_eq!(r.pinned("s"), None);
+        let text = run(Some(&r), "s", "/model").await.unwrap();
+        assert_eq!(
+            text,
+            "Not pinned; routing chooses this conversation's model. Use /model <id> to pin."
+        );
         let text = run(Some(&r), "s", "/model qwen3:8b").await.unwrap();
         assert!(text.contains("several endpoints"), "{text}");
         assert_eq!(r.pinned("s"), None);

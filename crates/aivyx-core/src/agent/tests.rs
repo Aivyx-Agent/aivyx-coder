@@ -5889,3 +5889,26 @@ async fn clearing_the_conversation_forgets_its_routing() {
     assert!(router.last_decision(agent.route_session()).is_none());
     drain(&mut rx);
 }
+
+#[tokio::test]
+async fn the_routed_model_is_announced_again_after_clearing() {
+    let (mut agent, mut rx, _router) =
+        build_routed_agent(vec![text_response("one"), text_response("two")]);
+    agent
+        .run_turn("first".into(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    agent.clear_conversation();
+    agent
+        .run_turn("second".into(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    let announced: Vec<String> = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ModelRouted { model, .. } => Some(model),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(announced, ["mock@backend", "mock@backend"]);
+}

@@ -104,9 +104,15 @@ impl RoutedBackend {
         self.state.lock().unwrap().profiles.clone()
     }
 
-    /// The model `session`'s main thread is currently on, if any.
+    /// The model `session`'s main thread is currently on, if any: its
+    /// `/model` pin, else the model routing made it stick to.
     pub fn current(&self, session: &str) -> Option<ModelKey> {
-        self.state.lock().unwrap().sticky.get(session).cloned()
+        let state = self.state.lock().unwrap();
+        state
+            .pins
+            .get(session)
+            .or_else(|| state.sticky.get(session))
+            .cloned()
     }
 
     pub fn last_decision(&self, session: &str) -> Option<RouteRecord> {
@@ -146,8 +152,12 @@ impl RoutedBackend {
             .insert(session.to_string(), key);
     }
 
+    /// Clears `session`'s pin and its sticky model, so its next main-thread
+    /// call is chosen by ranking. The last decision (`/models why`) stays.
     pub fn unpin(&self, session: &str) {
-        self.state.lock().unwrap().pins.remove(session);
+        let mut state = self.state.lock().unwrap();
+        state.pins.remove(session);
+        state.sticky.remove(session);
     }
 
     pub fn pinned(&self, session: &str) -> Option<ModelKey> {
@@ -197,11 +207,13 @@ impl RoutedBackend {
                     reason.push_str(&format!("; warning: it may lack {}", unmet.join(", ")));
                 }
             }
+            // A pin never writes the sticky map: `/model auto` must hand the
+            // session back to routing, not leave it on the pinned model.
             return Ok(Plan {
                 chain: vec![pin],
                 reason,
                 sticky_session,
-                may_stick: true,
+                may_stick: false,
             });
         }
         let any_cooling = state
@@ -785,9 +797,38 @@ mod tests {
         assert!(reason.contains("may lack tool calling"), "{reason}");
 
         f.router.unpin("s");
-        f.router.forget_session("s");
         let _ = f.router.stream_chat(r).await.unwrap();
         assert_eq!(f.calls("gpu", "big"), 1);
+    }
+
+    #[tokio::test]
+    async fn unpinning_returns_the_session_to_routing() {
+        let f = fixture(
+            vec![
+                profile("gpu", "big", Tier::Large, &[]),
+                profile("gpu", "tiny", Tier::Small, &[]),
+            ],
+            &[],
+        );
+        f.router.pin("s", key("gpu", "tiny"));
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "tiny"), 1);
+        // While pinned, the pin is the session's current model.
+        assert_eq!(f.router.current("s"), Some(key("gpu", "tiny")));
+        // No forget_session: `/model auto` alone must hand the session back.
+        f.router.unpin("s");
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "big"), 1);
+        assert_eq!(f.calls("gpu", "tiny"), 1);
+        assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
     }
 
     #[tokio::test]
@@ -819,9 +860,10 @@ mod tests {
             .unwrap();
         f.router.pin("s", key("gpu", "big"));
         f.router.forget_session("s");
-        assert_eq!(f.router.current("s"), None);
+        assert!(!f.router.state.lock().unwrap().sticky.contains_key("s"));
         assert!(f.router.last_decision("s").is_none());
         assert_eq!(f.router.pinned("s"), Some(key("gpu", "big")));
+        assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
     }
 
     struct FixedRefresher(Vec<ModelProfile>);

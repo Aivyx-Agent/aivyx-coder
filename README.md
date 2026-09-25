@@ -1298,7 +1298,7 @@ ends. A `/model` pin has no fallback.
 | `/models refresh` | Re-runs discovery and rebuilds the candidate list. |
 | `/models why` | The last routing decision in this conversation and its reason. |
 | `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. |
-| `/model auto` | Clears the pin. `/model` alone shows the current pin. |
+| `/model auto` | Clears the pin; routing chooses this conversation's model again on the next call. `/model` alone shows the current pin. |
 
 With routing off, these commands reply that routing is off. They are
 handled inside the agent, so they work in both the TUI and ACP.
