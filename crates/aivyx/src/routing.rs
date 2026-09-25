@@ -6,8 +6,8 @@ use std::sync::Arc;
 use aivyx_config::{BackendKind, Settings};
 use aivyx_llm::{BackendFactory, LlmBackend, OpenAiCompatBackend, ProfileRefresher, RoutedBackend};
 use aivyx_route::{
-    DefaultEndpoint, EndpointKind, EndpointRef, ModelKey, ModelProfile, RosterEntry, RoutingConfig,
-    merge,
+    Capability, DefaultEndpoint, EndpointKind, EndpointRef, ModelKey, ModelProfile, RosterEntry,
+    RoutingConfig, find, merge,
 };
 
 /// The `[backend]` section, as a routing endpoint name.
@@ -115,6 +115,30 @@ pub(crate) fn backend_factory(settings: &Settings, config: &RoutingConfig) -> Ba
     })
 }
 
+/// A warning when the `[backend]` model's tool support is undeclared while
+/// another candidate's is known: aivyx-route ranks unknown capabilities and
+/// windows below known ones, so it would lose every main-loop call.
+pub(crate) fn backend_caps_undeclared_warning(
+    profiles: &[ModelProfile],
+    default: &ModelKey,
+) -> Option<String> {
+    let backend = find(profiles, default)?;
+    if !backend.unknown_capabilities.contains(&Capability::Tools) {
+        return None;
+    }
+    let others_known = profiles
+        .iter()
+        .any(|p| p.key() != *default && p.capabilities.contains(&Capability::Tools));
+    others_known.then(|| {
+        format!(
+            "the [backend] model `{}` has no declared capabilities, so routing ranks it below \
+             every model known to call tools — add a [[routing.models]] entry for it with \
+             capabilities = [\"tools\", ...] and context_window = <your served window>",
+            default.id
+        )
+    })
+}
+
 /// Discovery (when `[routing] discover`) + merge, for startup and
 /// `/models refresh`.
 struct DiscoveryRefresher {
@@ -157,6 +181,9 @@ pub(crate) async fn wrap_with_routing(
         endpoint: EndpointRef::new(DEFAULT_ENDPOINT),
         id: settings.backend.model.clone(),
     };
+    if let Some(warning) = backend_caps_undeclared_warning(&profiles, &default_key) {
+        tracing::warn!("{warning}");
+    }
     let router = Arc::new(
         RoutedBackend::new(
             default_key,
@@ -282,6 +309,109 @@ mod tests {
                 .unwrap()
                 .contains("mistral")
         );
+    }
+
+    fn merged(
+        profiles: &[(
+            &str,
+            &str,
+            &[aivyx_route::Capability],
+            &[aivyx_route::Capability],
+        )],
+    ) -> Vec<ModelProfile> {
+        profiles
+            .iter()
+            .map(|(ep, id, known, unknown)| {
+                let mut p = ModelProfile::new(*id, EndpointRef::new(*ep));
+                p.capabilities.extend(known.iter().copied());
+                p.unknown_capabilities.extend(unknown.iter().copied());
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_undeclared_backend_model_is_warned_about() {
+        use aivyx_route::Capability::{Completion, Tools};
+        let default = key("backend", "qwen3.5:9b");
+        // The implicit entry (all unknown) vs a discovered tool-caller.
+        let ps = merged(&[
+            ("backend", "qwen3.5:9b", &[], &[Completion, Tools]),
+            ("gpu", "coder", &[Completion, Tools], &[]),
+        ]);
+        let warning = backend_caps_undeclared_warning(&ps, &default).expect("should warn");
+        assert!(warning.contains("qwen3.5:9b"), "{warning}");
+        assert!(warning.contains("[[routing.models]]"), "{warning}");
+        assert!(warning.contains("capabilities"), "{warning}");
+
+        // Declared tools on the backend model: no warning.
+        let ps = merged(&[
+            ("backend", "qwen3.5:9b", &[Completion, Tools], &[]),
+            ("gpu", "coder", &[Completion, Tools], &[]),
+        ]);
+        assert_eq!(backend_caps_undeclared_warning(&ps, &default), None);
+
+        // Nobody's tool support is known: nothing to lose to.
+        let ps = merged(&[
+            ("backend", "qwen3.5:9b", &[], &[Completion, Tools]),
+            ("gpu", "coder", &[], &[Tools]),
+        ]);
+        assert_eq!(backend_caps_undeclared_warning(&ps, &default), None);
+    }
+
+    #[tokio::test]
+    async fn the_backend_api_key_goes_only_to_the_backend_endpoint() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let backend_server = MockServer::start().await;
+        let gpu_server = MockServer::start().await;
+        for server in [&backend_server, &gpu_server] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(server)
+                .await;
+        }
+        let mut s = settings_with("");
+        s.backend.base_url = format!("{}/v1", backend_server.uri());
+        s.backend.api_key = Some("backend-secret".into());
+        s.routing.endpoints.insert(
+            "gpu".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::Ollama,
+                base_url: Some(gpu_server.uri()),
+            },
+        );
+        let factory = backend_factory(&s, &s.routing);
+        let request = || {
+            aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
+                aivyx_types::Role::User,
+                "hi",
+            )])
+        };
+        let _ = factory(&key("backend", "other"))
+            .unwrap()
+            .stream_chat(request())
+            .await;
+        let _ = factory(&key("gpu", "coder"))
+            .unwrap()
+            .stream_chat(request())
+            .await;
+
+        let auth = |reqs: Vec<wiremock::Request>| -> Vec<Option<String>> {
+            reqs.iter()
+                .map(|r| {
+                    r.headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string())
+                })
+                .collect()
+        };
+        assert_eq!(
+            auth(backend_server.received_requests().await.unwrap()),
+            [Some("Bearer backend-secret".to_string())]
+        );
+        assert_eq!(auth(gpu_server.received_requests().await.unwrap()), [None]);
     }
 
     #[tokio::test]
