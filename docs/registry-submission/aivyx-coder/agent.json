@@ -8,6 +8,12 @@
   "license_url": "https://github.com/Aivyx-Agent/aivyx-coder/blob/main/LICENSE",
   "distribution": {
     "binary": {
+      "darwin-aarch64": {
+        "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.2.0/aivyx-coder-v0.2.0-darwin-aarch64.tar.gz",
+        "sha256": "9e09e315a9f46350b9e8947a1f1c2189d523b4c3d9b9a746a5e7f0caed0f850f",
+        "cmd": "./aivyx-coder-v0.2.0-darwin-aarch64/aivyx-coder",
+        "args": ["--acp"]
+      },
       "linux-x86_64": {
         "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.2.0/aivyx-coder-v0.2.0-x86_64-linux-musl.tar.gz",
         "sha256": "34dff5a3b8c971c1cec42065e89b77853a8ace6a331a4f748b4171be2aa3bd6c",
