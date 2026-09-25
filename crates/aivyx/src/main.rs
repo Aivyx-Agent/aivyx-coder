@@ -10,6 +10,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod agent_builder;
+mod routing;
 mod setup_wizard;
 
 /// `[mcp_server].session_ttl_secs`/`.max_concurrent_sessions` accepting `0`

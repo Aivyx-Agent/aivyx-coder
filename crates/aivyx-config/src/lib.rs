@@ -58,6 +58,9 @@ pub struct Settings {
     pub persona: PersonaSettings,
     pub repl: ReplSettings,
     pub skills: SkillsSettings,
+    /// Task-aware model routing (`aivyx-route`). Off unless
+    /// `[routing] enabled = true`; see README's "Model routing".
+    pub routing: aivyx_route::RoutingConfig,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -2387,5 +2390,23 @@ mod tests {
         let settings = SkillsSettings::default();
         assert_eq!(settings.resolved_project_skills_dir(), None);
         assert_eq!(settings.resolved_user_skills_dir(), None);
+    }
+
+    #[test]
+    fn routing_is_off_by_default_and_parses_when_present() {
+        assert!(!Settings::default().routing.enabled);
+        let s: Settings = toml::from_str(
+            "[routing]\nenabled = true\n[[routing.models]]\nid = \"qwen3-coder:30b\"\ntier = \"large\"\n",
+        )
+        .unwrap();
+        assert!(s.routing.enabled);
+        assert_eq!(s.routing.models[0].id, "qwen3-coder:30b");
+    }
+
+    #[test]
+    fn a_default_config_round_trips_with_routing() {
+        let text = toml::to_string_pretty(&Settings::default()).unwrap();
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(back.routing, Settings::default().routing);
     }
 }

@@ -61,6 +61,12 @@ pub(crate) struct BuiltAgent {
     /// frontend to build a fresh `Agent` per session rather than sharing
     /// this struct's own (unused, for that frontend) `agent` field.
     pub(crate) llm: Arc<dyn LlmBackend>,
+    /// The model router when `[routing] enabled = true` — `llm` is then
+    /// this same router behind `dyn LlmBackend`.
+    // Read once the `Agent` takes the router (model routing Task 5);
+    // drop this allow then.
+    #[allow(dead_code)]
+    pub(crate) router: Option<Arc<aivyx_llm::RoutedBackend>>,
     pub(crate) confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
     pub(crate) checkpointer: Option<Arc<GitCheckpointer>>,
     pub(crate) repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)>,
@@ -256,7 +262,8 @@ pub(crate) async fn build_agent(
         );
     }
 
-    let llm: Arc<dyn LlmBackend> = build_llm_backend(settings).await?;
+    let (llm, router) =
+        crate::routing::wrap_with_routing(settings, build_llm_backend(settings).await?).await?;
 
     let deny_paths = settings.effective_deny_paths();
     // Canonicalized once and reused everywhere `cwd` is needed (sandbox
@@ -1306,6 +1313,7 @@ pub(crate) async fn build_agent(
         injection_taint,
         repl_resize,
         llm,
+        router,
         confiner,
         checkpointer,
         repo_map,

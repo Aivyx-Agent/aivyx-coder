@@ -110,6 +110,7 @@ dependencies = [
  "aivyx-mcp-server",
  "aivyx-recall",
  "aivyx-repomap",
+ "aivyx-route",
  "aivyx-sandbox",
  "aivyx-skills",
  "aivyx-team",
@@ -120,6 +121,7 @@ dependencies = [
  "aivyx-vision-mold",
  "aivyx-vision-svg",
  "anyhow",
+ "async-trait",
  "clap",
  "dialoguer",
  "directories",
@@ -165,6 +167,7 @@ dependencies = [
 name = "aivyx-config"
 version = "0.2.0"
 dependencies = [
+ "aivyx-route",
  "directories",
  "globset",
  "serde",
@@ -313,7 +316,9 @@ name = "aivyx-route"
 version = "0.1.0"
 source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=4219b98521b0f474ef440ce2e557610d960fe1d7#4219b98521b0f474ef440ce2e557610d960fe1d7"
 dependencies = [
+ "reqwest 0.13.4",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
