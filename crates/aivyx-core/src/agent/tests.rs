@@ -5776,3 +5776,114 @@ mod broker_mode_regressions {
         );
     }
 }
+
+#[tokio::test]
+async fn main_turn_requests_carry_a_code_edit_route_hint() {
+    let (mut agent, _rx, mock) = build_agent(vec![text_response("ok")], ToolRegistry::new(), 5);
+    agent
+        .run_turn("hello".into(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    let request = mock.received.lock().unwrap()[0].clone();
+    let hint = request.route.expect("main-loop calls are tagged");
+    assert_eq!(hint.task, aivyx_route::TaskKind::CodeEdit);
+    assert_eq!(hint.session.as_deref(), Some(agent.route_session()));
+    assert!(hint.estimated_prompt_tokens > 0);
+}
+
+#[tokio::test]
+async fn set_route_task_changes_the_tag() {
+    let (mut agent, _rx, mock) = build_agent(vec![text_response("ok")], ToolRegistry::new(), 5);
+    agent.set_route_task(aivyx_route::TaskKind::Custom("reviewer".into()));
+    agent
+        .run_turn("hello".into(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    let hint = mock.received.lock().unwrap()[0].route.clone().unwrap();
+    assert_eq!(hint.task, aivyx_route::TaskKind::Custom("reviewer".into()));
+}
+
+#[test]
+fn every_agent_gets_its_own_route_session() {
+    let (a, _ra, _) = build_agent(vec![], ToolRegistry::new(), 1);
+    let (b, _rb, _) = build_agent(vec![], ToolRegistry::new(), 1);
+    assert_ne!(a.route_session(), b.route_session());
+}
+
+/// An agent whose backend is a `RoutedBackend` over the scripted mock,
+/// with the router handed to the agent too.
+fn build_routed_agent(
+    responses: Vec<Vec<StreamEvent>>,
+) -> (
+    Agent,
+    UnboundedReceiver<AgentEvent>,
+    Arc<aivyx_llm::RoutedBackend>,
+) {
+    let (tx, rx) = unbounded_channel();
+    let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(responses));
+    let default_key = aivyx_route::ModelKey {
+        endpoint: aivyx_route::EndpointRef::new("backend"),
+        id: "mock".into(),
+    };
+    let mut default_profile =
+        aivyx_route::ModelProfile::new("mock", aivyx_route::EndpointRef::new("backend"));
+    default_profile
+        .capabilities
+        .insert(aivyx_route::Capability::Completion);
+    let router = Arc::new(aivyx_llm::RoutedBackend::new(
+        default_key,
+        mock,
+        vec![default_profile],
+        aivyx_route::TaskOverrides::default(),
+        Box::new(|k: &aivyx_route::ModelKey| Err(format!("no pool backend for `{k}`"))),
+    ));
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let mut agent = Agent::new(
+        Arc::clone(&router) as Arc<dyn LlmBackend>,
+        ToolExecutor::new(ToolRegistry::new(), gate, confiner),
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    agent.set_router(Arc::clone(&router));
+    (agent, rx, router)
+}
+
+#[tokio::test]
+async fn a_routed_model_is_announced_once_until_it_changes() {
+    let (mut agent, mut rx, _router) =
+        build_routed_agent(vec![text_response("one"), text_response("two")]);
+    for input in ["first", "second"] {
+        agent
+            .run_turn(input.into(), Path::new("."), CancellationToken::new())
+            .await
+            .unwrap();
+    }
+    let routed: Vec<(String, String)> = drain(&mut rx)
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ModelRouted { model, reason } => Some((model, reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(routed.len(), 1, "{routed:?}");
+    assert_eq!(routed[0].0, "mock@backend");
+    assert!(routed[0].1.starts_with("chose `mock`"), "{}", routed[0].1);
+}
+
+#[tokio::test]
+async fn clearing_the_conversation_forgets_its_routing() {
+    let (mut agent, mut rx, router) = build_routed_agent(vec![text_response("one")]);
+    agent
+        .run_turn("first".into(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(router.last_decision(agent.route_session()).is_some());
+    agent.clear_conversation();
+    assert!(router.last_decision(agent.route_session()).is_none());
+    drain(&mut rx);
+}

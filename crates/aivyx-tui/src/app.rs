@@ -679,6 +679,8 @@ impl App {
                 self.transcript
                     .push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
+            // Rendered in the status line by a later change.
+            AgentEvent::ModelRouted { .. } => {}
         }
     }
 
@@ -923,6 +925,7 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         | AgentEvent::CouncilNote(_)
         | AgentEvent::ArchitectNote(_)
         | AgentEvent::SubAgentActivity(_)
+        | AgentEvent::ModelRouted { .. }
         | AgentEvent::ConversationCleared
         | AgentEvent::MissionsUpdated(_)
         | AgentEvent::SpecialistSessionsUpdated(_) => String::new(),

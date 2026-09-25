@@ -253,6 +253,14 @@ pub struct Agent {
     /// own side; `preferred_slot` is not a partially-implemented
     /// feedback loop, it is simply never populated by this client.
     broker_mode: bool,
+    /// What the main loop's requests are tagged as for the model router.
+    route_task: aivyx_route::TaskKind,
+    /// This agent's stickiness key with the router — unique per `Agent`.
+    route_session: String,
+    /// Set when routing is on; used for `ModelRouted`, `/models`, `/model`.
+    router: Option<Arc<aivyx_llm::RoutedBackend>>,
+    /// The model the last `ModelRouted` event announced.
+    last_routed: Option<aivyx_route::ModelKey>,
     /// `AGENTS.md` support when configured (`set_agents_file`); `None`
     /// disables the feature entirely (both files).
     agents_file_config: Option<AgentsFileConfig>,
@@ -340,6 +348,16 @@ pub struct Agent {
     events_tx: UnboundedSender<AgentEvent>,
 }
 
+/// A process-unique stickiness key for each `Agent` (main, specialist,
+/// sub-agent, MCP session), so their main threads stick independently.
+fn next_route_session() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "agent-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 impl Agent {
     // `AgentConfig` already groups the scalar knobs (see its doc comment);
     // the remaining params are distinct collaborators (backend, executor,
@@ -383,6 +401,10 @@ impl Agent {
             kv_cache: None,
             kv_slot_id: None,
             broker_mode: false,
+            route_task: aivyx_route::TaskKind::CodeEdit,
+            route_session: next_route_session(),
+            router: None,
+            last_routed: None,
             agents_file_config: None,
             editor_context_config: None,
             repo_map_text: None,
@@ -463,6 +485,10 @@ impl Agent {
         if let Some(pool) = &self.specialist_session_pool {
             pool.close_all();
         }
+        if let Some(router) = &self.router {
+            router.forget_session(&self.route_session);
+        }
+        self.last_routed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
     }
@@ -566,6 +592,46 @@ impl Agent {
     /// slot lifecycle on this path, so this process must not also try.
     pub fn set_broker_mode(&mut self, enabled: bool) {
         self.broker_mode = enabled;
+    }
+
+    /// Tags this agent's main-loop calls as `task` (e.g. a specialist's
+    /// roster `task`). Default `CodeEdit`.
+    pub fn set_route_task(&mut self, task: aivyx_route::TaskKind) {
+        self.route_task = task;
+    }
+
+    /// Hands the agent the model router its backend is, for decision
+    /// events and the `/models`/`/model` commands.
+    pub fn set_router(&mut self, router: Arc<aivyx_llm::RoutedBackend>) {
+        self.router = Some(router);
+    }
+
+    pub fn route_session(&self) -> &str {
+        &self.route_session
+    }
+
+    // Read by the `/models`/`/model` commands, which land in a later task.
+    #[allow(dead_code)]
+    pub(crate) fn router(&self) -> Option<&Arc<aivyx_llm::RoutedBackend>> {
+        self.router.as_ref()
+    }
+
+    /// Emits `ModelRouted` when the router moved this conversation.
+    fn report_route(&mut self) {
+        let Some(record) = self
+            .router
+            .as_ref()
+            .and_then(|r| r.last_decision(&self.route_session))
+        else {
+            return;
+        };
+        if self.last_routed.as_ref() != Some(&record.model) {
+            self.last_routed = Some(record.model.clone());
+            self.emit(AgentEvent::ModelRouted {
+                model: record.model.to_string(),
+                reason: record.reason,
+            });
+        }
     }
 
     /// Checks out a slot (once per `Agent` lifetime -- idempotent, a
@@ -1755,11 +1821,18 @@ impl Agent {
                 max_tokens: None,
                 id_slot: self.kv_slot_id,
                 slot_hint,
-                route: None,
+                route: Some(aivyx_llm::RouteHint {
+                    task: self.route_task.clone(),
+                    session: Some(self.route_session.clone()),
+                    estimated_prompt_tokens: self.estimate_prompt_tokens(),
+                }),
             };
 
             let mut stream = match self.llm.stream_chat(request).await {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    self.report_route();
+                    stream
+                }
                 Err(err) => {
                     self.emit(AgentEvent::Error(err.to_string()));
                     return Err(AgentError::Llm(err));

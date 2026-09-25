@@ -76,6 +76,13 @@ pub enum AgentEvent {
     /// exactly, but for the single-seat architect/editor pairing feature.
     /// See `crate::architect::plan`.
     ArchitectNote(String),
+    /// The model router sent this conversation's main thread to a
+    /// different model than its previous call. Only emitted when routing is
+    /// on; `model` is `id@endpoint`, `reason` one human sentence.
+    ModelRouted {
+        model: String,
+        reason: String,
+    },
     /// One event produced by a `delegate_task` sub-agent's own turn loop,
     /// forwarded verbatim from its private `AgentEvent` channel so it can
     /// render in the transcript distinguished from the parent's own

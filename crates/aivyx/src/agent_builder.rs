@@ -63,8 +63,9 @@ pub(crate) struct BuiltAgent {
     pub(crate) llm: Arc<dyn LlmBackend>,
     /// The model router when `[routing] enabled = true` — `llm` is then
     /// this same router behind `dyn LlmBackend`.
-    // Read once the `Agent` takes the router (model routing Task 5);
-    // drop this allow then.
+    // `build_agent` hands the router to the main `Agent` from its local
+    // binding, so nothing reads this field yet; kept for frontends that
+    // build their own `Agent`s from `BuiltAgent` (e.g. the MCP server).
     #[allow(dead_code)]
     pub(crate) router: Option<Arc<aivyx_llm::RoutedBackend>>,
     pub(crate) confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
@@ -1141,6 +1142,9 @@ pub(crate) async fn build_agent(
         autonomous_mode.clone(),
         events_tx,
     );
+    if let Some(router) = &router {
+        agent.set_router(Arc::clone(router));
+    }
     agent.set_injection_taint(injection_taint.clone());
     if let Some(mission_plan_handle) = &mission_plan {
         agent.set_mission_plan_handle(Arc::clone(mission_plan_handle));

@@ -203,6 +203,9 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // today (only the TUI's `/clear` interception emits it), but
         // worth revisiting if `/clear` is ever wired into ACP.
         | AgentEvent::ConversationCleared
+        // Model-routing announcements are a TUI status-line concern; ACP
+        // has no equivalent surface for them.
+        | AgentEvent::ModelRouted { .. }
         // Tasks/mission/specialist-session state all feed a single,
         // merged ACP Plan (see `build_merged_plan`) -- handled
         // exclusively by `translate_event_with_state`, which tracks
