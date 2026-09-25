@@ -44,6 +44,16 @@ pub const COMMANDS: &[CommandInfo] = &[
         tier: CommandTier::AgentTurn,
     },
     CommandInfo {
+        name: "/models",
+        description: "List routing candidates; `/models refresh` re-runs discovery, `/models why` explains the last choice",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/model",
+        description: "Pin this conversation to a model (`/model <id>`), or `/model auto` to let routing choose",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
         name: "/clear",
         description: "Start a fresh conversation (clears history and tasks)",
         tier: CommandTier::AgentState,

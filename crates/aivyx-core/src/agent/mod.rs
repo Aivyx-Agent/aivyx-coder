@@ -610,8 +610,6 @@ impl Agent {
         &self.route_session
     }
 
-    // Read by the `/models`/`/model` commands, which land in a later task.
-    #[allow(dead_code)]
     pub(crate) fn router(&self) -> Option<&Arc<aivyx_llm::RoutedBackend>> {
         self.router.as_ref()
     }
@@ -1445,6 +1443,18 @@ impl Agent {
         // takes a different path (e.g. a /council command, which never
         // pauses).
         self.last_turn_paused = false;
+        // Routing commands never reach the model or the history.
+        if let Some(text) = crate::routing_commands::run(
+            self.router().map(|r| r.as_ref()),
+            &self.route_session.clone(),
+            &user_input,
+        )
+        .await
+        {
+            self.notify(text);
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
         // Commands are intercepted here, before the input can enter LLM
         // history — the raw `/council …` text is an instruction to aivyx,
         // not part of the conversation the model should see.

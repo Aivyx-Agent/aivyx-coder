@@ -512,6 +512,10 @@ struct App {
     /// Shared with the gate (enforcement) and the agent (tool filtering +
     /// system-prompt note); the TUI owns the only toggle.
     plan_mode: PlanMode,
+    /// The model the router last moved this conversation to, shown in the
+    /// status line. `None` until routing reports a choice (always `None`
+    /// with routing off).
+    routed_model: Option<String>,
 }
 
 impl App {
@@ -533,6 +537,7 @@ impl App {
             streaming_active: false,
             pending_permission: None,
             context_usage: None,
+            routed_model: None,
             tasks,
             mission_plan: None,
             open_specialist_sessions: Vec::new(),
@@ -668,6 +673,7 @@ impl App {
                 self.open_specialist_sessions.clear();
                 self.context_usage = None;
                 self.streaming_active = false;
+                self.routed_model = None;
             }
             AgentEvent::CouncilNote(text) => {
                 self.transcript.push(ChatLine::Council(text));
@@ -679,8 +685,11 @@ impl App {
                 self.transcript
                     .push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
-            // Rendered in the status line by a later change.
-            AgentEvent::ModelRouted { .. } => {}
+            AgentEvent::ModelRouted { model, reason } => {
+                self.transcript
+                    .push(ChatLine::Notice(format!("routing → {model}: {reason}")));
+                self.routed_model = Some(model);
+            }
         }
     }
 
@@ -839,6 +848,12 @@ impl App {
                     format_tokens(limit)
                 ),
                 Style::default().fg(color),
+            ));
+        }
+        if let Some(model) = &self.routed_model {
+            status_spans.push(Span::styled(
+                format!("   ·   model {model}"),
+                Style::default().fg(Color::Cyan),
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
@@ -1261,6 +1276,29 @@ mod tests {
     /// so joining cells naively across rows without a row-boundary marker
     /// risks two real words merging into one and silently passing a
     /// substring assertion that should have failed.
+    #[test]
+    fn the_status_line_shows_the_routed_model() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ModelRouted {
+            model: "qwen3-coder:30b@gpu".into(),
+            reason: "chose `qwen3-coder:30b`: matches the large tier wanted".into(),
+        });
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("model qwen3-coder:30b@gpu"), "{rendered}");
+        assert!(
+            rendered.contains("routing → qwen3-coder:30b@gpu"),
+            "{rendered}"
+        );
+
+        app.handle_agent_event(AgentEvent::ConversationCleared);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(!render_to_string(&terminal).contains("model qwen3-coder"));
+    }
+
     fn render_to_string(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         let width = buffer.area.width as usize;
