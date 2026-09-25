@@ -61,13 +61,6 @@ pub(crate) struct BuiltAgent {
     /// frontend to build a fresh `Agent` per session rather than sharing
     /// this struct's own (unused, for that frontend) `agent` field.
     pub(crate) llm: Arc<dyn LlmBackend>,
-    /// The model router when `[routing] enabled = true` — `llm` is then
-    /// this same router behind `dyn LlmBackend`.
-    // `build_agent` hands the router to the main `Agent` from its local
-    // binding, so nothing reads this field yet; kept for frontends that
-    // build their own `Agent`s from `BuiltAgent` (e.g. the MCP server).
-    #[allow(dead_code)]
-    pub(crate) router: Option<Arc<aivyx_llm::RoutedBackend>>,
     pub(crate) confiner: Arc<dyn aivyx_sandbox::ExecutionConfiner>,
     pub(crate) checkpointer: Option<Arc<GitCheckpointer>>,
     pub(crate) repo_map: Option<(Arc<aivyx_repomap::RepoMap>, u32)>,
@@ -1332,7 +1325,6 @@ pub(crate) async fn build_agent(
         injection_taint,
         repl_resize,
         llm,
-        router,
         confiner,
         checkpointer,
         repo_map,
