@@ -1,5 +1,8 @@
-//! `RoutedBackend`: an `LlmBackend` that picks a model per call with
-//! `aivyx-route` and forwards to a lazily-built backend for it. Untagged
+//! `RoutedBackend`: an `LlmBackend` that picks a model per call by
+//! delegating to the shared `aivyx_route::Router` — profiles, stickiness,
+//! pins, failure cooldowns, residency, and each session's last decision
+//! all live there now; see that crate for the full semantics — and
+//! forwards to a lazily-built backend for the chosen model. Untagged
 //! requests (`ChatRequest::route == None`) go to the configured default
 //! backend unchanged. See `aivyx-ecosystem/docs/superpowers/specs/
 //! 2026-09-25-model-routing-design.md`, "Parts 2 & 3".
@@ -8,17 +11,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aivyx_route::{
-    Availability, ModelKey, ModelProfile, Policy, Requirements, ResidencySnapshot, TaskKind,
-    TaskOverrides, find, select, unmet_needs,
-};
+use aivyx_route::{ModelKey, ModelProfile, ResidencySnapshot, RouteQuery, Router, TaskOverrides};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::backend::{ChatRequest, LlmBackend, LlmError, RouteHint, StreamEvent};
 
-/// How long a model that failed to answer is skipped.
-pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
+pub use aivyx_route::{DEFAULT_COOLDOWN, RouteRecord};
 
 /// Re-reads the candidate list (discovery + roster) for `/models refresh`.
 #[async_trait]
@@ -30,51 +29,17 @@ pub trait ProfileRefresher: Send + Sync {
 pub type BackendFactory =
     Box<dyn Fn(&ModelKey) -> Result<Arc<dyn LlmBackend>, String> + Send + Sync>;
 
-/// What a session's most recent routed call went to, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteRecord {
-    pub model: ModelKey,
-    pub task: TaskKind,
-    /// One human sentence: the decision's reason plus any fallback note.
-    pub reason: String,
-}
-
+/// Delegates every routing decision (profiles, stickiness, pins,
+/// cooldowns, residency, last-decision bookkeeping) to a shared
+/// `aivyx_route::Router`; owns only the default backend/model and the
+/// lazily-built pool of backends for every other candidate.
 pub struct RoutedBackend {
     default_key: ModelKey,
     default_backend: Arc<dyn LlmBackend>,
     factory: BackendFactory,
-    tasks: TaskOverrides,
-    cooldown: Duration,
     refresher: Option<Arc<dyn ProfileRefresher>>,
-    state: Mutex<State>,
-}
-
-#[derive(Default)]
-struct State {
-    profiles: Vec<ModelProfile>,
-    pool: HashMap<ModelKey, Arc<dyn LlmBackend>>,
-    /// Session → the model its main thread is on.
-    sticky: HashMap<String, ModelKey>,
-    last: HashMap<String, RouteRecord>,
-    /// Session → an explicit `/model` pin.
-    pins: HashMap<String, ModelKey>,
-    /// Model → when its cooldown (from a retryable failure) expires.
-    cooling: HashMap<ModelKey, Instant>,
-    /// Which models are loaded and what VRAM is free. Used by scoring,
-    /// updated on a short TTL by an external task — never per call.
-    residency: ResidencySnapshot,
-}
-
-/// The ordered models to try for one call, and why.
-struct Plan {
-    chain: Vec<ModelKey>,
-    reason: String,
-    /// `Some` only for a sticky task kind with a session.
-    sticky_session: Option<String>,
-    /// Whether answering from `chain[0]` may move the session there. False
-    /// while any candidate is cooling down: a choice made around a
-    /// temporarily failing model must not outlive its cooldown.
-    may_stick: bool,
+    router: Router,
+    pool: Mutex<HashMap<ModelKey, Arc<dyn LlmBackend>>>,
 }
 
 impl RoutedBackend {
@@ -89,13 +54,9 @@ impl RoutedBackend {
             default_key,
             default_backend,
             factory,
-            tasks,
-            cooldown: DEFAULT_COOLDOWN,
             refresher: None,
-            state: Mutex::new(State {
-                profiles,
-                ..State::default()
-            }),
+            router: Router::new(profiles, tasks),
+            pool: Mutex::new(HashMap::new()),
         }
     }
 
@@ -103,38 +64,35 @@ impl RoutedBackend {
         &self.default_key
     }
 
+    /// See `aivyx_route::Router::profiles`.
     pub fn profiles(&self) -> Vec<ModelProfile> {
-        self.state.lock().unwrap().profiles.clone()
+        self.router.profiles()
     }
 
     /// Sets the residency snapshot. Products refresh it on a short TTL,
     /// never per call, so `select()` can prefer already-loaded models.
+    /// See `aivyx_route::Router::set_residency`.
     pub fn set_residency(&self, snapshot: ResidencySnapshot) {
-        self.state.lock().unwrap().residency = snapshot;
+        self.router.set_residency(snapshot);
     }
 
-    /// Returns the current residency snapshot.
+    /// See `aivyx_route::Router::residency`.
     pub fn residency(&self) -> ResidencySnapshot {
-        self.state.lock().unwrap().residency.clone()
+        self.router.residency()
     }
 
-    /// The model `session`'s main thread is currently on, if any: its
-    /// `/model` pin, else the model routing made it stick to.
+    /// See `aivyx_route::Router::current`.
     pub fn current(&self, session: &str) -> Option<ModelKey> {
-        let state = self.state.lock().unwrap();
-        state
-            .pins
-            .get(session)
-            .or_else(|| state.sticky.get(session))
-            .cloned()
+        self.router.current(session)
     }
 
+    /// See `aivyx_route::Router::last_decision`.
     pub fn last_decision(&self, session: &str) -> Option<RouteRecord> {
-        self.state.lock().unwrap().last.get(session).cloned()
+        self.router.last_decision(session)
     }
 
     pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
-        self.cooldown = cooldown;
+        self.router = self.router.with_cooldown(cooldown);
         self
     }
 
@@ -143,7 +101,8 @@ impl RoutedBackend {
         self
     }
 
-    /// Re-runs discovery + merge. Returns the new candidate count.
+    /// Re-runs discovery + merge. Returns the new candidate count. Also
+    /// clears every cooldown (`aivyx_route::Router::set_profiles`).
     pub async fn refresh(&self) -> Result<usize, String> {
         let refresher = self
             .refresher
@@ -151,173 +110,56 @@ impl RoutedBackend {
             .ok_or_else(|| "this router has no discovery configured".to_string())?;
         let profiles = refresher.refresh().await;
         let count = profiles.len();
-        let mut state = self.state.lock().unwrap();
-        state.profiles = profiles;
-        state.cooling.clear();
+        self.router.set_profiles(profiles);
         Ok(count)
     }
 
-    /// Pins `session`'s main thread (sticky task kinds) to `key`.
+    /// See `aivyx_route::Router::pin`.
     pub fn pin(&self, session: &str, key: ModelKey) {
-        self.state
-            .lock()
-            .unwrap()
-            .pins
-            .insert(session.to_string(), key);
+        self.router.pin(session, key);
     }
 
-    /// Clears `session`'s pin and its sticky model, so its next main-thread
-    /// call is chosen by ranking. The last decision (`/models why`) stays.
+    /// See `aivyx_route::Router::unpin`.
     pub fn unpin(&self, session: &str) {
-        let mut state = self.state.lock().unwrap();
-        state.pins.remove(session);
-        state.sticky.remove(session);
+        self.router.unpin(session);
     }
 
+    /// See `aivyx_route::Router::pinned`.
     pub fn pinned(&self, session: &str) -> Option<ModelKey> {
-        self.state.lock().unwrap().pins.get(session).cloned()
+        self.router.pinned(session)
     }
 
-    /// A new conversation: drop the sticky model and last decision, keep
-    /// any `/model` pin (an explicit operator choice).
+    /// See `aivyx_route::Router::forget_session`.
     pub fn forget_session(&self, session: &str) {
-        let mut state = self.state.lock().unwrap();
-        state.sticky.remove(session);
-        state.last.remove(session);
+        self.router.forget_session(session);
     }
 
-    fn cool(&self, key: &ModelKey) {
-        self.state
-            .lock()
-            .unwrap()
-            .cooling
-            .insert(key.clone(), Instant::now() + self.cooldown);
-    }
-
-    fn plan(&self, request: &ChatRequest, hint: &RouteHint) -> Result<Plan, LlmError> {
-        let mut builder = Requirements::builder().task(&hint.task, &self.tasks);
-        if !request.tools.is_empty() {
-            builder = builder.tools();
-        }
-        if hint.estimated_prompt_tokens > 0 {
-            builder = builder.min_context(hint.estimated_prompt_tokens);
-        }
-        let req = builder.build();
-        let sticky_session = hint.session.clone().filter(|_| hint.task.is_sticky());
-        let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-        state.cooling.retain(|_, until| *until > now);
-        if let Some(session) = &sticky_session
-            && let Some(pin) = state.pins.get(session).cloned()
-        {
-            let mut reason = format!("pinned with /model to `{pin}`");
-            if let Some(profile) = find(&state.profiles, &pin) {
-                let unmet: Vec<String> = unmet_needs(&req, profile)
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
-                if !unmet.is_empty() {
-                    tracing::warn!(model = %pin, unmet = %unmet.join(", "), "pinned model may lack a hard requirement");
-                    reason.push_str(&format!("; warning: it may lack {}", unmet.join(", ")));
-                }
-            }
-            // A pin never writes the sticky map: `/model auto` must hand the
-            // session back to routing, not leave it on the pinned model.
-            return Ok(Plan {
-                chain: vec![pin],
-                reason,
-                sticky_session,
-                may_stick: false,
-            });
-        }
-        let any_cooling = state
-            .profiles
-            .iter()
-            .any(|p| state.cooling.contains_key(&p.key()));
-        let without_cooling: Vec<ModelProfile> = state
-            .profiles
-            .iter()
-            .cloned()
-            .map(|mut p| {
-                if state.cooling.contains_key(&p.key()) {
-                    p.availability = Availability::Unavailable;
-                }
-                p
-            })
-            .collect();
-        let policy = Policy {
-            sticky_model: sticky_session
-                .as_ref()
-                .and_then(|s| state.sticky.get(s).cloned()),
-            allow_cloud: false,
-            exclude: Vec::new(),
-            residency: state.residency.clone(),
-        };
-        // Cooling models are a last resort, never a reason to fail: if
-        // nothing else qualifies, try them anyway.
-        let (decision, retrying_cooled) = match select(&req, &without_cooling, &policy) {
-            Ok(decision) => (decision, false),
-            Err(_) if any_cooling => {
-                let decision = select(&req, &state.profiles, &policy).map_err(|e| {
-                    LlmError::Routing(format!(
-                        "{e} — add a capable model to [[routing.models]] (see /models)"
-                    ))
-                })?;
-                (decision, true)
-            }
-            Err(e) => {
-                return Err(LlmError::Routing(format!(
-                    "{e} — add a capable model to [[routing.models]] (see /models)"
-                )));
-            }
-        };
-        let mut chain = vec![decision.model.key()];
-        chain.extend(decision.fallbacks.iter().map(ModelProfile::key));
-        let mut reason = decision.to_string();
-        if retrying_cooled {
-            reason.push_str("; retrying a model still cooling down after a failure");
-        }
-        Ok(Plan {
-            chain,
-            reason,
-            sticky_session,
-            may_stick: !any_cooling,
-        })
-    }
-
+    /// The default model is served by the configured backend; every
+    /// other model's backend is built once, on first use.
     fn backend_for(&self, key: &ModelKey) -> Result<Arc<dyn LlmBackend>, String> {
         if *key == self.default_key {
             return Ok(Arc::clone(&self.default_backend));
         }
-        let mut state = self.state.lock().unwrap();
-        if let Some(backend) = state.pool.get(key) {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(backend) = pool.get(key) {
             return Ok(Arc::clone(backend));
         }
         let backend = (self.factory)(key)?;
-        state.pool.insert(key.clone(), Arc::clone(&backend));
+        pool.insert(key.clone(), Arc::clone(&backend));
         Ok(backend)
     }
+}
 
-    fn record(&self, plan: &Plan, hint: &RouteHint, model: &ModelKey, reason: String) {
-        let mut state = self.state.lock().unwrap();
-        // Only a clean first choice moves the session; a fallback or a
-        // choice made around a cooling model is temporary.
-        if let Some(session) = &plan.sticky_session
-            && plan.may_stick
-            && *model == plan.chain[0]
-        {
-            state.sticky.insert(session.clone(), model.clone());
-        }
-        if let Some(session) = &hint.session {
-            state.last.insert(
-                session.clone(),
-                RouteRecord {
-                    model: model.clone(),
-                    task: hint.task.clone(),
-                    reason,
-                },
-            );
-        }
+/// `ChatRequest` + `RouteHint` → what the shared Router needs to plan a
+/// call. aivyx-coder has no image content blocks, so `vision` is always
+/// `false`.
+fn query(request: &ChatRequest, hint: &RouteHint) -> RouteQuery {
+    RouteQuery {
+        task: hint.task.clone(),
+        session: hint.session.clone(),
+        tools: !request.tools.is_empty(),
+        vision: false,
+        estimated_prompt_tokens: hint.estimated_prompt_tokens,
     }
 }
 
@@ -335,13 +177,21 @@ impl LlmBackend for RoutedBackend {
         let Some(hint) = request.route.clone() else {
             return self.default_backend.stream_chat(request).await;
         };
-        let plan = self.plan(&request, &hint)?;
+        let query = query(&request, &hint);
+        let plan = self.router.plan(&query, Instant::now()).map_err(|e| {
+            LlmError::Routing(format!(
+                "{e} — add a capable model to [[routing.models]] (see /models)"
+            ))
+        })?;
+        if plan.reason.contains("; warning: it may lack") {
+            tracing::warn!(model = %plan.chain[0], reason = %plan.reason, "pinned model may lack a hard requirement");
+        }
         let mut failures: Vec<String> = Vec::new();
         for key in &plan.chain {
             let backend = match self.backend_for(key) {
                 Ok(backend) => backend,
                 Err(why) => {
-                    self.cool(key);
+                    self.router.failed(key, Instant::now());
                     failures.push(format!("`{key}` ({why})"));
                     continue;
                 }
@@ -354,17 +204,12 @@ impl LlmBackend for RoutedBackend {
             }
             match backend.stream_chat(attempt).await {
                 Ok(stream) => {
-                    let mut reason = plan.reason.clone();
-                    if !failures.is_empty() {
-                        reason
-                            .push_str(&format!("; fell back after {} failed", failures.join(", ")));
-                    }
-                    tracing::info!(model = %key, task = hint.task.name(), %reason, "routed model call");
-                    self.record(&plan, &hint, key, reason);
+                    let record = self.router.succeeded(&plan, key, &failures);
+                    tracing::info!(model = %key, task = hint.task.name(), reason = %record.reason, "routed model call");
                     return Ok(stream);
                 }
                 Err(err) if is_retryable(&err) => {
-                    self.cool(key);
+                    self.router.failed(key, Instant::now());
                     failures.push(format!("`{key}` ({err})"));
                 }
                 Err(err) => return Err(err),
@@ -393,17 +238,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use aivyx_route::{Capability, EndpointRef, Tier};
+    use aivyx_route::{Capability, EndpointRef, TaskKind, Tier};
     use aivyx_types::{Message, Role, ToolDefinition};
     use futures::StreamExt;
 
     use crate::backend::{FinishReason, SlotHint};
 
     /// Records every request; answers with an empty successful stream, or
-    /// with `BackendError { status }` when `fail` is set.
+    /// with `BackendError { status }` when `fail` is set. `succeed_first`
+    /// makes the very first call always succeed regardless of `fail`, so a
+    /// test can establish real stickiness before the model starts failing.
     struct Scripted {
         name: String,
         fail: Option<u16>,
+        succeed_first: bool,
         received: Mutex<Vec<ChatRequest>>,
     }
 
@@ -412,6 +260,17 @@ mod tests {
             Arc::new(Scripted {
                 name: name.to_string(),
                 fail,
+                succeed_first: false,
+                received: Mutex::new(Vec::new()),
+            })
+        }
+        /// The first call always succeeds; every call after that fails
+        /// with `status`.
+        fn succeed_then_fail(name: &str, status: u16) -> Arc<Self> {
+            Arc::new(Scripted {
+                name: name.to_string(),
+                fail: Some(status),
+                succeed_first: true,
                 received: Mutex::new(Vec::new()),
             })
         }
@@ -432,8 +291,14 @@ mod tests {
             &self,
             request: ChatRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
-            self.received.lock().unwrap().push(request);
-            if let Some(status) = self.fail {
+            let call_no = {
+                let mut received = self.received.lock().unwrap();
+                received.push(request);
+                received.len()
+            };
+            if let Some(status) = self.fail
+                && !(self.succeed_first && call_no == 1)
+            {
                 return Err(LlmError::BackendError {
                     status,
                     body: "down".into(),
@@ -573,8 +438,9 @@ mod tests {
         let f = fixture(vec![long], &[]);
         {
             // The default model's window is known and too small.
-            let mut state = f.router.state.lock().unwrap();
-            state.profiles[0].context_window = Some(8_192);
+            let mut profiles = f.router.router.profiles();
+            profiles[0].context_window = Some(8_192);
+            f.router.router.set_profiles(profiles);
         }
         let mut r = routed(TaskKind::Chat, None);
         r.route.as_mut().unwrap().estimated_prompt_tokens = 20_000;
@@ -648,6 +514,25 @@ mod tests {
         assert!(matches!(err, LlmError::Routing(_)), "{text}");
         assert!(text.contains("tool calling"), "{text}");
         assert!(text.contains("[[routing.models]]"), "{text}");
+        // Exact hint suffix (Global Constraints, exception 2).
+        assert!(
+            text.contains(" — add a capable model to [[routing.models]] (see /models)"),
+            "{text}"
+        );
+    }
+
+    /// Guard test: pins the delegation seam. `last_decision` must return
+    /// the shared `aivyx_route::RouteRecord`, not a local look-alike type.
+    #[tokio::test]
+    async fn last_decision_is_the_shared_routers_record_type() {
+        let f = fixture(vec![profile("gpu", "big", Tier::Large, &[])], &[]);
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        let record: aivyx_route::RouteRecord = f.router.last_decision("s").unwrap();
+        assert_eq!(record.model, key("gpu", "big"));
     }
 
     #[tokio::test]
@@ -754,8 +639,9 @@ mod tests {
             &[("gpu", "big", 503), ("gpu", "mid", 404)],
         );
         // Make the default model ineligible so only big and mid remain.
-        f.router.state.lock().unwrap().profiles[0].availability =
-            aivyx_route::Availability::Unavailable;
+        let mut profiles = f.router.router.profiles();
+        profiles[0].availability = aivyx_route::Availability::Unavailable;
+        f.router.router.set_profiles(profiles);
         let Err(err) = f.router.stream_chat(routed(TaskKind::CodeEdit, None)).await else {
             panic!("expected every candidate to fail");
         };
@@ -771,12 +657,9 @@ mod tests {
     async fn a_factory_error_falls_back() {
         let f = fixture(vec![], &[]);
         // In the candidate list but the factory has no backend for it.
-        f.router
-            .state
-            .lock()
-            .unwrap()
-            .profiles
-            .push(profile("gpu", "ghost", Tier::Large, &[]));
+        let mut profiles = f.router.router.profiles();
+        profiles.push(profile("gpu", "ghost", Tier::Large, &[]));
+        f.router.router.set_profiles(profiles);
         let _ = f
             .router
             .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
@@ -808,7 +691,9 @@ mod tests {
         let _ = f.router.stream_chat(r.clone()).await.unwrap();
         assert_eq!(f.calls("gpu", "tiny"), 1);
         let reason = f.router.last_decision("s").unwrap().reason;
-        assert!(reason.contains("pinned with /model"), "{reason}");
+        // Router wording (Global Constraints, exception 1): `pinned to`,
+        // not the old `pinned with /model to`.
+        assert!(reason.contains("pinned to `tiny@gpu`"), "{reason}");
         assert!(reason.contains("may lack tool calling"), "{reason}");
 
         f.router.unpin("s");
@@ -875,10 +760,15 @@ mod tests {
             .unwrap();
         f.router.pin("s", key("gpu", "big"));
         f.router.forget_session("s");
-        assert!(!f.router.state.lock().unwrap().sticky.contains_key("s"));
         assert!(f.router.last_decision("s").is_none());
         assert_eq!(f.router.pinned("s"), Some(key("gpu", "big")));
         assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
+        // Stickiness was cleared too, not just left standing behind the
+        // pin: once unpinned, the session has nothing left to fall back
+        // to (the shared Router's internal state isn't reachable directly
+        // from here, so this is proven behaviourally).
+        f.router.unpin("s");
+        assert_eq!(f.router.current("s"), None);
     }
 
     struct FixedRefresher(Vec<ModelProfile>);
@@ -911,8 +801,9 @@ mod tests {
             vec![profile("gpu", "big", Tier::Large, &[])],
             &[("gpu", "big", 503)],
         );
-        f.router.state.lock().unwrap().profiles[0].availability =
-            aivyx_route::Availability::Unavailable;
+        let mut profiles = f.router.router.profiles();
+        profiles[0].availability = aivyx_route::Availability::Unavailable;
+        f.router.router.set_profiles(profiles);
         for attempt in 1..=2 {
             let Err(err) = f.router.stream_chat(routed(TaskKind::CodeEdit, None)).await else {
                 panic!("big always fails");
@@ -971,40 +862,67 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_returns_to_its_model_once_the_cooldown_ends() {
-        let f = fixture(
-            vec![profile("gpu", "big", Tier::Large, &[])],
-            &[("gpu", "big", 503)],
+        // `big` succeeds once (establishing real stickiness through an
+        // actual call, since only a clean first choice may stick) and
+        // fails with 503 on every call after that.
+        let default = Scripted::new("default", None);
+        let big = Scripted::succeed_then_fail("big", 503);
+        let profiles = vec![
+            profile("backend", "default", Tier::Medium, &[]),
+            profile("gpu", "big", Tier::Large, &[]),
+        ];
+        let big_key = key("gpu", "big");
+        let pool: HashMap<ModelKey, Arc<Scripted>> =
+            HashMap::from([(big_key.clone(), Arc::clone(&big))]);
+        let factory: BackendFactory = Box::new(move |k: &ModelKey| {
+            pool.get(k)
+                .map(|b| Arc::clone(b) as Arc<dyn LlmBackend>)
+                .ok_or_else(|| format!("no backend for `{k}`"))
+        });
+        let backend = RoutedBackend::new(
+            key("backend", "default"),
+            Arc::clone(&default) as Arc<dyn LlmBackend>,
+            profiles,
+            TaskOverrides::default(),
+            factory,
         );
-        // The session is on big (as if an earlier call chose it).
-        f.router
-            .state
-            .lock()
-            .unwrap()
-            .sticky
-            .insert("s".into(), key("gpu", "big"));
-        let _ = f
-            .router
+
+        // First call: big succeeds, so the session sticks to it.
+        let _ = backend
             .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
             .await
             .unwrap();
-        assert_eq!(f.default.calls(), 1);
-        // While big cools down, calls go to the default model without
-        // moving the session.
-        let _ = f
-            .router
+        assert_eq!(backend.current("s"), Some(big_key.clone()));
+        assert_eq!(big.calls(), 1);
+
+        // Second call: big now fails and cools down; the session falls
+        // back to the default model without losing its stickiness to big.
+        let _ = backend
             .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
             .await
             .unwrap();
-        assert_eq!(f.default.calls(), 2);
-        assert_eq!(f.calls("gpu", "big"), 1);
-        assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
-        // Cooldown over: the session's own model is tried again.
-        f.router.state.lock().unwrap().cooling.clear();
-        let _ = f
-            .router
+        assert_eq!(default.calls(), 1);
+        assert_eq!(big.calls(), 2);
+        assert_eq!(backend.current("s"), Some(big_key.clone()));
+
+        // While big cools down, calls keep going to the default without
+        // even attempting big.
+        let _ = backend
             .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
             .await
             .unwrap();
-        assert_eq!(f.calls("gpu", "big"), 2);
+        assert_eq!(default.calls(), 2);
+        assert_eq!(big.calls(), 2);
+        assert_eq!(backend.current("s"), Some(big_key.clone()));
+
+        // Cooldown over (the same mechanism `/models refresh` uses to
+        // clear it): the session's own model is tried again.
+        let fresh = backend.router.profiles();
+        backend.router.set_profiles(fresh);
+        let _ = backend
+            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
+            .await
+            .unwrap();
+        assert_eq!(big.calls(), 3);
     }
 }
