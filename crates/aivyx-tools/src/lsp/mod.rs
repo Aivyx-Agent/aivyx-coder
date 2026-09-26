@@ -104,10 +104,20 @@ impl LspClient {
             .kill_on_drop(true);
 
         let mut child = command.spawn().map_err(|err| {
-            ToolError::ExecutionFailed(format!(
-                "{} not found on PATH — install it to use go_to_definition/find_references ({err})",
-                self.program
-            ))
+            ToolError::ExecutionFailed(if err.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "{} not found on PATH — install it to use go_to_definition/find_references \
+                     ({err})",
+                    self.program
+                )
+            } else {
+                // It exists but didn't start: installing it again won't help.
+                format!(
+                    "could not start {} ({err}) — check it is executable to use \
+                     go_to_definition/find_references",
+                    self.program
+                )
+            })
         })?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -404,6 +414,26 @@ mod tests {
         };
         assert!(msg.contains("not found on PATH"));
         assert!(msg.contains("definitely-not-a-real-binary-xyz"));
+    }
+
+    /// A server binary that exists but can't be started (here: not
+    /// executable) is not reported as missing from PATH.
+    #[tokio::test]
+    async fn a_server_that_cannot_start_is_not_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("rust-analyzer");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap(); // mode 0644
+        let client = LspClient::with_program(program.to_str().unwrap(), Duration::from_secs(5));
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+        let err = client
+            .ensure_started(Path::new("."), &confiner)
+            .await
+            .unwrap_err();
+        let ToolError::ExecutionFailed(msg) = err else {
+            panic!("expected ExecutionFailed")
+        };
+        assert!(!msg.contains("not found"), "{msg}");
+        assert!(msg.contains("could not start"), "{msg}");
     }
 
     #[tokio::test]
