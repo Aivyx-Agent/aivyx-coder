@@ -753,22 +753,19 @@ mod tests {
     #[tokio::test]
     async fn forget_session_clears_stickiness_but_keeps_the_pin() {
         let f = fixture(vec![profile("gpu", "big", Tier::Large, &[])], &[]);
-        let _ = f
-            .router
-            .stream_chat(routed(TaskKind::CodeEdit, Some("s")))
-            .await
-            .unwrap();
+        let call = || f.router.stream_chat(routed(TaskKind::CodeEdit, Some("s")));
+        // Stickiness alone (no pin): forgetting the session clears it.
+        let _ = call().await.unwrap();
+        assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
+        f.router.forget_session("s");
+        assert_eq!(f.router.current("s"), None, "stickiness must be cleared");
+        assert!(f.router.last_decision("s").is_none());
+        // A pin, on the other hand, survives it.
+        let _ = call().await.unwrap();
         f.router.pin("s", key("gpu", "big"));
         f.router.forget_session("s");
-        assert!(f.router.last_decision("s").is_none());
         assert_eq!(f.router.pinned("s"), Some(key("gpu", "big")));
         assert_eq!(f.router.current("s"), Some(key("gpu", "big")));
-        // Stickiness was cleared too, not just left standing behind the
-        // pin: once unpinned, the session has nothing left to fall back
-        // to (the shared Router's internal state isn't reachable directly
-        // from here, so this is proven behaviourally).
-        f.router.unpin("s");
-        assert_eq!(f.router.current("s"), None);
     }
 
     struct FixedRefresher(Vec<ModelProfile>);
