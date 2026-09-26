@@ -1089,7 +1089,8 @@ broker_base_url = "http://127.0.0.1:8899"
 ```
 
 `base_url` is no longer contacted directly by this process on this path —
-`broker_base_url` is. `aivyx-broker` exposes the same
+`broker_base_url` is (with or without a trailing `/v1`; requests go to
+`<broker_base_url>/v1/chat/completions` either way). `aivyx-broker` exposes the same
 `/v1/chat/completions` shape as a plain OpenAI-compatible server, so this
 is otherwise a drop-in swap; this repo's own contribution is just an
 additive `aivyx_slot_hint` field (a prefix hash, plus an always-omitted

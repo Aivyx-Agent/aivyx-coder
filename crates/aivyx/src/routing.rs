@@ -95,10 +95,13 @@ pub(crate) fn backend_factory(settings: &Settings, config: &RoutingConfig) -> Ba
             if key.endpoint.as_str() == DEFAULT_ENDPOINT {
                 match backend.kind {
                     BackendKind::Generic | BackendKind::LlamaServer => backend.base_url.clone(),
-                    BackendKind::LlamaServerBroker => backend
-                        .broker_base_url
-                        .clone()
-                        .ok_or_else(|| "backend.broker_base_url is not set".to_string())?,
+                    // aivyx-broker serves `/v1/chat/completions`.
+                    BackendKind::LlamaServerBroker => chat_base_url(
+                        backend
+                            .broker_base_url
+                            .as_deref()
+                            .ok_or_else(|| "backend.broker_base_url is not set".to_string())?,
+                    ),
                     BackendKind::MistralRs => {
                         return Err(format!(
                             "the embedded mistral.rs backend serves only `{}`",
@@ -540,6 +543,39 @@ mod tests {
             [Some("Bearer backend-secret".to_string())]
         );
         assert_eq!(auth(gpu_server.received_requests().await.unwrap()), [None]);
+    }
+
+    /// aivyx-broker serves `/v1/chat/completions`; the documented
+    /// `broker_base_url` has no `/v1`.
+    #[tokio::test]
+    async fn the_broker_default_endpoint_posts_to_v1_chat_completions() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let broker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&broker)
+            .await;
+        let mut s = settings_with("");
+        s.backend.kind = BackendKind::LlamaServerBroker;
+        s.backend.broker_base_url = Some(broker.uri());
+        let request = aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
+            aivyx_types::Role::User,
+            "hi",
+        )]);
+        let _ = backend_factory(&s, &s.routing)(&key("backend", "other"))
+            .unwrap()
+            .stream_chat(request)
+            .await;
+        let paths: Vec<String> = broker
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(paths, ["/v1/chat/completions"]);
     }
 
     #[tokio::test]

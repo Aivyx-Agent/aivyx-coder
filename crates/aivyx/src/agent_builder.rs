@@ -194,8 +194,10 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
                      http://127.0.0.1:8899"
                 )
             })?;
+            // aivyx-broker serves `/v1/chat/completions`; the documented
+            // `broker_base_url` has no `/v1`, and one that does keeps it.
             Ok(Arc::new(OpenAiCompatBackend::new(
-                broker_url,
+                crate::routing::chat_base_url(&broker_url),
                 settings.backend.model.clone(),
                 settings.backend.api_key.clone(),
             )))
@@ -1365,6 +1367,37 @@ mod tests {
     /// would hang forever; the outer `tokio::time::timeout` exists only
     /// as a safety bound so a regression here fails this test loudly
     /// (well within a normal test run) instead of hanging the suite.
+    /// aivyx-broker serves `/v1/chat/completions`; the documented
+    /// `broker_base_url` (`http://127.0.0.1:8899`) has no `/v1`.
+    #[tokio::test]
+    async fn a_broker_backend_posts_to_v1_chat_completions() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let broker = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&broker)
+            .await;
+        let mut settings = Settings::default();
+        settings.backend.kind = aivyx_config::BackendKind::LlamaServerBroker;
+        settings.backend.broker_base_url = Some(broker.uri());
+        let backend = build_llm_backend(&settings).await.unwrap();
+        let _ = backend
+            .stream_chat(aivyx_llm::ChatRequest::new(vec![
+                aivyx_types::Message::text(aivyx_types::Role::User, "hi"),
+            ]))
+            .await;
+        let paths: Vec<String> = broker
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(paths, ["/v1/chat/completions"]);
+    }
+
     #[tokio::test]
     async fn kv_cache_props_client_does_not_hang_against_an_unresponsive_server() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
