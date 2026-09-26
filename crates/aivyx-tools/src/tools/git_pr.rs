@@ -222,9 +222,15 @@ async fn check_gh_authenticated(gh_program: &str, ctx: &ToolExecutionContext) ->
             "gh is installed but not authenticated — run `gh auth login`, then try git_pr again"
                 .to_string(),
         ),
-        Err(_) => Err(format!(
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "gh CLI not found (tried \"{gh_program}\") — install it from \
              https://cli.github.com, then try git_pr again"
+        )),
+        // It exists but didn't start (not executable, busy, …): say so,
+        // rather than sending the user off to install something they have.
+        Err(e) => Err(format!(
+            "could not start the gh CLI (\"{gh_program}\"): {e} — check it is executable, \
+             then try git_pr again"
         )),
     }
 }
@@ -235,7 +241,6 @@ mod tests {
     use aivyx_checkpoint::test_support::{git, init_repo};
     use aivyx_sandbox::ExecutionConfiner;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(dir: &Path) -> ToolExecutionContext {
@@ -281,29 +286,38 @@ mod tests {
     /// create` echoes a fake PR URL to stdout — no real GitHub account or
     /// network access involved anywhere in this test suite.
     fn fake_gh(script_dir: &Path) -> std::path::PathBuf {
-        let script = script_dir.join("gh");
-        std::fs::write(
-            &script,
+        write_executable(
+            &script_dir.join("gh"),
             "#!/bin/sh\n\
              if [ \"$1\" = \"auth\" ]; then exit 0; fi\n\
              if [ \"$1\" = \"pr\" ]; then echo \"https://github.com/example/repo/pull/1\"; exit 0; fi\n\
              exit 1\n",
         )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        script
+    }
+
+    /// Writes an executable script without this process ever holding a
+    /// writable descriptor to it. Tests run in parallel threads: if this
+    /// process wrote the file itself, a child forked by another test in
+    /// the moment before the descriptor closed would inherit it, and
+    /// exec'ing the script would fail with ETXTBSY ("Text file busy") —
+    /// which surfaced as a flaky "gh CLI not found". `install` creates the
+    /// executable in its own process.
+    fn write_executable(path: &Path, contents: &str) -> std::path::PathBuf {
+        let source = path.with_extension("src");
+        std::fs::write(&source, contents).unwrap();
+        let status = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&source)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "install failed for {}", path.display());
+        path.to_path_buf()
     }
 
     /// Same shape as `fake_gh`, but `auth status` fails (not authenticated).
     fn fake_gh_unauthenticated(script_dir: &Path) -> std::path::PathBuf {
-        let script = script_dir.join("gh-unauth");
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        script
+        write_executable(&script_dir.join("gh-unauth"), "#!/bin/sh\nexit 1\n")
     }
 
     /// `git_pr`'s own checks (the local upstream-tracking preflight, and
@@ -427,6 +441,25 @@ mod tests {
         let tool = GitPrTool::new();
         let result = tool.permission_request(&json!({ "title": "  " }), Path::new("."));
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    /// A `gh` that exists but can't be started (here: not executable) is
+    /// not reported as missing — the OS error is shown instead.
+    #[tokio::test]
+    async fn a_gh_that_cannot_start_is_not_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let script_dir = tempfile::tempdir().unwrap();
+        let gh = script_dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nexit 0\n").unwrap(); // mode 0644
+        let err = check_gh_authenticated(
+            gh.to_str().unwrap(),
+            &ctx_with_confiner(dir.path(), SpyConfiner::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.contains("not found"), "{err}");
+        assert!(err.contains("could not start"), "{err}");
     }
 
     #[tokio::test]
