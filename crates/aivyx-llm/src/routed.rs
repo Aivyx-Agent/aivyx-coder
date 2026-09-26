@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aivyx_route::{
-    Availability, ModelKey, ModelProfile, Policy, Requirements, TaskKind, TaskOverrides, find,
-    select, unmet_needs,
+    Availability, ModelKey, ModelProfile, Policy, Requirements, ResidencySnapshot, TaskKind,
+    TaskOverrides, find, select, unmet_needs,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -60,6 +60,9 @@ struct State {
     pins: HashMap<String, ModelKey>,
     /// Model → when its cooldown (from a retryable failure) expires.
     cooling: HashMap<ModelKey, Instant>,
+    /// Which models are loaded and what VRAM is free. Used by scoring,
+    /// updated on a short TTL by an external task — never per call.
+    residency: ResidencySnapshot,
 }
 
 /// The ordered models to try for one call, and why.
@@ -102,6 +105,17 @@ impl RoutedBackend {
 
     pub fn profiles(&self) -> Vec<ModelProfile> {
         self.state.lock().unwrap().profiles.clone()
+    }
+
+    /// Sets the residency snapshot. Products refresh it on a short TTL,
+    /// never per call, so `select()` can prefer already-loaded models.
+    pub fn set_residency(&self, snapshot: ResidencySnapshot) {
+        self.state.lock().unwrap().residency = snapshot;
+    }
+
+    /// Returns the current residency snapshot.
+    pub fn residency(&self) -> ResidencySnapshot {
+        self.state.lock().unwrap().residency.clone()
     }
 
     /// The model `session`'s main thread is currently on, if any: its
@@ -237,6 +251,7 @@ impl RoutedBackend {
                 .and_then(|s| state.sticky.get(s).cloned()),
             allow_cloud: false,
             exclude: Vec::new(),
+            residency: state.residency.clone(),
         };
         // Cooling models are a last resort, never a reason to fail: if
         // nothing else qualifies, try them anyway.
@@ -907,6 +922,51 @@ mod tests {
             assert!(!text.contains("[[routing.models]]"), "{text}");
             assert_eq!(f.calls("gpu", "big"), attempt);
         }
+    }
+
+    #[tokio::test]
+    async fn residency_snapshot_affects_model_selection() {
+        use aivyx_route::ModelResidency;
+
+        // Two same-tier (Small) candidates for Summarize task. Without
+        // residency, both are equal so first in list is chosen. With
+        // residency marking beta as loaded, beta should rank higher.
+        let f = fixture(
+            vec![
+                profile("gpu", "alpha", Tier::Small, &[]),
+                profile("gpu", "beta", Tier::Small, &[]),
+            ],
+            &[],
+        );
+
+        // Summarize task wants Small. Without residency, alpha (first) is chosen.
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::Summarize, None))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "alpha"), 1);
+        assert_eq!(f.calls("gpu", "beta"), 0);
+
+        // Now mark beta as loaded (cost 0) while alpha stays unknown (cost 2).
+        let mut snapshot = ResidencySnapshot::default();
+        snapshot.models.insert(
+            key("gpu", "beta"),
+            ModelResidency::Loaded { vram_bytes: None },
+        );
+        f.router.set_residency(snapshot.clone());
+
+        // The next call should prefer beta (loaded, lower cost).
+        let _ = f
+            .router
+            .stream_chat(routed(TaskKind::Summarize, None))
+            .await
+            .unwrap();
+        assert_eq!(f.calls("gpu", "beta"), 1);
+        assert_eq!(f.calls("gpu", "alpha"), 1);
+
+        // residency() returns the snapshot.
+        assert_eq!(f.router.residency(), snapshot);
     }
 
     #[tokio::test]
