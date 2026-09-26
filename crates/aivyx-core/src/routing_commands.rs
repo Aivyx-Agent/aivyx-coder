@@ -137,9 +137,6 @@ pub fn format_models(
 /// poll that feeds the router. An empty snapshot (no residency source
 /// configured, or none has answered yet) adds nothing. Pure.
 fn render_residency(snapshot: &ResidencySnapshot, profiles: &[ModelProfile]) -> String {
-    if *snapshot == ResidencySnapshot::default() {
-        return String::new();
-    }
     let mut loaded = Vec::new();
     let mut needs_load = Vec::new();
     let mut wont_fit = Vec::new();
@@ -151,27 +148,34 @@ fn render_residency(snapshot: &ResidencySnapshot, profiles: &[ModelProfile]) -> 
             None => {}
         }
     }
-    let mut out = String::from("\n\nResidency:");
+    // Final review M2 — a non-empty snapshot (roster-only entries, or only
+    // `slots` set) can still say nothing about any candidate here and
+    // carry no VRAM figure; build the body first so that case also adds
+    // nothing, the same as a genuinely empty snapshot.
+    let mut body = String::new();
     if !loaded.is_empty() {
-        out.push_str(&format!("\n  loaded: {}", loaded.join(", ")));
+        body.push_str(&format!("\n  loaded: {}", loaded.join(", ")));
     }
     if !needs_load.is_empty() {
-        out.push_str(&format!("\n  needs load: {}", needs_load.join(", ")));
+        body.push_str(&format!("\n  needs load: {}", needs_load.join(", ")));
     }
     if !wont_fit.is_empty() {
-        out.push_str(&format!("\n  may not fit: {}", wont_fit.join(", ")));
+        body.push_str(&format!("\n  may not fit: {}", wont_fit.join(", ")));
     }
     if let Some(vram) = snapshot.vram {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let available = snapshot.available_vram().unwrap_or(0);
-        out.push_str(&format!(
+        body.push_str(&format!(
             "\nVRAM: {:.1} GiB used of {:.1} GiB ({:.1} GiB available for a load)",
             gib(vram.used_bytes),
             gib(vram.total_bytes),
             gib(available)
         ));
     }
-    out
+    if body.is_empty() {
+        return String::new();
+    }
+    format!("\n\nResidency:{body}")
 }
 
 #[cfg(test)]
@@ -263,6 +267,7 @@ mod tests {
         let profiles = [
             profile("backend", "default", Tier::Medium),
             profile("a-gpu", "qwen3:8b", Tier::Small),
+            profile("c-gpu", "small", Tier::Small),
         ];
         let mut residency = ResidencySnapshot::default();
         residency.models.insert(
@@ -277,6 +282,14 @@ mod tests {
                 size_bytes: Some(30 << 30),
             },
         );
+        // Final review M4 — a small cold model exercises the "needs load"
+        // line, untested before.
+        residency.models.insert(
+            key("c-gpu", "small"),
+            ModelResidency::NotLoaded {
+                size_bytes: Some(1 << 30),
+            },
+        );
         residency.vram = Some(Vram {
             total_bytes: 24 << 30,
             used_bytes: 4 << 30,
@@ -284,11 +297,27 @@ mod tests {
         let text = format_models(&profiles, None, None, &residency);
         assert!(text.contains("Residency:"), "{text}");
         assert!(text.contains("loaded: default@backend"), "{text}");
+        assert!(text.contains("needs load: small@c-gpu"), "{text}");
         assert!(text.contains("may not fit: qwen3:8b@a-gpu"), "{text}");
         assert!(
             text.contains("VRAM: 4.0 GiB used of 24.0 GiB (24.0 GiB available for a load)"),
             "{text}"
         );
+    }
+
+    /// Final review M2 — a non-empty snapshot that still says nothing about
+    /// any candidate here, and carries no VRAM figure, must add nothing to
+    /// `/models`, same as a genuinely empty snapshot.
+    #[test]
+    fn format_models_adds_nothing_when_the_snapshot_matches_no_candidate() {
+        let profiles = [profile("backend", "default", Tier::Medium)];
+        let mut residency = ResidencySnapshot::default();
+        residency.models.insert(
+            key("other-gpu", "unrelated"),
+            aivyx_route::ModelResidency::Loaded { vram_bytes: None },
+        );
+        let text = format_models(&profiles, None, None, &residency);
+        assert!(!text.contains("Residency"), "{text}");
     }
 
     #[test]

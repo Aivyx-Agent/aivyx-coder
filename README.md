@@ -1329,10 +1329,13 @@ residency report, which also supplies VRAM), or the embedded
 feeds the result to the router, which prefers already-loaded models over
 ones that would need a load. `kind = "generic"` has no residency signal:
 it may be Ollama's OpenAI-compatible API, which lists many models and
-loads on demand. The poll never blocks a call — it only ever makes a
-prior, cheaper decision available to the next one — and is skipped
-entirely when no source is configured. `/models` shows the current
-snapshot.
+loads on demand. If a `generic` `[backend]` actually points at an Ollama
+server that is also listed under `[routing.endpoints]`, the same model
+appears twice (once `@backend`, once `@<endpoint>`), and only the
+`@<endpoint>` copy gets residency. The poll never blocks a call — it
+only ever makes a prior, cheaper decision available to the next one —
+and is skipped entirely when no source is configured. `/models` shows
+the current snapshot.
 
 ### Commands
 
