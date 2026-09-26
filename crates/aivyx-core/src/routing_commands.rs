@@ -3,7 +3,7 @@
 //! and ACP frontends both get them, and never reach the model.
 
 use aivyx_llm::RoutedBackend;
-use aivyx_route::{Availability, ModelKey, ModelProfile, find};
+use aivyx_route::{Availability, ModelKey, ModelProfile, ResidencyNote, ResidencySnapshot, find};
 
 use crate::commands::parse_slash_command;
 
@@ -30,6 +30,7 @@ pub async fn run(router: Option<&RoutedBackend>, session: &str, input: &str) -> 
                 &router.profiles(),
                 router.current(session).as_ref(),
                 router.pinned(session).as_ref(),
+                &router.residency(),
             ),
             other => format!(
                 "Unknown /models argument `{other}` — try /models, /models refresh or /models why."
@@ -93,11 +94,13 @@ pub fn resolve(profiles: &[ModelProfile], arg: &str) -> Result<ModelKey, String>
 }
 
 /// One line per candidate: `* ` marks the conversation's current model;
-/// unknown capabilities carry a `?`.
+/// unknown capabilities carry a `?`. Appends a `Residency:` block (Model
+/// routing Part 4) when `residency` has anything to say.
 pub fn format_models(
     profiles: &[ModelProfile],
     current: Option<&ModelKey>,
     pinned: Option<&ModelKey>,
+    residency: &ResidencySnapshot,
 ) -> String {
     let mut out = String::from("Routing candidates (* = this conversation's model):");
     for p in profiles {
@@ -125,6 +128,48 @@ pub fn format_models(
         if pinned == Some(&key) {
             out.push_str(" (pinned)");
         }
+    }
+    out.push_str(&render_residency(residency, profiles));
+    out
+}
+
+/// The `/models` residency block (Model routing Part 4), from the same
+/// poll that feeds the router. An empty snapshot (no residency source
+/// configured, or none has answered yet) adds nothing. Pure.
+fn render_residency(snapshot: &ResidencySnapshot, profiles: &[ModelProfile]) -> String {
+    if *snapshot == ResidencySnapshot::default() {
+        return String::new();
+    }
+    let mut loaded = Vec::new();
+    let mut needs_load = Vec::new();
+    let mut wont_fit = Vec::new();
+    for p in profiles {
+        match snapshot.cost(p).1 {
+            Some(ResidencyNote::Loaded) => loaded.push(p.key().to_string()),
+            Some(ResidencyNote::NeedsLoad) => needs_load.push(p.key().to_string()),
+            Some(ResidencyNote::WontFit) => wont_fit.push(p.key().to_string()),
+            None => {}
+        }
+    }
+    let mut out = String::from("\n\nResidency:");
+    if !loaded.is_empty() {
+        out.push_str(&format!("\n  loaded: {}", loaded.join(", ")));
+    }
+    if !needs_load.is_empty() {
+        out.push_str(&format!("\n  needs load: {}", needs_load.join(", ")));
+    }
+    if !wont_fit.is_empty() {
+        out.push_str(&format!("\n  may not fit: {}", wont_fit.join(", ")));
+    }
+    if let Some(vram) = snapshot.vram {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let available = snapshot.available_vram().unwrap_or(0);
+        out.push_str(&format!(
+            "\nVRAM: {:.1} GiB used of {:.1} GiB ({:.1} GiB available for a load)",
+            gib(vram.used_bytes),
+            gib(vram.total_bytes),
+            gib(available)
+        ));
     }
     out
 }
@@ -192,6 +237,7 @@ mod tests {
             &[profile("backend", "default", Tier::Medium), coder],
             Some(&key("a-gpu", "coder")),
             Some(&key("a-gpu", "coder")),
+            &ResidencySnapshot::default(),
         );
         let line = text.lines().find(|l| l.contains("coder@a-gpu")).unwrap();
         assert!(line.starts_with("* "), "{line}");
@@ -206,6 +252,43 @@ mod tests {
             .unwrap();
         assert!(other.starts_with("  "), "{other}");
         assert!(other.contains("ctx ?"), "{other}");
+        // An empty snapshot adds nothing.
+        assert!(!text.contains("Residency"), "{text}");
+    }
+
+    #[test]
+    fn format_models_shows_residency_when_the_snapshot_has_anything_to_say() {
+        use aivyx_route::{ModelResidency, Vram};
+
+        let profiles = [
+            profile("backend", "default", Tier::Medium),
+            profile("a-gpu", "qwen3:8b", Tier::Small),
+        ];
+        let mut residency = ResidencySnapshot::default();
+        residency.models.insert(
+            key("backend", "default"),
+            ModelResidency::Loaded {
+                vram_bytes: Some(4 << 30),
+            },
+        );
+        residency.models.insert(
+            key("a-gpu", "qwen3:8b"),
+            ModelResidency::NotLoaded {
+                size_bytes: Some(30 << 30),
+            },
+        );
+        residency.vram = Some(Vram {
+            total_bytes: 24 << 30,
+            used_bytes: 4 << 30,
+        });
+        let text = format_models(&profiles, None, None, &residency);
+        assert!(text.contains("Residency:"), "{text}");
+        assert!(text.contains("loaded: default@backend"), "{text}");
+        assert!(text.contains("may not fit: qwen3:8b@a-gpu"), "{text}");
+        assert!(
+            text.contains("VRAM: 4.0 GiB used of 24.0 GiB (24.0 GiB available for a load)"),
+            "{text}"
+        );
     }
 
     #[test]

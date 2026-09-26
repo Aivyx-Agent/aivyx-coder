@@ -1,13 +1,15 @@
 //! Builds the `RoutedBackend` from `[routing]` at startup. With routing
 //! off, `wrap_with_routing` hands back the configured backend untouched.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use aivyx_config::{BackendKind, Settings};
+use aivyx_config::{BackendKind, BackendSettings, Settings};
 use aivyx_llm::{BackendFactory, LlmBackend, OpenAiCompatBackend, ProfileRefresher, RoutedBackend};
+use aivyx_route::discovery::residency::{BrokerSource, collect, endpoints_of};
 use aivyx_route::{
-    Capability, DefaultEndpoint, EndpointKind, EndpointRef, ModelKey, ModelProfile, RosterEntry,
-    RoutingConfig, find, merge,
+    Capability, DefaultEndpoint, EndpointConfig, EndpointKind, EndpointRef, ModelKey, ModelProfile,
+    ResidencySnapshot, RosterEntry, RoutingConfig, find, merge,
 };
 
 /// The `[backend]` section, as a routing endpoint name.
@@ -76,6 +78,13 @@ pub(crate) fn chat_base_url(base: &str) -> String {
     } else {
         format!("{base}/v1")
     }
+}
+
+/// The inverse of [`chat_base_url`]: a residency probe hits the server's
+/// own root, not its OpenAI-compatible `/v1` path.
+fn strip_v1(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/v1").unwrap_or(url).to_string()
 }
 
 pub(crate) fn backend_factory(settings: &Settings, config: &RoutingConfig) -> BackendFactory {
@@ -158,6 +167,121 @@ impl ProfileRefresher for DiscoveryRefresher {
     }
 }
 
+/// Model routing Part 4 — how often the router's residency snapshot is
+/// refreshed. Cheap endpoints; never polled per call.
+pub(crate) const RESIDENCY_REFRESH: Duration = Duration::from_secs(5);
+
+/// What the `backend` endpoint can tell residency, by `[backend] kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefaultResidency {
+    /// No signal: `Generic` may be Ollama's OpenAI API (many models,
+    /// loaded on demand) or any other multi-model OpenAI-compatible
+    /// server.
+    None,
+    /// `llama-server`: router-mode `/models` (loaded/loading/unloaded/
+    /// sleeping), and resident — a single-model server has its model
+    /// loaded whatever it calls it.
+    LlamaServer(String),
+    /// The embedded mistral.rs backend: a single-model server with
+    /// nothing to ask.
+    Resident,
+    /// `aivyx-broker` at this base URL, fronting a single llama-server.
+    Broker(String),
+}
+
+/// [`DefaultResidency`] for `[backend]`, per the exact `BackendKind`
+/// mapping (see the Model Routing Part 4b spec).
+pub(crate) fn default_residency(backend: &BackendSettings) -> DefaultResidency {
+    match backend.kind {
+        BackendKind::LlamaServer => DefaultResidency::LlamaServer(strip_v1(&backend.base_url)),
+        BackendKind::LlamaServerBroker => backend
+            .broker_base_url
+            .as_deref()
+            .map_or(DefaultResidency::None, |url| {
+                DefaultResidency::Broker(strip_v1(url))
+            }),
+        BackendKind::MistralRs => DefaultResidency::Resident,
+        BackendKind::Generic => DefaultResidency::None,
+    }
+}
+
+/// Everything one residency poll reads.
+pub(crate) struct ResidencySources {
+    endpoints: Vec<(EndpointRef, EndpointConfig)>,
+    default: DefaultResidency,
+    vram_bytes: Option<u64>,
+}
+
+impl ResidencySources {
+    pub(crate) fn new(config: &RoutingConfig, default: DefaultResidency) -> Self {
+        let mut endpoints = endpoints_of(config);
+        if let DefaultResidency::LlamaServer(url) = &default {
+            endpoints.push((
+                EndpointRef::new(DEFAULT_ENDPOINT),
+                EndpointConfig {
+                    kind: EndpointKind::LlamaRouter,
+                    base_url: Some(url.clone()),
+                },
+            ));
+        }
+        ResidencySources {
+            endpoints,
+            default,
+            vram_bytes: config.vram_bytes,
+        }
+    }
+
+    /// Anything to read at all? Without a source no refresh task runs.
+    pub(crate) fn is_active(&self) -> bool {
+        self.default != DefaultResidency::None
+            || self.vram_bytes.is_some()
+            || self
+                .endpoints
+                .iter()
+                .any(|(_, c)| matches!(c.kind, EndpointKind::Ollama | EndpointKind::LlamaRouter))
+    }
+
+    pub(crate) async fn poll(&self, client: &reqwest::Client) -> ResidencySnapshot {
+        let default = EndpointRef::new(DEFAULT_ENDPOINT);
+        let broker = match &self.default {
+            DefaultResidency::Broker(url) => Some(BrokerSource {
+                endpoint: default.clone(),
+                base_url: url.clone(),
+            }),
+            _ => None,
+        };
+        let mut snap = collect(&self.endpoints, broker.as_ref(), self.vram_bytes, client).await;
+        if matches!(
+            self.default,
+            DefaultResidency::LlamaServer(_)
+                | DefaultResidency::Resident
+                | DefaultResidency::Broker(_)
+        ) {
+            snap.resident_endpoints.insert(default);
+        }
+        snap
+    }
+}
+
+/// Polls `sources` every [`RESIDENCY_REFRESH`] (first poll immediately)
+/// and hands each snapshot to `routed`'s router; exits once `routed` is
+/// gone.
+pub(crate) fn spawn_residency_refresh(routed: Weak<RoutedBackend>, sources: ResidencySources) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut tick = tokio::time::interval(RESIDENCY_REFRESH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let snapshot = sources.poll(&client).await;
+            let Some(routed) = routed.upgrade() else {
+                break;
+            };
+            routed.set_residency(snapshot);
+        }
+    });
+}
+
 /// Routing off ⇒ `(llm, None)` with `llm` untouched. Routing on ⇒ a
 /// `RoutedBackend` whose default is `llm`.
 pub(crate) async fn wrap_with_routing(
@@ -198,6 +322,10 @@ pub(crate) async fn wrap_with_routing(
         candidates = router.profiles().len(),
         "model routing enabled"
     );
+    let residency = ResidencySources::new(&config, default_residency(&settings.backend));
+    if residency.is_active() {
+        spawn_residency_refresh(Arc::downgrade(&router), residency);
+    }
     Ok((Arc::clone(&router) as Arc<dyn LlmBackend>, Some(router)))
 }
 
@@ -461,5 +589,179 @@ mod tests {
             None,
         ));
         assert!(wrap_with_routing(&s, llm).await.is_err());
+    }
+
+    #[test]
+    fn strip_v1_drops_v1_and_trailing_slashes() {
+        assert_eq!(strip_v1("http://127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(strip_v1("http://127.0.0.1:8080/"), "http://127.0.0.1:8080");
+        assert_eq!(
+            strip_v1("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            strip_v1("http://127.0.0.1:8080/v1/"),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn default_residency_follows_the_backend_kind() {
+        use DefaultResidency as D;
+        let backend = |kind, base_url: &str, broker: Option<&str>| BackendSettings {
+            kind,
+            base_url: base_url.to_string(),
+            broker_base_url: broker.map(String::from),
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            default_residency(&backend(
+                BackendKind::LlamaServer,
+                "http://127.0.0.1:8080/v1",
+                None
+            )),
+            D::LlamaServer("http://127.0.0.1:8080".into())
+        );
+        assert_eq!(
+            default_residency(&backend(
+                BackendKind::LlamaServerBroker,
+                "http://x/v1",
+                Some("http://127.0.0.1:8899")
+            )),
+            D::Broker("http://127.0.0.1:8899".into())
+        );
+        assert_eq!(
+            default_residency(&backend(
+                BackendKind::LlamaServerBroker,
+                "http://x/v1",
+                None
+            )),
+            D::None
+        );
+        assert_eq!(
+            default_residency(&backend(BackendKind::MistralRs, "http://x/v1", None)),
+            D::Resident
+        );
+        assert_eq!(
+            default_residency(&backend(BackendKind::Generic, "http://x/v1", None)),
+            D::None
+        );
+    }
+
+    #[test]
+    fn residency_sources_add_the_default_endpoints_own_signal() {
+        let mut config = RoutingConfig::default();
+        config.endpoints.insert(
+            "gpu".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::Ollama,
+                base_url: Some("http://gpu:11434".into()),
+            },
+        );
+        let s = ResidencySources::new(
+            &config,
+            DefaultResidency::LlamaServer("http://x:8080".into()),
+        );
+        let names: Vec<(String, EndpointKind)> = s
+            .endpoints
+            .iter()
+            .map(|(e, c)| (e.to_string(), c.kind))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("gpu".to_string(), EndpointKind::Ollama),
+                (DEFAULT_ENDPOINT.to_string(), EndpointKind::LlamaRouter),
+            ]
+        );
+        assert!(s.is_active());
+
+        // Nothing to read ⇒ inactive: no task is spawned.
+        let idle = ResidencySources::new(&RoutingConfig::default(), DefaultResidency::None);
+        assert!(!idle.is_active());
+
+        // An OpenAI-compatible routing endpoint is not a residency source.
+        let mut compat = RoutingConfig::default();
+        compat.endpoints.insert(
+            "c".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::OpenaiCompat,
+                base_url: Some("http://c".into()),
+            },
+        );
+        assert!(!ResidencySources::new(&compat, DefaultResidency::None).is_active());
+
+        // vram_bytes alone is a source.
+        let vram = RoutingConfig {
+            vram_bytes: Some(24 << 30),
+            ..RoutingConfig::default()
+        };
+        assert!(ResidencySources::new(&vram, DefaultResidency::None).is_active());
+    }
+
+    #[tokio::test]
+    async fn a_single_model_default_is_marked_resident_without_any_network() {
+        let s = ResidencySources::new(&RoutingConfig::default(), DefaultResidency::Resident);
+        let snap = s.poll(&reqwest::Client::new()).await;
+        assert!(
+            snap.resident_endpoints
+                .contains(&EndpointRef::new(DEFAULT_ENDPOINT))
+        );
+        assert!(snap.models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn residency_refresh_reports_a_loaded_ollama_model() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ollama = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"models":[{"name":"qwen3:8b","model":"qwen3:8b","size":5000000000,"size_vram":5000000000}]}"#,
+                "application/json",
+            ))
+            .mount(&ollama)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"models":[{"name":"qwen3:8b","size":5000000000},{"name":"phi4:14b","size":9000000000}]}"#,
+                "application/json",
+            ))
+            .mount(&ollama)
+            .await;
+
+        let mut s = settings_with("[routing]\nenabled = true\ndiscover = false\n");
+        s.routing.endpoints.insert(
+            "ollama".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::Ollama,
+                base_url: Some(ollama.uri()),
+            },
+        );
+        let llm: Arc<dyn LlmBackend> = Arc::new(aivyx_llm::OpenAiCompatBackend::new(
+            s.backend.base_url.clone(),
+            s.backend.model.clone(),
+            None,
+        ));
+        let (_, router) = wrap_with_routing(&s, llm).await.unwrap();
+        let router = router.expect("routing is on");
+
+        let target = key("ollama", "qwen3:8b");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut loaded = None;
+        while std::time::Instant::now() < deadline {
+            loaded = router.residency().models.get(&target).copied();
+            if loaded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            matches!(loaded, Some(aivyx_route::ModelResidency::Loaded { .. })),
+            "{loaded:?}"
+        );
     }
 }

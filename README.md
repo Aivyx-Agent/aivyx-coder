@@ -1211,6 +1211,7 @@ built from `[backend]`, with no wrapper in between.
 [routing]
 enabled = true
 discover = true           # default; probe each [routing.endpoints.*] at startup
+# vram_bytes = 25769803776 # host GPU memory, for residency scoring without a broker
 
 [routing.endpoints.gpu]
 kind = "ollama"           # ollama | llama_router | openai_compat
@@ -1316,11 +1317,28 @@ A fallback, or a choice made while some model was cooling down, is
 temporary: the conversation returns to its own model once the cooldown
 ends. A `/model` pin has no fallback.
 
+### Model residency
+
+Every 5 seconds, a background task polls whichever residency sources are
+configured — Ollama (`/api/ps` + `/api/tags`) or llama-server router mode
+(`/models`) on any `[routing.endpoints.*]` entry of that kind, plus
+`[backend]` itself when it is `kind = "llama_server"` (resident and
+router-mode-probed), `kind = "llama_server_broker"` (`aivyx-broker`'s
+residency report, which also supplies VRAM), or the embedded
+`kind = "mistral_rs"` backend (always resident, nothing to poll) — and
+feeds the result to the router, which prefers already-loaded models over
+ones that would need a load. `kind = "generic"` has no residency signal:
+it may be Ollama's OpenAI-compatible API, which lists many models and
+loads on demand. The poll never blocks a call — it only ever makes a
+prior, cheaper decision available to the next one — and is skipped
+entirely when no source is configured. `/models` shows the current
+snapshot.
+
 ### Commands
 
 | Command | What it does |
 |---|---|
-| `/models` | Lists the candidates: `id@endpoint`, tier, capabilities (unknown ones marked `?`), context window, availability. `*` marks this conversation's current model; a pin is marked `(pinned)`. |
+| `/models` | Lists the candidates: `id@endpoint`, tier, capabilities (unknown ones marked `?`), context window, availability, and (when a residency source is configured) a `Residency:` block of loaded / needs-load / may-not-fit models and the host's VRAM. `*` marks this conversation's current model; a pin is marked `(pinned)`. |
 | `/models refresh` | Re-runs discovery, rebuilds the candidate list, and clears every cooldown. |
 | `/models why` | The last routing decision in this conversation and its reason. |
 | `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. |
