@@ -1215,7 +1215,7 @@ discover = true           # default; probe each [routing.endpoints.*] at startup
 # vram_bytes = 25769803776 # host GPU memory, for residency scoring without a broker
 
 [routing.endpoints.gpu]
-kind = "ollama"           # ollama | llama_router | openai_compat
+kind = "ollama"           # ollama | llama_router | openai_compat | lemonade
 base_url = "http://localhost:11434"
 
 [[routing.models]]
@@ -1263,6 +1263,13 @@ summarize = { tier = "small" }
 - Endpoints are configured as discovery sees them
   (`http://localhost:11434`); chat requests go to their
   OpenAI-compatible `/v1` path.
+- `kind = "lemonade"` targets [Lemonade Server](https://github.com/lemonade-sdk/lemonade)'s
+  own gateway (default `http://127.0.0.1:13305/api`, port 13305 — not the
+  underlying llama-server port the "Serving" section above recommends for
+  `[backend]`). Chat goes to `.../api/v1/chat/completions`. Lemonade holds
+  one LLM at a time and reports which one via its own `/v1/health` +
+  `/v1/models`, so — unlike a plain `openai_compat` endpoint — it is a real
+  residency source (see "Model residency" below).
 - **Discovery** (`discover`, default `true`) probes every
   `[routing.endpoints.*]` at startup (Ollama `/api/tags` + `/api/show`,
   llama-server router mode `/models`, or `/v1/models`) with a 5 s timeout
@@ -1321,20 +1328,28 @@ ends. A `/model` pin has no fallback.
 ### Model residency
 
 Every 5 seconds, a background task polls whichever residency sources are
-configured — Ollama (`/api/ps` + `/api/tags`) or llama-server router mode
-(`/models`) on any `[routing.endpoints.*]` entry of that kind, plus
-`[backend]` itself when it is `kind = "llama_server"` (resident and
-router-mode-probed), `kind = "llama_server_broker"` (`aivyx-broker`'s
-residency report, which also supplies VRAM), or the embedded
-`kind = "mistral_rs"` backend (always resident, nothing to poll) — and
-feeds the result to the router, which prefers already-loaded models over
-ones that would need a load. `kind = "generic"` has no residency signal:
-it may be Ollama's OpenAI-compatible API, which lists many models and
-loads on demand. If a `generic` `[backend]` actually points at an Ollama
-server that is also listed under `[routing.endpoints]`, the same model
-appears twice (once `@backend`, once `@<endpoint>`), and only the
-`@<endpoint>` copy gets residency. The poll never blocks a call — it
-only ever makes a prior, cheaper decision available to the next one —
+configured — Ollama (`/api/ps` + `/api/tags`), llama-server router mode
+(`/models`), or Lemonade (`/v1/health` + `/v1/models`) on any
+`[routing.endpoints.*]` entry of that kind, plus `[backend]` itself when it
+is `kind = "llama_server"` (resident and router-mode-probed),
+`kind = "llama_server_broker"` (`aivyx-broker`'s residency report, which
+also supplies VRAM), or the embedded `kind = "mistral_rs"` backend (always
+resident, nothing to poll) — and feeds the result to the router, which
+prefers already-loaded models over ones that would need a load. There is no
+`[backend] kind = "lemonade"`: point `[backend] kind = "generic"` at
+`base_url = "http://127.0.0.1:13305/api/v1"` to use Lemonade as the default
+backend (see "Serving" above), and list the same base again under
+`[routing.endpoints.*] kind = "lemonade"` to get its residency reporting —
+the `[backend]` copy itself has no residency signal, same as any other
+`generic` endpoint. A Lemonade routing endpoint is never itself marked
+resident (it reports per-model residency instead, and holds only one model
+loaded at a time). `kind = "generic"` otherwise has no residency signal: it
+may be Ollama's OpenAI-compatible API, which lists many models and loads on
+demand. If a `generic` `[backend]` actually points at an Ollama server that
+is also listed under `[routing.endpoints]`, the same model appears twice
+(once `@backend`, once `@<endpoint>`), and only the `@<endpoint>` copy gets
+residency. The poll never blocks a call — it only ever makes a prior,
+cheaper decision available to the next one —
 and is skipped entirely when no source is configured. `/models` shows
 the current snapshot.
 

@@ -238,10 +238,12 @@ impl ResidencySources {
     pub(crate) fn is_active(&self) -> bool {
         self.default != DefaultResidency::None
             || self.vram_bytes.is_some()
-            || self
-                .endpoints
-                .iter()
-                .any(|(_, c)| matches!(c.kind, EndpointKind::Ollama | EndpointKind::LlamaRouter))
+            || self.endpoints.iter().any(|(_, c)| {
+                matches!(
+                    c.kind,
+                    EndpointKind::Ollama | EndpointKind::LlamaRouter | EndpointKind::Lemonade
+                )
+            })
     }
 
     pub(crate) async fn poll(&self, client: &reqwest::Client) -> ResidencySnapshot {
@@ -370,6 +372,12 @@ mod tests {
         assert!(err.contains("reserved"), "{err}");
 
         let s = settings_with("[routing.endpoints.gpu]\nkind = \"ollama\"\n");
+        assert!(check_routing_config(&s.routing).is_ok());
+    }
+
+    #[test]
+    fn a_lemonade_endpoint_is_accepted() {
+        let s = settings_with("[routing.endpoints.lemon]\nkind = \"lemonade\"\n");
         assert!(check_routing_config(&s.routing).is_ok());
     }
 
@@ -578,6 +586,45 @@ mod tests {
         assert_eq!(paths, ["/v1/chat/completions"]);
     }
 
+    /// Lemonade's base is the `.../api` form; the OpenAI-compatible backend
+    /// needs `.../api/v1`.
+    #[tokio::test]
+    async fn the_factory_builds_a_lemonade_backend_on_its_api_v1_base() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let lemonade = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&lemonade)
+            .await;
+        let mut s = settings_with("");
+        s.routing.endpoints.insert(
+            "lemon".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::Lemonade,
+                base_url: Some(format!("{}/api", lemonade.uri())),
+            },
+        );
+        let factory = backend_factory(&s, &s.routing);
+        let request = aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
+            aivyx_types::Role::User,
+            "hi",
+        )]);
+        let _ = factory(&key("lemon", "some-model"))
+            .unwrap()
+            .stream_chat(request)
+            .await;
+        let paths: Vec<String> = lemonade
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(paths, ["/api/v1/chat/completions"]);
+    }
+
     #[tokio::test]
     async fn routing_off_returns_the_same_backend() {
         let s = settings_with("");
@@ -733,6 +780,21 @@ mod tests {
             ..RoutingConfig::default()
         };
         assert!(ResidencySources::new(&vram, DefaultResidency::None).is_active());
+    }
+
+    /// Lemonade holds one LLM at a time and reports its own residency
+    /// (`/v1/health` + `/v1/models`), same as Ollama and llama-router.
+    #[test]
+    fn a_lemonade_endpoint_counts_as_a_residency_source() {
+        let mut config = RoutingConfig::default();
+        config.endpoints.insert(
+            "lemon".into(),
+            EndpointConfig {
+                kind: aivyx_route::EndpointKind::Lemonade,
+                base_url: Some("http://127.0.0.1:13305/api".into()),
+            },
+        );
+        assert!(ResidencySources::new(&config, DefaultResidency::None).is_active());
     }
 
     #[tokio::test]
