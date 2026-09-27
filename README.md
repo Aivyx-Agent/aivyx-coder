@@ -1338,8 +1338,10 @@ resident, nothing to poll) — and feeds the result to the router, which
 prefers already-loaded models over ones that would need a load. There is no
 `[backend] kind = "lemonade"`: point `[backend] kind = "generic"` at
 `base_url = "http://127.0.0.1:13305/api/v1"` to use Lemonade as the default
-backend (see "Serving" above), and list the same base again under
-`[routing.endpoints.*] kind = "lemonade"` to get its residency reporting —
+backend (see "Serving" above), and list the same server under
+`[routing.endpoints.*] kind = "lemonade"` as
+`base_url = "http://127.0.0.1:13305/api"` (no `/v1`: discovery and
+residency append `/v1/...` themselves) to get its residency reporting —
 the `[backend]` copy itself has no residency signal, same as any other
 `generic` endpoint. A Lemonade routing endpoint is never itself marked
 resident (it reports per-model residency instead, and holds only one model
