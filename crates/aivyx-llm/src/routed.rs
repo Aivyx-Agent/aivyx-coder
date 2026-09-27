@@ -160,6 +160,8 @@ fn query(request: &ChatRequest, hint: &RouteHint) -> RouteQuery {
         tools: !request.tools.is_empty(),
         vision: false,
         estimated_prompt_tokens: hint.estimated_prompt_tokens,
+        // aivyx-coder has no classifier-driven soft tier of its own yet.
+        tier: None,
     }
 }
 
