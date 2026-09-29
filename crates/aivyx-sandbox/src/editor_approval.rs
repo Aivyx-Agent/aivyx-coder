@@ -201,20 +201,38 @@ pub(crate) fn build_pending_request(
 /// Writes the pending-request file, 0600 (explicit, not relying on the
 /// process umask — this file can carry real file content or command text,
 /// unlike `editor_context`'s deliberately metadata-only file).
+///
+/// Atomic: written to a 0600 temp file beside it, then renamed over it, so
+/// an editor polling the path never reads an empty or half-written request,
+/// and the content is never briefly readable under the umask's mode.
 pub(crate) async fn write_pending_request(
     path: &Path,
     pending: &PendingApprovalRequest,
 ) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let json = serde_json::to_string(pending)
         .map_err(std::io::Error::other)?;
-    tokio::fs::write(path, json).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.{}.tmp", std::process::id(), pending.request_id));
+    let tmp = path.with_file_name(tmp_name);
+    let write = async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp).await?;
+        file.write_all(json.as_bytes()).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await
+    };
+    if let Err(e) = write.await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
     }
     Ok(())
 }
@@ -523,5 +541,49 @@ mod tests {
             let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "request file must be 0600");
         }
+    }
+
+    /// An editor plugin polls this file while the gate writes it: it must
+    /// only ever see a whole request, never an empty or half-written one.
+    #[tokio::test]
+    async fn a_reader_never_sees_a_partial_request_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        let pending = PendingApprovalRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: "req-1".to_string(),
+            target: "/project/a.rs".to_string(),
+            content: ApprovalContent::Write {
+                old_content: "old\n".repeat(20_000),
+                new_content: "new\n".repeat(20_000),
+            },
+        };
+        write_pending_request(&path, &pending).await.unwrap();
+
+        // The "editor" reads on its own OS thread while the gate rewrites.
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut partial = 0;
+                while !done.load(Ordering::SeqCst) {
+                    if let Ok(content) = std::fs::read_to_string(&path)
+                        && serde_json::from_str::<serde_json::Value>(&content).is_err()
+                    {
+                        partial += 1;
+                    }
+                }
+                partial
+            })
+        };
+        for _ in 0..200 {
+            write_pending_request(&path, &pending).await.unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        let partial = reader.join().unwrap();
+        assert_eq!(partial, 0, "a reader saw {partial} partial request files");
     }
 }
