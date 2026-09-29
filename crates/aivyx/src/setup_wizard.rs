@@ -83,7 +83,7 @@ pub async fn run() -> anyhow::Result<()> {
         let backup = backup_path(&config_path);
         let replace = dialoguer::Confirm::new()
             .with_prompt(format!(
-                "A config already exists at {}. Replace it? (the current one is kept as {})",
+                "A config already exists at {}. Replace it? (the current one is kept as {}, replacing any earlier backup)",
                 config_path.display(),
                 backup.display()
             ))
