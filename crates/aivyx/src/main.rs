@@ -123,7 +123,8 @@ fn build_system_prompt(executor: &ToolExecutor, edit_format: EditFormat) -> Stri
 #[derive(Parser, Debug)]
 #[command(
     name = "aivyx-coder",
-    about = "A TUI coding agent for local LLMs (Ollama / vLLM / llama.cpp)"
+    version,
+    about = "A TUI coding agent for local LLMs (Ollama, Lemonade, llama.cpp, vLLM, ...)"
 )]
 struct Cli {
     /// Override config.toml's backend base_url (e.g. http://localhost:11434/v1)
@@ -162,15 +163,13 @@ struct Cli {
     /// for embedding in an editor (Zed, or VS Code via the
     /// formulahendry.acp-client extension) instead of the TUI. Mutually
     /// exclusive with --plan (ACP's own session/set_mode supersedes it),
-    /// --auto (not yet supported together — see docs/superpowers/
-    /// specs/2026-07-20-acp-editor-integration-design.md's Out of Scope),
-    /// and --resume (the editor manages its own conversation view, so
+    /// --auto (not supported together yet), and --resume (the editor manages its own conversation view, so
     /// resumed history would be invisible to it).
     #[arg(long)]
     acp: bool,
 
     /// Run as an MCP (Model Context Protocol) server over stdin/stdout,
-    /// for delegation from another local MCP client (e.g. aivyx). Requires
+    /// for delegation from another local MCP client (e.g. aivyx-pa). Requires
     /// [mcp_server].max_access_level to be configured in config.toml first
     /// -- refuses to start otherwise, matching --auto's own posture for
     /// its required [verification].command. Mutually exclusive with
@@ -182,8 +181,9 @@ struct Cli {
     mcp_server: bool,
 
     /// Run the interactive first-run setup wizard (pick a backend, pick
-    /// a model, write config.toml) instead of starting the agent.
-    /// First-run only -- refuses if config.toml already exists. Also the
+    /// a model, write config.toml) instead of starting the agent. If
+    /// config.toml already exists it asks before replacing it (the old one
+    /// is kept as config.toml.bak). Also the
     /// entry point Zed/JetBrains/other ACP clients launch for this
     /// agent's "terminal" authentication method (see aivyx-acp's own
     /// InitializeResponse wiring).

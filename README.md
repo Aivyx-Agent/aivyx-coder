@@ -1421,11 +1421,12 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 
 ### First-run setup
 
-`aivyx-coder --setup` runs an interactive wizard (pick a backend, pick a
+`aivyx-coder --setup` runs an interactive wizard (pick a backend —
+Ollama, Lemonade Server, or any running OpenAI-compatible server — pick a
 model, verify it responds) and writes `config.toml` for you, instead of
-the silent defaults-on-first-run behavior. First-run only -- if
-`config.toml` already exists, it tells you to edit it directly rather
-than overwriting it. This is also the entry point Zed/JetBrains/other
+the silent defaults-on-first-run behavior. You can re-run it: if
+`config.toml` already exists it asks before replacing it, and keeps the
+old one as `config.toml.bak`. This is also the entry point Zed/JetBrains/other
 ACP clients launch automatically as this agent's `terminal` authentication
 method, before the agent is otherwise usable.
 

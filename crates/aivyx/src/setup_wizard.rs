@@ -1,7 +1,7 @@
 //! `aivyx-coder --setup`: an interactive first-run wizard that picks a
 //! backend, picks (or verifies) a model, and writes `config.toml`.
-//! First-run only -- refuses immediately if a config already exists,
-//! before any prompt.
+//! Re-runnable: when a config already exists it asks before replacing it,
+//! and keeps the old one as `config.toml.bak`.
 //!
 //! Split into a pure decision layer (`backend_settings_from_answers`,
 //! `default_base_url` -- both tested) and a thin interactive-I/O layer
@@ -17,6 +17,7 @@ use aivyx_llm::probe::{ServedContext, probe_served_context};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendChoice {
     Ollama,
+    Lemonade,
     GenericOpenAiCompatible,
 }
 
@@ -40,8 +41,17 @@ pub(crate) struct WizardAnswers {
 pub(crate) fn default_base_url(choice: BackendChoice) -> &'static str {
     match choice {
         BackendChoice::Ollama => "http://localhost:11434/v1",
+        // Lemonade Server's OpenAI-compatible API lives under /api.
+        BackendChoice::Lemonade => "http://127.0.0.1:13305/api/v1",
         BackendChoice::GenericOpenAiCompatible => "http://localhost:8080/v1",
     }
+}
+
+/// Where a re-run of `--setup` keeps the config it replaces.
+pub(crate) fn backup_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = config_path.as_os_str().to_os_string();
+    name.push(".bak");
+    std::path::PathBuf::from(name)
 }
 
 /// Pure decision layer: maps the wizard's answers plus the probed served
@@ -70,11 +80,23 @@ pub(crate) fn backend_settings_from_answers(
 pub async fn run() -> anyhow::Result<()> {
     let config_path = Settings::config_path()?;
     if config_path.exists() {
-        println!(
-            "config.toml already exists at {}. Edit it directly, or delete it and re-run --setup.",
-            config_path.display()
-        );
-        return Ok(());
+        let backup = backup_path(&config_path);
+        let replace = dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "A config already exists at {}. Replace it? (the current one is kept as {})",
+                config_path.display(),
+                backup.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !replace {
+            println!(
+                "Kept the existing config. Edit it directly, or re-run --setup to replace it."
+            );
+            return Ok(());
+        }
+        std::fs::rename(&config_path, &backup)?;
+        println!("Moved the old config to {}.", backup.display());
     }
 
     let backend_choice = prompt_backend_choice()?;
@@ -126,17 +148,18 @@ pub async fn run() -> anyhow::Result<()> {
 fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
     let choices = [
         "Ollama (recommended, zero setup)",
-        "A running OpenAI-compatible server (llama-server, vLLM, ...)",
+        "Lemonade Server",
+        "A running OpenAI-compatible server (llama-server, vLLM, Jan, ...)",
     ];
     let selection = dialoguer::Select::new()
         .with_prompt("Which backend are you using?")
         .items(&choices)
         .default(0)
         .interact()?;
-    Ok(if selection == 0 {
-        BackendChoice::Ollama
-    } else {
-        BackendChoice::GenericOpenAiCompatible
+    Ok(match selection {
+        0 => BackendChoice::Ollama,
+        1 => BackendChoice::Lemonade,
+        _ => BackendChoice::GenericOpenAiCompatible,
     })
 }
 
@@ -152,7 +175,9 @@ fn prompt_base_url(choice: BackendChoice) -> anyhow::Result<String> {
 async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<String> {
     let listed = match choice {
         BackendChoice::Ollama => list_ollama_models(base_url).await,
-        BackendChoice::GenericOpenAiCompatible => list_openai_compatible_models(base_url).await,
+        BackendChoice::Lemonade | BackendChoice::GenericOpenAiCompatible => {
+            list_openai_compatible_models(base_url).await
+        }
     };
     match listed {
         Ok(models) if !models.is_empty() => {
@@ -175,6 +200,23 @@ async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lemonade_defaults_to_its_openai_compatible_api() {
+        assert_eq!(
+            default_base_url(BackendChoice::Lemonade),
+            "http://127.0.0.1:13305/api/v1"
+        );
+    }
+
+    #[test]
+    fn re_running_setup_keeps_the_old_config_as_bak() {
+        let p = std::path::Path::new("/home/u/.config/aivyx-coder/config.toml");
+        assert_eq!(
+            backup_path(p),
+            std::path::PathBuf::from("/home/u/.config/aivyx-coder/config.toml.bak")
+        );
+    }
 
     #[test]
     fn backend_settings_from_answers_maps_ollama_choice_to_generic_kind() {
