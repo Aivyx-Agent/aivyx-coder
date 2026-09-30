@@ -39,7 +39,10 @@ impl TerminalGuard {
     fn init_after_raw_mode() -> io::Result<Self> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        // Start from a blank screen even where the alternate screen isn't
+        // cleared on entry, so first-run setup text can't show through.
+        terminal.clear()?;
         install_panic_hook();
         Ok(Self { terminal })
     }

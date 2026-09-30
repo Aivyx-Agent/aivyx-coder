@@ -637,8 +637,8 @@ impl App {
                     ""
                 };
                 self.transcript.push(ChatLine::ToolCall(format!(
-                    "{prefix}{}({})",
-                    call.name, call.arguments
+                    "{prefix}{}",
+                    tool_call_summary(&call.name, &call.arguments)
                 )));
             }
             AgentEvent::ToolResult(result) => {
@@ -725,11 +725,14 @@ impl App {
             .split(frame.area());
         let (input_area, status_area) = (layout[layout.len() - 2], layout[layout.len() - 1]);
 
-        let lines: Vec<Line> = self
+        let mut lines: Vec<Line> = self
             .transcript
             .iter()
             .flat_map(chat_line_to_lines)
             .collect();
+        if !self.transcript.iter().any(|l| matches!(l, ChatLine::User(_))) {
+            lines.extend(first_message_hint());
+        }
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
@@ -894,8 +897,8 @@ fn seed_transcript(history: &[Message]) -> Vec<ChatLine> {
                                 ""
                             };
                             lines.push(ChatLine::ToolCall(format!(
-                                "{prefix}{}({})",
-                                call.name, call.arguments
+                                "{prefix}{}",
+                                tool_call_summary(&call.name, &call.arguments)
                             )));
                         }
                         _ => {}
@@ -1046,6 +1049,55 @@ fn new_input_box() -> TextArea<'static> {
     input
 }
 
+/// Shown until the first message: what to type, and what happens next.
+fn first_message_hint() -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    [
+        "",
+        "Ask for a change or a question about this project, for example:",
+        "  \"the tests in calc.py fail — find out why and fix it\"",
+        "  \"explain how the config file is loaded\"",
+        "Every file edit and command waits for your approval ([y] to allow).",
+        "/help lists commands · Ctrl+C quits",
+    ]
+    .into_iter()
+    .map(|t| Line::from(t).style(dim))
+    .collect()
+}
+
+/// A path as the person reads it: relative to the project directory when
+/// it's inside it, as given otherwise.
+fn display_path(path: &std::path::Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.display().to_string()))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// One readable line for a tool call in the transcript: its name and the
+/// argument that says what it touches (`edit_file(calc.py)`,
+/// `run_shell(cargo test)`), not the raw JSON with escaped newlines. The
+/// permission modal still shows the full change before anything runs.
+fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str());
+    let what = field("path")
+        .map(|p| display_path(std::path::Path::new(p)))
+        .or_else(|| field("command").map(str::to_string))
+        .or_else(|| field("pattern").map(str::to_string))
+        .or_else(|| field("query").map(str::to_string));
+    match what {
+        Some(w) => format!("{name}({w})"),
+        None => {
+            let raw = args.to_string();
+            let raw = if raw == "{}" { String::new() } else { raw };
+            let cut: String = raw.chars().take(160).collect();
+            let ellipsis = if cut.len() < raw.len() { "…" } else { "" };
+            format!("{name}({cut}{ellipsis})")
+        }
+    }
+}
+
 fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionRequest) {
     let area = centered_rect(70, 60, frame.area());
     frame.render_widget(Clear, area);
@@ -1066,7 +1118,17 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     lines.push(Line::from(""));
 
     match request.preview.as_deref() {
-        Some(preview) if !preview.is_empty() => lines.extend(preview.lines().map(diff_line)),
+        Some(preview) if !preview.is_empty() => lines.extend(preview.lines().map(|l| {
+            // The diff's file headers name the file relative to the project.
+            match l.strip_prefix("--- ").or_else(|| l.strip_prefix("+++ ")) {
+                Some(path) => diff_line(&format!(
+                    "{} {}",
+                    &l[..3],
+                    display_path(std::path::Path::new(path))
+                )),
+                None => diff_line(l),
+            }
+        })),
         _ => lines.push(Line::from(format!("Args: {}", request.arguments_preview))),
     }
 
@@ -1106,7 +1168,7 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
     // label ("Command: ", "Target: ") whose width the continuation lines
     // are indented to, matching the transcript's `prefixed_lines`.
     let (label, body) = match target {
-        PermissionTarget::Path(path) => ("Target: ", path.display().to_string()),
+        PermissionTarget::Path(path) => ("Target: ", display_path(path)),
         PermissionTarget::Command { program, args } => {
             ("Command: ", format!("{program} {}", args.join(" ")))
         }
@@ -1266,6 +1328,25 @@ fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_calls_read_as_what_they_touch() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = cwd.join("src/calc.py");
+        let args = serde_json::json!({"path": inside, "old_string": "a\nb", "new_string": "c"});
+        assert_eq!(tool_call_summary("edit_file", &args), "edit_file(src/calc.py)");
+        let args = serde_json::json!({"command": "cargo test -q"});
+        assert_eq!(tool_call_summary("run_shell", &args), "run_shell(cargo test -q)");
+        assert_eq!(tool_call_summary("list_tasks", &serde_json::json!({})), "list_tasks()");
+        let long = serde_json::json!({"items": "x".repeat(400)});
+        let s = tool_call_summary("other", &long);
+        assert!(s.ends_with("…)") && s.chars().count() < 180, "{s}");
+    }
+
+    #[test]
+    fn paths_outside_the_project_stay_absolute() {
+        assert_eq!(display_path(std::path::Path::new("/etc/hosts")), "/etc/hosts");
+    }
     use aivyx_sandbox::ActionKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
