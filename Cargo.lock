@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-client-protocol",
  "aivyx-acp",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-acp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "agent-client-protocol",
  "aivyx-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-config"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-route",
  "directories",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-kvcache",
  "aivyx-llm",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-llm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-route",
  "aivyx-types",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-mcp-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-core",
  "aivyx-kvcache",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-repomap"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "globset",
  "ignore",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-sandbox"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-confine",
  "aivyx-injection-guard",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-team"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-tools"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-checkpoint",
  "aivyx-llm",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aivyx-core",
  "aivyx-sandbox",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "aivyx-types"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",

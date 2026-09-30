@@ -40,13 +40,13 @@ pre-built binary instead of building from source (see "Platform
 support" below for what differs between the two):
 
 ```sh
-curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.3.0-x86_64-linux-musl.tar.gz \
+curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.3.1-x86_64-linux-musl.tar.gz \
   | tar xz
-cd aivyx-coder-v0.3.0-x86_64-linux-musl
+cd aivyx-coder-v0.3.1-x86_64-linux-musl
 ./aivyx-coder --help
 ```
 
-(Replace `v0.3.0` with whatever the actual latest tag is if you're
+(Replace `v0.3.1` with whatever the actual latest tag is if you're
 reading this later — check the
 [Releases page](https://github.com/Aivyx-Agent/aivyx-coder/releases).)
 
