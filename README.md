@@ -20,7 +20,36 @@ This is a from-scratch Rust project built reliability-first: the security
 boundary was designed before the tools that need it, and hardened through
 repeated full-codebase audits (see `docs/HISTORY.md` for the phase history).
 
-## Building and running
+## Quick start
+
+**1. Install** the latest release into `~/.local/bin` (Linux x86_64; on
+Apple Silicon set `T=darwin-aarch64`):
+
+```sh
+V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Aivyx-Agent/aivyx-coder/releases/latest | sed 's#.*/##')
+T=x86_64-linux-musl
+curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" | tar xz
+mkdir -p ~/.local/bin && mv "aivyx-coder-$V-$T/aivyx-coder" ~/.local/bin/
+```
+
+(Make sure `~/.local/bin` is on your `PATH`.)
+
+**2. Start a local model server** with a tool-capable model loaded:
+Lemonade Server, Ollama, llama.cpp's `llama-server`, vLLM or Jan.
+
+**3. Run setup** from the project you want to work on:
+
+```sh
+aivyx-coder --setup
+```
+
+Setup picks up the server that's running, lists its models, checks that
+the one you choose really answers, and writes
+`~/.config/aivyx-coder/config.toml`. After that, plain `aivyx-coder` in
+any project directory opens the TUI. Ask for a change; every file edit
+and command waits for your approval (`y` to allow).
+
+## Building from source
 
 ```
 cargo run -p aivyx
@@ -33,22 +62,11 @@ scripts/build-release.sh
 ```
 
 Produces `dist/aivyx-coder-v<version>-x86_64-linux-musl.tar.gz` plus a
-`.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are built
-and published automatically via GitHub Actions for **both** Linux
-x86_64 (static musl) and macOS aarch64 (Apple Silicon) — grab a
-pre-built binary instead of building from source (see "Platform
-support" below for what differs between the two):
-
-```sh
-curl -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-v0.3.1-x86_64-linux-musl.tar.gz \
-  | tar xz
-cd aivyx-coder-v0.3.1-x86_64-linux-musl
-./aivyx-coder --help
-```
-
-(Replace `v0.3.1` with whatever the actual latest tag is if you're
-reading this later — check the
-[Releases page](https://github.com/Aivyx-Agent/aivyx-coder/releases).)
+`.sha256` checksum alongside it. Tagged releases (`vX.Y.Z`) are built and
+published automatically via GitHub Actions for **both** Linux x86_64
+(static musl) and macOS aarch64 (Apple Silicon) — the Quick start above
+installs the latest one (see "Platform support" below for what differs
+between the two).
 
 The installed executable is named `aivyx-coder`, not `aivyx` — the
 crate's package name is still `aivyx` (so `cargo run -p aivyx` above
