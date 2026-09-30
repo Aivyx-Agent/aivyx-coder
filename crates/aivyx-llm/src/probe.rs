@@ -7,8 +7,9 @@
 //! service says otherwise, the `/v1` API cannot change it per-call, and a
 //! reasoning model's thinking phase burns through the remainder invisibly.
 //!
-//! Two provider-specific endpoints are tried; a server exposing neither is
-//! simply `Unknown` — this is advisory, never a gate.
+//! Three provider-specific endpoints are tried (llama-server, Ollama,
+//! Lemonade Server); a server exposing none is simply `Unknown` — this is
+//! advisory, never a gate.
 
 use std::time::Duration;
 
@@ -60,7 +61,80 @@ pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext 
         };
     }
 
+    // Lemonade Server: GET <base>/health lists each loaded model with the
+    // context size it was launched with. Only a loaded model is listed.
+    if let Ok(response) = client
+        .get(format!("{}/health", base_url.trim_end_matches('/')))
+        .send()
+        .await
+        && response.status().is_success()
+        && let Ok(json) = response.json::<serde_json::Value>().await
+        && let Some(n_ctx) = parse_lemonade_health(&json, model)
+    {
+        return ServedContext::Known(n_ctx);
+    }
+
     ServedContext::Unknown
+}
+
+/// How long `verify_model_responds` waits: long enough for a server that
+/// loads the model on first use (Lemonade, Ollama) to load it.
+pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Asks `model` for a one-token reply at `base_url` (the backend's `.../v1`
+/// URL). Also loads the model on servers that load on first use, so a
+/// following `probe_served_context` can see it.
+pub async fn verify_model_responds(base_url: &str, model: &str) -> Result<(), String> {
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(VERIFY_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .post(format!("{base}/chat/completions"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                format!("no reply from {base} within {}s", VERIFY_TIMEOUT.as_secs())
+            } else {
+                format!("couldn't reach {base} -- is the server running?")
+            }
+        })?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body: String = body.chars().take(200).collect();
+    Err(format!("the server answered {status}: {}", body.trim()))
+}
+
+/// The context size Lemonade Server launched `model` with, from its
+/// `/health` body: `recipe_options.ctx_size`, else the `--ctx-size` in its
+/// launch command. `None` when `model` isn't loaded.
+fn parse_lemonade_health(json: &serde_json::Value, model: &str) -> Option<u32> {
+    let entry = json
+        .get("all_models_loaded")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("model_name").and_then(|n| n.as_str()) == Some(model))?;
+    let from_options = entry
+        .get("recipe_options")
+        .and_then(|o| o.get("ctx_size"))
+        .and_then(|n| n.as_u64());
+    let from_command = || {
+        let args = entry.get("launch_command")?.as_array()?;
+        let flag = args.iter().position(|a| a.as_str() == Some("--ctx-size"))?;
+        args.get(flag + 1)?.as_str()?.parse::<u64>().ok()
+    };
+    from_options.or_else(from_command).map(|n| n as u32)
 }
 
 fn parse_llama_props(json: &serde_json::Value) -> Option<u32> {
@@ -133,6 +207,52 @@ mod tests {
         });
         assert_eq!(parse_llama_props(&json), Some(16384));
         assert_eq!(parse_llama_props(&serde_json::json!({})), None);
+    }
+
+    /// Trimmed from a real Lemonade Server 11.9 `/api/v1/health` with one
+    /// model loaded.
+    fn lemonade_health() -> serde_json::Value {
+        serde_json::json!({
+            "all_models_loaded": [{
+                "backend_url": "http://127.0.0.1:8001/v1",
+                "launch_command": ["llama-server", "-m", "m.gguf", "--ctx-size", "217162", "--port", "8001"],
+                "loaded": true,
+                "max_context_window": 262144,
+                "model_name": "Qwen3-4B-Instruct-2507-GGUF",
+                "recipe": "llamacpp",
+                "recipe_options": { "ctx_size": 217162, "llamacpp_args": "--temp 0.6" },
+                "type": "llm"
+            }],
+            "model_loaded": null,
+            "status": "ok",
+            "version": "11.9.0"
+        })
+    }
+
+    #[test]
+    fn parses_the_served_window_from_lemonade_health() {
+        let json = lemonade_health();
+        assert_eq!(
+            parse_lemonade_health(&json, "Qwen3-4B-Instruct-2507-GGUF"),
+            Some(217162)
+        );
+        // Another model, or none loaded: no claim.
+        assert_eq!(parse_lemonade_health(&json, "Qwen3.5-9B-GGUF"), None);
+        let empty = serde_json::json!({ "all_models_loaded": [], "status": "ok" });
+        assert_eq!(parse_lemonade_health(&empty, "Qwen3-4B-Instruct-2507-GGUF"), None);
+    }
+
+    #[test]
+    fn lemonade_health_falls_back_to_the_launch_command() {
+        let mut json = lemonade_health();
+        json["all_models_loaded"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("recipe_options");
+        assert_eq!(
+            parse_lemonade_health(&json, "Qwen3-4B-Instruct-2507-GGUF"),
+            Some(217162)
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use aivyx_config::{BackendKind, BackendSettings, Settings};
 use aivyx_llm::context_warning;
 use aivyx_llm::list_models::{list_ollama_models, list_openai_compatible_models};
-use aivyx_llm::probe::{ServedContext, probe_served_context};
+use aivyx_llm::probe::{ServedContext, probe_served_context, verify_model_responds};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendChoice {
@@ -75,6 +75,34 @@ pub(crate) fn backend_settings_from_answers(
     settings
 }
 
+/// What the wizard prints after verifying the model and probing its served
+/// context window. Pure, so the wording is tested; `default_context` is what
+/// gets written when the window is unknown.
+pub(crate) fn verification_lines(
+    verified: &Result<(), String>,
+    served: &ServedContext,
+    default_context: u32,
+) -> Vec<String> {
+    let mut lines = vec![match verified {
+        Ok(()) => "  ok: the model answered".to_string(),
+        Err(why) => format!(
+            "  warning: the model didn't answer ({why}) -- writing the config anyway; \
+             fix the server, then re-run `aivyx-coder --setup`"
+        ),
+    }];
+    match served {
+        ServedContext::Known(n) => lines.push(format!("  served context window: {n} tokens")),
+        ServedContext::Unknown => lines.push(format!(
+            "  couldn't read the served context window; using {default_context} tokens -- \
+             if your server serves more, raise [backend] context_tokens in config.toml"
+        )),
+        // context_warning() always has something to say for this variant --
+        // printed after the settings are built, so nothing extra here.
+        ServedContext::OllamaDefaultUnknown => {}
+    }
+    lines
+}
+
 /// The wizard's real entry point -- checks for an existing config first,
 /// then runs the interactive flow, verifies the choice, and writes.
 pub async fn run() -> anyhow::Result<()> {
@@ -103,16 +131,14 @@ pub async fn run() -> anyhow::Result<()> {
     let base_url = prompt_base_url(backend_choice)?;
     let model = prompt_model(backend_choice, &base_url).await?;
 
-    println!("Verifying {model} at {base_url} ...");
+    println!("Verifying {model} at {base_url} (the first reply can take a while if it has to load) ...");
+    // Verify first: on servers that load a model on first use (Lemonade),
+    // that load is what lets the probe below see its context window.
+    let verified = verify_model_responds(&base_url, &model).await;
     let served = probe_served_context(&base_url, &model).await;
-    match &served {
-        ServedContext::Known(n) => println!("  served context window: {n} tokens"),
-        ServedContext::Unknown => println!(
-            "  warning: could not verify the server responded at all -- writing config anyway"
-        ),
-        // context_warning() always has something to say for this variant --
-        // printed unconditionally below, so nothing extra here.
-        ServedContext::OllamaDefaultUnknown => {}
+    let default_context = BackendSettings::default().context_tokens;
+    for line in verification_lines(&verified, &served, default_context) {
+        println!("{line}");
     }
     let answers = WizardAnswers {
         backend_choice,
@@ -200,6 +226,34 @@ async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_context_size_is_not_reported_as_a_dead_server() {
+        let lines = verification_lines(&Ok(()), &ServedContext::Unknown, 8192);
+        assert_eq!(lines[0], "  ok: the model answered");
+        assert!(lines[1].contains("couldn't read the served context window"), "{lines:?}");
+        assert!(lines[1].contains("8192"), "{lines:?}");
+        assert!(lines[1].contains("context_tokens"), "{lines:?}");
+        assert!(!lines.concat().contains("could not verify the server responded"));
+    }
+
+    #[test]
+    fn a_model_that_does_not_answer_says_so_and_how_to_retry() {
+        let lines = verification_lines(
+            &Err("couldn't reach http://localhost:11434/v1 -- is the server running?".into()),
+            &ServedContext::Unknown,
+            8192,
+        );
+        assert!(lines[0].starts_with("  warning: the model didn't answer"), "{lines:?}");
+        assert!(lines[0].contains("is the server running?"), "{lines:?}");
+        assert!(lines[0].contains("--setup"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_known_context_size_is_reported() {
+        let lines = verification_lines(&Ok(()), &ServedContext::Known(217162), 8192);
+        assert_eq!(lines[1], "  served context window: 217162 tokens");
+    }
 
     #[test]
     fn lemonade_defaults_to_its_openai_compatible_api() {
