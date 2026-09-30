@@ -103,9 +103,34 @@ pub(crate) fn verification_lines(
     lines
 }
 
+/// Whether a plain launch should run the wizard before starting: no config
+/// yet and someone at a terminal to answer it. `--mcp-server` and `--auto`
+/// have nobody to ask, so they keep writing the defaults.
+pub(crate) fn first_run_needs_setup(
+    config_exists: bool,
+    interactive: bool,
+    mcp_server: bool,
+    auto: bool,
+) -> bool {
+    !config_exists && interactive && !mcp_server && !auto
+}
+
+/// What happens after the wizard writes the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterSetup {
+    /// `--setup`: exit, telling the user how to start.
+    Exit,
+    /// A first plain launch: the caller starts the agent next.
+    StartAgent,
+}
+
 /// The wizard's real entry point -- checks for an existing config first,
 /// then runs the interactive flow, verifies the choice, and writes.
 pub async fn run() -> anyhow::Result<()> {
+    run_then(AfterSetup::Exit).await
+}
+
+pub(crate) async fn run_then(after: AfterSetup) -> anyhow::Result<()> {
     let config_path = Settings::config_path()?;
     if config_path.exists() {
         let backup = backup_path(&config_path);
@@ -127,7 +152,7 @@ pub async fn run() -> anyhow::Result<()> {
         println!("Moved the old config to {}.", backup.display());
     }
 
-    let backend_choice = prompt_backend_choice()?;
+    let backend_choice = prompt_backend_choice().await?;
     let base_url = prompt_base_url(backend_choice)?;
     let model = prompt_model(backend_choice, &base_url).await?;
 
@@ -164,6 +189,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     if std::env::var("AIVYX_CODER_ACP_TERMINAL_AUTH").is_ok() {
         println!("Setup complete -- reconnecting...");
+    } else if after == AfterSetup::StartAgent {
+        println!("Setup complete -- starting aivyx-coder ...");
     } else {
         println!("Setup complete. Run `aivyx-coder` to start.");
     }
@@ -171,16 +198,57 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
-    let choices = [
-        "Ollama (recommended, zero setup)",
+/// The backend menu's labels and preselected index, given which of Ollama,
+/// Lemonade and a generic server (in menu order) answered at their default
+/// address. The first one running is preselected; with none, Ollama is.
+pub(crate) fn backend_menu(running: [bool; 3]) -> ([String; 3], usize) {
+    let base = [
+        "Ollama",
         "Lemonade Server",
         "A running OpenAI-compatible server (llama-server, vLLM, Jan, ...)",
     ];
+    let default = running.iter().position(|r| *r);
+    let labels = std::array::from_fn(|i| match (default, running[i]) {
+        (None, _) if i == 0 => "Ollama (recommended, zero setup)".to_string(),
+        (_, true) => format!("{} -- running now", base[i]),
+        _ => base[i].to_string(),
+    });
+    (labels, default.unwrap_or(0))
+}
+
+/// Which backends answer at their default address right now (menu order).
+async fn detect_running_backends() -> [bool; 3] {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return [false; 3],
+    };
+    let answers = |url: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+        }
+    };
+    let (ollama, lemonade, generic) = tokio::join!(
+        answers("http://localhost:11434/api/tags"),
+        answers("http://127.0.0.1:13305/api/v1/health"),
+        answers("http://localhost:8080/v1/models"),
+    );
+    [ollama, lemonade, generic]
+}
+
+async fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
+    let (choices, default) = backend_menu(detect_running_backends().await);
     let selection = dialoguer::Select::new()
         .with_prompt("Which backend are you using?")
         .items(&choices)
-        .default(0)
+        .default(default)
         .interact()?;
     Ok(match selection {
         0 => BackendChoice::Ollama,
@@ -226,6 +294,33 @@ async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_menu_preselects_the_first_server_found_running() {
+        // Nothing running: Ollama, the easiest to install, stays first choice.
+        let (labels, default) = backend_menu([false, false, false]);
+        assert_eq!(default, 0);
+        assert_eq!(labels[0], "Ollama (recommended, zero setup)");
+        // Only Lemonade running: it's preselected and marked.
+        let (labels, default) = backend_menu([false, true, false]);
+        assert_eq!(default, 1);
+        assert_eq!(labels[1], "Lemonade Server -- running now");
+        assert_eq!(labels[0], "Ollama");
+        // Several running: the first one wins.
+        let (_, default) = backend_menu([true, true, false]);
+        assert_eq!(default, 0);
+    }
+
+    #[test]
+    fn a_first_interactive_run_without_a_config_runs_setup() {
+        assert!(first_run_needs_setup(false, true, false, false));
+        // A config exists, or nobody is at a terminal to answer: no wizard.
+        assert!(!first_run_needs_setup(true, true, false, false));
+        assert!(!first_run_needs_setup(false, false, false, false));
+        // Non-interactive modes keep writing defaults as before.
+        assert!(!first_run_needs_setup(false, true, true, false));
+        assert!(!first_run_needs_setup(false, true, false, true));
+    }
 
     #[test]
     fn a_missing_context_size_is_not_reported_as_a_dead_server() {

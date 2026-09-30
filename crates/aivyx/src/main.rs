@@ -264,6 +264,22 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()));
     }
 
+    // A first plain launch at a terminal runs the setup wizard instead of
+    // silently writing defaults that point at a server the user may not run.
+    {
+        use std::io::IsTerminal;
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if crate::setup_wizard::first_run_needs_setup(
+            Settings::config_path()?.exists(),
+            interactive,
+            cli.mcp_server,
+            cli.auto.is_some(),
+        ) {
+            println!("No config yet -- let's set one up (you can re-run this any time with --setup).");
+            crate::setup_wizard::run_then(crate::setup_wizard::AfterSetup::StartAgent).await?;
+        }
+    }
+
     let mut settings = Settings::load()?;
     settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
 

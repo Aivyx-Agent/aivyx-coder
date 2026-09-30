@@ -118,7 +118,7 @@ pub enum FinishReason {
 
 #[derive(Debug, Error)]
 pub enum LlmError {
-    #[error("request to backend failed: {0}")]
+    #[error("{}", describe_request_error(.0))]
     Request(#[from] reqwest::Error),
     #[error("backend returned an error response ({status}): {body}")]
     BackendError { status: u16, body: String },
@@ -132,8 +132,40 @@ pub enum LlmError {
     Routing(String),
 }
 
+/// A request failure in plain words: a refused connection is the common
+/// first-run case (the server isn't running, or the config points
+/// elsewhere), so it names the server and what to check.
+fn describe_request_error(err: &reqwest::Error) -> String {
+    if err.is_connect() {
+        let server = err
+            .url()
+            .map(|u| format!("{}://{}", u.scheme(), u.authority()))
+            .unwrap_or_else(|| "the configured base_url".to_string());
+        return format!(
+            "couldn't connect to the model server at {server} -- is it running? \
+             Check [backend] base_url in config.toml, or run `aivyx-coder --setup`"
+        );
+    }
+    format!("request to backend failed: {err}")
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_unreachable_server_says_what_to_check() {
+        // Port 1 on loopback: nothing listens there, so the connect fails.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/v1/chat/completions")
+            .send()
+            .await
+            .unwrap_err();
+        let text = LlmError::Request(err).to_string();
+        assert!(text.contains("couldn't connect to the model server"), "{text}");
+        assert!(text.contains("127.0.0.1:1"), "{text}");
+        assert!(text.contains("is it running?"), "{text}");
+        assert!(text.contains("aivyx-coder --setup"), "{text}");
+    }
+
     use super::*;
 
     #[test]

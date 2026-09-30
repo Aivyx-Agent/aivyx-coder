@@ -9,8 +9,8 @@
 [![CI](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
-A terminal (TUI) coding agent for **local** LLMs only — Ollama, vLLM, or
-llama.cpp over their OpenAI-compatible `/chat/completions` endpoints. It never
+A terminal (TUI) coding agent for **local** LLMs only — Ollama, Lemonade
+Server, llama.cpp, vLLM or Jan over their OpenAI-compatible `/chat/completions` endpoints. It never
 talks to a cloud API. An LLM drives tool calls (read/write/edit files, search,
 run commands) against your real filesystem, gated by a layered permission and
 sandboxing model designed so that a mistaken — or actively manipulated — model
@@ -70,11 +70,11 @@ flag and refuse to launch; installing via `curl | tar` (as shown above)
 avoids that, since quarantine is only applied by apps that set it on
 download (browsers, `curl` does not).
 
-Requires a local inference server. On first run a config file is written to
-your XDG config directory (`~/.config/aivyx-coder/config.toml`) with defaults
-pointing at Ollama (`http://localhost:11434/v1`); edit it to taste. Prefer
-`aivyx-coder --setup` instead — it walks you through picking a backend and
-model interactively rather than leaving you to hand-edit the defaults; see
+Requires a local inference server. The first time you run `aivyx-coder` in
+a terminal it runs a short setup — it finds the servers already running
+(Ollama, Lemonade Server, or one on port 8080), lets you pick a model, checks
+that it answers, and writes `~/.config/aivyx-coder/config.toml` — then
+starts. Re-run it any time with `aivyx-coder --setup`; see
 [First-run setup](#first-run-setup) below for details.
 
 Sessions persist automatically: after every completed turn the conversation
@@ -1422,9 +1422,12 @@ content (images, embedded resources) — see `docs/superpowers/specs/
 ### First-run setup
 
 `aivyx-coder --setup` runs an interactive wizard (pick a backend —
-Ollama, Lemonade Server, or any running OpenAI-compatible server — pick a
-model, verify it responds) and writes `config.toml` for you, instead of
-the silent defaults-on-first-run behavior. You can re-run it: if
+Ollama, Lemonade Server, or any running OpenAI-compatible server, with the
+ones already running preselected — pick a model, check that it answers, and
+read the context window it's served with) and writes `config.toml` for you.
+A plain `aivyx-coder` runs the same wizard the first time, at a terminal
+(`--mcp-server` and `--auto`, which have nobody to ask, still write the
+defaults and point at Ollama). You can re-run it: if
 `config.toml` already exists it asks before replacing it, and keeps the
 old one as `config.toml.bak`. This is also the entry point Zed/JetBrains/other
 ACP clients launch automatically as this agent's `terminal` authentication
