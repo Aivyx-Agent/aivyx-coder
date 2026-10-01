@@ -1681,7 +1681,30 @@ way to *remove* a built-in default through config. This covers:
 Every tool call passes through the gate before it runs:
 
 1. **Denied** (`deny_paths`) → blocked, no prompt.
-2. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
+2. **`.git` write block**: any `Write`/`Delete`/`Move` whose target has a
+   `.git` path component (a repo's own metadata directory, at any depth —
+   `touches_git_metadata`), or targets the global `~/.gitconfig`/
+   `~/.config/git` (`touches_global_git_config`), is hard-denied here too —
+   same tier as `deny_paths`, before any prompt, in every mode. A file
+   written there (a hooks script, `core.fsmonitor`/`filter.<x>.clean` in
+   `.git/config`, or a tracked `.gitattributes` line) makes a *later*,
+   unconfined git invocation — the pre-write checkpoint's `git add -A`,
+   `git_read`, `git_commit` — run an attacker-chosen program, turning "may
+   edit files" into "may run any program." Deliberately **not** folded into
+   `deny_paths` itself for the global-config case: that list is also
+   consumed by the Landlock read-grant builder below, which grants exactly
+   `~/.gitconfig`/`~/.config/git` so a *confined* `git` child process can
+   still read the user's own identity (an existing-but-unreadable git
+   config is fatal to git) — a `deny_paths` entry there would strip that
+   grant instead of just blocking the model's own write. Read actions are
+   unaffected (`read_file .git/HEAD` stays allowed). `git_read`'s own
+   invocations additionally prefix every argv with `-c core.fsmonitor=false`
+   (plus `--no-ext-diff --no-textconv` for `diff`, `log.showSignature=false`
+   and `--no-show-signature` for `log`), and `git_commit`'s `add`/`commit`
+   calls get the same `-c core.fsmonitor=false` prefix, as defense in depth
+   against a config entry that predates this block or was written by the
+   user themselves — the user's own hooks still run intentionally either way.
+3. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
    no side effect on its own, so prompting on every read would make the tool
    unusable. This auto-allow is **not** scoped to the project's working
    directory — any path the model asks to read is served unless it falls
@@ -1697,7 +1720,7 @@ Every tool call passes through the gate before it runs:
    but are a distinct action kind so audit logs never record a state change as
    a "read" — and so a tool that touches the outside world can't honestly
    describe itself as internal.
-3. **Plan mode** (when active) → every remaining action is denied outright,
+4. **Plan mode** (when active) → every remaining action is denied outright,
    with a reason the model can read. This check deliberately sits *before*
    the Always-Allow cache and the pre-approved command tier below: an
    approval you granted before entering plan mode cannot execute during it.
@@ -1705,10 +1728,12 @@ Every tool call passes through the gate before it runs:
    way to exit it. Belt-and-braces: in plan mode the mutating tools aren't
    even offered to the model in the request, so this gate tier is the
    backstop for a hallucinated call, not the primary UX.
-4. **Everything else** → an interactive confirmation modal, showing the exact
+5. **Everything else** → an interactive confirmation modal, showing the exact
    target/command and (for edits) a diff. Choosing **Always Allow** caches that
-   *exact* target `(program, args)` or path for the rest of the session.
-5. **Pre-approved commands**: entries in `permissions.allowed_commands` are
+   *exact* target `(program, args)` or path for the rest of the session —
+   except for a target flagged by `runs_code_later` (below), where Always
+   Allow isn't offered at all.
+6. **Pre-approved commands**: entries in `permissions.allowed_commands` are
    seeded into the Always-Allow cache at startup, so a command you already
    trusted by writing it into config runs without a prompt. This is the
    command-level allowlist tier.

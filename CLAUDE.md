@@ -77,8 +77,10 @@ model emits a tool call → `ToolExecutor::dispatch` (`aivyx-tools/src/lib.rs`)
 `ActionKind` (`Read | Write | Execute | Delete | Internal` — `Internal`
 exists so session-only state like `set_tasks` can auto-allow without
 dishonestly claiming to be a `Read`) → `gate.check()` walks a fixed tier
-order: deny_paths hard block (path-only) → `Read`/`Internal` auto-allow →
-plan-mode deny (checked *before* the cache below, specifically so an
+order: deny_paths hard block (path-only) → `.git`/global-git-config write
+block (`touches_git_metadata`/`touches_global_git_config`, same tier,
+`Write`/`Delete`/`Move` only — see README's "Security model") → `Read`/
+`Internal` auto-allow → plan-mode deny (checked *before* the cache below, specifically so an
 approval granted before entering plan mode can't leak through) →
 Always-Allow cache lookup, keyed on the **exact** target — full path or full
 `(program, args)`, never the tool or program alone, so approving `write
