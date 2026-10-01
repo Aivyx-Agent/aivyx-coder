@@ -315,6 +315,92 @@ pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
     })
 }
 
+/// True if `path` has a path component exactly equal to `.git` — i.e.
+/// writing to it could write into git's own metadata directory (hooks,
+/// `config`, filters, fsmonitor), regardless of whether `.git` is a real
+/// directory or a gitfile (worktree/submodule pointer), and regardless of
+/// how deeply nested the target is under it.
+///
+/// Deliberately component-based (`Path::components`), not a string
+/// prefix/substring check: `.github/x` and a literal `.gitignore`/
+/// `.gitattributes` file share the `.git` text prefix but are ordinary
+/// tracked files, not git metadata, and must not false-positive. See
+/// audit finding A1 (2026-10-02): a write to `<repo>/.git/config` or
+/// `<repo>/.gitattributes` (defining `core.fsmonitor`/a `filter.<x>.clean`)
+/// makes a later, unconfined git invocation (the pre-write checkpoint's
+/// `git add -A`, `git_read`, `git_commit`) run an attacker-chosen program —
+/// turning "may edit files" into "may run any program."
+pub fn touches_git_metadata(path: &Path) -> bool {
+    path.components()
+        .any(|component| component == std::path::Component::Normal(std::ffi::OsStr::new(".git")))
+}
+
+/// If `path` resolves (relative to the real home directory, same lookup as
+/// `aivyx-config`'s tilde expansion) to a shell-startup file, an XDG
+/// autostart entry, or a systemd user unit, returns a short reason a human
+/// can be shown before approving a write/delete/move to it — these run
+/// code outside Landlock's confinement scope every time they're triggered
+/// (a new shell, a login, a service start), not just within this session,
+/// and Landlock only ever scopes *this* process's spawned children.
+/// Returns `None` for anything else, including when there's no resolvable
+/// home directory at all (nothing to flag) or `path` isn't under it.
+///
+/// Deliberately doesn't block the write — dotfile edits are a legitimate,
+/// common request — only warns, so the human approving sees the real
+/// consequence instead of a plain file write. See audit finding M1
+/// (2026-10-02).
+pub fn runs_code_later(path: &Path) -> Option<&'static str> {
+    let home = directories::UserDirs::new()?.home_dir().to_path_buf();
+    let rel = path.strip_prefix(&home).ok()?;
+
+    const SHELL_INTERACTIVE: &[&str] = &[".bashrc", ".zshrc", ".zshenv"];
+    const SHELL_LOGIN: &[&str] = &[".bash_profile", ".bash_login", ".profile", ".zprofile", ".zlogin"];
+    const FISH_CONFIG: &str = ".config/fish/config.fish";
+    const FISH_CONF_D: &str = ".config/fish/conf.d";
+    const AUTOSTART: &str = ".config/autostart";
+    const SYSTEMD_USER: &str = ".config/systemd/user";
+
+    if SHELL_INTERACTIVE.iter().any(|f| rel == Path::new(f)) || rel == Path::new(FISH_CONFIG) {
+        return Some("runs every time you open a shell");
+    }
+    if rel.starts_with(FISH_CONF_D) {
+        return Some("runs every time you open a shell");
+    }
+    if SHELL_LOGIN.iter().any(|f| rel == Path::new(f)) {
+        return Some("runs when you log in");
+    }
+    if rel.starts_with(AUTOSTART) {
+        return Some("runs when you log in");
+    }
+    if rel.starts_with(SYSTEMD_USER) {
+        return Some("runs as a background service");
+    }
+    None
+}
+
+/// `runs_code_later` scoped to a `PermissionRequest`: only meaningful for
+/// `Write`/`Delete`/`Move` (a `Read` of a shell startup file has no
+/// write-time consequence to warn about), and for `Move` checks the
+/// destination first — the file that will actually exist and run at that
+/// path afterward — falling back to the source so a move *out of* one of
+/// these locations still surfaces a warning too. Shared by every frontend
+/// (`aivyx-tui`'s permission modal, `aivyx-acp`'s `session/request_permission`)
+/// so the warning text and "don't offer Always Allow for this" decision
+/// stay identical regardless of which one is driving the session.
+pub fn runs_code_later_for_request(request: &PermissionRequest) -> Option<&'static str> {
+    if !matches!(
+        request.action,
+        ActionKind::Write | ActionKind::Delete | ActionKind::Move
+    ) {
+        return None;
+    }
+    match &request.target {
+        PermissionTarget::Path(path) => runs_code_later(path),
+        PermissionTarget::Move { from, to } => runs_code_later(to).or_else(|| runs_code_later(from)),
+        PermissionTarget::Command { .. } | PermissionTarget::Other(_) => None,
+    }
+}
+
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is
 /// required but no real one (e.g. `ConfirmationGate`) has been wired up
 /// yet: since it fails closed, forgetting to swap it in later breaks a
@@ -402,5 +488,139 @@ mod tests {
             &deny_paths
         ));
         assert!(!path_is_denied(Path::new("/home/user/other"), &deny_paths));
+    }
+
+    // --- touches_git_metadata (audit finding A1) ---
+
+    #[test]
+    fn touches_git_metadata_matches_a_file_inside_dot_git() {
+        assert!(touches_git_metadata(Path::new("/r/.git/config")));
+    }
+
+    #[test]
+    fn touches_git_metadata_matches_the_dot_git_directory_itself() {
+        assert!(touches_git_metadata(Path::new("/r/.git")));
+    }
+
+    #[test]
+    fn touches_git_metadata_does_not_match_dot_github() {
+        assert!(!touches_git_metadata(Path::new("/r/.github/x")));
+    }
+
+    #[test]
+    fn touches_git_metadata_does_not_match_a_gitignore_file() {
+        assert!(!touches_git_metadata(Path::new("/r/src/.gitignore")));
+    }
+
+    #[test]
+    fn touches_git_metadata_does_not_match_a_gitattributes_file() {
+        assert!(!touches_git_metadata(Path::new("/r/.gitattributes")));
+    }
+
+    #[test]
+    fn touches_git_metadata_matches_a_nested_dot_git_hooks_path() {
+        assert!(touches_git_metadata(Path::new(
+            "/r/sub/.git/hooks/pre-commit"
+        )));
+    }
+
+    // --- runs_code_later (audit finding M1) ---
+
+    #[test]
+    fn runs_code_later_flags_bashrc() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(runs_code_later(&home.join(".bashrc")).is_some());
+    }
+
+    #[test]
+    fn runs_code_later_flags_zshrc() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(runs_code_later(&home.join(".zshrc")).is_some());
+    }
+
+    #[test]
+    fn runs_code_later_flags_fish_config() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(runs_code_later(&home.join(".config/fish/config.fish")).is_some());
+    }
+
+    #[test]
+    fn runs_code_later_flags_anything_under_fish_conf_d() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(
+            runs_code_later(&home.join(".config/fish/conf.d/99-custom.fish")).is_some()
+        );
+    }
+
+    #[test]
+    fn runs_code_later_flags_autostart_entries() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(
+            runs_code_later(&home.join(".config/autostart/evil.desktop")).is_some()
+        );
+    }
+
+    #[test]
+    fn runs_code_later_flags_systemd_user_units() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(
+            runs_code_later(&home.join(".config/systemd/user/evil.service")).is_some()
+        );
+    }
+
+    #[test]
+    fn runs_code_later_returns_none_for_an_ordinary_project_file() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(runs_code_later(&home.join("project/src/main.rs")).is_none());
+    }
+
+    #[test]
+    fn runs_code_later_returns_none_outside_the_home_directory() {
+        assert!(runs_code_later(Path::new("/tmp/.bashrc")).is_none());
+    }
+
+    #[test]
+    fn runs_code_later_for_request_ignores_read_actions() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        let request = PermissionRequest {
+            tool_name: "read_file".to_string(),
+            action: ActionKind::Read,
+            target: PermissionTarget::Path(home.join(".bashrc")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        assert!(runs_code_later_for_request(&request).is_none());
+    }
+
+    #[test]
+    fn runs_code_later_for_request_flags_a_write_to_a_shell_startup_file() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(home.join(".bashrc")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        assert!(runs_code_later_for_request(&request).is_some());
+    }
+
+    #[test]
+    fn runs_code_later_for_request_checks_the_move_destination() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        let request = PermissionRequest {
+            tool_name: "move_file".to_string(),
+            action: ActionKind::Move,
+            target: PermissionTarget::Move {
+                from: home.join("project/notes.txt"),
+                to: home.join(".zshrc"),
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        assert!(runs_code_later_for_request(&request).is_some());
     }
 }

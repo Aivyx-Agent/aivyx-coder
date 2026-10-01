@@ -62,6 +62,17 @@ const AUTONOMOUS_PERSISTENT_MEMORY_DENIAL: &str =
 const AUTONOMOUS_INTERACT_DENIAL: &str =
     "interacting with a REPL/process session cannot happen in autonomous mode";
 
+/// Told to the model when a Write/Delete/Move target touches `.git`
+/// metadata (audit finding A1, 2026-10-02). Hard-denied at the same tier
+/// as `deny_paths` — before any prompt, in every mode — because a write
+/// here (a hooks script, `core.fsmonitor`/`filter.<x>.clean` in `.git/config`
+/// or a tracked `.gitattributes`) makes a *later*, unconfined git
+/// invocation (the pre-write checkpoint's `git add -A`, `git_read`,
+/// `git_commit`) run an attacker-chosen program, turning "may edit files"
+/// into "may run any program."
+const GIT_METADATA_WRITE_DENIAL: &str = "Writing inside .git is blocked: git runs programs named \
+    there (hooks, filters, fsmonitor). Ask the user to change git settings themselves.";
+
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
 /// must not silently bless every future write anywhere.
@@ -202,6 +213,27 @@ impl ConfirmationGate {
         }
     }
 
+    /// True if this request would write/delete/move something at or under a
+    /// `.git` directory (either endpoint, for a `Move`). Checked at the same
+    /// tier as `is_denied` — see `GIT_METADATA_WRITE_DENIAL`'s doc comment
+    /// for why this must be a hard, unconditional block rather than an
+    /// ordinary prompt.
+    fn touches_git_metadata(&self, request: &PermissionRequest) -> bool {
+        if !matches!(
+            request.action,
+            ActionKind::Write | ActionKind::Delete | ActionKind::Move
+        ) {
+            return false;
+        }
+        match &request.target {
+            PermissionTarget::Path(path) => crate::touches_git_metadata(path),
+            PermissionTarget::Move { from, to } => {
+                crate::touches_git_metadata(from) || crate::touches_git_metadata(to)
+            }
+            PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
+        }
+    }
+
     /// The autonomous-mode edit boundary: a `Write`/`Delete`/`Move` action
     /// is only in-scope if every path it touches is at-or-under `cwd` — for
     /// `Move` that means both `from` and `to`. Only meaningful for
@@ -277,6 +309,16 @@ impl PermissionGate for ConfirmationGate {
             return PermissionDecision::Deny(Some(
                 "target is under a configured deny_paths entry (hard-blocked)".to_string(),
             ));
+        }
+
+        if self.touches_git_metadata(request) {
+            tracing::warn!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "permission denied: target touches .git metadata"
+            );
+            return PermissionDecision::Deny(Some(GIT_METADATA_WRITE_DENIAL.to_string()));
         }
 
         if matches!(request.action, ActionKind::Read | ActionKind::Internal) {
@@ -2604,5 +2646,143 @@ mod tests {
             0,
             "Network must be auto-allowed with no prompt in plain interactive use"
         );
+    }
+
+    // --- .git metadata hard-deny (audit finding A1) ---
+
+    #[tokio::test]
+    async fn a_write_inside_dot_git_is_denied_without_prompting_in_interactive_mode() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/.git/config"))
+            .await;
+
+        let PermissionDecision::Deny(Some(reason)) = decision else {
+            panic!("expected a denial with a reason, got {decision:?}");
+        };
+        assert!(reason.contains(".git"), "reason: {reason}");
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            0,
+            "the prompter must never be called for a .git metadata write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_dot_git_is_denied_in_plan_mode() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            plan_mode,
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request("/home/user/project/.git/hooks/pre-commit"))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_dot_git_is_denied_in_autonomous_mode() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let autonomous_mode = AutonomousMode::new();
+        autonomous_mode.set_active(true);
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            autonomous_mode,
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        // Inside cwd, so it would otherwise be auto-allowed by the
+        // autonomous-mode worktree check -- the .git tier must win first.
+        let decision = gate
+            .check(&write_request("/home/user/project/.git/config"))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_move_whose_destination_only_is_inside_dot_git_is_denied() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&move_request(
+                "/home/user/project/notes.txt",
+                "/home/user/project/.git/hooks/post-checkout",
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reading_inside_dot_git_is_unaffected() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Deny,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&read_request("/home/user/project/.git/HEAD"))
+            .await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
     }
 }
