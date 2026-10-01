@@ -408,7 +408,18 @@ pub async fn run(
                                 app.resolve_permission(UserResponse::Allow);
                             }
                             (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                                app.resolve_permission(UserResponse::AllowAlways);
+                                // Not offered (and not honored, even if typed
+                                // blind) for a target `offer_always_allow`
+                                // flags -- one approval must not silently
+                                // bless every future edit to a file that
+                                // runs code outside Landlock's confinement.
+                                let offered = app
+                                    .pending_permission
+                                    .as_ref()
+                                    .is_some_and(|modal| offer_always_allow(&modal.request));
+                                if offered {
+                                    app.resolve_permission(UserResponse::AllowAlways);
+                                }
                             }
                             (KeyCode::Char('n'), KeyModifiers::NONE)
                             | (KeyCode::Esc, KeyModifiers::NONE)
@@ -1098,6 +1109,28 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Whether the modal should offer "Always Allow" for this request — `false`
+/// for a Write/Delete/Move target `aivyx_sandbox::runs_code_later_for_request`
+/// flags (a shell startup file, an XDG autostart entry, a systemd user
+/// unit), so one approval can't silently bless every future edit to a file
+/// that runs code outside Landlock's confinement scope. See audit finding
+/// M1 (2026-10-02).
+fn offer_always_allow(request: &PermissionRequest) -> bool {
+    aivyx_sandbox::runs_code_later_for_request(request).is_none()
+}
+
+/// The warning line shown above the diff/preview for a target
+/// `runs_code_later_for_request` flags, or `None` for anything else.
+fn runs_code_later_warning(request: &PermissionRequest) -> Option<Line<'static>> {
+    let reason = aivyx_sandbox::runs_code_later_for_request(request)?;
+    Some(
+        Line::from(format!(
+            "⚠ This file {reason} — approving lets it run code outside the sandbox."
+        ))
+        .style(Style::default().fg(Color::Yellow)),
+    )
+}
+
 fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionRequest) {
     let area = centered_rect(70, 60, frame.area());
     frame.render_widget(Clear, area);
@@ -1115,6 +1148,9 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
         Line::from(format!("Action: {:?}", request.action)),
     ];
     lines.extend(target_lines(&request.target));
+    if let Some(warning) = runs_code_later_warning(request) {
+        lines.push(warning);
+    }
     lines.push(Line::from(""));
 
     match request.preview.as_deref() {
@@ -1152,10 +1188,12 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     let content = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(content, rows[0]);
 
-    let footer = Paragraph::new(Line::from(
-        "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny",
-    ))
-    .style(Style::default().fg(Color::DarkGray));
+    let footer_text = if offer_always_allow(request) {
+        "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny"
+    } else {
+        "[y] Allow    [n] / [Esc] / [Enter] Deny"
+    };
+    let footer = Paragraph::new(Line::from(footer_text)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, rows[1]);
 }
 
@@ -1449,6 +1487,93 @@ mod tests {
             rendered.contains("Allow"),
             "the Allow/Deny button row must always be visible, even for a long diff:\n{rendered}"
         );
+    }
+
+    // --- M1: warn + hide Always Allow for a file that runs code later ---
+
+    fn shell_startup_write_request() -> PermissionRequest {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(home.join(".bashrc")),
+            arguments_preview: serde_json::json!({}),
+            preview: Some("+echo hi\n".to_string()),
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn offer_always_allow_is_false_for_a_shell_startup_file_write() {
+        assert!(!offer_always_allow(&shell_startup_write_request()));
+    }
+
+    #[test]
+    fn offer_always_allow_is_true_for_an_ordinary_project_write() {
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/tmp/project/src/main.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        assert!(offer_always_allow(&request));
+    }
+
+    #[test]
+    fn render_permission_modal_shows_a_warning_for_a_shell_startup_file() {
+        let request = shell_startup_write_request();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("runs every time you open a shell"),
+            "{rendered}"
+        );
+        // Checked as two separate substrings, not one contiguous phrase --
+        // the Paragraph's word-wrap can split "...outside / the sandbox."
+        // across a row boundary at this terminal width, and
+        // `render_to_string` inserts a `\n` at every row boundary.
+        assert!(rendered.contains("approving lets it run code"), "{rendered}");
+        assert!(rendered.contains("sandbox"), "{rendered}");
+    }
+
+    #[test]
+    fn render_permission_modal_hides_always_allow_for_a_shell_startup_file() {
+        let request = shell_startup_write_request();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(
+            !rendered.contains("Always Allow"),
+            "Always Allow must not be offered for a file that runs code later:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_permission_modal_still_offers_always_allow_for_an_ordinary_write() {
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/tmp/project/src/main.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: Some("+fn main() {}\n".to_string()),
+            diff: None,
+        };
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("Always Allow"), "{rendered}");
     }
 
     #[test]
