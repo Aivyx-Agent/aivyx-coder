@@ -330,6 +330,12 @@ pub fn path_is_denied(path: &Path, deny_paths: &[PathBuf]) -> bool {
 /// makes a later, unconfined git invocation (the pre-write checkpoint's
 /// `git add -A`, `git_read`, `git_commit`) run an attacker-chosen program —
 /// turning "may edit files" into "may run any program."
+///
+/// This relies on the caller having already resolved `path` the way
+/// `aivyx-tools`' own tools do (`path_resolve::resolve`, which
+/// symlink-canonicalizes) — which also yields the real on-disk casing, so
+/// a component comparison against the lowercase literal `.git` still
+/// catches a path spelled `.GIT`/`.Git` on a case-insensitive filesystem.
 pub fn touches_git_metadata(path: &Path) -> bool {
     path.components()
         .any(|component| component == std::path::Component::Normal(std::ffi::OsStr::new(".git")))
@@ -353,7 +359,34 @@ pub fn touches_global_git_config(path: &Path) -> bool {
     let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
         return false;
     };
-    path == home.join(".gitconfig") || path.starts_with(home.join(".config/git"))
+    // Non-empty and absolute, matching how a shell/git itself would treat
+    // it — an empty or relative `XDG_CONFIG_HOME` is not a usable override.
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_absolute());
+    touches_global_git_config_inner(path, &home, xdg_config_home.as_deref())
+}
+
+/// `touches_global_git_config`'s real logic, taking `home`/`xdg_config_home`
+/// explicitly so it's testable without mutating the process-global
+/// `XDG_CONFIG_HOME` env var (a real race against any other test under
+/// `cargo test`'s default multi-threaded runner). Covers `~/.gitconfig`,
+/// anything under `~/.config/git`, **and** anything under
+/// `$XDG_CONFIG_HOME/git` when `xdg_config_home` is set — git itself only
+/// ever consults one of the latter two (whichever `XDG_CONFIG_HOME`
+/// resolution picks), but this predicate deliberately covers both
+/// unconditionally: failing toward blocking an extra, unreachable-by-git
+/// path is safe, silently missing the one git would actually read is not.
+fn touches_global_git_config_inner(path: &Path, home: &Path, xdg_config_home: Option<&Path>) -> bool {
+    if path == home.join(".gitconfig") || path.starts_with(home.join(".config/git")) {
+        return true;
+    }
+    if let Some(xdg) = xdg_config_home
+        && path.starts_with(xdg.join("git"))
+    {
+        return true;
+    }
+    false
 }
 
 /// If `path` resolves (relative to the real home directory, same lookup as
@@ -583,6 +616,74 @@ mod tests {
         assert!(!touches_global_git_config(Path::new(
             "/home/user/project/.gitconfig"
         )));
+    }
+
+    // --- touches_global_git_config_inner (fix round 1, item 2) ---
+    //
+    // `touches_global_git_config` ignored `$XDG_CONFIG_HOME` -- git uses
+    // `$XDG_CONFIG_HOME/git/config` instead of `~/.config/git/config` when
+    // it's set. Exercised via an inner fn taking home/xdg explicitly so the
+    // test never mutates the process-global env var (a real race against
+    // any other test under cargo test's default multi-threaded runner).
+
+    #[test]
+    fn inner_matches_the_home_gitconfig_file_regardless_of_xdg() {
+        let home = Path::new("/home/user");
+        assert!(touches_global_git_config_inner(
+            &home.join(".gitconfig"),
+            home,
+            None
+        ));
+        assert!(touches_global_git_config_inner(
+            &home.join(".gitconfig"),
+            home,
+            Some(Path::new("/home/user/.xdgconfig"))
+        ));
+    }
+
+    #[test]
+    fn inner_matches_under_home_config_git_when_no_xdg_override() {
+        let home = Path::new("/home/user");
+        assert!(touches_global_git_config_inner(
+            &home.join(".config/git/config"),
+            home,
+            None
+        ));
+    }
+
+    #[test]
+    fn inner_matches_under_the_xdg_config_home_git_directory_when_set() {
+        let home = Path::new("/home/user");
+        let xdg = Path::new("/home/user/.xdgconfig");
+        assert!(touches_global_git_config_inner(
+            &xdg.join("git/config"),
+            home,
+            Some(xdg)
+        ));
+    }
+
+    #[test]
+    fn inner_still_matches_home_config_git_even_when_xdg_is_set_elsewhere() {
+        // Conservative/fail-toward-blocking: both locations are covered
+        // regardless of which one git itself would actually consult.
+        let home = Path::new("/home/user");
+        let xdg = Path::new("/home/user/.xdgconfig");
+        assert!(touches_global_git_config_inner(
+            &home.join(".config/git/config"),
+            home,
+            Some(xdg)
+        ));
+    }
+
+    #[test]
+    fn inner_does_not_match_an_unrelated_path_under_the_xdg_dir() {
+        let home = Path::new("/home/user");
+        let xdg = Path::new("/home/user/.xdgconfig");
+        assert!(!touches_global_git_config_inner(
+            &xdg.join("fish/config.fish"),
+            home,
+            Some(xdg)
+        ));
     }
 
     // --- runs_code_later (audit finding M1) ---
