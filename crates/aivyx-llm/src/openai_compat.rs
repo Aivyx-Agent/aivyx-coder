@@ -96,11 +96,32 @@ impl OpenAiCompatBackend {
 /// cost for normal use.
 fn debug_log_from_env() -> Option<Arc<Mutex<std::fs::File>>> {
     let path = std::env::var_os("AIVYX_DEBUG_LOG")?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok()?;
+    open_debug_log(std::path::Path::new(&path))
+}
+
+/// Opens (creating if absent) the debug log at `path`, owner-only. Split
+/// out from `debug_log_from_env` so it's testable without mutating the
+/// process-global `AIVYX_DEBUG_LOG` env var (a real race with any other
+/// test touching it under `cargo test`'s default multi-threaded runner).
+///
+/// A *fresh* file is created with mode `0600` directly via
+/// `OpenOptionsExt::mode` (`cfg(unix)`) rather than `create(true)` +
+/// `set_permissions` after the fact — the two-step version left a real
+/// window, between the file coming into existence and the follow-up
+/// `chmod`, where it had the process umask's default mode (typically
+/// world-readable, `0644`) instead. `set_permissions` still runs
+/// unconditionally afterward (not just "when freshly created") for a
+/// pre-existing file from before this fix existed, which might still have
+/// looser permissions.
+fn open_debug_log(path: &std::path::Path) -> Option<Arc<Mutex<std::fs::File>>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).ok()?;
 
     // This file can accumulate whatever the agent reads or runs — file
     // contents, command output, potentially secrets — across the whole
@@ -110,7 +131,7 @@ fn debug_log_from_env() -> Option<Arc<Mutex<std::fs::File>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
 
     Some(Arc::new(Mutex::new(file)))
@@ -737,6 +758,26 @@ mod tests {
         assert_eq!(
             json.get("aivyx_slot_hint"),
             Some(&serde_json::json!({"prefix_hash": "abc123"}))
+        );
+    }
+
+    // --- open_debug_log (audit finding L1) ---
+
+    #[test]
+    #[cfg(unix)]
+    fn a_freshly_created_debug_log_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("debug.log");
+
+        let log = open_debug_log(&path).expect("open_debug_log should succeed");
+        drop(log);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a freshly created debug log must be mode 0600, got {mode:o}"
         );
     }
 }
