@@ -1738,6 +1738,22 @@ Every tool call passes through the gate before it runs:
    trusted by writing it into config runs without a prompt. This is the
    command-level allowlist tier.
 
+**Files that run code later** (`runs_code_later`, audit finding M1,
+2026-10-02): a shell startup file (`~/.bashrc`, `~/.zshrc`, `~/.profile`,
+`~/.zshenv`, `~/.bash_profile`/`.bash_login`/`.zprofile`/`.zlogin`,
+`~/.config/fish/config.fish` or anything under `~/.config/fish/conf.d/`),
+an XDG autostart entry (`~/.config/autostart/`), or a systemd user unit
+(`~/.config/systemd/user/`) runs outside Landlock's confinement scope
+every time it's triggered — a new shell, a login, a service start — not
+just within this session, and Landlock only ever scopes *this* process's
+spawned children. These aren't blocked (editing your own dotfiles is a
+legitimate, common request), but tier 5's confirmation modal shows an
+extra warning line ("⚠ This file runs every time you open a shell —
+approving lets it run code outside the sandbox.") and doesn't offer
+**Always Allow** at all for such a target, in both the TUI and ACP's
+`session/request_permission` — one approval must not silently bless every
+future edit to a file with this kind of reach.
+
 Denials carry their reason through to the model (`plan mode is active…`,
 `target is under a configured deny_paths entry…`, `the user denied this
 action`), so it can adapt instead of blindly retrying.
