@@ -335,6 +335,27 @@ pub fn touches_git_metadata(path: &Path) -> bool {
         .any(|component| component == std::path::Component::Normal(std::ffi::OsStr::new(".git")))
 }
 
+/// True if `path` is the user's global git config file (`~/.gitconfig`) or
+/// anything under the global git config directory (`~/.config/git`) —
+/// writing either lets the same hooks/filters/fsmonitor attack
+/// `touches_git_metadata` blocks for one repo's `.git` work globally, for
+/// every repository the agent (or the user) ever touches on this machine.
+/// Resolved against the real home directory, same lookup as
+/// `runs_code_later`; returns `false` if there's no resolvable home
+/// directory at all.
+///
+/// Deliberately *not* implemented via `default_deny_paths()`/the shared
+/// `deny_paths` list — see this predicate's own test module doc comment
+/// in `lib.rs`'s `tests` module for why that would silently break every
+/// confined git invocation on a machine with a global git config (audit
+/// finding A1 item 2, 2026-10-02).
+pub fn touches_global_git_config(path: &Path) -> bool {
+    let Some(home) = directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
+        return false;
+    };
+    path == home.join(".gitconfig") || path.starts_with(home.join(".config/git"))
+}
+
 /// If `path` resolves (relative to the real home directory, same lookup as
 /// `aivyx-config`'s tilde expansion) to a shell-startup file, an XDG
 /// autostart entry, or a systemd user unit, returns a short reason a human
@@ -521,6 +542,46 @@ mod tests {
     fn touches_git_metadata_matches_a_nested_dot_git_hooks_path() {
         assert!(touches_git_metadata(Path::new(
             "/r/sub/.git/hooks/pre-commit"
+        )));
+    }
+
+    // --- touches_global_git_config (audit finding A1 item 2) ---
+    //
+    // Deliberately NOT implemented via `default_deny_paths()`/the shared
+    // `deny_paths` list: that same list is also consumed by
+    // `LandlockConfiner`'s read-grant construction (see `aivyx-confine`),
+    // which grants exactly `~/.gitconfig`/`~/.config/git` so a *confined*
+    // `git` child process can still read the user's own identity (an
+    // existing-but-unreadable git config is fatal to git). Putting these
+    // two paths in `deny_paths` would have `grant_paths_excluding` strip
+    // that grant entirely (exact-root match -> empty grant, not a partial
+    // carve-out), breaking every confined `git_read`/`git_commit` on any
+    // machine with a global git config. This predicate gets the same
+    // hard-deny security property for the model's own Write/Delete/Move
+    // tool calls without touching the list Landlock's read grants depend on.
+
+    #[test]
+    fn touches_global_git_config_matches_the_gitconfig_file() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(touches_global_git_config(&home.join(".gitconfig")));
+    }
+
+    #[test]
+    fn touches_global_git_config_matches_a_file_under_the_config_git_directory() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(touches_global_git_config(&home.join(".config/git/config")));
+    }
+
+    #[test]
+    fn touches_global_git_config_does_not_match_an_unrelated_home_file() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        assert!(!touches_global_git_config(&home.join(".bashrc")));
+    }
+
+    #[test]
+    fn touches_global_git_config_does_not_match_a_project_gitconfig_lookalike() {
+        assert!(!touches_global_git_config(Path::new(
+            "/home/user/project/.gitconfig"
         )));
     }
 

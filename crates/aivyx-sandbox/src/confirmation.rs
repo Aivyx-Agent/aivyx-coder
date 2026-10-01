@@ -70,8 +70,9 @@ const AUTONOMOUS_INTERACT_DENIAL: &str =
 /// invocation (the pre-write checkpoint's `git add -A`, `git_read`,
 /// `git_commit`) run an attacker-chosen program, turning "may edit files"
 /// into "may run any program."
-const GIT_METADATA_WRITE_DENIAL: &str = "Writing inside .git is blocked: git runs programs named \
-    there (hooks, filters, fsmonitor). Ask the user to change git settings themselves.";
+const GIT_METADATA_WRITE_DENIAL: &str = "Writing inside .git (or the global git config) is \
+    blocked: git runs programs named there (hooks, filters, fsmonitor). Ask the user to change \
+    git settings themselves.";
 
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
@@ -225,11 +226,12 @@ impl ConfirmationGate {
         ) {
             return false;
         }
+        fn touches(path: &Path) -> bool {
+            crate::touches_git_metadata(path) || crate::touches_global_git_config(path)
+        }
         match &request.target {
-            PermissionTarget::Path(path) => crate::touches_git_metadata(path),
-            PermissionTarget::Move { from, to } => {
-                crate::touches_git_metadata(from) || crate::touches_git_metadata(to)
-            }
+            PermissionTarget::Path(path) => touches(path),
+            PermissionTarget::Move { from, to } => touches(from) || touches(to),
             PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
         }
     }
@@ -2783,6 +2785,58 @@ mod tests {
             .await;
 
         assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_to_the_global_gitconfig_is_denied_without_prompting() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request(home.join(".gitconfig").to_str().unwrap()))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_under_the_global_git_config_directory_is_denied_without_prompting() {
+        let home = directories::UserDirs::new().unwrap().home_dir().to_path_buf();
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let decision = gate
+            .check(&write_request(
+                home.join(".config/git/config").to_str().unwrap(),
+            ))
+            .await;
+
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
     }
 }
