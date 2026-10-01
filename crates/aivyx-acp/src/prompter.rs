@@ -23,13 +23,38 @@ const REJECT_ALWAYS: &str = "reject_always";
 /// rather than a struct literal — `PermissionOption` is `#[non_exhaustive]`
 /// in `agent-client-protocol-schema` 1.4.0, so a plain struct literal
 /// doesn't compile from outside that crate.
-fn fixed_options() -> Vec<PermissionOption> {
-    vec![
-        PermissionOption::new(ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
-        PermissionOption::new(ALLOW_ALWAYS, "Always Allow", PermissionOptionKind::AllowAlways),
-        PermissionOption::new(REJECT_ONCE, "Deny", PermissionOptionKind::RejectOnce),
-        PermissionOption::new(REJECT_ALWAYS, "Always Deny", PermissionOptionKind::RejectAlways),
-    ]
+///
+/// Omits `ALLOW_ALWAYS` when `request`'s target is one
+/// `aivyx_sandbox::runs_code_later_for_request` flags (a shell startup
+/// file, an XDG autostart entry, a systemd user unit) — same reasoning as
+/// `aivyx-tui`'s permission modal hiding its own "Always Allow" button for
+/// the same targets (audit finding M1, 2026-10-02): one approval must not
+/// silently bless every future edit to a file that runs code outside
+/// Landlock's confinement scope.
+fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
+    let mut options = vec![PermissionOption::new(
+        ALLOW_ONCE,
+        "Allow",
+        PermissionOptionKind::AllowOnce,
+    )];
+    if aivyx_sandbox::runs_code_later_for_request(request).is_none() {
+        options.push(PermissionOption::new(
+            ALLOW_ALWAYS,
+            "Always Allow",
+            PermissionOptionKind::AllowAlways,
+        ));
+    }
+    options.push(PermissionOption::new(
+        REJECT_ONCE,
+        "Deny",
+        PermissionOptionKind::RejectOnce,
+    ));
+    options.push(PermissionOption::new(
+        REJECT_ALWAYS,
+        "Always Deny",
+        PermissionOptionKind::RejectAlways,
+    ));
+    options
 }
 
 fn target_string(target: &PermissionTarget) -> String {
@@ -56,7 +81,7 @@ fn target_string(target: &PermissionTarget) -> String {
 /// `crates/aivyx-sandbox/src/confirmation.rs`.
 fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpdate {
     let title = target_string(&request.target);
-    let content = match (request.action, &request.diff) {
+    let mut content = match (request.action, &request.diff) {
         (ActionKind::Write | ActionKind::Delete, Some(diff)) => {
             let path = match &request.target {
                 PermissionTarget::Path(p) => p.clone(),
@@ -82,6 +107,17 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
             None => Vec::new(),
         },
     };
+    // Same warning aivyx-tui's permission modal shows for the same targets
+    // (audit finding M1, 2026-10-02) — appended regardless of which branch
+    // above populated `content`, since a Write/Delete with a diff never
+    // otherwise gets a chance to say anything beyond the diff itself.
+    if let Some(reason) = aivyx_sandbox::runs_code_later_for_request(request) {
+        let warning: ToolCallContent = format!(
+            "⚠ This file {reason} — approving lets it run code outside the sandbox."
+        )
+        .into();
+        content.push(warning);
+    }
     let kind = match request.action {
         ActionKind::Write => ToolKind::Edit,
         ActionKind::Delete => ToolKind::Delete,
@@ -107,7 +143,7 @@ pub(crate) fn permission_request_to_acp(
     request: &PermissionRequest,
     call_id: &str,
 ) -> RequestPermissionRequest {
-    RequestPermissionRequest::new(session_id, pending_tool_call(request, call_id), fixed_options())
+    RequestPermissionRequest::new(session_id, pending_tool_call(request, call_id), options_for(request))
 }
 
 /// `RejectOnce`/`RejectAlways` both deny this one call — aivyx-coder's
@@ -286,6 +322,52 @@ mod tests {
             acp.tool_call.fields.title.as_deref(),
             Some("/project/old.rs -> /project/new.rs")
         );
+    }
+
+    // --- M1: warn + hide Always Allow for files that run code later ---
+
+    fn shell_startup_write_request() -> PermissionRequest {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(home.join(".bashrc")),
+            arguments_preview: serde_json::json!({}),
+            preview: Some("echo hi".to_string()),
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn a_shell_startup_file_write_omits_the_always_allow_option() {
+        let request = shell_startup_write_request();
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
+        assert!(
+            acp.options.iter().all(|o| o.option_id.0.as_ref() != ALLOW_ALWAYS),
+            "Always Allow must not be offered for a file that runs code later: {:?}",
+            acp.options
+        );
+        // Allow-once and both deny options are still offered.
+        assert_eq!(acp.options.len(), 3);
+    }
+
+    #[test]
+    fn an_ordinary_write_still_offers_always_allow() {
+        let request = write_request(None);
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
+        assert!(acp.options.iter().any(|o| o.option_id.0.as_ref() == ALLOW_ALWAYS));
+        assert_eq!(acp.options.len(), 4);
+    }
+
+    #[test]
+    fn a_shell_startup_file_write_carries_the_sandbox_escape_warning() {
+        let request = shell_startup_write_request();
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
+        let content = acp.tool_call.fields.content.as_ref().unwrap();
+        let has_warning = content.iter().any(|c| {
+            matches!(c, ToolCallContent::Content(block) if format!("{block:?}").contains("outside the sandbox"))
+        });
+        assert!(has_warning, "expected a sandbox-escape warning in content: {content:?}");
     }
 
     #[test]
