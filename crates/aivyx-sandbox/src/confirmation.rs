@@ -232,6 +232,15 @@ impl ConfirmationGate {
         match &request.target {
             PermissionTarget::Path(path) => touches(path),
             PermissionTarget::Move { from, to } => touches(from) || touches(to),
+            // Deliberately out of scope: a `Command`/`Other` target (e.g.
+            // `run_shell`, `git_commit`'s own `Command` target) is never a
+            // path this check could inspect, and — unlike a path-based
+            // Write/Delete/Move, which can slip through on the strength of
+            // a single prior approval — it already can't reach `.git` this
+            // way without an explicit, per-exact-argv approval of its own
+            // (a shell command string isn't resolved/compared as a path at
+            // all here), and is hidden from the model entirely in
+            // autonomous mode (`AUTONOMOUS_HIDDEN_TOOLS`).
             PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
         }
     }
@@ -491,7 +500,21 @@ impl PermissionGate for ConfirmationGate {
         // in either direction — see ActionKind::Memory's doc comment for
         // why (the target description is fixed regardless of proposed
         // content, so caching would silently bless every future rewrite).
-        let never_cached = request.action == ActionKind::Memory;
+        //
+        // A target `runs_code_later_for_request` flags (a shell startup
+        // file, an XDG autostart entry, a systemd user unit) never
+        // participates either, same direction: one approval must not
+        // silently bless every future edit to a file that runs code
+        // outside Landlock's confinement scope. Enforced *here*, in the
+        // gate, rather than only in each frontend's option list — a
+        // frontend omitting "Always Allow" from what it offers doesn't
+        // stop it from mapping some other answer (or a stale/buggy
+        // client) to `UserResponse::AllowAlways` anyway; the gate is the
+        // one place every frontend's answer actually passes through, so
+        // it's the only place this can be enforced uniformly (fix round 1,
+        // audit finding M1, 2026-10-02).
+        let runs_code_later = crate::runs_code_later_for_request(request).is_some();
+        let never_cached = request.action == ActionKind::Memory || runs_code_later;
         let key = PermissionKey::from_request(request);
         if !never_cached && self.always_allow.lock().unwrap().contains(&key) {
             tracing::info!(
@@ -505,6 +528,19 @@ impl PermissionGate for ConfirmationGate {
 
         let decision = match self.resolve_via_prompter_or_editor(request).await {
             UserResponse::Allow => PermissionDecision::Allow,
+            UserResponse::AllowAlways if runs_code_later => {
+                // Downgraded to a one-time Allow, never cached, regardless
+                // of what the frontend's prompter actually answered — see
+                // the comment above.
+                tracing::info!(
+                    tool = %request.tool_name,
+                    action = ?request.action,
+                    target = ?request.target,
+                    "an AllowAlways answer was downgraded to a one-time Allow \
+                     (target runs code outside the sandbox later)"
+                );
+                PermissionDecision::Allow
+            }
             UserResponse::AllowAlways => {
                 if !never_cached {
                     self.always_allow.lock().unwrap().insert(key);
@@ -2838,5 +2874,55 @@ mod tests {
 
         assert!(matches!(decision, PermissionDecision::Deny(_)));
         assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // --- fix round 1, item 1: AllowAlways on a runs_code_later target
+    // must never be cached, regardless of which frontend answered ---
+
+    #[tokio::test]
+    async fn allow_always_on_a_shell_startup_file_is_a_one_time_allow_not_cached() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"));
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::AllowAlways,
+            calls: AtomicUsize::new(0),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        );
+
+        let target = home.join(".bashrc");
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(target),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        let first = gate.check(&request).await;
+        assert_eq!(
+            first,
+            PermissionDecision::Allow,
+            "an AllowAlways answer must be downgraded to a one-time Allow for a \
+             runs_code_later target, even though the prompter said AllowAlways"
+        );
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1);
+
+        // Same exact target again: must prompt again -- nothing was cached.
+        let second = gate.check(&request).await;
+        assert_eq!(second, PermissionDecision::Allow);
+        assert_eq!(
+            prompter.calls.load(Ordering::SeqCst),
+            2,
+            "the prompter must be asked again -- a runs_code_later target must never \
+             be satisfied from the Always-Allow cache"
+        );
     }
 }
