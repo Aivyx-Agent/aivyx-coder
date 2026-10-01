@@ -165,7 +165,13 @@ impl Tool for GitCommitTool {
 
 fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
+    // Global `-c core.fsmonitor=false` on every invocation (audit finding
+    // A1 item 3): defense in depth alongside the gate's hard-deny on
+    // writing `.git/config` in the first place -- hooks themselves still
+    // run deliberately (the user's own), this only stops a *planted*
+    // fsmonitor hook from firing via this tool's own `add`/`commit` calls.
     command
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
@@ -360,5 +366,27 @@ mod tests {
         let tool = GitCommitTool::new(vec![]);
         let result = tool.permission_request(&json!({ "message": "  " }), Path::new("."));
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[test]
+    fn git_command_prefixes_the_global_fsmonitor_override() {
+        // Audit finding A1 item 3: defense in depth alongside the gate's
+        // hard-deny on writing `.git/config` -- a repo's own config naming
+        // an fsmonitor hook must not get the chance to run even via the
+        // tool's own confined `add`/`commit` invocations.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let command = git_command(&["status".to_string()], &ctx);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..2],
+            &["-c".to_string(), "core.fsmonitor=false".to_string()],
+            "argv: {args:?}"
+        );
+        assert_eq!(args[2], "status");
     }
 }

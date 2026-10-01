@@ -62,44 +62,63 @@ impl GitReadTool {
     /// also makes them inert as `-options` or `:(magic)` pathspecs.
     fn build_args(&self, args: &GitReadArgs, cwd: &Path) -> Vec<String> {
         let excludes = exclude_pathspecs(cwd, &self.deny_paths);
+        // Global `-c core.fsmonitor=false` on every invocation: defense in
+        // depth alongside the gate's hard-deny on writing `.git/config`
+        // (audit finding A1) -- this is a confined process with the
+        // network open, so a repo's own config naming an fsmonitor hook
+        // must not get the chance to run even read-only.
+        let mut argv: Vec<String> = vec!["-c".into(), "core.fsmonitor=false".into()];
         match args.mode {
             GitReadMode::Status => {
-                let mut argv: Vec<String> =
-                    vec!["status".into(), "--short".into(), "--branch".into()];
+                argv.push("status".into());
+                argv.push("--short".into());
+                argv.push("--branch".into());
                 if !excludes.is_empty() {
                     argv.push("--".into());
                     argv.push(".".into());
                     argv.extend(excludes);
                 }
-                argv
             }
             GitReadMode::Diff => {
-                let mut argv: Vec<String> = vec!["diff".into()];
+                argv.push("diff".into());
                 if args.staged {
                     argv.push("--cached".into());
                 }
+                // A `diff.<driver>.textconv`/`diff.*.command` entry in the
+                // repo's own config can run an arbitrary program to render
+                // a "diff" -- disabled regardless of what the config says.
+                argv.push("--no-ext-diff".into());
+                argv.push("--no-textconv".into());
                 argv.push("--".into());
                 match &args.path {
                     Some(path) => argv.push(resolve(cwd, path).display().to_string()),
                     None => argv.push(".".into()),
                 }
                 argv.extend(excludes);
-                argv
             }
             GitReadMode::Log => {
                 let count = args
                     .count
                     .unwrap_or(DEFAULT_LOG_COUNT)
                     .clamp(1, MAX_LOG_COUNT);
-                vec![
-                    "log".into(),
-                    "--oneline".into(),
-                    "-n".into(),
-                    count.to_string(),
-                ]
+                // `log.showSignature`/a configured `gpg.program` could run
+                // an arbitrary signature-verification helper per commit --
+                // disabled both ways (global config key and the per-run
+                // flag) regardless of what the repo's config says.
+                argv.push("-c".into());
+                argv.push("log.showSignature=false".into());
+                argv.push("log".into());
+                argv.push("--oneline".into());
+                argv.push("--no-show-signature".into());
+                argv.push("-n".into());
+                argv.push(count.to_string());
             }
-            GitReadMode::Branches => vec!["branch".into(), "-vv".into()],
+            GitReadMode::Branches => {
+                argv.push("branch".into());
+                argv.push("-vv".into());
+            }
         }
+        argv
     }
 }
 
@@ -176,6 +195,58 @@ mod tests {
     use super::*;
     use aivyx_checkpoint::test_support::{git, init_repo};
     use serde_json::json;
+
+    // --- build_args argv assertions (audit finding A1 item 3) ---
+    //
+    // `git_read` already runs confined (Landlock + seccomp), but the
+    // network is open to a confined process -- so a planted
+    // `core.fsmonitor`/`diff.*.textconv`/a signature-verification helper
+    // in the repo's own `.git/config` could still exfiltrate or run
+    // arbitrary logic when `status`/`diff`/`log` runs. Global `-c`
+    // overrides neutralize that regardless of what the repo's config says,
+    // as defense in depth alongside A1.1's hard-deny on writing there.
+
+    #[test]
+    fn every_mode_disables_fsmonitor_via_a_global_dash_c() {
+        let tool = GitReadTool::new(vec![]);
+        for args in [
+            GitReadArgs { mode: GitReadMode::Status, path: None, staged: false, count: None },
+            GitReadArgs { mode: GitReadMode::Diff, path: None, staged: false, count: None },
+            GitReadArgs { mode: GitReadMode::Log, path: None, staged: false, count: None },
+            GitReadArgs { mode: GitReadMode::Branches, path: None, staged: false, count: None },
+        ] {
+            let argv = tool.build_args(&args, Path::new("/repo"));
+            assert_eq!(
+                &argv[..2],
+                &["-c".to_string(), "core.fsmonitor=false".to_string()],
+                "argv did not start with the global fsmonitor override: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_mode_disables_ext_diff_and_textconv() {
+        let tool = GitReadTool::new(vec![]);
+        let args = GitReadArgs { mode: GitReadMode::Diff, path: None, staged: false, count: None };
+        let argv = tool.build_args(&args, Path::new("/repo"));
+        assert!(argv.contains(&"--no-ext-diff".to_string()), "argv: {argv:?}");
+        assert!(argv.contains(&"--no-textconv".to_string()), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn log_mode_disables_signature_verification() {
+        let tool = GitReadTool::new(vec![]);
+        let args = GitReadArgs { mode: GitReadMode::Log, path: None, staged: false, count: None };
+        let argv = tool.build_args(&args, Path::new("/repo"));
+        assert!(
+            argv.windows(2).any(|w| w == ["-c".to_string(), "log.showSignature=false".to_string()]),
+            "argv missing a global -c log.showSignature=false: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--no-show-signature".to_string()),
+            "argv: {argv:?}"
+        );
+    }
 
     fn ctx(dir: &Path) -> ToolExecutionContext {
         ToolExecutionContext {
