@@ -738,7 +738,8 @@ impl App {
 
     /// `e` in the `/commit` modal: cancel it (the agent unstages what it
     /// staged) and put `/commit -m "<draft>"` in the input box to edit and
-    /// send. Returns `false`, doing nothing, for any other modal.
+    /// send — or, when the box already holds text, show the draft in the
+    /// transcript rather than overwrite it. Returns `false`, doing nothing, for any other modal.
     fn edit_commit_message(&mut self) -> bool {
         let Some(modal) = &self.pending_permission else {
             return false;
@@ -751,8 +752,14 @@ impl App {
             .unwrap_or_default()
             .to_string();
         self.resolve_permission(UserResponse::Deny);
-        self.input = new_input_box();
-        self.input.insert_str(commit_edit_input(&draft));
+        if self.input.is_empty() {
+            self.input = new_input_box();
+            self.input.insert_str(commit_edit_input(&draft));
+        } else {
+            // Never discard what the user was typing: the draft goes to
+            // the transcript instead.
+            self.transcript.push(ChatLine::Info(format!("Draft: {draft}")));
+        }
         true
     }
 
@@ -1538,7 +1545,7 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     frame.render_widget(content, rows[0]);
 
     let footer_text = if request.tool_name == "commit" {
-        "[y] Commit    [e] Edit message    [n] / [Esc] Cancel"
+        "[y] Commit    [e] Edit message    [n] / [Esc] / [Enter] Cancel"
     } else if offer_always_allow(request) {
         "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny"
     } else {
@@ -3274,7 +3281,7 @@ mod tests {
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("[y] Commit"), "{rendered}");
         assert!(rendered.contains("[e] Edit message"), "{rendered}");
-        assert!(rendered.contains("[n] / [Esc] Cancel"), "{rendered}");
+        assert!(rendered.contains("[n] / [Esc] / [Enter] Cancel"), "{rendered}");
         assert!(!rendered.contains("Always"), "{rendered}");
     }
 
@@ -3305,6 +3312,21 @@ mod tests {
             app.input.lines().join("\n"),
             "/commit -m \"Say \\\"hi\\\"\""
         );
+    }
+
+    #[test]
+    fn e_on_the_commit_modal_never_overwrites_typed_text() {
+        let mut app = App::new(None, PlanMode::new());
+        app.input.insert_str("half a thought");
+        let (modal, mut rx) = commit_modal("Fix the average");
+        app.open_permission(modal);
+        assert!(app.edit_commit_message());
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny);
+        assert_eq!(app.input.lines().join("\n"), "half a thought");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Info(t)) if t == "Draft: Fix the average"
+        ));
     }
 
     #[test]
