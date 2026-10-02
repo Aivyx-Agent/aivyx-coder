@@ -131,6 +131,29 @@ fn plan_mode_turn_notice(plan_mode_active: bool, had_model_activity: bool) -> Op
     }
 }
 
+/// B2 part 3's auto-sent instruction when Ctrl+P approves a pending plan —
+/// shown in the transcript as a normal user turn, exactly as if typed.
+const PLAN_APPROVED_MESSAGE: &str = "The plan is approved. Carry it out now, task by task.";
+
+/// B2 part 3's decision function: whether turning plan mode OFF should
+/// also auto-send `PLAN_APPROVED_MESSAGE`, starting execution immediately
+/// instead of leaving the user to type the same thing themselves. Fires
+/// only on the specific transition this exists for: plan mode *was* on
+/// (so this toggle just turned it off), there's at least one pending task
+/// to carry out, and no turn is currently running to interrupt. With no
+/// tasks, today's behaviour (just the toggle notice) is kept.
+fn plan_approval_message(
+    plan_mode_was_on: bool,
+    has_pending_tasks: bool,
+    turn_idle: bool,
+) -> Option<&'static str> {
+    if plan_mode_was_on && has_pending_tasks && turn_idle {
+        Some(PLAN_APPROVED_MESSAGE)
+    } else {
+        None
+    }
+}
+
 fn goal_achieved_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
 }
@@ -497,7 +520,9 @@ pub async fn run(
                             continue;
                         }
                         (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                            app.toggle_plan_mode();
+                            if let Some(message) = app.toggle_plan_mode_and_maybe_approve() {
+                                let _ = input_tx.send(message);
+                            }
                             continue;
                         }
                         _ => {}
@@ -614,6 +639,21 @@ impl App {
         } else {
             "plan mode OFF — full tool access restored".to_string()
         }));
+    }
+
+    /// Toggles plan mode (as `toggle_plan_mode` always has), and — per
+    /// `plan_approval_message` (B2 part 3) — when that turns it OFF with a
+    /// pending task list and no turn running, also pushes
+    /// `PLAN_APPROVED_MESSAGE` as a user turn and returns it so the caller
+    /// can forward it to the agent exactly like a typed message.
+    fn toggle_plan_mode_and_maybe_approve(&mut self) -> Option<String> {
+        let was_on = self.plan_mode.active();
+        self.toggle_plan_mode();
+        let has_pending_tasks = self.tasks.iter().any(|t| t.status == TaskStatus::Pending);
+        let turn_idle = !self.streaming_active;
+        let message = plan_approval_message(was_on, has_pending_tasks, turn_idle)?;
+        self.push_user_message(message.to_string());
+        Some(message.to_string())
     }
 
     fn resolve_permission(&mut self, response: UserResponse) {
@@ -2344,6 +2384,81 @@ mod tests {
         assert_eq!(plan_mode_turn_notice(false, true), None);
         assert_eq!(plan_mode_turn_notice(false, false), None);
         assert!(plan_mode_turn_notice(true, true).unwrap().contains("Ctrl+P"));
+    }
+
+    #[test]
+    fn plan_approval_message_only_fires_on_off_with_pending_tasks_and_an_idle_turn() {
+        // The one true case: this toggle just turned plan mode off, there
+        // are pending tasks to carry out, and nothing is already running.
+        assert!(plan_approval_message(true, true, true).is_some());
+        // Toggling it ON (plan_mode_was_on == false) never auto-sends.
+        assert_eq!(plan_approval_message(false, true, true), None);
+        // No tasks -- keep today's behaviour (just the toggle notice).
+        assert_eq!(plan_approval_message(true, false, true), None);
+        // A turn is already running -- don't interrupt it.
+        assert_eq!(plan_approval_message(true, true, false), None);
+    }
+
+    #[test]
+    fn ctrl_p_approving_a_pending_plan_sends_the_approval_message_as_a_user_turn() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.tasks = vec![Task {
+            id: 1,
+            text: "step one".to_string(),
+            status: TaskStatus::Pending,
+        }];
+
+        let sent = app.toggle_plan_mode_and_maybe_approve();
+
+        assert!(!app.plan_mode.active());
+        assert_eq!(sent, Some(PLAN_APPROVED_MESSAGE.to_string()));
+        assert!(matches!(app.transcript.last(), Some(ChatLine::User(text)) if text == PLAN_APPROVED_MESSAGE));
+        assert!(app.streaming_active, "sending it must start a real turn");
+    }
+
+    #[test]
+    fn ctrl_p_with_no_tasks_only_shows_the_toggle_notice() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+
+        let sent = app.toggle_plan_mode_and_maybe_approve();
+
+        assert_eq!(sent, None);
+        assert!(!app.plan_mode.active());
+        assert!(matches!(app.transcript.last(), Some(ChatLine::Notice(_))));
+    }
+
+    #[test]
+    fn ctrl_p_while_a_turn_is_already_running_does_not_auto_send() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.tasks = vec![Task {
+            id: 1,
+            text: "step one".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        app.streaming_active = true;
+
+        let sent = app.toggle_plan_mode_and_maybe_approve();
+
+        assert_eq!(sent, None);
+    }
+
+    #[test]
+    fn ctrl_p_turning_plan_mode_on_never_auto_sends_even_with_pending_tasks() {
+        let mut app = App::new(None, PlanMode::new());
+        app.tasks = vec![Task {
+            id: 1,
+            text: "step one".to_string(),
+            status: TaskStatus::Pending,
+        }];
+        assert!(!app.plan_mode.active());
+
+        let sent = app.toggle_plan_mode_and_maybe_approve();
+
+        assert_eq!(sent, None);
+        assert!(app.plan_mode.active());
     }
 
     #[test]
