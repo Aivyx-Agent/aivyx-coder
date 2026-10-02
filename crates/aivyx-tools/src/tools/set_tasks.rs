@@ -183,7 +183,7 @@ fn strip_leading_number(text: &str) -> String {
     else {
         return text.to_string();
     };
-    let after_ws = after_marker.trim_start_matches([' ', '\t']);
+    let after_ws = after_marker.trim_start_matches(char::is_whitespace);
     if after_ws.len() == after_marker.len() {
         // No whitespace followed the marker (e.g. "1.5x speed") — not a
         // numbering prefix, leave it alone.
@@ -397,6 +397,19 @@ mod tests {
         // Not an ordinal prefix (no "." / ")" + whitespace after the
         // digits) — left alone.
         assert_eq!(tasks[3].text, "2024 tax prep");
+    }
+
+    #[test]
+    fn strip_leading_number_treats_any_unicode_whitespace_as_the_separator() {
+        // Fix round 1 (Minor): the brief says `\s+`, not just ASCII space/
+        // tab -- a non-breaking space (U+00A0, which IS in Unicode's
+        // White_Space property) and a newline must both work as the
+        // separator after the marker.
+        assert_eq!(strip_leading_number("1.\u{a0}do the thing"), "do the thing");
+        assert_eq!(strip_leading_number("2.\ndo the thing"), "do the thing");
+        // Still untouched: no "." / ")" + whitespace after the digits.
+        assert_eq!(strip_leading_number("2024 roadmap"), "2024 roadmap");
+        assert_eq!(strip_leading_number("1.5x speedup"), "1.5x speedup");
     }
 
     #[test]
