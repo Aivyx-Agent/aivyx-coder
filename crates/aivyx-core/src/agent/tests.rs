@@ -3089,8 +3089,9 @@ impl LlmBackend for ScriptThenFailBackend {
     }
 }
 
-/// An undo agent over `llm`, keeping the mock handle out of the caller's way.
-async fn undo_agent_over(dir: &Path, llm: Arc<dyn LlmBackend>) -> Agent {
+/// An undo agent over `llm` (the caller keeps the mock handle), with its
+/// event receiver for reading notices.
+async fn undo_agent_over(dir: &Path, llm: Arc<dyn LlmBackend>) -> (Agent, UnboundedReceiver<AgentEvent>) {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(aivyx_tools::WriteFileTool));
     let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
@@ -3099,9 +3100,10 @@ async fn undo_agent_over(dir: &Path, llm: Arc<dyn LlmBackend>) -> Agent {
         vec![],
         Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
     );
-    let (tx, _rx) = unbounded_channel();
-    Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
-        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx)
+    let (tx, rx) = unbounded_channel();
+    let agent = Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    (agent, rx)
 }
 
 fn last_user_text(mock: &MockBackend) -> String {
@@ -3120,7 +3122,7 @@ async fn two_undos_both_reach_the_model_in_order() {
         write_call("c2", "b.txt", "b\n"), text_response("done"),
         text_response("ok"),
     ]));
-    let mut agent = undo_agent_over(&cwd, mock.clone()).await;
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock.clone()).await;
     agent.set_command_prompter(allow_prompter(2));
     agent.run_turn("make a".into(), &cwd, CancellationToken::new()).await.unwrap();
     agent.run_turn("make b".into(), &cwd, CancellationToken::new()).await.unwrap();
@@ -3153,7 +3155,7 @@ async fn pending_notes_survive_a_session_save_and_restore() {
         vec!["The user undid your changes from the last turn: a.txt.".to_string()]
     );
     let mock = Arc::new(MockBackend::new(vec![text_response("ok")]));
-    let mut agent2 = undo_agent_over(&cwd, mock.clone()).await;
+    let (mut agent2, _rx2) = undo_agent_over(&cwd, mock.clone()).await;
     agent2.restore(loaded);
     agent2.run_turn("what now?".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(
@@ -3181,7 +3183,7 @@ async fn undo_in_a_fresh_process_whose_first_turn_failed_leaves_the_stored_sessi
     let before = std::fs::read_to_string(&session_path).unwrap();
 
     let llm = Arc::new(ScriptThenFailBackend(Mutex::new(vec![write_call("c1", "a.txt", "a\n")].into())));
-    let mut agent = undo_agent_over(&cwd, llm).await;
+    let (mut agent, _rx) = undo_agent_over(&cwd, llm).await;
     agent.set_session_path(session_path.clone());
     agent.set_command_prompter(allow_prompter(1));
     assert!(agent.run_turn("write then fail".into(), &cwd, CancellationToken::new()).await.is_err());
@@ -3190,6 +3192,137 @@ async fn undo_in_a_fresh_process_whose_first_turn_failed_leaves_the_stored_sessi
     agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert!(!cwd.join("a.txt").exists(), "the undo itself happened");
     assert_eq!(std::fs::read_to_string(&session_path).unwrap(), before, "stored session untouched");
+}
+#[tokio::test]
+async fn undo_of_a_pruned_turn_says_too_old_and_keeps_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(1));
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.undo.marks[0].before_oid = "f".repeat(40);
+    let ledger_before = agent.undo_ledger().clone();
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let got = notices(&mut rx);
+    assert!(
+        got.contains(&"That turn is too old to undo (only the newest 50 checkpoints are kept).".to_string()),
+        "{got:?}"
+    );
+    assert_eq!(agent.undo_ledger(), &ledger_before);
+    assert!(cwd.join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn undo_undo_redo_redo_walks_the_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![
+        write_call("c1", "a.txt", "a\n"), text_response("done"),
+        write_call("c2", "b.txt", "b\n"), text_response("done"),
+    ]).await;
+    agent.set_command_prompter(allow_prompter(4));
+    agent.run_turn("make a".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("make b".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let state = |agent: &Agent| {
+        (
+            cwd.join("a.txt").exists(),
+            cwd.join("b.txt").exists(),
+            agent.undo_ledger().marks.len(),
+            agent.undo_ledger().redo.len(),
+        )
+    };
+    assert_eq!(state(&agent), (true, true, 2, 0));
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(state(&agent), (true, false, 1, 1));
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(state(&agent), (false, false, 0, 2));
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(state(&agent), (true, false, 1, 1));
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(state(&agent), (true, true, 2, 0));
+}
+
+#[tokio::test]
+async fn a_new_changing_turn_after_undo_clears_redo() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let llm = Arc::new(MockBackend::new(vec![
+        write_call("c1", "a.txt", "a\n"), text_response("done"),
+        write_call("c2", "b.txt", "b\n"), text_response("done"),
+    ]));
+    let (mut agent, mut rx) = undo_agent_over(&cwd, llm).await;
+    agent.set_command_prompter(allow_prompter(2));
+    agent.run_turn("make a".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.undo_ledger().redo.len(), 1);
+    agent.run_turn("make b".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(agent.undo_ledger().redo.is_empty());
+    let _ = notices(&mut rx);
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(notices(&mut rx).contains(&"Nothing to redo.".to_string()));
+    assert!(!cwd.join("a.txt").exists(), "the undone change stays undone");
+}
+
+#[tokio::test]
+async fn undo_works_after_resume_in_a_new_process() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let session_path = state_dir.path().join("session.json");
+    let mut agent = undo_agent(&cwd, vec![
+        write_call("c1", "tracked.txt", "v2\n"), write_call("c2", "a.txt", "a\n"), text_response("done"),
+    ]).await;
+    agent.set_session_path(session_path.clone());
+    agent.run_turn("change".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drop(agent);
+
+    let (mut agent2, _rx) = undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![]))).await;
+    agent2.restore(crate::session::load(&session_path).expect("saved"));
+    agent2.set_command_prompter(allow_prompter(1));
+    agent2.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "v1\n");
+    assert!(!cwd.join("a.txt").exists());
+    assert!(agent2.undo_ledger().marks.is_empty());
+    assert_eq!(agent2.undo_ledger().redo.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_restore_keeps_the_ledger() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(cwd.join("sub")).unwrap();
+    std::fs::write(cwd.join("sub/t.txt"), "v1\n").unwrap();
+    aivyx_tools::run_git(&cwd, &["add", "-A"], &[]).await.unwrap();
+    aivyx_tools::run_git(&cwd, &["commit", "-q", "-m", "sub"], &[]).await.unwrap();
+    let (mut agent, mut rx) = undo_agent_over(
+        &cwd,
+        Arc::new(MockBackend::new(vec![write_call("c1", "sub/t.txt", "v2\n"), text_response("done")])),
+    )
+    .await;
+    agent.set_command_prompter(allow_prompter(1));
+    agent.run_turn("edit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let ledger_before = agent.undo_ledger().clone();
+    // A read-only directory: git can't replace sub/t.txt, so the restore fails.
+    std::fs::set_permissions(cwd.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let writable_anyway = std::fs::write(cwd.join("sub/probe"), "").is_ok(); // e.g. running as root
+    if !writable_anyway {
+        agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    }
+    std::fs::set_permissions(cwd.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    if writable_anyway {
+        return;
+    }
+    let got = notices(&mut rx);
+    assert!(got.iter().any(|t| t.starts_with("Couldn't undo: ")), "{got:?}");
+    assert_eq!(agent.undo_ledger(), &ledger_before);
+    assert!(agent.pending_notes.is_empty());
 }
 
 // ----- /wiki (Phase 11b) -----
