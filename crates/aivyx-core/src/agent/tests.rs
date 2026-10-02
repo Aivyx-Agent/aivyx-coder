@@ -7125,3 +7125,310 @@ async fn diff_turn_with_a_pruned_snapshot_is_too_old() {
         vec!["That turn is too old to show (only the newest 50 checkpoints are kept).".to_string()]
     );
 }
+
+// ----- /commit -----
+
+/// A backend that fails the test if it's ever asked for anything.
+struct PanickingBackend;
+
+#[async_trait::async_trait]
+impl LlmBackend for PanickingBackend {
+    fn model_id(&self) -> &str {
+        "panicking"
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        panic!("the backend must not be called");
+    }
+}
+
+async fn git_text(cwd: &Path, args: &[&str]) -> String {
+    let out = tokio::process::Command::new("git").args(args).current_dir(cwd).output().await.unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+async fn commit_count(cwd: &Path) -> usize {
+    match tokio::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .unwrap()
+    {
+        out if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().parse().unwrap(),
+        _ => 0,
+    }
+}
+
+fn scripted(replies: Vec<UserResponse>) -> Arc<ScriptedPrompter> {
+    Arc::new(ScriptedPrompter { replies: Mutex::new(replies.into()), seen: Mutex::default() })
+}
+
+const DRAFT: &str = "Fix the average\n\nUse len.";
+
+async fn init_bare_git_repo(cwd: &Path) {
+    for argv in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.name", "test"],
+        vec!["config", "user.email", "test@test.invalid"],
+    ] {
+        git_in(cwd, &argv).await;
+    }
+}
+
+#[tokio::test]
+async fn commit_drafts_a_message_and_commits_everything_once_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, mut rx) = undo_agent_over(&cwd, mock.clone()).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(commit_count(&cwd).await, 2);
+    assert_eq!(git_text(&cwd, &["log", "-1", "--format=%B"]).await.trim(), DRAFT);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "", "worktree is clean");
+    let hash = git_text(&cwd, &["rev-parse", "--short", "HEAD"]).await;
+    assert_eq!(infos(&mut rx), vec![format!("Committed {}: Fix the average", hash.trim())]);
+
+    let seen = prompter.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let request = &seen[0];
+    assert_eq!(request.tool_name, "commit");
+    assert_eq!(request.action, ActionKind::Write);
+    assert_eq!(request.target, PermissionTarget::Other("commit".into()));
+    assert_eq!(request.arguments_preview, serde_json::json!({ "message": DRAFT }));
+    assert_eq!(
+        request.preview.as_deref(),
+        Some("Fix the average\n\nUse len.\n\nFiles:\n  new.txt\n  tracked.txt")
+    );
+
+    let received = mock.received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].messages[0].text_content(), crate::changes::COMMIT_DRAFT_PROMPT);
+    let user = received[0].messages[1].text_content();
+    assert!(user.starts_with("Files: new.txt, tracked.txt"), "{user}");
+    assert!(user.contains("+v2"), "{user}");
+    let route = received[0].route.as_ref().expect("routed");
+    assert_eq!(route.task, aivyx_route::TaskKind::Summarize);
+    assert!(agent.history.iter().all(|m| m.role != Role::User), "/commit is not a turn");
+}
+
+#[tokio::test]
+async fn commit_with_a_hand_staged_set_commits_only_that() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("a.txt"), "staged\n").unwrap();
+    git_in(&cwd, &["add", "a.txt"]).await;
+    std::fs::write(cwd.join("tracked.txt"), "unstaged edit\n").unwrap();
+    let (mut agent, _rx) =
+        undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
+    agent.set_command_prompter(scripted(vec![UserResponse::Allow]));
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(git_text(&cwd, &["show", "--name-only", "--format=", "HEAD"]).await.trim(), "a.txt");
+    assert_eq!(git_text(&cwd, &["diff", "--name-only"]).await.trim(), "tracked.txt");
+    assert_eq!(git_text(&cwd, &["diff", "--cached", "--name-only"]).await, "");
+}
+
+#[tokio::test]
+async fn commit_cancelled_leaves_the_index_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) =
+        undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT), text_response(DRAFT)]))).await;
+    agent.set_command_prompter(scripted(vec![UserResponse::Deny, UserResponse::Deny]));
+
+    // Nothing staged: everything /commit staged is unstaged again.
+    let status_before = git_text(&cwd, &["status", "--porcelain"]).await;
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, status_before);
+    assert_eq!(infos(&mut rx), vec!["Commit cancelled — nothing was committed.".to_string()]);
+
+    // A hand-staged file stays staged.
+    git_in(&cwd, &["add", "new.txt"]).await;
+    let cached_before = git_text(&cwd, &["diff", "--cached", "--name-only"]).await;
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["diff", "--cached", "--name-only"]).await, cached_before);
+    assert_eq!(cached_before.trim(), "new.txt");
+}
+
+#[tokio::test]
+async fn commit_with_a_message_skips_the_model_and_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    let prompter = scripted(vec![]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit -m \"Hand written\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(git_text(&cwd, &["log", "-1", "--format=%B"]).await.trim(), "Hand written");
+    assert!(prompter.seen.lock().unwrap().is_empty(), "no prompt");
+    let hash = git_text(&cwd, &["rev-parse", "--short", "HEAD"]).await;
+    assert_eq!(infos(&mut rx), vec![format!("Committed {}: Hand written", hash.trim())]);
+}
+
+#[tokio::test]
+async fn commit_rejected_by_a_hook_reports_it_and_restores_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let hook = cwd.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho nope >&2\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let status_before = git_text(&cwd, &["status", "--porcelain"]).await;
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+
+    agent.run_turn("/commit -m \"Blocked\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let notes = notices(&mut rx);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("The commit hook rejected it:\n"), "{notes:?}");
+    assert!(notes[0].contains("nope"), "{notes:?}");
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, status_before);
+}
+
+#[tokio::test]
+async fn commit_with_nothing_to_commit_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Info(t) if t == "Nothing to commit.")),
+        "{events:?}"
+    );
+    assert_eq!(commit_count(&cwd).await, 1);
+}
+
+#[tokio::test]
+async fn commit_when_the_draft_fails_restores_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let status_before = git_text(&cwd, &["status", "--porcelain"]).await;
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(FailingBackend)).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let notes = notices(&mut rx);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("Couldn't draft a message ("), "{notes:?}");
+    assert!(notes[0].ends_with(") — commit with /commit -m \"…\"."), "{notes:?}");
+    assert!(prompter.seen.lock().unwrap().is_empty());
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, status_before);
+}
+
+#[tokio::test]
+async fn commit_with_an_empty_draft_restores_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(
+        &cwd,
+        Arc::new(MockBackend::new(vec![text_response("<think>hmm</think>  \n")])),
+    )
+    .await;
+    agent.set_command_prompter(scripted(vec![UserResponse::Allow]));
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let notes = notices(&mut rx);
+    assert!(notes.len() == 1 && notes[0].starts_with("Couldn't draft a message ("), "{notes:?}");
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
+}
+
+#[tokio::test]
+async fn commit_works_in_a_repository_with_no_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    init_bare_git_repo(&cwd).await;
+    std::fs::write(cwd.join("one.txt"), "1\n").unwrap();
+    let (mut agent, _rx) =
+        undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
+    agent.set_command_prompter(scripted(vec![UserResponse::Deny]));
+
+    // Cancel first: with no HEAD the staged files are removed from the
+    // index again rather than reset.
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, 0);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? one.txt\n");
+
+    agent.run_turn("/commit -m \"First\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["log", "-1", "--format=%s"]).await.trim(), "First");
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "");
+}
+
+#[tokio::test]
+async fn commit_from_a_subdirectory_commits_the_whole_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/inner.txt"), "inner\n").unwrap();
+    std::fs::write(root.join("tracked.txt"), "outside the subdirectory\n").unwrap();
+    std::fs::write(root.join("ünïcode.txt"), "u\n").unwrap();
+    let sub = root.join("sub");
+    let (mut agent, _rx) =
+        undo_agent_over(&sub, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &sub, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(git_text(&root, &["status", "--porcelain"]).await, "", "everything committed");
+    let files = git_text(&root, &["-c", "core.quotePath=false", "show", "--name-only", "--format=", "HEAD"]).await;
+    assert_eq!(files, "sub/inner.txt\ntracked.txt\nünïcode.txt\n");
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(preview.ends_with("Files:\n  sub/inner.txt\n  tracked.txt\n  ünïcode.txt"), "{preview}");
+}
+
+#[tokio::test]
+async fn commit_outside_a_repository_or_without_a_prompter() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["Not a git repository.".to_string()]);
+
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["/commit isn't available here.".to_string()]);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
+}
