@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 aivyx-route = { workspace = true }
-aivyx-types = { version = "0.3.2", path = "../aivyx-types" }
+aivyx-types = { version = "0.3.3", path = "../aivyx-types" }
 async-trait = "0.1.89"
 eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
