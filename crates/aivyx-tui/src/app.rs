@@ -108,6 +108,15 @@ fn cancelled_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: cancelled by user after {iterations_used} iteration(s)")
 }
 
+/// U3: the exact marker appended to the transcript when an interactive
+/// (non-autonomous) streaming turn is cancelled mid-stream (Ctrl+C) -- a
+/// partial assistant answer otherwise looks identical to a complete one.
+/// Routed through `agent.notify()` (`AgentEvent::Error`, the one existing
+/// background-task → transcript bridge) and recognized by exact text in
+/// `handle_agent_event`, which renders it via `ChatLine::Cancelled` (dim)
+/// instead of the red/bold `ChatLine::Notice` a real error gets.
+const CANCELLED_TURN_MARKER: &str = "— stopped (Ctrl+C)";
+
 fn goal_achieved_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
 }
@@ -152,6 +161,10 @@ enum ChatLine {
     /// errors and warnings, which made `/help` read as if something had
     /// gone wrong. Rendered as a plain, unprefixed, unstyled block.
     Help(String),
+    /// A streaming turn was cancelled mid-stream (U3, Ctrl+C) — rendered
+    /// dim, not red/bold like `Notice`: nothing failed, the user just
+    /// chose to stop.
+    Cancelled(String),
     /// A turn paused on the iteration cap while still working — deliberately
     /// styled distinctly from `Notice` (which today also carries real
     /// errors and is red/bold): nothing failed, the session is resumable by
@@ -361,8 +374,14 @@ pub async fn run(
                 }
                 let cancellation = CancellationToken::new();
                 *background_cancellation.lock().unwrap() = Some(cancellation.clone());
-                let _ = agent.run_turn(input, &cwd, cancellation).await;
+                let _ = agent.run_turn(input, &cwd, cancellation.clone()).await;
                 *background_cancellation.lock().unwrap() = None;
+
+                // U3: Ctrl+C mid-stream must not leave a partial answer
+                // looking like a complete one.
+                if cancellation.is_cancelled() {
+                    agent.notify(CANCELLED_TURN_MARKER);
+                }
 
                 // Peek — never take() — the shared taint flag after every
                 // interactive turn too, not just autonomous mode's gate and
@@ -657,6 +676,10 @@ impl App {
                     .push(ChatLine::ToolResult(tool_output_text(&result.output)));
             }
             AgentEvent::TurnComplete => self.streaming_active = false,
+            AgentEvent::Error(message) if message == CANCELLED_TURN_MARKER => {
+                self.transcript.push(ChatLine::Cancelled(message));
+                self.streaming_active = false;
+            }
             AgentEvent::Error(message) => {
                 self.transcript.push(ChatLine::Notice(message));
                 self.streaming_active = false;
@@ -1344,6 +1367,9 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ),
         // Plain block, no prefix — see the variant's own doc comment.
         ChatLine::Help(text) => prefixed_lines(text, "", Style::default()),
+        ChatLine::Cancelled(text) => {
+            prefixed_lines(text, "  ", Style::default().fg(Color::DarkGray))
+        }
         // Deliberately not red/bold like Notice — a paused turn hasn't
         // failed, and shouldn't read like it has.
         ChatLine::Paused(text) => {
@@ -2158,6 +2184,45 @@ mod tests {
         let message = cancelled_notice(2);
         assert!(message.contains("cancelled by user"));
         assert!(message.contains('2'));
+    }
+
+    #[test]
+    fn a_cancelled_turn_marker_renders_as_a_dim_cancelled_line_not_a_notice() {
+        // U3: the interactive background task reports a mid-stream Ctrl+C
+        // via `agent.notify(CANCELLED_TURN_MARKER)` -- same bridge as any
+        // other notice -- but it must render distinctly, not as a red/bold
+        // error.
+        let mut app = App::new(None, PlanMode::new());
+        app.streaming_active = true;
+        app.transcript.push(ChatLine::Assistant("partial ans".to_string()));
+
+        app.handle_agent_event(AgentEvent::Error(CANCELLED_TURN_MARKER.to_string()));
+
+        assert!(!app.streaming_active);
+        assert!(matches!(app.transcript.last(), Some(ChatLine::Cancelled(_))));
+        let Some(ChatLine::Cancelled(text)) = app.transcript.last() else {
+            unreachable!()
+        };
+        assert_eq!(text, CANCELLED_TURN_MARKER);
+    }
+
+    #[test]
+    fn a_real_error_still_renders_as_a_notice() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::Error("backend timed out".to_string()));
+        assert!(matches!(app.transcript.last(), Some(ChatLine::Notice(_))));
+    }
+
+    #[test]
+    fn cancelled_chat_line_has_no_notice_prefix() {
+        let lines = chat_line_to_lines(&ChatLine::Cancelled(CANCELLED_TURN_MARKER.to_string()));
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("stopped"));
+        assert!(!rendered.contains('!'));
     }
 
     #[test]
