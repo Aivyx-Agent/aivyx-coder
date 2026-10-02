@@ -114,7 +114,7 @@ pub fn parse_name_status(from_to_name_status: &str) -> Vec<(String, ChangeKind)>
                     out.push((p.to_string(), ChangeKind::Restored));
                 }
             }
-            Some('R') | Some('C') => {
+            Some('R') => {
                 if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
                     out.push((old.to_string(), ChangeKind::Restored));
                     out.push((new.to_string(), ChangeKind::Removed));
@@ -244,6 +244,14 @@ mod tests {
                 ("new.rs".to_string(), ChangeKind::Removed),
             ]
         );
+    }
+
+    #[test]
+    fn name_status_skips_copy_status_as_unknown() {
+        // A copy's source exists in both trees, so treating it like a
+        // rename would wrongly claim it "will come back".
+        let out = "C100\told\tnew";
+        assert_eq!(parse_name_status(out), vec![]);
     }
 
     #[test]
