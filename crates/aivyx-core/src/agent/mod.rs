@@ -23,6 +23,7 @@ use crate::edit_blocks::{self, BlockParse};
 use crate::editor_context;
 use crate::session::{self, SessionState, Task};
 use crate::specialist_sessions::SpecialistSessionPool;
+use crate::undo::TurnMark;
 
 #[cfg(test)]
 mod tests;
@@ -359,6 +360,20 @@ pub struct Agent {
     /// in flight, or once it's resolved (pass or rewind). Interactive mode
     /// never reads this field. See ROADMAP.md Phase 11c.
     pre_experiment_ref: Option<String>,
+    /// The `/undo` model: which turns changed files, and where to rewind
+    /// each one to. Persisted with the session (see `persist`/`restore`);
+    /// reset by `clear_conversation`.
+    undo: crate::undo::UndoLedger,
+    /// Set `false` at the start of every `run_turn_inner` call; flipped to
+    /// `true` the first time this turn's tool-dispatch loop records a mark
+    /// (see the batch-checkpoint block) so later mutating calls in the same
+    /// turn don't record a second mark. Consulted by `run_turn` after the
+    /// turn finishes to decide whether to take the "after" snapshot.
+    turn_mark_recorded: bool,
+    /// This turn's user text, already run through `undo::text_preview` —
+    /// cached at the start of `run_turn_inner` so the mark recorded
+    /// mid-loop doesn't need to re-derive it.
+    current_user_text: String,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -437,8 +452,18 @@ impl Agent {
             last_scoped_verification_output: None,
             verification_touched_paths: Vec::new(),
             pre_experiment_ref: None,
+            undo: crate::undo::UndoLedger::default(),
+            turn_mark_recorded: false,
+            current_user_text: String::new(),
             events_tx,
         }
+    }
+
+    /// The `/undo` ledger — which turns changed files, and where to rewind
+    /// each one to. Test accessor; the real `/undo`/`/redo` commands (a
+    /// later task) will read and mutate this through dedicated methods.
+    pub fn undo_ledger(&self) -> &crate::undo::UndoLedger {
+        &self.undo
     }
 
     /// Whether the most recent `run_turn` call paused (Phase 12A's
@@ -504,6 +529,7 @@ impl Agent {
             router.forget_session(&self.route_session);
         }
         self.last_routed = None;
+        self.undo.clear();
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
         self.session_owns_slot = true;
@@ -1025,6 +1051,7 @@ impl Agent {
         if state.plan_mode_active {
             self.plan_mode.set_active(true);
         }
+        self.undo = state.undo;
     }
 
     /// A clone of the current conversation history. Used to persist a
@@ -1059,12 +1086,13 @@ impl Agent {
             .as_ref()
             .map(SpecialistSessionPool::snapshot_for_persistence)
             .unwrap_or_default();
-        let state = SessionState::new(
+        let mut state = SessionState::new(
             self.history.clone(),
             tasks,
             self.plan_mode.active(),
             specialist_sessions,
         );
+        state.undo = self.undo.clone();
         if let Err(err) = session::save(path, &state) {
             tracing::warn!(error = %err, "failed to persist session");
         }
@@ -1481,6 +1509,10 @@ impl Agent {
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }
+        // Cloned up front: every branch below consumes `cancellation` by
+        // value, but the turn-end `/undo` snapshot after the match still
+        // needs one — `CancellationToken` is a cheap `Arc`-backed clone.
+        let cancellation_for_undo = cancellation.clone();
         // Commands are intercepted here, before the input can enter LLM
         // history — the raw `/council …` text is an instruction to aivyx,
         // not part of the conversation the model should see.
@@ -1500,6 +1532,23 @@ impl Agent {
                 },
             },
         };
+        // Turn-end `/undo` snapshot: only the plain tool-dispatch path
+        // (`run_turn_inner`) ever sets `turn_mark_recorded`, and it's
+        // cleared here right after being consumed, so this is a no-op for
+        // every other kind of turn (/council, /wiki, /architect) and for a
+        // turn that made no changes.
+        if self.turn_mark_recorded {
+            if let Some(r) = self
+                .executor
+                .checkpoint_now("turn-end", &cancellation_for_undo)
+                .await
+                && let Some(after_cwd) = self.executor.checkpoint_cwd().map(Path::to_path_buf)
+                && let Some(oid) = resolve_oid(&after_cwd, &r).await
+            {
+                self.undo.set_last_after(oid);
+            }
+            self.turn_mark_recorded = false;
+        }
         if result.is_ok() || self.session_owns_slot {
             self.persist();
             self.session_owns_slot = true;
@@ -1808,6 +1857,11 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
+        // Per-turn `/undo` state: reset so a mark from an earlier turn
+        // can't bleed into this one, and cache the preview text the mark
+        // (if any) will carry.
+        self.turn_mark_recorded = false;
+        self.current_user_text = crate::undo::text_preview(&user_input);
         self.history.push(Message::text(Role::User, user_input));
         // Once per turn, not per iteration: within a turn the map rarely
         // changes materially, and re-walking on every tool round-trip would
@@ -2261,6 +2315,9 @@ impl Agent {
                 };
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
+                // Captured before the move below — needed by the
+                // `/undo` mark-recording check once `result` is known.
+                let call_name = call.name.clone();
                 let mut result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
@@ -2295,6 +2352,32 @@ impl Agent {
                 let ref_after_this_call = self.executor.latest_checkpoint_ref(&cancellation).await;
                 let minted_new_checkpoint = ref_after_this_call != last_checkpoint_ref;
                 last_checkpoint_ref = ref_after_this_call.clone();
+
+                // `/undo` mark recording: one mark per turn, taken the
+                // first time a successful call this turn needed a
+                // checkpoint. Deliberately NOT gated on
+                // `minted_new_checkpoint` — a checkpoint deduplicated
+                // against an earlier identical tree is still the correct
+                // "before" state to rewind to.
+                if matches!(result.output, ToolOutput::Ok(_))
+                    && !self.turn_mark_recorded
+                    && self.executor.needs_checkpoint(&call_name)
+                    && let (Some(r), Some(mark_cwd)) = (
+                        ref_after_this_call.clone(),
+                        self.executor.checkpoint_cwd().map(Path::to_path_buf),
+                    )
+                    && let Some(oid) = resolve_oid(&mark_cwd, &r).await
+                {
+                    self.undo.record(TurnMark {
+                        user_text_preview: self.current_user_text.clone(),
+                        before_ref: r,
+                        before_oid: oid,
+                        after_oid: None,
+                        created_unix: now_unix(),
+                    });
+                    self.turn_mark_recorded = true;
+                }
+
                 if matches!(result.output, ToolOutput::Ok(_)) && minted_new_checkpoint {
                     if batch_start_ref.is_none() {
                         batch_start_ref = ref_after_this_call;
@@ -2533,6 +2616,26 @@ fn elide(text: &str, cap: usize) -> String {
 /// without this, a flagged `web_fetch` finding's source would read as the
 /// bare string `"web_fetch"` with no indication of which URL it came from.
 /// Anything else falls back to just the tool's name.
+/// Resolves a checkpoint ref (or any git ref) to the commit oid it names,
+/// or `None` if the ref doesn't resolve to a commit (gone, or never a
+/// commit in the first place). Used by the `/undo` mark-recording path so
+/// a `TurnMark`'s `before_ref`/`after_oid` survive a ref being pruned or
+/// moved later — the oid is a stable snapshot, the ref name is not.
+pub(crate) async fn resolve_oid(cwd: &Path, git_ref: &str) -> Option<String> {
+    aivyx_tools::run_git(cwd, &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")], &[])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn describe_tool_call_target(call: &ToolCall) -> String {
     if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
         return format!("{path} ({})", call.name);

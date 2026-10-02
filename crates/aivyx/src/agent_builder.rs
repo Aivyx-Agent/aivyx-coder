@@ -963,7 +963,7 @@ pub(crate) async fn build_agent(
 
     let mut executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::clone(&confiner));
     if let Some(cp) = &checkpointer {
-        executor.set_checkpointer(Arc::clone(cp));
+        executor.set_checkpointer_at(cwd.clone(), Arc::clone(cp));
     }
     let system_prompt = build_system_prompt(&executor, edit_format);
 

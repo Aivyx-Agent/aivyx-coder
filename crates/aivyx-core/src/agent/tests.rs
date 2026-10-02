@@ -2577,6 +2577,140 @@ async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
     );
 }
 
+// ----- /undo (Task 2): recording a mark per changing turn -----
+
+/// Builds an agent over a real git repo at `dir`, wired so `write_file`
+/// calls checkpoint (`needs_checkpoint()` defaults to
+/// `mutates_outside_session()`, true for `write_file`) and `checkpoint_cwd`
+/// resolves — the `/undo` mark-recording path requires both.
+async fn undo_agent(dir: &Path, responses: Vec<Vec<StreamEvent>>) -> Agent {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(responses));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        Arc::new(
+            aivyx_tools::GitCheckpointer::detect(dir, vec![])
+                .await
+                .unwrap(),
+        ),
+    );
+    let (tx, _rx) = unbounded_channel();
+    Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    )
+}
+
+#[tokio::test]
+async fn a_turn_that_writes_records_one_mark_with_before_and_after() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(
+        &cwd,
+        vec![
+            write_call("c1", "a.txt", "one\n"),
+            write_call("c2", "b.txt", "two\n"),
+            text_response("done"),
+        ],
+    )
+    .await;
+    agent
+        .run_turn("make two files".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let ledger = agent.undo_ledger();
+    assert_eq!(ledger.marks.len(), 1, "one mark per turn, not per call");
+    let m = &ledger.marks[0];
+    assert_eq!(m.user_text_preview, "make two files");
+    let before_files = aivyx_tools::run_git(&cwd, &["ls-tree", "--name-only", &m.before_oid], &[])
+        .await
+        .unwrap();
+    assert!(
+        !before_files.contains("a.txt"),
+        "before point predates the first write"
+    );
+    let after = m.after_oid.as_ref().expect("after snapshot taken at turn end");
+    let after_files = aivyx_tools::run_git(&cwd, &["ls-tree", "--name-only", after], &[])
+        .await
+        .unwrap();
+    assert!(after_files.contains("a.txt") && after_files.contains("b.txt"));
+}
+
+#[tokio::test]
+async fn a_turn_with_no_changes_records_nothing_and_clear_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(
+        &cwd,
+        vec![
+            text_response("hi"),
+            write_call("c1", "a.txt", "x\n"),
+            text_response("ok"),
+        ],
+    )
+    .await;
+    agent
+        .run_turn("hello".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(agent.undo_ledger().marks.is_empty());
+    agent
+        .run_turn("write".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(agent.undo_ledger().marks.len(), 1);
+    agent.clear_conversation();
+    assert!(agent.undo_ledger().marks.is_empty());
+}
+
+#[tokio::test]
+async fn undo_ledger_survives_a_session_save_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let session_path = dir.path().join("session.json");
+
+    let mut agent = undo_agent(&cwd, vec![write_call("c1", "a.txt", "one\n"), text_response("done")])
+        .await;
+    agent.set_session_path(session_path.clone());
+    agent
+        .run_turn("make a file".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(agent.undo_ledger().marks.len(), 1);
+
+    let (tx2, _rx2) = unbounded_channel();
+    let executor2 = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    let mut agent2 = Agent::new(
+        Arc::new(MockBackend::new(vec![])) as Arc<dyn LlmBackend>,
+        executor2,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx2,
+    );
+    let loaded = crate::session::load(&session_path).expect("session should have been saved");
+    agent2.restore(loaded);
+
+    assert_eq!(agent2.undo_ledger(), agent.undo_ledger());
+}
+
 // ----- /wiki (Phase 11b) -----
 
 fn stale(name: &str, covers: &[&str]) -> aivyx_tools::wiki::StalePage {

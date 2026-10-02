@@ -67,6 +67,13 @@ pub struct SessionState {
     /// unused.
     #[serde(default)]
     pub specialist_sessions: Vec<PersistedSpecialistSession>,
+    /// The `/undo` ledger: which turns changed files, and where to rewind
+    /// each one to. `#[serde(default)]` so a session file written before
+    /// this field existed still loads — as an empty ledger, the only state
+    /// possible then (there's nothing to backfill: earlier checkpoint refs
+    /// may already be pruned by the time this field shipped).
+    #[serde(default)]
+    pub undo: crate::undo::UndoLedger,
 }
 
 impl SessionState {
@@ -82,6 +89,7 @@ impl SessionState {
             tasks,
             plan_mode_active,
             specialist_sessions,
+            undo: crate::undo::UndoLedger::default(),
         }
     }
 }

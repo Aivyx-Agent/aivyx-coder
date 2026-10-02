@@ -26,7 +26,7 @@ mod tools;
 pub mod web;
 pub mod wiki;
 
-pub use aivyx_checkpoint::GitCheckpointer;
+pub use aivyx_checkpoint::{GitCheckpointer, run_git};
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use path_resolve::resolve;
@@ -201,6 +201,13 @@ pub struct ToolExecutor {
     /// call (see `checkpoint.rs`). `None` = disabled (config, or not a
     /// git repository).
     checkpointer: Option<Arc<GitCheckpointer>>,
+    /// The directory `checkpointer` snapshots, when known. Set only by
+    /// `set_checkpointer_at` — plain `set_checkpointer` (used by delegated
+    /// sub-executors that clone the parent's checkpointer but don't need
+    /// `/undo` tracking of their own) leaves this `None`. `Agent` uses this
+    /// to resolve a checkpoint ref to a commit oid for the undo ledger; see
+    /// `checkpoint_cwd`.
+    checkpoint_cwd: Option<PathBuf>,
 }
 
 impl ToolExecutor {
@@ -214,11 +221,48 @@ impl ToolExecutor {
             gate,
             confiner,
             checkpointer: None,
+            checkpoint_cwd: None,
         }
     }
 
     pub fn set_checkpointer(&mut self, checkpointer: Arc<GitCheckpointer>) {
         self.checkpointer = Some(checkpointer);
+    }
+
+    /// Like `set_checkpointer`, but also remembers `cwd` so `checkpoint_cwd`
+    /// and therefore the `/undo` mark-recording path (`agent/mod.rs`) can
+    /// resolve checkpoint refs to commit oids. Use this for the top-level
+    /// agent's own executor; delegated sub-executors that only need
+    /// checkpoint/restore (not undo tracking) can keep using
+    /// `set_checkpointer`.
+    pub fn set_checkpointer_at(&mut self, cwd: PathBuf, checkpointer: Arc<GitCheckpointer>) {
+        self.checkpoint_cwd = Some(cwd);
+        self.checkpointer = Some(checkpointer);
+    }
+
+    /// The directory the checkpointer snapshots, if `set_checkpointer_at`
+    /// was used to configure it.
+    pub fn checkpoint_cwd(&self) -> Option<&Path> {
+        self.checkpoint_cwd.as_deref()
+    }
+
+    /// Snapshot the worktree now (e.g. before `/undo`, so `/redo` can
+    /// return to it) and return the newest checkpoint ref — which, when the
+    /// tree is unchanged since the last checkpoint (deduplicated), is that
+    /// one.
+    pub async fn checkpoint_now(&self, label: &str, cancellation: &CancellationToken) -> Option<String> {
+        let checkpointer = self.checkpointer.as_ref()?;
+        checkpointer.checkpoint(label, cancellation).await;
+        checkpointer.latest_ref(cancellation).await
+    }
+
+    /// Whether a call to `tool_name` should be preceded by a checkpoint —
+    /// `false` for an unknown/unregistered name, mirroring `dispatch`'s own
+    /// tool lookup.
+    pub fn needs_checkpoint(&self, tool_name: &str) -> bool {
+        self.registry
+            .get(tool_name)
+            .is_some_and(|t| t.needs_checkpoint())
     }
 
     /// The most recent checkpoint ref, or `None` if no checkpointer is
@@ -1019,6 +1063,47 @@ mod tests {
             std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
             "v2\n"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_snapshots_the_current_worktree() {
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        let cwd = dir.path().canonicalize().unwrap();
+        executor.set_checkpointer_at(
+            cwd.clone(),
+            Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()),
+        );
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        let r = executor
+            .checkpoint_now("undo", &CancellationToken::new())
+            .await
+            .unwrap();
+        let shown = run_git(&cwd, &["show", &format!("{r}:tracked.txt")], &[]).await.unwrap();
+        assert_eq!(shown, "changed\n");
+        assert_eq!(executor.checkpoint_cwd(), Some(cwd.as_path()));
+    }
+
+    #[tokio::test]
+    async fn plain_set_checkpointer_leaves_checkpoint_cwd_unset() {
+        // `set_checkpointer` (no `_at`) is what delegated sub-executors use
+        // to share the parent's checkpointer without needing `/undo`
+        // tracking of their own — `checkpoint_cwd` must stay `None` so
+        // `Agent`'s mark-recording path (which requires it) stays a no-op
+        // for them.
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        executor.set_checkpointer(Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+        assert_eq!(executor.checkpoint_cwd(), None);
     }
 
     #[test]
