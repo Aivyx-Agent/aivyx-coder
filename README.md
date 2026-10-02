@@ -175,6 +175,17 @@ change itself. The rollback notice is folded directly into the failing
 call's own error text, so the model sees exactly what happened and what
 was undone in the same turn.
 
+**Reviewing and committing**: after every turn that changed files, a dim line
+shows what changed (`Changed: stats.py (+3 −1) · test_stats.py (+12, new)`).
+**`/diff`** opens everything uncommitted in a scrollable view (↑↓, PgUp/PgDn,
+Home/End, Esc); **`/diff turn`** shows just the last turn's changes.
+**`/commit`** commits what you've staged — or, if nothing is staged, every
+uncommitted change (`.gitignore` respected) — with a message the model drafts
+from the diff: approve it, press **e** to edit it, or cancel (your staging is
+left exactly as it was). `/commit -m "message"` commits with your own message
+straight away. Commits use your git identity and run your hooks.
+`/commit` never stages files on your deny list, and if you stage one yourself it's committed but its contents are never sent to the model. If aivyx-coder is sandboxed and was started in a subfolder of the repository, `/commit` can't write the repository's `.git` and says so — start it at the repository root, or commit with git.
+
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx-coder --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
 task list (the task panel becomes the reviewable plan), but tools that touch
