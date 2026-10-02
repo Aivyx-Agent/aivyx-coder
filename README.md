@@ -143,14 +143,25 @@ the agent snapshots the entire worktree to `refs/aivyx/checkpoints/<ts>`
 *before every mutating tool call* (file writes, edits, and any
 `run_command`/`run_shell` execution) — via plumbing that never touches your
 HEAD, index, or worktree, respecting `.gitignore`, deduplicating identical
-states, and keeping the newest 50. To inspect or rewind:
+states, and keeping the newest 50. It also snapshots the worktree when each
+of your messages arrives and when the reply finishes, so every turn that
+changed files can be taken back as a whole.
+
+To take back what the assistant just did, type **`/undo`**: it shows which
+files will change (flagging any you edited after that turn), asks first, and
+rewinds the whole turn — every edit, command effect, and edit made by a
+delegated sub-agent. `/undo` again goes back another turn; **`/redo`** puts
+back what the last `/undo` removed; **`/checkpoints`** lists the turns you
+can take back. The model is told about an undo in your next message. Only
+the newest 50 checkpoints are kept, git-ignored files are never touched, and
+the commands are unavailable in MCP-server sessions (no one to confirm).
+
+The same checkpoints are plain git refs, if you prefer git:
 
 ```
 git for-each-ref refs/aivyx/checkpoints/          # list checkpoints
-git log --oneline <ref>                           # see one in context
 git diff <ref>                                    # what changed since it
 git checkout <ref> -- <path>                      # restore one file
-git checkout <ref> -- .                           # restore everything
 ```
 
 Disable with `[git] checkpoints = false`. Checkpoints use a synthetic

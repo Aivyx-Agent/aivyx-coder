@@ -1213,10 +1213,6 @@ fn help_text() -> String {
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
-    lines.push(String::new());
-    lines.push(
-        "Undo: every edit is checkpointed — see README \"Worktree checkpoints\"".to_string(),
-    );
     lines.join("\n")
 }
 
@@ -2774,7 +2770,7 @@ mod tests {
     }
 
     #[test]
-    fn help_text_lists_real_keybindings_and_the_undo_pointer() {
+    fn help_text_lists_real_keybindings_and_the_undo_commands() {
         let text = help_text();
         assert!(text.contains("Keys:"));
         assert!(text.contains("Enter") && text.contains("send"));
@@ -2784,7 +2780,9 @@ mod tests {
         // No scrolling keybinding exists in the input loop -- must not be
         // claimed.
         assert!(!text.to_lowercase().contains("scroll"));
-        assert!(text.contains("Undo") && text.contains("Worktree checkpoints"));
+        // Undo is an in-app command now, not a pointer to the README.
+        assert!(text.contains("/undo") && text.contains("/redo") && text.contains("/checkpoints"));
+        assert!(!text.contains("Worktree checkpoints"));
     }
 
     #[test]
