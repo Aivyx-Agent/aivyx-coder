@@ -169,8 +169,17 @@ agent read-only while you scope out work: it can read, search, and build a
 task list (the task panel becomes the reviewable plan), but tools that touch
 files or run commands are withheld from the model entirely — and the
 permission gate independently denies them even if the model invents a call.
-Press `Ctrl+P` again to approve the plan and switch back to Act mode; a
-magenta `PLAN` badge in the status line shows the current stance. See
+`set_tasks` itself enforces the same read-only rule: every task must stay
+`pending` while plan mode is on, so the model can't claim a step is
+`in_progress`/`done` (i.e. report work as completed) when nothing could
+actually have been done yet; a completed turn also gets a one-line reminder
+("Plan mode — nothing was changed...") in the TUI so a plan-mode reply never
+reads like a real one. Press `Ctrl+P` again to approve the plan and switch
+back to Act mode; a magenta `PLAN` badge in the status line shows the
+current stance. If the plan left behind a pending task list and no turn is
+running, that same `Ctrl+P` also sends "The plan is approved. Carry it out
+now, task by task." as a normal message, so approving starts execution
+immediately instead of requiring a second, manually-typed prompt. See
 "Security model" for why this is an enforced boundary, not a suggestion.
 
 **Enforced verification** (`[verification] command`, off by default): once
@@ -1582,7 +1591,7 @@ below for exact forms):
 | `/architect` | needs the model | Has the configured architect model produce a plan for `/architect <task>`, then hands it to the primary model to execute. |
 | `/models`, `/model` | agent state, no model call | Model routing: list candidates, refresh, explain the last choice, pin or unpin a model. See "Model routing" above. |
 | `/clear` | agent state, no model call | Starts a fresh conversation — clears history and the task list, keeps plan mode as-is. |
-| `/help` | frontend only | Lists all of the above. |
+| `/help` | frontend only | Lists all of the above, plus the real keybindings (Enter, Ctrl+C, Ctrl+P, y/a/n) and a pointer to worktree checkpoints as the way to undo an edit. |
 | `/quit` | frontend only | Exits `aivyx-coder` (same as Ctrl+C). |
 
 While composing a command (input starts with `/`, no space yet), the TUI
