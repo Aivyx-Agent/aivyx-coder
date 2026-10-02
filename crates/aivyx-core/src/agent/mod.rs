@@ -28,6 +28,7 @@ use crate::undo::TurnMark;
 #[cfg(test)]
 mod tests;
 mod types;
+mod undo_commands;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
 use types::{AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig};
@@ -364,6 +365,16 @@ pub struct Agent {
     /// each one to. Persisted with the session (see `persist`/`restore`);
     /// reset by `clear_conversation`.
     undo: crate::undo::UndoLedger,
+    /// Asks the user to confirm `/undo` / `/redo`. Deliberately not the
+    /// tool gate: plan mode must not block an undo, and the answer must
+    /// never be cached. `None` (e.g. MCP sessions, which have no human)
+    /// makes those commands unavailable.
+    command_prompter: Option<Arc<dyn aivyx_sandbox::PermissionPrompter>>,
+    /// A note for the model about something the user did between turns
+    /// (an `/undo`), prefixed to the next user message — never sent as a
+    /// message of its own, so chat templates that require alternating
+    /// roles still work.
+    pending_note: Option<String>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -443,6 +454,8 @@ impl Agent {
             verification_touched_paths: Vec::new(),
             pre_experiment_ref: None,
             undo: crate::undo::UndoLedger::default(),
+            command_prompter: None,
+            pending_note: None,
             events_tx,
         }
     }
@@ -532,6 +545,7 @@ impl Agent {
         }
         self.last_routed = None;
         self.undo.clear();
+        self.pending_note = None;
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
         self.session_owns_slot = true;
@@ -1038,6 +1052,11 @@ impl Agent {
 
     /// Enables session persistence: after each turn the full session is
     /// written to `path` (best-effort).
+    /// See the `command_prompter` field.
+    pub fn set_command_prompter(&mut self, prompter: Arc<dyn aivyx_sandbox::PermissionPrompter>) {
+        self.command_prompter = Some(prompter);
+    }
+
     pub fn set_session_path(&mut self, path: PathBuf) {
         self.session_path = Some(path);
     }
@@ -1518,6 +1537,14 @@ impl Agent {
         // and /architect running several inner turns, delegated sub-agents
         // writing through their own executors, commands — and a cancelled
         // turn: both snapshots use a fresh token, never the turn's own.
+        // `/undo`, `/redo`, `/checkpoints` act on files and the ledger
+        // directly — they never reach the model and are never a turn of
+        // their own (so they're intercepted before the snapshot below).
+        if let Some(command) = undo_commands::parse(&user_input) {
+            self.run_undo_command(command).await;
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
         let turn_before = self.undo_snapshot("turn-start").await;
         let turn_preview = crate::undo::text_preview(&user_input);
         // Commands are intercepted here, before the input can enter LLM
@@ -1860,6 +1887,10 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
+        let user_input = match self.pending_note.take() {
+            Some(note) => format!("({note})\n\n{user_input}"),
+            None => user_input,
+        };
         self.history.push(Message::text(Role::User, user_input));
         // Once per turn, not per iteration: within a turn the map rarely
         // changes materially, and re-walking on every tool round-trip would

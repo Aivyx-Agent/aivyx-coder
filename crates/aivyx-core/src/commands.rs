@@ -61,6 +61,21 @@ pub const COMMANDS: &[CommandInfo] = &[
         tier: CommandTier::AgentState,
     },
     CommandInfo {
+        name: "/undo",
+        description: "Take back the assistant's last turn (asks first; /redo puts it back)",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/redo",
+        description: "Put back what the last /undo removed",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/checkpoints",
+        description: "List the turns /undo can take back",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
         name: "/help",
         description: "List available commands",
         tier: CommandTier::FrontendOnly,

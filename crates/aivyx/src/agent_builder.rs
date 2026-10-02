@@ -1144,6 +1144,8 @@ pub(crate) async fn build_agent(
         agent.set_router(Arc::clone(router));
     }
     agent.set_injection_taint(injection_taint.clone());
+    // `/undo` / `/redo` confirm through the same modal as tool approvals.
+    agent.set_command_prompter(Arc::clone(&prompter));
     if let Some(mission_plan_handle) = &mission_plan {
         agent.set_mission_plan_handle(Arc::clone(mission_plan_handle));
     }

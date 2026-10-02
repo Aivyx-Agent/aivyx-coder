@@ -2881,6 +2881,181 @@ async fn edits_by_a_tool_that_takes_no_checkpoint_are_still_captured() {
     assert!(!before.contains("sneaky.txt"));
 }
 
+// ----- /undo, /redo, /checkpoints -----
+
+struct ScriptedPrompter { replies: Mutex<VecDeque<UserResponse>>, seen: Mutex<Vec<PermissionRequest>> }
+#[async_trait::async_trait]
+impl PermissionPrompter for ScriptedPrompter {
+    async fn prompt(&self, r: &PermissionRequest) -> UserResponse {
+        self.seen.lock().unwrap().push(r.clone());
+        self.replies.lock().unwrap().pop_front().unwrap_or(UserResponse::Deny)
+    }
+}
+
+#[tokio::test]
+async fn undo_rewinds_the_whole_turn_and_redo_brings_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![
+        write_call("c1", "tracked.txt", "v2\n"), write_call("c2", "new.txt", "n\n"), text_response("done"),
+        text_response("ok"),
+    ]).await;
+    let prompter = Arc::new(ScriptedPrompter {
+        replies: Mutex::new(vec![UserResponse::Allow, UserResponse::Allow].into()), seen: Mutex::default() });
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("change things".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "v1\n");
+    assert!(!cwd.join("new.txt").exists());
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(preview.contains("~ tracked.txt") && preview.contains("− new.txt   (will be removed)"), "{preview}");
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "v2\n");
+    assert!(cwd.join("new.txt").exists());
+    assert_eq!(agent.undo_ledger().marks.len(), 1);
+}
+
+#[tokio::test]
+async fn a_hand_edit_is_flagged_and_deny_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![write_call("c1", "tracked.txt", "v2\n"), text_response("done")]).await;
+    let prompter = Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny].into()), seen: Mutex::default() });
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("edit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "hand edit\n").unwrap();
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(preview.contains("tracked.txt   ⚠ changed after the turn"), "{preview}");
+    assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "hand edit\n");
+    assert_eq!(agent.undo_ledger().marks.len(), 1, "deny keeps the mark");
+}
+
+#[tokio::test]
+async fn the_next_message_tells_the_model_about_the_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mock = Arc::new(MockBackend::new(vec![
+        write_call("c1", "tracked.txt", "v2\n"), text_response("done"), text_response("ok"),
+    ]));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let llm: Arc<dyn LlmBackend> = mock.clone();
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(cwd.clone(), Arc::new(aivyx_tools::GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+    let (tx, _rx) = unbounded_channel();
+    let mut agent = Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    agent.set_command_prompter(Arc::new(ScriptedPrompter {
+        replies: Mutex::new(vec![UserResponse::Allow].into()), seen: Mutex::default() }));
+
+    agent.run_turn("edit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("what now?".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let last = received.last().unwrap();
+    let last_user = last.messages.iter().rev().find(|m| m.role == Role::User).unwrap();
+    assert_eq!(
+        last_user.text_content(),
+        "(The user undid your changes from the last turn: tracked.txt.)\n\nwhat now?"
+    );
+}
+
+/// Builds an agent and keeps the event receiver so tests can read notices.
+async fn undo_agent_with_events(
+    dir: &Path,
+    with_checkpointer: bool,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![write_call("c1", "a.txt", "x\n"), text_response("ok")]));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    if with_checkpointer {
+        executor.set_checkpointer_at(dir.to_path_buf(), Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()));
+    }
+    let (tx, rx) = unbounded_channel();
+    let agent = Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    (agent, rx)
+}
+
+fn notices(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::Error(text) = ev {
+            out.push(text);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn undo_messages_without_repo_marks_or_prompter() {
+    let allow = || Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Allow].into()), seen: Mutex::default() });
+
+    // (1) not a git repository
+    let plain = tempfile::tempdir().unwrap();
+    let cwd = plain.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_command_prompter(allow());
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(notices(&mut rx).contains(&"No checkpoints here — this folder isn't a git repository.".to_string()));
+
+    // (2) repo, nothing done yet; (4) nothing to redo
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow());
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let got = notices(&mut rx);
+    assert!(got.contains(&"Nothing to undo — no changes made in this session.".to_string()), "{got:?}");
+    assert!(got.contains(&"Nothing to redo.".to_string()), "{got:?}");
+
+    // (3) a mark exists but no command prompter (e.g. an MCP session)
+    let repo2 = tempfile::tempdir().unwrap();
+    init_git_repo(repo2.path()).await;
+    let cwd = repo2.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(notices(&mut rx).contains(&"/undo isn't available here.".to_string()));
+    assert!(cwd.join("a.txt").exists(), "nothing was undone");
+}
+
+#[tokio::test]
+async fn checkpoints_lists_changing_turns_newest_first() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![
+        write_call("c1", "a.txt", "1\n"), text_response("ok"), write_call("c2", "b.txt", "2\n"), text_response("ok"),
+    ]));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(cwd.clone(), Arc::new(aivyx_tools::GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+    let (tx, mut rx) = unbounded_channel();
+    let mut agent = Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    agent.run_turn("first change".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("second change".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/checkpoints".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let listing = notices(&mut rx).into_iter().find(|t| t.starts_with("Undoable turns (newest first")).unwrap();
+    let second = listing.find("\"second change\"").unwrap();
+    let first = listing.find("\"first change\"").unwrap();
+    assert!(second < first, "{listing}");
+}
+
+
 // ----- /wiki (Phase 11b) -----
 
 fn stale(name: &str, covers: &[&str]) -> aivyx_tools::wiki::StalePage {
