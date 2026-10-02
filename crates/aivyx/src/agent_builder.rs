@@ -472,7 +472,10 @@ pub(crate) async fn build_agent(
     registry.register(Arc::new(ReplStopTool::new(Arc::clone(&repl_session))));
     let repl_resize: Arc<dyn aivyx_sandbox::ResizeTarget> =
         Arc::new(ReplResizeTarget::new(repl_session));
-    registry.register(Arc::new(SetTasksTool::new(Arc::clone(&tasks))));
+    registry.register(Arc::new(SetTasksTool::new(
+        Arc::clone(&tasks),
+        plan_mode.clone(),
+    )));
 
     // Cross-session memory (memory_write/memory_read/memory_forget),
     // backed by aivyx-recall's FileRecall — one shared Arc<dyn Recall>

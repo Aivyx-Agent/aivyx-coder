@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, PlanMode};
 use aivyx_types::{Task, TaskStatus, ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -60,11 +60,18 @@ impl From<TaskItemStatus> for TaskStatus {
 /// with the session); this tool is just the model-facing mutator.
 pub struct SetTasksTool {
     tasks: Arc<Mutex<Vec<Task>>>,
+    /// Read on every call (B2): while plan mode is active, nothing has
+    /// actually been done yet (the mode is read-only), so a task marked
+    /// anything but `pending` here would be the model falsely reporting
+    /// work as complete. The gate itself auto-allows this tool's
+    /// `ActionKind::Internal` even in plan mode (see this struct's own doc
+    /// comment) — this check is the actual enforcement.
+    plan_mode: PlanMode,
 }
 
 impl SetTasksTool {
-    pub fn new(tasks: Arc<Mutex<Vec<Task>>>) -> Self {
-        Self { tasks }
+    pub fn new(tasks: Arc<Mutex<Vec<Task>>>, plan_mode: PlanMode) -> Self {
+        Self { tasks, plan_mode }
     }
 }
 
@@ -126,13 +133,26 @@ impl Tool for SetTasksTool {
             )));
         }
 
+        if self.plan_mode.active()
+            && args
+                .tasks
+                .iter()
+                .any(|item| !matches!(item.status, TaskItemStatus::Pending))
+        {
+            return Err(ToolError::ExecutionFailed(
+                "Plan mode is read-only: nothing can be done yet, so every task must stay \
+                 pending until the user approves the plan (Ctrl+P)."
+                    .to_string(),
+            ));
+        }
+
         let new_tasks: Vec<Task> = args
             .tasks
             .into_iter()
             .enumerate()
             .map(|(i, item)| Task {
                 id: (i + 1) as u32,
-                text: item.text,
+                text: strip_leading_number(&item.text),
                 status: item.status.into(),
             })
             .collect();
@@ -141,6 +161,35 @@ impl Tool for SetTasksTool {
         *self.tasks.lock().unwrap() = new_tasks;
         Ok(ToolOutput::Ok(summary))
     }
+}
+
+/// Strips a model-supplied leading "1. "/"2) " ordinal from task text (U1):
+/// models often number their own list items even though `TaskItem`s are
+/// already ordered and rendered with their own `id` — left alone, that
+/// shows up doubled as "1. 1. do the thing". Strips at most one such
+/// prefix, so a task whose real text legitimately starts with a number
+/// (e.g. "2024 tax prep") is untouched unless it's immediately followed by
+/// `.`/`)` and whitespace.
+fn strip_leading_number(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let digits_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+    if digits_end == 0 {
+        return text.to_string();
+    }
+    let rest = &trimmed[digits_end..];
+    let Some(after_marker) = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix(')'))
+    else {
+        return text.to_string();
+    };
+    let after_ws = after_marker.trim_start_matches([' ', '\t']);
+    if after_ws.len() == after_marker.len() {
+        // No whitespace followed the marker (e.g. "1.5x speed") — not a
+        // numbering prefix, leave it alone.
+        return text.to_string();
+    }
+    after_ws.to_string()
 }
 
 /// Echo the accepted list back compactly so the model's context reflects
@@ -184,7 +233,7 @@ mod tests {
             text: "stale".to_string(),
             status: TaskStatus::Done,
         }]));
-        let tool = SetTasksTool::new(Arc::clone(&shared));
+        let tool = SetTasksTool::new(Arc::clone(&shared), PlanMode::new());
 
         let output = tool
             .execute(
@@ -218,7 +267,7 @@ mod tests {
             text: "old".to_string(),
             status: TaskStatus::Pending,
         }]));
-        let tool = SetTasksTool::new(Arc::clone(&shared));
+        let tool = SetTasksTool::new(Arc::clone(&shared), PlanMode::new());
 
         let output = tool.execute(json!({ "tasks": [] }), &ctx()).await.unwrap();
 
@@ -236,7 +285,7 @@ mod tests {
             text: "keep me".to_string(),
             status: TaskStatus::Pending,
         }]));
-        let tool = SetTasksTool::new(Arc::clone(&shared));
+        let tool = SetTasksTool::new(Arc::clone(&shared), PlanMode::new());
 
         let huge: Vec<_> = (0..MAX_TASKS + 1)
             .map(|i| json!({ "text": format!("t{i}"), "status": "pending" }))
@@ -249,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_status_is_an_invalid_arguments_error() {
-        let tool = SetTasksTool::new(Arc::default());
+        let tool = SetTasksTool::new(Arc::default(), PlanMode::new());
         let result = tool
             .execute(
                 json!({ "tasks": [{ "text": "x", "status": "doing" }] }),
@@ -259,9 +308,100 @@ mod tests {
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
     }
 
+    #[tokio::test]
+    async fn plan_mode_rejects_a_non_pending_task_and_leaves_the_list_untouched() {
+        let shared = Arc::new(Mutex::new(vec![Task {
+            id: 1,
+            text: "keep me".to_string(),
+            status: TaskStatus::Pending,
+        }]));
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let tool = SetTasksTool::new(Arc::clone(&shared), plan_mode);
+
+        let result = tool
+            .execute(
+                json!({ "tasks": [
+                    { "text": "first", "status": "done" },
+                    { "text": "second", "status": "pending" },
+                ]}),
+                &ctx(),
+            )
+            .await;
+
+        let Err(ToolError::ExecutionFailed(message)) = result else {
+            panic!("expected ExecutionFailed, got {result:?}");
+        };
+        assert!(message.contains("Plan mode is read-only"));
+        assert!(message.contains("Ctrl+P"));
+        // Rejected outright — the existing list is untouched.
+        assert_eq!(shared.lock().unwrap()[0].text, "keep me");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_still_allows_an_all_pending_list() {
+        let plan_mode = PlanMode::new();
+        plan_mode.set_active(true);
+        let tool = SetTasksTool::new(Arc::default(), plan_mode);
+
+        let result = tool
+            .execute(
+                json!({ "tasks": [
+                    { "text": "first", "status": "pending" },
+                    { "text": "second", "status": "pending" },
+                ]}),
+                &ctx(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn act_mode_still_allows_marking_tasks_done() {
+        // Outside plan mode, today's behaviour (any status, any turn) is
+        // unchanged.
+        let tool = SetTasksTool::new(Arc::default(), PlanMode::new());
+
+        let result = tool
+            .execute(
+                json!({ "tasks": [{ "text": "first", "status": "done" }] }),
+                &ctx(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_leading_model_supplied_ordinal_is_stripped_from_task_text() {
+        let shared: Arc<Mutex<Vec<Task>>> = Arc::default();
+        let tool = SetTasksTool::new(Arc::clone(&shared), PlanMode::new());
+
+        tool.execute(
+            json!({ "tasks": [
+                { "text": "1. do the thing", "status": "pending" },
+                { "text": "2) another one", "status": "pending" },
+                { "text": "no number here", "status": "pending" },
+                { "text": "2024 tax prep", "status": "pending" },
+            ]}),
+            &ctx(),
+        )
+        .await
+        .unwrap();
+
+        let tasks = shared.lock().unwrap().clone();
+        assert_eq!(tasks[0].text, "do the thing");
+        assert_eq!(tasks[1].text, "another one");
+        assert_eq!(tasks[2].text, "no number here");
+        // Not an ordinal prefix (no "." / ")" + whitespace after the
+        // digits) — left alone.
+        assert_eq!(tasks[3].text, "2024 tax prep");
+    }
+
     #[test]
     fn permission_request_is_internal_and_never_touches_a_path_or_command() {
-        let tool = SetTasksTool::new(Arc::default());
+        let tool = SetTasksTool::new(Arc::default(), PlanMode::new());
         let request = tool
             .permission_request(
                 &json!({ "tasks": [{ "text": "x", "status": "pending" }] }),

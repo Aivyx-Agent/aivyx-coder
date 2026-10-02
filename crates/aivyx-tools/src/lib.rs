@@ -382,6 +382,7 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivyx_sandbox::PlanMode;
 
     #[test]
     fn plan_definitions_offer_only_session_safe_tools() {
@@ -397,7 +398,10 @@ mod tests {
         registry.register(Arc::new(GrepTool::new(vec![])));
         registry.register(Arc::new(GlobTool::new(vec![])));
         registry.register(Arc::new(RunShellTool));
-        registry.register(Arc::new(SetTasksTool::new(Arc::default())));
+        registry.register(Arc::new(SetTasksTool::new(
+            Arc::default(),
+            PlanMode::new(),
+        )));
         registry.register(Arc::new(GitReadTool::new(vec![])));
         registry.register(Arc::new(GitCommitTool::new(vec![])));
         registry.register(Arc::new(ReplStartTool::new(

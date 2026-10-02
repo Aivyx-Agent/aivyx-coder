@@ -2096,7 +2096,10 @@ async fn a_set_tasks_call_surfaces_tasks_updated_and_persists_the_session() {
     // notices, emits, and persists it with the turn).
     let tasks: Arc<Mutex<Vec<Task>>> = Arc::default();
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(aivyx_tools::SetTasksTool::new(Arc::clone(&tasks))));
+    registry.register(Arc::new(aivyx_tools::SetTasksTool::new(
+        Arc::clone(&tasks),
+        PlanMode::new(),
+    )));
 
     let (tx, mut rx) = unbounded_channel();
     let mock = Arc::new(MockBackend::new(vec![
