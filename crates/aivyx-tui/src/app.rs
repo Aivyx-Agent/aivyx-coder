@@ -122,9 +122,17 @@ const CANCELLED_TURN_MARKER: &str = "— stopped (Ctrl+C)";
 /// `had_model_activity` is `false` for a command-only turn that calls
 /// `run_turn` but never touches the model (`/models`, an unconfigured
 /// `/council`, etc.) -- those must not get the reminder, since nothing
-/// about them is explained by plan mode being on.
-fn plan_mode_turn_notice(plan_mode_active: bool, had_model_activity: bool) -> Option<&'static str> {
-    if plan_mode_active && had_model_activity {
+/// about them is explained by plan mode being on. `cancelled` is `true`
+/// when the user Ctrl+C'd this turn (fix round 1, Important): a cancelled
+/// turn already gets U3's own `CANCELLED_TURN_MARKER` line, and showing
+/// both made it look like two different things happened to the same
+/// reply -- the plan-mode reminder is suppressed in that case.
+fn plan_mode_turn_notice(
+    plan_mode_active: bool,
+    had_model_activity: bool,
+    cancelled: bool,
+) -> Option<&'static str> {
+    if plan_mode_active && had_model_activity && !cancelled {
         Some("Plan mode — nothing was changed. Press Ctrl+P to approve the plan and start.")
     } else {
         None
@@ -463,6 +471,7 @@ pub async fn run(
                                 app.resolve_permission(UserResponse::Deny);
                                 if let Some(cancellation) = active_cancellation.lock().unwrap().as_ref() {
                                     cancellation.cancel();
+                                    app.cancel_requested = true;
                                 }
                             }
                             (KeyCode::Char('y'), KeyModifiers::NONE) => {
@@ -499,7 +508,10 @@ pub async fn run(
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let cancellation = active_cancellation.lock().unwrap().clone();
                             match cancellation {
-                                Some(cancellation) => cancellation.cancel(),
+                                Some(cancellation) => {
+                                    cancellation.cancel();
+                                    app.cancel_requested = true;
+                                }
                                 None => break,
                             }
                             continue;
@@ -595,6 +607,19 @@ struct App {
     /// which call `run_turn` but never touch the model) -- the plan-mode
     /// "nothing was changed" notice must only follow the former.
     turn_had_model_activity: bool,
+    /// Set `true` the moment Ctrl+C cancels an in-flight turn (the render
+    /// loop's key handler, synchronously -- well before the background
+    /// task's `run_turn` call returns and its events reach here), reset to
+    /// `false` by `push_user_message` at the start of the next turn (fix
+    /// round 1, Important). The background task only learns of the
+    /// cancellation *after* `run_turn` returns and reports it via
+    /// `agent.notify(CANCELLED_TURN_MARKER)` -- which arrives strictly
+    /// after that turn's own `TurnComplete` (cancellation still runs the
+    /// turn loop to a normal `TurnComplete`, it just stops early) -- so
+    /// `TurnComplete`'s own handler can't yet see "this turn was
+    /// cancelled" from the event stream alone; this flag is read there
+    /// instead to suppress `plan_mode_turn_notice` for a cancelled turn.
+    cancel_requested: bool,
     /// The model the router last moved this conversation to, shown in the
     /// status line. `None` until routing reports a choice (always `None`
     /// with routing off).
@@ -626,6 +651,7 @@ impl App {
             open_specialist_sessions: Vec::new(),
             plan_mode,
             turn_had_model_activity: false,
+            cancel_requested: false,
         }
     }
 
@@ -682,6 +708,7 @@ impl App {
         self.transcript.push(ChatLine::User(text));
         self.streaming_active = true;
         self.turn_had_model_activity = false;
+        self.cancel_requested = false;
     }
 
     /// Renders the `/help` command via `help_text()` as a `ChatLine::Help`
@@ -746,9 +773,11 @@ impl App {
             }
             AgentEvent::TurnComplete => {
                 self.streaming_active = false;
-                if let Some(notice) =
-                    plan_mode_turn_notice(self.plan_mode.active(), self.turn_had_model_activity)
-                {
+                if let Some(notice) = plan_mode_turn_notice(
+                    self.plan_mode.active(),
+                    self.turn_had_model_activity,
+                    self.cancel_requested,
+                ) {
                     self.transcript.push(ChatLine::Notice(notice.to_string()));
                 }
                 self.turn_had_model_activity = false;
@@ -2379,11 +2408,67 @@ mod tests {
 
     #[test]
     fn plan_mode_turn_notice_only_fires_when_both_plan_mode_and_real_activity() {
-        assert!(plan_mode_turn_notice(true, true).is_some());
-        assert_eq!(plan_mode_turn_notice(true, false), None);
-        assert_eq!(plan_mode_turn_notice(false, true), None);
-        assert_eq!(plan_mode_turn_notice(false, false), None);
-        assert!(plan_mode_turn_notice(true, true).unwrap().contains("Ctrl+P"));
+        assert!(plan_mode_turn_notice(true, true, false).is_some());
+        assert_eq!(plan_mode_turn_notice(true, false, false), None);
+        assert_eq!(plan_mode_turn_notice(false, true, false), None);
+        assert_eq!(plan_mode_turn_notice(false, false, false), None);
+        assert!(
+            plan_mode_turn_notice(true, true, false)
+                .unwrap()
+                .contains("Ctrl+P")
+        );
+    }
+
+    #[test]
+    fn plan_mode_turn_notice_is_suppressed_for_a_cancelled_turn() {
+        // Fix round 1 (Important): a cancelled turn already gets U3's own
+        // "— stopped (Ctrl+C)" marker -- showing the plan-mode reminder
+        // too made it look like two different things happened.
+        assert_eq!(plan_mode_turn_notice(true, true, true), None);
+        // Plan mode + real activity + NOT cancelled must still show it.
+        assert!(plan_mode_turn_notice(true, true, false).is_some());
+    }
+
+    #[test]
+    fn a_cancelled_plan_mode_turn_shows_only_the_cancelled_marker_not_the_plan_notice() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.push_user_message("do the thing".to_string());
+        app.handle_agent_event(AgentEvent::TextDelta("partial".to_string()));
+        app.cancel_requested = true;
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+        app.handle_agent_event(AgentEvent::Error(CANCELLED_TURN_MARKER.to_string()));
+
+        assert!(
+            !app.transcript
+                .iter()
+                .any(|line| matches!(line, ChatLine::Notice(text) if text.contains("Plan mode"))),
+            "the plan-mode reminder must not appear on a cancelled turn"
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| matches!(line, ChatLine::Cancelled(_))),
+            "the cancelled marker must still appear"
+        );
+    }
+
+    #[test]
+    fn a_non_cancelled_plan_mode_turn_still_shows_the_plan_notice() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.push_user_message("do the thing".to_string());
+        app.handle_agent_event(AgentEvent::TextDelta("sure, here's the plan".to_string()));
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| matches!(line, ChatLine::Notice(text) if text.contains("Plan mode"))),
+            "the plan-mode reminder must still appear when the turn wasn't cancelled"
+        );
     }
 
     #[test]
