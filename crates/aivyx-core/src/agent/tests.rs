@@ -3010,7 +3010,10 @@ async fn undo_messages_without_repo_marks_or_prompter() {
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
     agent.set_command_prompter(allow());
     agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
-    assert!(notices(&mut rx).contains(&"No checkpoints here — this folder isn't a git repository.".to_string()));
+    agent.run_turn("/checkpoints".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let no_checkpoints =
+        "No checkpoints here — checkpoints are off or this folder isn't a git repository.".to_string();
+    assert_eq!(notices(&mut rx), vec![no_checkpoints.clone(), no_checkpoints]);
 
     // (2) repo, nothing done yet; (4) nothing to redo
     let repo = tempfile::tempdir().unwrap();

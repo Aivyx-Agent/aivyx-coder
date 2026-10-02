@@ -46,7 +46,7 @@ the files changed (for example "+1 file, ~2 files"). Turns whose checkpoint was 
 
 ### Limits, stated plainly
 
-- **Not a git repository:** "No checkpoints here — this folder isn't a git repository."
+- **No checkpointer (checkpoints off, or not a git repository):** "No checkpoints here — checkpoints are off or this folder isn't a git repository."
 - **Nothing to undo:** "Nothing to undo — no changes made in this session." Likewise for `/redo`.
 - **Turn too old:** only the newest 50 checkpoints are kept. Store the commit id as well as the ref name. If
   `git cat-file -e <oid>` fails, say "That turn is too old to undo (only the newest 50 checkpoints are kept)."

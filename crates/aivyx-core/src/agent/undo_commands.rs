@@ -17,7 +17,10 @@ use crate::undo::{
     preview_title_undo,
 };
 
-const NO_REPO: &str = "No checkpoints here — this folder isn't a git repository.";
+/// Shown when there is no checkpointer: `[git] checkpoints = false`, or
+/// the folder isn't a git repository.
+const NO_CHECKPOINTS: &str =
+    "No checkpoints here — checkpoints are off or this folder isn't a git repository.";
 const NOTHING_TO_UNDO: &str = "Nothing to undo — no changes made in this session.";
 const TOO_OLD: &str = "That turn is too old to undo (only the newest 50 checkpoints are kept).";
 
@@ -74,7 +77,7 @@ impl Agent {
         match self.executor.checkpoint_cwd() {
             Some(cwd) => Some(cwd.to_path_buf()),
             None => {
-                self.notify(NO_REPO);
+                self.notify(NO_CHECKPOINTS);
                 None
             }
         }
@@ -257,7 +260,7 @@ impl Agent {
 
     async fn list_checkpoints(&mut self) {
         let Some(cwd) = self.executor.checkpoint_cwd().map(Path::to_path_buf) else {
-            self.notify(NO_REPO);
+            self.notify(NO_CHECKPOINTS);
             return;
         };
         let mut missing = HashSet::new();
