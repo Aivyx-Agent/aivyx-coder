@@ -76,6 +76,16 @@ pub const COMMANDS: &[CommandInfo] = &[
         tier: CommandTier::AgentState,
     },
     CommandInfo {
+        name: "/diff",
+        description: "Show uncommitted changes (`/diff turn`: just the last turn's)",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/commit",
+        description: "Commit with a drafted message you approve (`/commit -m \"…\"` to write your own)",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
         name: "/help",
         description: "List available commands",
         tier: CommandTier::FrontendOnly,

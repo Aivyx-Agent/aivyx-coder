@@ -6920,3 +6920,128 @@ async fn the_change_summary_arrives_after_the_reply() {
     let info = events.iter().position(|e| matches!(e, AgentEvent::Info(_))).unwrap();
     assert!(info > complete, "{events:?}");
 }
+
+fn shown_diffs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::ShowDiff { title, text } = ev {
+            out.push((title, text));
+        }
+    }
+    out
+}
+
+#[test]
+fn change_commands_parse() {
+    use super::change_commands::{ChangeCommand, parse};
+    assert_eq!(parse("/diff"), Some(ChangeCommand::Diff { turn: false }));
+    assert_eq!(parse("  /diff turn "), Some(ChangeCommand::Diff { turn: true }));
+    assert_eq!(parse("/commit"), Some(ChangeCommand::Commit { message: None }));
+    assert_eq!(
+        parse("/commit -m \"x\""),
+        Some(ChangeCommand::Commit { message: Some("x".into()) })
+    );
+    assert_eq!(parse("/differ"), None);
+    assert_eq!(parse("/commitment"), None);
+    assert_eq!(parse("please /diff"), None);
+}
+
+#[tokio::test]
+async fn diff_shows_tracked_edits_and_untracked_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let (title, text) = &diffs[0];
+    assert_eq!(title, "Uncommitted changes");
+    assert!(text.contains("+v2"), "{text}");
+    assert!(text.contains("new.txt"), "{text}");
+    assert!(text.contains("new file mode"), "{text}");
+    assert!(agent.undo_ledger().marks.is_empty(), "/diff is not a turn");
+}
+
+#[tokio::test]
+async fn diff_in_a_clean_repo_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let events = drain(&mut rx);
+    let infos: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Info(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(infos, vec!["No uncommitted changes.".to_string()]);
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ShowDiff { .. })));
+    assert!(matches!(events.last(), Some(AgentEvent::TurnComplete)), "{events:?}");
+}
+
+#[tokio::test]
+async fn diff_turn_shows_only_the_last_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "hand edit\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("write a file".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let (title, text) = &diffs[0];
+    assert_eq!(title, "Changes from the last turn (\"write a file\")");
+    assert!(text.contains("a.txt"), "{text}");
+    assert!(!text.contains("tracked.txt"), "{text}");
+    assert!(!text.contains("hand edit"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_turn_without_marks_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["No changes from the last turn to show.".to_string()]);
+}
+
+#[tokio::test]
+async fn diff_without_commits_is_against_the_empty_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    for argv in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.name", "test"],
+        vec!["config", "user.email", "test@test.invalid"],
+    ] {
+        tokio::process::Command::new("git").args(&argv).current_dir(&cwd).output().await.unwrap();
+    }
+    std::fs::write(cwd.join("one.txt"), "1\n").unwrap();
+    std::fs::write(cwd.join("two.txt"), "2\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let (title, text) = &diffs[0];
+    assert_eq!(title, "Uncommitted changes");
+    assert!(text.contains("one.txt") && text.contains("two.txt"), "{text}");
+    assert!(text.contains("+1") && text.contains("+2"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_without_a_checkpointer_is_not_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["Not a git repository.".to_string()]);
+}

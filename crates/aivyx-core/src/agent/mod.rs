@@ -28,6 +28,7 @@ use crate::undo::TurnMark;
 #[cfg(test)]
 mod tests;
 mod types;
+mod change_commands;
 mod undo_commands;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
@@ -1564,6 +1565,12 @@ impl Agent {
         // their own (so they're intercepted before the snapshot below).
         if let Some(command) = undo_commands::parse(&user_input) {
             self.run_undo_command(command).await;
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+        // `/diff` and `/commit` likewise act on the worktree directly.
+        if let Some(command) = change_commands::parse(&user_input) {
+            self.run_change_command(command).await;
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }
