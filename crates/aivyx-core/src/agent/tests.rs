@@ -58,6 +58,25 @@ impl LlmBackend for MockBackend {
     }
 }
 
+/// A backend whose every `stream_chat` call fails outright — simulates the
+/// server being down (connection refused) for B1's "a failed turn must not
+/// overwrite the saved session" tests.
+struct FailingBackend;
+
+#[async_trait::async_trait]
+impl LlmBackend for FailingBackend {
+    fn model_id(&self) -> &str {
+        "failing"
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        Err(LlmError::Timeout)
+    }
+}
+
 /// Gate that allows everything — the loop tests are about loop mechanics,
 /// not permission decisions (those have their own tests in aivyx-sandbox).
 struct AllowAllGate;
@@ -2141,6 +2160,96 @@ async fn a_set_tasks_call_surfaces_tasks_updated_and_persists_the_session() {
     );
     // user, assistant (tool call), tool result, final assistant text.
     assert_eq!(saved.history.len(), 4);
+}
+
+/// Builds a bare agent wired to `FailingBackend` with a real session path
+/// (and, for part (b)/(c), a `MockBackend`) -- B1's regression tests need
+/// to swap backends mid-test, which none of the existing builders support.
+fn build_agent_with_backend(
+    llm: Arc<dyn LlmBackend>,
+    session_path: PathBuf,
+) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let (tx, rx) = unbounded_channel();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(ToolRegistry::new(), gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    agent.set_session_path(session_path);
+    (agent, rx)
+}
+
+#[tokio::test]
+async fn b1_a_fresh_agent_with_a_failing_backend_leaves_the_stored_session_unchanged() {
+    // Repro: a session with real history already on disk (as if a previous
+    // process persisted it); start fresh (no restore), the backend is down,
+    // and the turn fails -- the stored file must be untouched, not
+    // overwritten with just the one failed user message.
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.json");
+    let existing = crate::session::SessionState::new(
+        vec![user_msg("earlier turn"), assistant_msg("earlier reply")],
+        vec![],
+        false,
+        vec![],
+    );
+    crate::session::save(&session_path, &existing).unwrap();
+
+    let (mut agent, _rx) =
+        build_agent_with_backend(Arc::new(FailingBackend), session_path.clone());
+
+    let err = agent
+        .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+        .await;
+    assert!(err.is_err());
+
+    let saved = crate::session::load(&session_path).expect("file should still exist");
+    assert_eq!(saved.history.len(), 2);
+}
+
+#[tokio::test]
+async fn b1_success_persists_and_a_later_failure_in_the_same_process_still_persists() {
+    // Once this process has saved a real turn, the session "owns the slot"
+    // -- a later failure in the same process is allowed to persist (today's
+    // behaviour: the failed user message staying in history is accepted).
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.json");
+
+    let mock = Arc::new(MockBackend::new(vec![text_response("ok")]));
+    let llm: Arc<dyn LlmBackend> = mock;
+    let (mut agent, _rx) = build_agent_with_backend(llm, session_path.clone());
+
+    agent
+        .run_turn("first".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    let saved = crate::session::load(&session_path).expect("success should persist");
+    assert_eq!(saved.history.len(), 2);
+
+    // Swap in a failing backend for the second turn, in the same process /
+    // same agent instance.
+    agent.llm = Arc::new(FailingBackend);
+    let err = agent
+        .run_turn("second".to_string(), Path::new("."), CancellationToken::new())
+        .await;
+    assert!(err.is_err());
+
+    let saved = crate::session::load(&session_path).expect("file should still exist");
+    // The failed "second" user message was pushed to history before the
+    // backend call failed, and -- since this session already owns the
+    // slot -- that failure still persists.
+    assert_eq!(saved.history.len(), 3);
 }
 
 #[tokio::test]

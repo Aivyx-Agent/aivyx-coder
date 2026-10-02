@@ -195,6 +195,20 @@ pub struct Agent {
     specialist_session_pool: Option<SpecialistSessionPool>,
     /// Where the session is persisted after each turn; `None` disables it.
     session_path: Option<PathBuf>,
+    /// Set the first time this `Agent` instance successfully persists
+    /// (a successful turn, or `clear_conversation`'s deliberate empty-state
+    /// save) -- i.e. once this process has actually written to the session
+    /// slot on disk. Read by `run_turn` (B1): a *failed* turn only persists
+    /// (overwriting whatever's on disk, e.g. with just the failed user
+    /// message) once this is already `true`. Before that -- a fresh
+    /// process whose first turn fails outright (server down, etc.) -- the
+    /// stored file, which may hold real prior history from an earlier
+    /// process, must be left untouched rather than clobbered with the
+    /// single failed message. Deliberately process-scoped, not
+    /// persisted/restored itself: `restore()` does not set it, so a
+    /// `--resume`d session's first turn in a *new* process is held to the
+    /// same rule.
+    session_owns_slot: bool,
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
     plan_mode: PlanMode,
@@ -393,6 +407,7 @@ impl Agent {
             mission_plan: None,
             specialist_session_pool: None,
             session_path: None,
+            session_owns_slot: false,
             plan_mode,
             autonomous_mode,
             injection_taint: InjectionTaint::new(),
@@ -491,6 +506,7 @@ impl Agent {
         self.last_routed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
+        self.session_owns_slot = true;
     }
 
     /// Enables `/council` (Phase 11a). The caller builds the seats — each
@@ -1433,6 +1449,15 @@ impl Agent {
     /// wrapper ensures *every* exit path of the inner loop (normal, error,
     /// iteration-cap, cancellation) saves, without threading a save into
     /// each `return`.
+    ///
+    /// B1: a *failed* turn (`result` is `Err`) only persists if this
+    /// session already owns the slot (`session_owns_slot` -- see its field
+    /// doc comment), i.e. this process has already saved at least once.
+    /// Otherwise a fresh process whose very first turn fails (backend down)
+    /// would overwrite a real prior session with just the one failed
+    /// message. A successful turn always persists, and marks the slot as
+    /// owned for every subsequent turn in this process, matching today's
+    /// behaviour from then on.
     pub async fn run_turn(
         &mut self,
         user_input: String,
@@ -1475,7 +1500,10 @@ impl Agent {
                 },
             },
         };
-        self.persist();
+        if result.is_ok() || self.session_owns_slot {
+            self.persist();
+            self.session_owns_slot = true;
+        }
         result
     }
 
