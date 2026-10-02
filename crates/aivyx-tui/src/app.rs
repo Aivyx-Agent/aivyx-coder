@@ -1216,7 +1216,13 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
                 None => diff_line(l),
             }
         })),
-        _ => lines.push(Line::from(format!("Args: {}", request.arguments_preview))),
+        // U2: an empty object (e.g. `run_shell`, whose whole command
+        // already appears on the "Command: " line above) is pure noise --
+        // omit the line entirely rather than showing "Args: {}".
+        _ if request.arguments_preview != serde_json::json!({}) => {
+            lines.push(Line::from(format!("Args: {}", request.arguments_preview)));
+        }
+        _ => {}
     }
 
     // The action-key legend renders in its own fixed-height footer row,
@@ -1259,7 +1265,16 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
     let (label, body) = match target {
         PermissionTarget::Path(path) => ("Target: ", display_path(path)),
         PermissionTarget::Command { program, args } => {
-            ("Command: ", format!("{program} {}", args.join(" ")))
+            // U2: quote any word that needs it (e.g. a `run_shell` script
+            // body, which is itself one `sh -c` argument but often
+            // contains spaces) as a single shell word, so the line reads
+            // as the real invocation rather than looking like several
+            // separate arguments to `sh`.
+            let words: Vec<String> = std::iter::once(program.as_str())
+                .chain(args.iter().map(String::as_str))
+                .map(shell_quote_word)
+                .collect();
+            ("Command: ", words.join(" "))
         }
         PermissionTarget::Other(description) => ("Target: ", description.clone()),
         PermissionTarget::Move { from, to } => {
@@ -1278,6 +1293,23 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
             Line::from(format!("{prefix}{line}"))
         })
         .collect()
+}
+
+/// Quotes `word` as a single POSIX shell word if it needs it (U2) --
+/// otherwise returned as-is, so a simple program name or flag like `sh` or
+/// `-c` isn't cluttered with needless quotes. "Needs it" means empty, or
+/// containing whitespace or any shell-meta character; single-quoted with
+/// the standard `'` → `'\''` escape (safe inside single quotes, where
+/// nothing else is special).
+fn shell_quote_word(word: &str) -> String {
+    let needs_quoting = word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_whitespace() || "'\"$`\\&|;()<>!*?[]{}~#".contains(c));
+    if !needs_quoting {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 fn diff_line(line: &str) -> Line<'static> {
@@ -1649,9 +1681,68 @@ mod tests {
             2,
             "expected the newline to split into two lines"
         );
-        assert_eq!(lines[0].to_string(), "Command: sh -c echo first");
+        // U2: the script contains whitespace, so it's quoted as one shell
+        // word -- the leading quote lands on the first visible line.
+        assert_eq!(lines[0].to_string(), "Command: sh -c 'echo first");
         // The second statement must be present as its own visible line.
         assert!(lines[1].to_string().contains("echo second"));
+    }
+
+    #[test]
+    fn a_run_shell_script_with_spaces_is_quoted_as_one_shell_word() {
+        // U2 regression: "sh -c python3 -m unittest test_stats.py" read as
+        // if `sh` got several separate arguments; it must instead read as
+        // the real invocation, the whole script quoted as sh's one `-c`
+        // argument.
+        let target = PermissionTarget::Command {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "python3 -m unittest test_stats.py".to_string(),
+            ],
+        };
+
+        let lines = target_lines(&target);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].to_string(),
+            "Command: sh -c 'python3 -m unittest test_stats.py'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_word_leaves_simple_words_bare() {
+        assert_eq!(shell_quote_word("sh"), "sh");
+        assert_eq!(shell_quote_word("-c"), "-c");
+        assert_eq!(shell_quote_word("cargo"), "cargo");
+    }
+
+    #[test]
+    fn shell_quote_word_escapes_an_embedded_single_quote() {
+        assert_eq!(shell_quote_word("it's broken"), "'it'\\''s broken'");
+    }
+
+    #[test]
+    fn render_permission_modal_omits_the_args_line_for_an_empty_object_preview() {
+        let request = PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "echo hi".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(!rendered.contains("Args:"), "unexpected Args line: {rendered}");
     }
 
     #[test]
