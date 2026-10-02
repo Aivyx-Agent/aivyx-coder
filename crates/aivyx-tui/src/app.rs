@@ -469,6 +469,13 @@ pub async fn run(
                 if let CtEvent::Key(key) = &event
                     && key.kind == KeyEventKind::Press
                 {
+                    // The /diff pager takes every key while it's open. It is
+                    // never open at the same time as a permission modal
+                    // (`open_permission` closes it), so this can't starve one.
+                    let viewport = diff_viewport(guard.terminal().size()?.height);
+                    if app.handle_diff_key(key.code, viewport) {
+                        continue;
+                    }
                     if app.pending_permission.is_some() {
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -558,7 +565,7 @@ pub async fn run(
             }
             maybe_modal = permission_rx.recv() => {
                 if let Some(modal) = maybe_modal {
-                    app.pending_permission = Some(modal);
+                    app.open_permission(modal);
                 }
             }
             _ = async {
@@ -628,6 +635,9 @@ struct App {
     /// status line. `None` until routing reports a choice (always `None`
     /// with routing off).
     routed_model: Option<String>,
+    /// The full-screen `/diff` pager, while it's open. Never open at the
+    /// same time as `pending_permission`.
+    diff_view: Option<DiffView>,
 }
 
 impl App {
@@ -656,7 +666,30 @@ impl App {
             plan_mode,
             turn_had_model_activity: false,
             cancel_requested: false,
+            diff_view: None,
         }
+    }
+
+    /// Shows a permission modal. An open `/diff` pager is closed first so
+    /// the modal is visible and every key reaches it.
+    fn open_permission(&mut self, modal: ModalRequest) {
+        self.diff_view = None;
+        self.pending_permission = Some(modal);
+    }
+
+    /// Routes a key to the `/diff` pager. Returns `false` (key not
+    /// consumed) when the pager isn't open; otherwise every key is
+    /// consumed — scrolling, closing, or swallowed.
+    fn handle_diff_key(&mut self, code: KeyCode, viewport: usize) -> bool {
+        let Some(view) = self.diff_view.as_mut() else {
+            return false;
+        };
+        match diff_key(code) {
+            Some(DiffKeyAction::Scroll(key)) => view.scroll(key, viewport),
+            Some(DiffKeyAction::Close) => self.diff_view = None,
+            None => {}
+        }
+        true
     }
 
     fn toggle_plan_mode(&mut self) {
@@ -842,9 +875,18 @@ impl App {
             AgentEvent::Info(text) => {
                 self.transcript.push(ChatLine::Info(text));
             }
-            // Placeholder until the diff pager exists (Task 4).
-            AgentEvent::ShowDiff { title, .. } => {
-                self.transcript.push(ChatLine::Info(title));
+            // Never opened over a permission modal; the title still lands
+            // in the transcript so the request isn't silently lost.
+            AgentEvent::ShowDiff { title, text } => {
+                if self.pending_permission.is_some() {
+                    self.transcript.push(ChatLine::Info(title));
+                } else {
+                    self.diff_view = Some(DiffView {
+                        title,
+                        lines: text.lines().map(str::to_string).collect(),
+                        offset: 0,
+                    });
+                }
             }
         }
     }
@@ -1022,12 +1064,96 @@ impl App {
         // wakeup, so a redraw that lands in the same tick the editor
         // answered (before the branch has run) must not repaint a modal
         // whose decision is already resolved.
+        if let Some(view) = &self.diff_view {
+            render_diff_view(frame, view);
+        }
+
         if !self.pending_permission_is_stale()
             && let Some(modal) = &self.pending_permission
         {
             render_permission_modal(frame, &modal.request);
         }
     }
+}
+
+/// The `/diff` pager's state: the diff split into lines and the index of
+/// the first visible one.
+struct DiffView {
+    title: String,
+    lines: Vec<String>,
+    offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffKey {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffKeyAction {
+    Scroll(DiffKey),
+    Close,
+}
+
+impl DiffView {
+    /// Moves the view; `viewport` is the number of visible lines. The
+    /// offset never goes past the point where the last line is at the
+    /// bottom, so a diff shorter than the viewport never scrolls.
+    fn scroll(&mut self, key: DiffKey, viewport: usize) {
+        let max = self.lines.len().saturating_sub(viewport);
+        let page = viewport.saturating_sub(1).max(1);
+        self.offset = match key {
+            DiffKey::Up => self.offset.saturating_sub(1),
+            DiffKey::Down => self.offset + 1,
+            DiffKey::PageUp => self.offset.saturating_sub(page),
+            DiffKey::PageDown => self.offset + page,
+            DiffKey::Home => 0,
+            DiffKey::End => max,
+        }
+        .min(max);
+    }
+}
+
+/// The pager's key map: ↑/↓, PgUp/PgDn, Home/End scroll; Esc or q close.
+fn diff_key(code: KeyCode) -> Option<DiffKeyAction> {
+    Some(match code {
+        KeyCode::Up => DiffKeyAction::Scroll(DiffKey::Up),
+        KeyCode::Down => DiffKeyAction::Scroll(DiffKey::Down),
+        KeyCode::PageUp => DiffKeyAction::Scroll(DiffKey::PageUp),
+        KeyCode::PageDown => DiffKeyAction::Scroll(DiffKey::PageDown),
+        KeyCode::Home => DiffKeyAction::Scroll(DiffKey::Home),
+        KeyCode::End => DiffKeyAction::Scroll(DiffKey::End),
+        KeyCode::Esc | KeyCode::Char('q') => DiffKeyAction::Close,
+        _ => return None,
+    })
+}
+
+/// Visible diff lines for a terminal `height` rows tall: the pager is
+/// full-screen with a one-row border top and bottom.
+fn diff_viewport(height: u16) -> usize {
+    usize::from(height.saturating_sub(2))
+}
+
+fn render_diff_view(frame: &mut ratatui::Frame, view: &DiffView) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let viewport = diff_viewport(area.height);
+    // Re-clamp here too: the terminal may have grown since the last key.
+    let start = view.offset.min(view.lines.len().saturating_sub(viewport));
+    let lines: Vec<Line> = view.lines[start..]
+        .iter()
+        .take(viewport)
+        .map(|l| diff_line(l))
+        .collect();
+    // No wrap: one diff line per row keeps the offset maths exact.
+    let title = format!("{} — ↑↓ PgUp/PgDn Home/End · Esc to close", view.title);
+    let pager = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(pager, area);
 }
 
 /// Rebuilds transcript lines from a restored session's message history, so
@@ -1213,8 +1339,9 @@ fn new_input_box() -> TextArea<'static> {
 /// the autocomplete hint's own logic reads, so this listing can never
 /// drift from what actually exists), then a "Keys" section listing only
 /// the bindings that actually exist in the key-handling loop above
-/// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`a`/`n` during an approval prompt --
-/// there is no scrolling binding today, so none is claimed here), then
+/// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`a`/`n` during an approval prompt,
+/// and the `/diff` pager's own keys -- the transcript has no scrolling
+/// binding, so none is claimed for it), then
 /// one line pointing at the real undo mechanism (git-ref checkpoints) --
 /// included unconditionally since there is no in-app undo command yet;
 /// remove this line if one is ever added.
@@ -1229,6 +1356,7 @@ fn help_text() -> String {
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
+    lines.push("  /diff view   ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
     lines.join("\n")
 }
 
@@ -2816,9 +2944,19 @@ mod tests {
         assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
         assert!(text.contains("Ctrl+P") && text.contains("plan mode on/off"));
         assert!(text.contains("y / a / n"));
-        // No scrolling keybinding exists in the input loop -- must not be
-        // claimed.
+        // The transcript has no scrolling binding -- must not be claimed.
+        // Only the /diff pager scrolls, and only its own line names the
+        // paging keys.
         assert!(!text.to_lowercase().contains("scroll"));
+        let paging_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("PgUp") || l.contains('↑') || l.contains("Home"))
+            .collect();
+        assert_eq!(
+            paging_lines,
+            ["  /diff view   ↑↓ PgUp/PgDn Home/End · Esc to close"],
+            "{text}"
+        );
         // Undo is an in-app command now, not a pointer to the README.
         assert!(text.contains("/undo") && text.contains("/redo") && text.contains("/checkpoints"));
         assert!(!text.contains("Worktree checkpoints"));
@@ -2891,5 +3029,147 @@ mod tests {
         };
         let clamped = command_hint_rect(near_top, 6);
         assert_eq!(clamped.y, 0);
+    }
+
+    fn diff_view(n: usize) -> DiffView {
+        DiffView {
+            title: "t".into(),
+            lines: (0..n).map(|i| format!("line {i}")).collect(),
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn diff_view_up_and_down_move_one_line_clamped_at_both_ends() {
+        let mut view = diff_view(10);
+        view.scroll(DiffKey::Up, 4);
+        assert_eq!(view.offset, 0);
+        view.scroll(DiffKey::Down, 4);
+        assert_eq!(view.offset, 1);
+        view.scroll(DiffKey::Up, 4);
+        assert_eq!(view.offset, 0);
+        for _ in 0..20 {
+            view.scroll(DiffKey::Down, 4);
+        }
+        assert_eq!(view.offset, 6);
+    }
+
+    #[test]
+    fn diff_view_page_keys_move_by_one_screen_less_one() {
+        let mut view = diff_view(100);
+        view.scroll(DiffKey::PageDown, 10);
+        assert_eq!(view.offset, 9);
+        view.scroll(DiffKey::PageDown, 10);
+        assert_eq!(view.offset, 18);
+        view.scroll(DiffKey::PageUp, 10);
+        assert_eq!(view.offset, 9);
+        view.scroll(DiffKey::PageUp, 10);
+        view.scroll(DiffKey::PageUp, 10);
+        assert_eq!(view.offset, 0);
+    }
+
+    #[test]
+    fn diff_view_home_and_end_jump_to_the_ends() {
+        let mut view = diff_view(30);
+        view.scroll(DiffKey::End, 10);
+        assert_eq!(view.offset, 20);
+        view.scroll(DiffKey::Home, 10);
+        assert_eq!(view.offset, 0);
+    }
+
+    #[test]
+    fn diff_view_shorter_than_the_viewport_never_scrolls() {
+        let mut view = diff_view(3);
+        for key in [DiffKey::Down, DiffKey::PageDown, DiffKey::End] {
+            view.scroll(key, 10);
+            assert_eq!(view.offset, 0);
+        }
+    }
+
+    #[test]
+    fn diff_keys_map_to_pager_actions() {
+        let scrolls = [
+            (KeyCode::Up, DiffKey::Up),
+            (KeyCode::Down, DiffKey::Down),
+            (KeyCode::PageUp, DiffKey::PageUp),
+            (KeyCode::PageDown, DiffKey::PageDown),
+            (KeyCode::Home, DiffKey::Home),
+            (KeyCode::End, DiffKey::End),
+        ];
+        for (code, key) in scrolls {
+            assert_eq!(diff_key(code), Some(DiffKeyAction::Scroll(key)));
+        }
+        assert_eq!(diff_key(KeyCode::Esc), Some(DiffKeyAction::Close));
+        assert_eq!(diff_key(KeyCode::Char('q')), Some(DiffKeyAction::Close));
+        assert_eq!(diff_key(KeyCode::Char('x')), None);
+        assert_eq!(diff_key(KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn show_diff_opens_the_pager_and_esc_closes_it() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "diff --git a/x b/x\n+added\n-removed".into(),
+        });
+        let view = app.diff_view.as_ref().expect("pager opened");
+        assert_eq!(view.title, "Uncommitted changes");
+        assert_eq!(view.lines, ["diff --git a/x b/x", "+added", "-removed"]);
+        assert_eq!(view.offset, 0);
+
+        // Other keys are swallowed and leave it open.
+        assert!(app.handle_diff_key(KeyCode::Char('x'), 10));
+        assert!(app.diff_view.is_some());
+        assert!(app.handle_diff_key(KeyCode::Esc, 10));
+        assert!(app.diff_view.is_none());
+        // With the pager closed, keys are not consumed.
+        assert!(!app.handle_diff_key(KeyCode::Esc, 10));
+    }
+
+    #[test]
+    fn show_diff_renders_a_full_screen_pager_with_its_title_and_keys() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "+first added line\n context".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("Uncommitted changes — ↑↓ PgUp/PgDn Home/End · Esc to close"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("+first added line"), "{rendered}");
+        // The transcript's own frame is covered.
+        assert!(!rendered.contains("aivyx-coder"), "{rendered}");
+    }
+
+    #[test]
+    fn a_permission_prompt_closes_an_open_pager() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "+x".into(),
+        });
+        let (modal, _rx) = modal_request();
+        app.open_permission(modal);
+        assert!(app.diff_view.is_none());
+        assert!(app.pending_permission.is_some());
+        // Keys now reach the modal path, not the pager.
+        assert!(!app.handle_diff_key(KeyCode::Esc, 10));
+    }
+
+    #[test]
+    fn show_diff_does_not_open_the_pager_over_a_permission_prompt() {
+        let mut app = App::new(None, PlanMode::new());
+        let (modal, _rx) = modal_request();
+        app.open_permission(modal);
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "+x".into(),
+        });
+        assert!(app.diff_view.is_none());
+        assert!(app.pending_permission.is_some());
     }
 }
