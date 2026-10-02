@@ -208,6 +208,10 @@ pub struct ToolExecutor {
     /// to resolve a checkpoint ref to a commit oid for the undo ledger; see
     /// `checkpoint_cwd`.
     checkpoint_cwd: Option<PathBuf>,
+    /// The deny paths `checkpointer` excludes from its snapshots, so
+    /// `checkpoint_now` can verify a snapshot against the same tree. Set
+    /// with `checkpoint_cwd`.
+    checkpoint_deny_paths: Vec<PathBuf>,
 }
 
 impl ToolExecutor {
@@ -222,6 +226,7 @@ impl ToolExecutor {
             confiner,
             checkpointer: None,
             checkpoint_cwd: None,
+            checkpoint_deny_paths: Vec::new(),
         }
     }
 
@@ -234,9 +239,17 @@ impl ToolExecutor {
     /// resolve checkpoint refs to commit oids. Use this for the top-level
     /// agent's own executor; delegated sub-executors that only need
     /// checkpoint/restore (not undo tracking) can keep using
-    /// `set_checkpointer`.
-    pub fn set_checkpointer_at(&mut self, cwd: PathBuf, checkpointer: Arc<GitCheckpointer>) {
+    /// `set_checkpointer`. `deny_paths` must be the ones `checkpointer` was
+    /// detected with: `checkpoint_now` verifies snapshots against a tree
+    /// built with the same excludes.
+    pub fn set_checkpointer_at(
+        &mut self,
+        cwd: PathBuf,
+        deny_paths: Vec<PathBuf>,
+        checkpointer: Arc<GitCheckpointer>,
+    ) {
         self.checkpoint_cwd = Some(cwd);
+        self.checkpoint_deny_paths = deny_paths;
         self.checkpointer = Some(checkpointer);
     }
 
@@ -247,13 +260,77 @@ impl ToolExecutor {
     }
 
     /// Snapshot the worktree now (e.g. before `/undo`, so `/redo` can
-    /// return to it) and return the newest checkpoint ref — which, when the
-    /// tree is unchanged since the last checkpoint (deduplicated), is that
-    /// one.
-    pub async fn checkpoint_now(&self, label: &str, cancellation: &CancellationToken) -> Option<String> {
+    /// return to it) and return a checkpoint ref whose tree is *verified*
+    /// to be the worktree's current tree — or `None` when there is no
+    /// checkpointer, `set_checkpointer_at` wasn't used, or the snapshot
+    /// can't be confirmed.
+    ///
+    /// Verification matters because `GitCheckpointer::checkpoint` swallows
+    /// its own errors (a git failure, the 10 s timeout) and
+    /// `refs/aivyx/checkpoints/` is shared by every aivyx process using the
+    /// repository: "the newest ref" may be stale or another process's. So
+    /// this recomputes the worktree's tree the way the checkpointer does (a
+    /// private index plus `write-tree`, with the same deny-path excludes)
+    /// and returns the newest of the last few refs whose tree matches.
+    /// When the tree is unchanged since the last checkpoint (deduplicated),
+    /// that earlier ref is the match.
+    pub async fn checkpoint_now(
+        &self,
+        label: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        /// How many of the newest refs to search for the matching tree.
+        const SCAN: &str = "--count=8";
         let checkpointer = self.checkpointer.as_ref()?;
+        let cwd = self.checkpoint_cwd.as_deref()?;
         checkpointer.checkpoint(label, cancellation).await;
-        checkpointer.latest_ref(cancellation).await
+        let tree = tokio::select! {
+            tree = self.current_worktree_tree(cwd) => tree?,
+            _ = cancellation.cancelled() => return None,
+        };
+        let refs = run_git(
+            cwd,
+            &[
+                "for-each-ref",
+                "--sort=-refname",
+                SCAN,
+                "--format=%(refname) %(tree)",
+                "refs/aivyx/checkpoints/",
+            ],
+            &[],
+        )
+        .await
+        .ok()?;
+        refs.lines().find_map(|line| {
+            let (name, ref_tree) = line.split_once(' ')?;
+            (ref_tree.trim() == tree).then(|| name.to_string())
+        })
+    }
+
+    /// The tree oid of the worktree as the checkpointer would snapshot it
+    /// now: everything `git add -A` stages, minus the deny paths, staged
+    /// into a throwaway private index under the git dir (never the user's
+    /// index).
+    async fn current_worktree_tree(&self, cwd: &Path) -> Option<String> {
+        let git_dir = run_git(cwd, &["rev-parse", "--absolute-git-dir"], &[])
+            .await
+            .ok()?;
+        let index = PathBuf::from(git_dir.trim())
+            .join(format!("aivyx-verify-index-{}", std::process::id()));
+        let index_str = index.to_str()?.to_string();
+        let env = [("GIT_INDEX_FILE", index_str.as_str())];
+        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        add_args.extend(aivyx_checkpoint::exclude_pathspecs(
+            cwd,
+            &self.checkpoint_deny_paths,
+        ));
+        let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
+        let tree = match run_git(cwd, &add_args, &env).await {
+            Ok(_) => run_git(cwd, &["write-tree"], &env).await.ok(),
+            Err(_) => None,
+        };
+        let _ = std::fs::remove_file(&index);
+        Some(tree?.trim().to_string())
     }
 
     /// Whether `dispatch` checkpoints a call to `tool_name` before running
@@ -1081,6 +1158,7 @@ mod tests {
         let cwd = dir.path().canonicalize().unwrap();
         executor.set_checkpointer_at(
             cwd.clone(),
+            vec![],
             Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()),
         );
         std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
@@ -1113,6 +1191,124 @@ mod tests {
         assert!(!executor.needs_checkpoint("read_file"));
         assert!(!executor.needs_checkpoint("web_fetch"));
         assert!(!executor.needs_checkpoint("no_such_tool"));
+    }
+
+    /// The tree of the worktree as it is now, computed independently of
+    /// `ToolExecutor` (own private index), for the `checkpoint_now` tests.
+    async fn independent_worktree_tree(cwd: &Path) -> String {
+        let index = cwd.join(".git").join("test-independent-index");
+        let index = index.to_str().unwrap();
+        run_git(cwd, &["add", "-A", "--", "."], &[("GIT_INDEX_FILE", index)])
+            .await
+            .unwrap();
+        let tree = run_git(cwd, &["write-tree"], &[("GIT_INDEX_FILE", index)])
+            .await
+            .unwrap();
+        std::fs::remove_file(index).unwrap();
+        tree.trim().to_string()
+    }
+
+    async fn tree_of_ref(cwd: &Path, r: &str) -> String {
+        run_git(cwd, &["rev-parse", &format!("{r}^{{tree}}")], &[])
+            .await
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    async fn undo_executor(cwd: &Path, deny_paths: Vec<PathBuf>) -> ToolExecutor {
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        executor.set_checkpointer_at(
+            cwd.to_path_buf(),
+            deny_paths.clone(),
+            Arc::new(GitCheckpointer::detect(cwd, deny_paths).await.unwrap()),
+        );
+        executor
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_returns_a_ref_whose_tree_is_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let executor = undo_executor(&cwd, vec![]).await;
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(cwd.join("new.txt"), "new\n").unwrap();
+        let r = executor
+            .checkpoint_now("undo", &CancellationToken::new())
+            .await
+            .expect("a working checkpoint is returned");
+        assert_eq!(tree_of_ref(&cwd, &r).await, independent_worktree_tree(&cwd).await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_verifies_with_the_same_deny_path_excludes() {
+        // A deny-listed file inside the worktree is never in a checkpoint's
+        // tree; the verification tree must exclude it too, or every
+        // snapshot would look failed.
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("secret.env"), "TOKEN=x\n").unwrap();
+        let executor = undo_executor(&cwd, vec![cwd.join("secret.env")]).await;
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        let r = executor
+            .checkpoint_now("undo", &CancellationToken::new())
+            .await
+            .expect("deny paths must not make verification fail");
+        let shown = run_git(&cwd, &["show", &format!("{r}:tracked.txt")], &[]).await.unwrap();
+        assert_eq!(shown, "changed\n");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_never_returns_a_foreign_newer_ref() {
+        // Another aivyx process sharing the repo can leave a newer ref in
+        // refs/aivyx/checkpoints/. A deduplicated (or failed) snapshot must
+        // not hand that ref back as "the current state".
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let executor = undo_executor(&cwd, vec![]).await;
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        let real = executor
+            .checkpoint_now("undo", &CancellationToken::new())
+            .await
+            .unwrap();
+        run_git(
+            &cwd,
+            &["update-ref", "refs/aivyx/checkpoints/9999999999999-0000", "HEAD"],
+            &[],
+        )
+        .await
+        .unwrap();
+        // Same tree as before: the checkpointer deduplicates and mints nothing.
+        let again = executor.checkpoint_now("undo", &CancellationToken::new()).await;
+        assert_ne!(again.as_deref(), Some("refs/aivyx/checkpoints/9999999999999-0000"));
+        let again = again.expect("the real, matching snapshot is still found");
+        assert_eq!(tree_of_ref(&cwd, &again).await, tree_of_ref(&cwd, &real).await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_is_none_when_the_snapshot_fails() {
+        // Force the checkpointer to fail (its private index directory is a
+        // file), with a foreign ref present: the swallowed error must
+        // surface as None, not as that unrelated ref.
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let executor = undo_executor(&cwd, vec![]).await;
+        run_git(
+            &cwd,
+            &["update-ref", "refs/aivyx/checkpoints/9999999999999-0000", "HEAD"],
+            &[],
+        )
+        .await
+        .unwrap();
+        std::fs::write(cwd.join(".git").join("aivyx"), "not a directory").unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        assert_eq!(executor.checkpoint_now("undo", &CancellationToken::new()).await, None);
     }
 
     #[tokio::test]
