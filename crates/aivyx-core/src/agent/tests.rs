@@ -3325,6 +3325,76 @@ async fn a_failed_restore_keeps_the_ledger() {
     assert_eq!(agent.undo_ledger(), &ledger_before);
     assert!(agent.pending_notes.is_empty());
 }
+#[tokio::test]
+async fn undo_with_nothing_left_to_take_back_drops_the_mark_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    let prompter = allow_prompter(1);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    std::fs::remove_file(cwd.join("a.txt")).unwrap(); // the user already took it back
+    let _ = notices(&mut rx);
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        notices(&mut rx),
+        vec!["Nothing to undo there — that turn's changes are already gone.".to_string()]
+    );
+    assert!(agent.undo_ledger().marks.is_empty());
+    assert!(agent.undo_ledger().redo.is_empty(), "nothing to redo either");
+    assert!(agent.pending_notes.is_empty(), "the model is told nothing");
+    assert!(prompter.seen.lock().unwrap().is_empty(), "nothing to confirm");
+}
+
+#[tokio::test]
+async fn redo_with_the_changes_already_back_drops_the_entry_quietly() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    let prompter = allow_prompter(2);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    std::fs::write(cwd.join("a.txt"), "x\n").unwrap(); // the user put it back by hand
+    let notes_before = agent.pending_notes.clone();
+    let _ = notices(&mut rx);
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        notices(&mut rx),
+        vec!["Nothing to redo — those changes are already back.".to_string()]
+    );
+    assert!(agent.undo_ledger().redo.is_empty());
+    assert_eq!(agent.pending_notes, notes_before, "no redo note");
+    assert_eq!(prompter.seen.lock().unwrap().len(), 1, "only the /undo asked");
+}
+
+#[tokio::test]
+async fn redo_flags_paths_changed_since_the_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![
+        write_call("c1", "tracked.txt", "v2\n"), write_call("c2", "a.txt", "a\n"), text_response("done"),
+    ]).await;
+    let prompter = Arc::new(ScriptedPrompter {
+        replies: Mutex::new(vec![UserResponse::Allow, UserResponse::Deny].into()),
+        seen: Mutex::default(),
+    });
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("change".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "hand edit\n").unwrap();
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[1].preview.clone().unwrap();
+    assert!(preview.contains("~ tracked.txt   ⚠ changed after the turn"), "{preview}");
+    assert!(preview.contains("+ a.txt   (will come back)\n"), "unchanged path not flagged: {preview}");
+    assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "hand edit\n");
+}
 
 // ----- /wiki (Phase 11b) -----
 

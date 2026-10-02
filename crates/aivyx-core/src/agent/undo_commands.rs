@@ -141,9 +141,11 @@ impl Agent {
             }
         };
         if changes.is_empty() {
+            // The worktree is already where the undo would take it: drop
+            // the mark, but there is nothing to redo and nothing to tell
+            // the model.
             self.undo.pop_mark();
-            self.undo.push_redo(RedoMark { mark, redo_oid });
-            self.notify("Undone: nothing had changed since that turn.");
+            self.notify("Nothing to undo there — that turn's changes are already gone.");
             self.persist_if_owned();
             return;
         }
@@ -209,13 +211,26 @@ impl Agent {
                 return;
             }
         };
+        if changes.is_empty() {
+            self.undo.pop_redo();
+            self.notify("Nothing to redo — those changes are already back.");
+            self.persist_if_owned();
+            return;
+        }
+        // Paths edited since the undo (which left the worktree at the
+        // turn's `before_oid`): the redo would overwrite those edits.
+        let changed_after: HashSet<String> =
+            git(&cwd, &["diff", "--name-only", &redo.mark.before_oid, &current])
+                .await
+                .map(|out| out.lines().map(str::to_string).collect())
+                .unwrap_or_default();
         let paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
         let entries: Vec<PreviewEntry> = changes
             .into_iter()
             .map(|(path, kind)| PreviewEntry {
+                changed_after: changed_after.contains(&path),
                 path,
                 kind,
-                changed_after: false,
             })
             .collect();
         let preview = preview_text("Redo the last undo?", &entries);
