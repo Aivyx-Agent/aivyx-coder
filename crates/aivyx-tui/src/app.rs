@@ -147,6 +147,11 @@ enum ChatLine {
     ToolCall(String),
     ToolResult(String),
     Notice(String),
+    /// `/help` output (U4/U5) — deliberately its own kind, not `Notice`:
+    /// `Notice` renders with the red/bold "  ! " prefix used for real
+    /// errors and warnings, which made `/help` read as if something had
+    /// gone wrong. Rendered as a plain, unprefixed, unstyled block.
+    Help(String),
     /// A turn paused on the iteration cap while still working — deliberately
     /// styled distinctly from `Notice` (which today also carries real
     /// errors and is red/bold): nothing failed, the session is resumable by
@@ -595,16 +600,11 @@ impl App {
         self.streaming_active = true;
     }
 
-    /// Renders the `/help` command: every known slash command with its
-    /// one-line description, sourced from `aivyx_core::commands::COMMANDS`
-    /// — the same table `/clear`'s and the autocomplete hint's own logic
-    /// reads, so this listing can never drift from what actually exists.
+    /// Renders the `/help` command via `help_text()` as a `ChatLine::Help`
+    /// (U4/U5) -- deliberately not `Notice` (see that variant's doc
+    /// comment).
     fn show_help(&mut self) {
-        let mut lines = vec!["Available commands:".to_string()];
-        for cmd in aivyx_core::commands::COMMANDS {
-            lines.push(format!("  {} — {}", cmd.name, cmd.description));
-        }
-        self.transcript.push(ChatLine::Notice(lines.join("\n")));
+        self.transcript.push(ChatLine::Help(help_text()));
     }
 
     /// Slash-command suggestions for the input box's current
@@ -1060,6 +1060,34 @@ fn new_input_box() -> TextArea<'static> {
     input
 }
 
+/// Builds the `/help` block (U4/U5): every known slash command (sourced
+/// from `aivyx_core::commands::COMMANDS` -- the same table `/clear`'s and
+/// the autocomplete hint's own logic reads, so this listing can never
+/// drift from what actually exists), then a "Keys" section listing only
+/// the bindings that actually exist in the key-handling loop above
+/// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`a`/`n` during an approval prompt --
+/// there is no scrolling binding today, so none is claimed here), then
+/// one line pointing at the real undo mechanism (git-ref checkpoints) --
+/// included unconditionally since there is no in-app undo command yet;
+/// remove this line if one is ever added.
+fn help_text() -> String {
+    let mut lines = vec!["Available commands:".to_string()];
+    for cmd in aivyx_core::commands::COMMANDS {
+        lines.push(format!("  {} — {}", cmd.name, cmd.description));
+    }
+    lines.push(String::new());
+    lines.push("Keys:".to_string());
+    lines.push("  Enter       send".to_string());
+    lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
+    lines.push("  Ctrl+P      plan mode on/off".to_string());
+    lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
+    lines.push(String::new());
+    lines.push(
+        "Undo: every edit is checkpointed — see README \"Worktree checkpoints\"".to_string(),
+    );
+    lines.join("\n")
+}
+
 /// Shown until the first message: what to type, and what happens next.
 fn first_message_hint() -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -1314,6 +1342,8 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             "  ! ",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        // Plain block, no prefix — see the variant's own doc comment.
+        ChatLine::Help(text) => prefixed_lines(text, "", Style::default()),
         // Deliberately not red/bold like Notice — a paused turn hasn't
         // failed, and shouldn't read like it has.
         ChatLine::Paused(text) => {
@@ -2283,8 +2313,8 @@ mod tests {
         app.show_help();
 
         assert_eq!(app.transcript.len(), 1);
-        let ChatLine::Notice(text) = &app.transcript[0] else {
-            panic!("expected a Notice line");
+        let ChatLine::Help(text) = &app.transcript[0] else {
+            panic!("expected a Help line, not a Notice (U4/U5: /help must not read as an error)");
         };
         for cmd in aivyx_core::commands::COMMANDS {
             assert!(
@@ -2292,6 +2322,31 @@ mod tests {
                 "help text missing {}: {text}",
                 cmd.name
             );
+        }
+    }
+
+    #[test]
+    fn help_text_lists_real_keybindings_and_the_undo_pointer() {
+        let text = help_text();
+        assert!(text.contains("Keys:"));
+        assert!(text.contains("Enter") && text.contains("send"));
+        assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
+        assert!(text.contains("Ctrl+P") && text.contains("plan mode on/off"));
+        assert!(text.contains("y / a / n"));
+        // No scrolling keybinding exists in the input loop -- must not be
+        // claimed.
+        assert!(!text.to_lowercase().contains("scroll"));
+        assert!(text.contains("Undo") && text.contains("Worktree checkpoints"));
+    }
+
+    #[test]
+    fn a_help_chat_line_renders_with_no_notice_prefix() {
+        // U4/U5: the generic "! " notice prefix must not appear on /help
+        // output -- only `ChatLine::Notice` gets that treatment.
+        let lines = chat_line_to_lines(&ChatLine::Help("Available commands:\nfoo".to_string()));
+        for line in &lines {
+            let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!rendered.contains('!'), "unexpected '!' in: {rendered}");
         }
     }
 
