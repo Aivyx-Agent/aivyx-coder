@@ -157,9 +157,15 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // response is for the turn's *final* outcome). Surfaced the same way
         // as `CouncilNote`/`ArchitectNote` — and the same way the TUI already
         // renders it, as a transcript line rather than a fatal condition.
-        AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) | AgentEvent::Error(text) => {
-            SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
-        }
+        AgentEvent::CouncilNote(text)
+        | AgentEvent::ArchitectNote(text)
+        | AgentEvent::Error(text)
+        | AgentEvent::Info(text) => SessionUpdate::AgentMessageChunk(text_chunk(text.clone())),
+        // No pager over ACP: the diff goes to the client as a fenced block
+        // its own markdown renderer can highlight.
+        AgentEvent::ShowDiff { title, text } => SessionUpdate::AgentMessageChunk(text_chunk(
+            format!("{title}\n\n```diff\n{text}\n```"),
+        )),
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
             AcpToolCall::new(call.id.0.clone(), call.name.clone())
                 .kind(tool_kind(&call.name))
@@ -293,6 +299,38 @@ mod tests {
         let update =
             translate_event(&sid(), &AgentEvent::ReasoningDelta("thinking".to_string())).unwrap();
         assert!(matches!(update, SessionUpdate::AgentThoughtChunk(_)));
+    }
+
+    #[test]
+    fn info_and_show_diff_become_message_text() {
+        let info =
+            translate_event(&sid(), &AgentEvent::Info("Changed: a.txt".to_string())).unwrap();
+        match info {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                assert_eq!(
+                    chunk.content,
+                    ContentBlock::Text(TextContent::new("Changed: a.txt"))
+                );
+            }
+            other => panic!("expected AgentMessageChunk, got {other:?}"),
+        }
+        let diff = translate_event(
+            &sid(),
+            &AgentEvent::ShowDiff {
+                title: "Uncommitted changes".to_string(),
+                text: "+x".to_string(),
+            },
+        )
+        .unwrap();
+        match diff {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                assert_eq!(
+                    chunk.content,
+                    ContentBlock::Text(TextContent::new("Uncommitted changes\n\n```diff\n+x\n```"))
+                );
+            }
+            other => panic!("expected AgentMessageChunk, got {other:?}"),
+        }
     }
 
     #[test]

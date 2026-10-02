@@ -91,6 +91,20 @@ pub enum AgentEvent {
     /// make every `AgentEvent` at least as large as its own biggest
     /// variant recursively.
     SubAgentActivity(Box<AgentEvent>),
+    /// A neutral, informational line — not an error, not a warning, and
+    /// not a turn boundary (it never ends or interrupts a turn). E.g. the
+    /// per-turn change summary (`Changed: a.txt (+1, new) · …`) emitted
+    /// after a turn that changed files. Frontends render it dim/unprefixed,
+    /// unlike `Error`'s red notice.
+    Info(String),
+    /// A diff to show the user (`/diff`): `title` is a one-line heading
+    /// (e.g. `Uncommitted changes`), `text` the unified diff itself,
+    /// already truncated for display. Frontends show it in a pager (TUI)
+    /// or a fenced ```diff block (ACP).
+    ShowDiff {
+        title: String,
+        text: String,
+    },
 }
 
 /// How edit content travels to and from the model. See ROADMAP.md Phase 2

@@ -37,7 +37,7 @@ pub use generate_svg::GenerateSvgTool;
 pub use generate_svg_completer::CoderTextCompleter;
 pub use generation_tools::{GenerateImageTool, GenerateThreeDTool};
 pub use git_branch::GitBranchTool;
-pub use git_commit::GitCommitTool;
+pub use git_commit::{GitCommitTool, confined_git};
 pub use git_pr::GitPrTool;
 pub use git_push::GitPushTool;
 pub use git_read::GitReadTool;

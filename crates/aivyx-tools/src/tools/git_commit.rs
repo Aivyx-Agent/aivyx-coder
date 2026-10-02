@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
+use aivyx_sandbox::{
+    ActionKind, ExecutionConfiner, PermissionRequest, PermissionTarget, path_is_denied,
+};
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -164,20 +166,32 @@ impl Tool for GitCommitTool {
 }
 
 fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::Command {
+    confined_git(args, &ctx.cwd, ctx.confiner.as_ref())
+}
+
+/// A confined `git <args>` in `cwd` with null stdin and piped
+/// stdout/stderr — shared by this tool and the `/commit` command so both
+/// build git invocations the same way.
+///
+/// Global `-c core.fsmonitor=false` on every invocation (audit finding A1
+/// item 3): defense in depth alongside the gate's hard-deny on writing
+/// `.git/config` in the first place -- hooks themselves still run
+/// deliberately (the user's own), this only stops a *planted* fsmonitor
+/// hook from firing via these `add`/`commit` calls.
+pub fn confined_git(
+    args: &[String],
+    cwd: &Path,
+    confiner: &dyn ExecutionConfiner,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
-    // Global `-c core.fsmonitor=false` on every invocation (audit finding
-    // A1 item 3): defense in depth alongside the gate's hard-deny on
-    // writing `.git/config` in the first place -- hooks themselves still
-    // run deliberately (the user's own), this only stops a *planted*
-    // fsmonitor hook from firing via this tool's own `add`/`commit` calls.
     command
         .args(["-c", "core.fsmonitor=false"])
         .args(args)
-        .current_dir(&ctx.cwd)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    ctx.confiner.confine(command)
+    confiner.confine(command)
 }
 
 /// What the human sees in the modal before approving: a file-granularity
@@ -234,6 +248,15 @@ mod tests {
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[test]
+    fn confined_git_disables_fsmonitor_before_the_subcommand() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = confined_git(&["status".into()], dir.path(), &aivyx_sandbox::NoopConfiner);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["-c", "core.fsmonitor=false", "status"]);
+        assert_eq!(command.as_std().get_current_dir(), Some(dir.path()));
     }
 
     #[tokio::test]

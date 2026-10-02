@@ -2977,9 +2977,18 @@ async fn undo_agent_with_events(
     dir: &Path,
     with_checkpointer: bool,
 ) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    undo_agent_with_script(dir, with_checkpointer, vec![write_call("c1", "a.txt", "x\n"), text_response("ok")]).await
+}
+
+/// `undo_agent_with_events` with a caller-chosen model script.
+async fn undo_agent_with_script(
+    dir: &Path,
+    with_checkpointer: bool,
+    responses: Vec<Vec<StreamEvent>>,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(aivyx_tools::WriteFileTool));
-    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![write_call("c1", "a.txt", "x\n"), text_response("ok")]));
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(responses));
     let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
     if with_checkpointer {
         executor.set_checkpointer_at(dir.to_path_buf(), vec![], Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()));
@@ -6866,4 +6875,48 @@ async fn the_routed_model_is_announced_again_after_clearing() {
         })
         .collect();
     assert_eq!(announced, ["mock@backend", "mock@backend"]);
+}
+
+fn infos(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::Info(text) = ev {
+            out.push(text);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_turn_that_changed_files_reports_a_change_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, vec![
+        multi_call_response(vec![
+            write_call_in("a.txt", "one\n", "c1"),
+            write_call_in("tracked.txt", "v2\n", "c2"),
+        ]),
+        text_response("done"),
+        text_response("just reading"),
+    ]).await;
+
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["Changed: a.txt (+1, new) · tracked.txt (+1 −1)".to_string()]);
+
+    agent.run_turn("read only".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), Vec::<String>::new(), "a read-only turn reports nothing");
+}
+
+#[tokio::test]
+async fn the_change_summary_arrives_after_the_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let events = drain(&mut rx);
+    let complete = events.iter().rposition(|e| matches!(e, AgentEvent::TurnComplete)).unwrap();
+    let info = events.iter().position(|e| matches!(e, AgentEvent::Info(_))).unwrap();
+    assert!(info > complete, "{events:?}");
 }

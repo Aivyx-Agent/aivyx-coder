@@ -34,7 +34,7 @@ pub use process::{CommandSpec, run};
 pub use tools::{
     CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GenerateImageTool,
     GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool, GitBranchTool, GitCommitTool, GitPrTool,
-    GitPushTool, GitReadTool, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
+    GitPushTool, GitReadTool, confined_git, GlobTool, GoToDefinitionTool, GrepTool, ListMcpPromptsTool,
     ListMcpResourcesTool, LoadSkillTool, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
     MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
     RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
@@ -228,6 +228,13 @@ impl ToolExecutor {
             checkpoint_cwd: None,
             checkpoint_deny_paths: Vec::new(),
         }
+    }
+
+    /// The confiner this executor runs tool subprocesses under — so
+    /// commands that shell out on the agent's behalf outside a tool call
+    /// (e.g. `/commit`) are confined the same way.
+    pub fn confiner(&self) -> Arc<dyn ExecutionConfiner> {
+        Arc::clone(&self.confiner)
     }
 
     pub fn set_checkpointer(&mut self, checkpointer: Arc<GitCheckpointer>) {

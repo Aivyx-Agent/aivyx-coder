@@ -230,6 +230,10 @@ enum ChatLine {
     /// deliberation and the parent's own transcript, since the architect is
     /// a separate model producing a plan, not "aivyx" speaking.
     Architect(String),
+    /// A neutral informational line (`AgentEvent::Info`, e.g. the per-turn
+    /// change summary) — dim and unprefixed: not an error, so never the
+    /// red/bold `Notice` style.
+    Info(String),
 }
 
 /// Configures an unattended `--auto` session (ROADMAP.md Phase 11c). `tasks`
@@ -833,6 +837,15 @@ impl App {
                     .push(ChatLine::Notice(format!("routing → {model}: {reason}")));
                 self.routed_model = Some(model);
             }
+            // Not a turn boundary: the change summary arrives after
+            // `TurnComplete`, so this must not touch `streaming_active`.
+            AgentEvent::Info(text) => {
+                self.transcript.push(ChatLine::Info(text));
+            }
+            // Placeholder until the diff pager exists (Task 4).
+            AgentEvent::ShowDiff { title, .. } => {
+                self.transcript.push(ChatLine::Info(title));
+            }
         }
     }
 
@@ -1079,7 +1092,10 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         AgentEvent::TextDelta(text) | AgentEvent::ReasoningDelta(text) => text.clone(),
         AgentEvent::ToolCallDetected(call) => format!("{}({})", call.name, call.arguments),
         AgentEvent::ToolResult(result) => tool_output_text(&result.output),
-        AgentEvent::Error(text) | AgentEvent::TurnPaused(text) => text.clone(),
+        AgentEvent::Error(text) | AgentEvent::TurnPaused(text) | AgentEvent::Info(text) => {
+            text.clone()
+        }
+        AgentEvent::ShowDiff { title, .. } => title.clone(),
         AgentEvent::TurnComplete
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::TasksUpdated(_)
@@ -1504,7 +1520,7 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
         ),
         // Plain block, no prefix — see the variant's own doc comment.
         ChatLine::Help(text) => prefixed_lines(text, "", Style::default()),
-        ChatLine::Cancelled(text) => {
+        ChatLine::Cancelled(text) | ChatLine::Info(text) => {
             prefixed_lines(text, "  ", Style::default().fg(Color::DarkGray))
         }
         // Deliberately not red/bold like Notice — a paused turn hasn't
@@ -2590,6 +2606,29 @@ mod tests {
         let mut app = App::new(None, PlanMode::new());
         app.handle_agent_event(AgentEvent::Error("backend timed out".to_string()));
         assert!(matches!(app.transcript.last(), Some(ChatLine::Notice(_))));
+    }
+
+    #[test]
+    fn an_info_event_is_a_neutral_line_that_leaves_streaming_alone() {
+        for streaming in [true, false] {
+            let mut app = App::new(None, PlanMode::new());
+            app.streaming_active = streaming;
+            app.handle_agent_event(AgentEvent::Info("x".to_string()));
+            assert!(matches!(app.transcript.last(), Some(ChatLine::Info(t)) if t == "x"));
+            assert_eq!(app.streaming_active, streaming);
+        }
+    }
+
+    #[test]
+    fn info_chat_line_has_no_notice_prefix() {
+        let lines = chat_line_to_lines(&ChatLine::Info("Changed: a.txt (+1, new)".to_string()));
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("Changed: a.txt"));
+        assert!(!rendered.contains('!'));
     }
 
     #[test]

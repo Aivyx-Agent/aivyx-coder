@@ -513,6 +513,13 @@ impl Agent {
         self.emit(AgentEvent::Error(message.into()));
     }
 
+    /// Sends a neutral informational line into the transcript
+    /// (`AgentEvent::Info`) — for things that are neither errors nor model
+    /// output, like the per-turn change summary.
+    pub(crate) fn info(&self, text: impl Into<String>) {
+        self.emit(AgentEvent::Info(text.into()));
+    }
+
     /// Starts a fresh conversation: clears `history` and the shared task
     /// list, persists the now-empty session (so a crash immediately after
     /// doesn't reload the old conversation via `--resume`), and emits
@@ -1589,16 +1596,46 @@ impl Agent {
             self.undo.record(TurnMark {
                 user_text_preview: turn_preview,
                 before_ref,
-                before_oid,
-                after_oid: Some(after_oid),
+                before_oid: before_oid.clone(),
+                after_oid: Some(after_oid.clone()),
                 created_unix: now_unix(),
             });
+            // What this turn changed, as one line after the reply (the
+            // inner turn already emitted `TurnComplete`). Best-effort: a
+            // git failure just means no summary.
+            self.emit_change_summary(&cwd, &before_oid, &after_oid)
+                .await;
         }
         if result.is_ok() || self.session_owns_slot {
             self.persist();
             self.session_owns_slot = true;
         }
         result
+    }
+
+    /// Emits `Changed: …` (an `Info` line) for the files that differ
+    /// between two snapshot commits; nothing when git fails or nothing
+    /// changed.
+    async fn emit_change_summary(&self, cwd: &Path, before_oid: &str, after_oid: &str) {
+        let diff = |format: &'static str| {
+            let args = [
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-renames",
+                format,
+                before_oid,
+                after_oid,
+            ];
+            async move { aivyx_tools::run_git(cwd, &args, &[]).await }
+        };
+        let numstat = diff("--numstat").await;
+        let names = diff("--name-status").await;
+        if let (Ok(n), Ok(s)) = (numstat, names)
+            && let Some(line) = crate::changes::summary_line(&crate::changes::parse_numstat(&n, &s))
+        {
+            self.info(line);
+        }
     }
 
     /// Runs `/council`: convenes the configured council on `subject_arg`
