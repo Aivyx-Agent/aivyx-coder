@@ -3287,12 +3287,18 @@ async fn undo_works_after_resume_in_a_new_process() {
 
     let (mut agent2, _rx) = undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![]))).await;
     agent2.restore(crate::session::load(&session_path).expect("saved"));
+    agent2.set_session_path(session_path.clone());
     agent2.set_command_prompter(allow_prompter(1));
     agent2.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "v1\n");
     assert!(!cwd.join("a.txt").exists());
     assert!(agent2.undo_ledger().marks.is_empty());
     assert_eq!(agent2.undo_ledger().redo.len(), 1);
+    // A resumed session owns its slot, so the undo (ledger + note for the
+    // model) is saved even though no model turn ran in this process.
+    let saved = crate::session::load(&session_path).expect("saved");
+    assert_eq!(saved.undo.redo.len(), 1);
+    assert_eq!(saved.pending_notes.len(), 1);
 }
 
 #[tokio::test]

@@ -315,8 +315,18 @@ impl ToolExecutor {
         let git_dir = run_git(cwd, &["rev-parse", "--absolute-git-dir"], &[])
             .await
             .ok()?;
-        let index = PathBuf::from(git_dir.trim())
-            .join(format!("aivyx-verify-index-{}", std::process::id()));
+        let git_dir = PathBuf::from(git_dir.trim());
+        let index = git_dir.join(format!("aivyx-verify-index-{}", std::process::id()));
+        // Start from a copy of the checkpointer's own index, not an empty
+        // one: git keeps an already-indexed file even after it becomes
+        // ignored, so only the same starting index yields the same tree the
+        // checkpointer wrote — and its cached stat data spares re-hashing
+        // the whole worktree on every message.
+        let _ = std::fs::remove_file(&index);
+        let checkpointer_index = git_dir.join("aivyx").join("index");
+        if checkpointer_index.exists() {
+            let _ = std::fs::copy(&checkpointer_index, &index);
+        }
         let index_str = index.to_str()?.to_string();
         let env = [("GIT_INDEX_FILE", index_str.as_str())];
         let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
@@ -1144,6 +1154,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
             "v2\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_still_verifies_after_a_captured_file_becomes_ignored() {
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        let cwd = dir.path().canonicalize().unwrap();
+        executor.set_checkpointer_at(
+            cwd.clone(),
+            vec![],
+            Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()),
+        );
+        // A build artifact exists before .gitignore covers it, so the
+        // checkpointer's own index captures it and keeps it.
+        std::fs::create_dir(cwd.join("build")).unwrap();
+        std::fs::write(cwd.join("build/out.o"), "obj\n").unwrap();
+        assert!(executor.checkpoint_now("first", &CancellationToken::new()).await.is_some());
+        std::fs::write(cwd.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+        assert!(
+            executor.checkpoint_now("second", &CancellationToken::new()).await.is_some(),
+            "a file ignored after it was captured must not make every snapshot fail"
         );
     }
 

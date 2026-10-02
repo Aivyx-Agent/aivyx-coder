@@ -206,10 +206,10 @@ pub struct Agent {
     /// process whose first turn fails outright (server down, etc.) -- the
     /// stored file, which may hold real prior history from an earlier
     /// process, must be left untouched rather than clobbered with the
-    /// single failed message. Deliberately process-scoped, not
-    /// persisted/restored itself: `restore()` does not set it, so a
-    /// `--resume`d session's first turn in a *new* process is held to the
-    /// same rule.
+    /// single failed message. A `--resume`d session owns the slot from the
+    /// start (`restore()` sets it): its history in memory *is* the stored
+    /// history, so saving it — e.g. after an `/undo` right after resuming —
+    /// can only add to what's there, never clobber it.
     session_owns_slot: bool,
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
@@ -1075,6 +1075,7 @@ impl Agent {
             self.plan_mode.set_active(true);
         }
         self.undo = state.undo;
+        self.session_owns_slot = true;
         self.pending_notes = state.pending_notes;
     }
 
