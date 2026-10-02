@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, UserResponse};
 use tokio_util::sync::CancellationToken;
 
-use super::{Agent, now_unix, resolve_oid};
+use super::{Agent, resolve_oid};
 use crate::undo::{
     ChangeKind, PreviewEntry, RedoMark, checkpoints_listing, parse_name_status, preview_text,
     preview_title_undo,
@@ -271,7 +271,6 @@ impl Agent {
         }
         self.notify(checkpoints_listing(
             &self.undo.marks,
-            now_unix(),
             local_offset_secs(),
             |m| missing.contains(&m.before_oid),
         ));

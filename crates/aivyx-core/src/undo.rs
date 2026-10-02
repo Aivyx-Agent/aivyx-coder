@@ -45,14 +45,6 @@ impl UndoLedger {
         }
     }
 
-    pub fn set_last_after(&mut self, after_oid: String) {
-        if let Some(last) = self.marks.last_mut()
-            && last.after_oid.is_none()
-        {
-            last.after_oid = Some(after_oid);
-        }
-    }
-
     pub fn pop_mark(&mut self) -> Option<TurnMark> {
         self.marks.pop()
     }
@@ -161,7 +153,6 @@ pub fn text_preview(user_text: &str) -> String {
 
 pub fn checkpoints_listing(
     marks: &[TurnMark],
-    _now_unix: i64,
     local_offset_secs: i32,
     is_pruned: impl Fn(&TurnMark) -> bool,
 ) -> String {
@@ -210,8 +201,6 @@ mod tests {
     fn undo_redo_stack_round_trip() {
         let mut l = UndoLedger::default();
         l.record(mark(1));
-        l.set_last_after("a".repeat(40));
-        assert_eq!(l.marks[0].after_oid.as_deref(), Some("a".repeat(40).as_str()));
         let m = l.pop_mark().unwrap();
         l.push_redo(RedoMark { mark: m.clone(), redo_oid: "b".repeat(40) });
         assert!(l.pop_mark().is_none());
@@ -292,7 +281,7 @@ mod tests {
         a.user_text_preview = "first".into();
         let mut b = mark(1_000 + 3_600);
         b.user_text_preview = "second".into();
-        let text = checkpoints_listing(&[a.clone(), b], 1_000 + 7_200, 0, |m| m.created_unix == a.created_unix);
+        let text = checkpoints_listing(&[a.clone(), b], 0, |m| m.created_unix == a.created_unix);
         assert_eq!(
             text,
             "Undoable turns (newest first — /undo takes back the top one):\n\
@@ -300,7 +289,7 @@ mod tests {
              2  00:16 · \"first\"   too old to undo"
         );
         assert_eq!(
-            checkpoints_listing(&[], 0, 0, |_| false),
+            checkpoints_listing(&[], 0, |_| false),
             "Nothing to undo — no changes made in this session."
         );
     }
