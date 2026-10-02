@@ -11,6 +11,7 @@ pub mod routing_commands;
 pub mod session;
 pub mod specialist_enforcement;
 pub mod specialist_sessions;
+pub mod undo;
 pub mod wiki;
 
 pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, EditFormat};
