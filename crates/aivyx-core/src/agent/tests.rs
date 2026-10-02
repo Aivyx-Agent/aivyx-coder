@@ -3058,6 +3058,139 @@ async fn checkpoints_lists_changing_turns_newest_first() {
     assert!(second < first, "{listing}");
 }
 
+fn allow_prompter(n: usize) -> Arc<ScriptedPrompter> {
+    Arc::new(ScriptedPrompter {
+        replies: Mutex::new(vec![UserResponse::Allow; n].into()),
+        seen: Mutex::default(),
+    })
+}
+
+/// Plays `responses` in order, then fails every further call — a turn that
+/// writes a file and then loses the backend.
+struct ScriptThenFailBackend(Mutex<VecDeque<Vec<StreamEvent>>>);
+
+#[async_trait::async_trait]
+impl LlmBackend for ScriptThenFailBackend {
+    fn model_id(&self) -> &str {
+        "script-then-fail"
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        let next = self.0.lock().unwrap().pop_front();
+        match next {
+            Some(events) => {
+                Ok(futures::stream::iter(events.into_iter().map(Ok::<StreamEvent, LlmError>)).boxed())
+            }
+            None => Err(LlmError::Timeout),
+        }
+    }
+}
+
+/// An undo agent over `llm`, keeping the mock handle out of the caller's way.
+async fn undo_agent_over(dir: &Path, llm: Arc<dyn LlmBackend>) -> Agent {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        vec![],
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
+    );
+    let (tx, _rx) = unbounded_channel();
+    Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx)
+}
+
+fn last_user_text(mock: &MockBackend) -> String {
+    let received = mock.received.lock().unwrap();
+    let last = received.last().unwrap();
+    last.messages.iter().rev().find(|m| m.role == Role::User).unwrap().text_content()
+}
+
+#[tokio::test]
+async fn two_undos_both_reach_the_model_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mock = Arc::new(MockBackend::new(vec![
+        write_call("c1", "a.txt", "a\n"), text_response("done"),
+        write_call("c2", "b.txt", "b\n"), text_response("done"),
+        text_response("ok"),
+    ]));
+    let mut agent = undo_agent_over(&cwd, mock.clone()).await;
+    agent.set_command_prompter(allow_prompter(2));
+    agent.run_turn("make a".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("make b".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("what now?".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        last_user_text(&mock),
+        "(The user undid your changes from the last turn: b.txt. \
+         The user undid your changes from the last turn: a.txt.)\n\nwhat now?"
+    );
+}
+
+#[tokio::test]
+async fn pending_notes_survive_a_session_save_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let session_path = state_dir.path().join("session.json");
+    let mut agent = undo_agent(&cwd, vec![write_call("c1", "a.txt", "a\n"), text_response("done")]).await;
+    agent.set_session_path(session_path.clone());
+    agent.set_command_prompter(allow_prompter(1));
+    agent.run_turn("make a".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let loaded = crate::session::load(&session_path).expect("saved");
+    assert_eq!(
+        loaded.pending_notes,
+        vec!["The user undid your changes from the last turn: a.txt.".to_string()]
+    );
+    let mock = Arc::new(MockBackend::new(vec![text_response("ok")]));
+    let mut agent2 = undo_agent_over(&cwd, mock.clone()).await;
+    agent2.restore(loaded);
+    agent2.run_turn("what now?".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        last_user_text(&mock),
+        "(The user undid your changes from the last turn: a.txt.)\n\nwhat now?"
+    );
+}
+
+#[tokio::test]
+async fn undo_in_a_fresh_process_whose_first_turn_failed_leaves_the_stored_session_alone() {
+    // B1 for /undo: this process has never saved (its first turn failed),
+    // so an /undo must not overwrite the real session on disk.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let session_path = state_dir.path().join("session.json");
+    let existing = crate::session::SessionState::new(
+        vec![user_msg("earlier turn"), assistant_msg("earlier reply")],
+        vec![],
+        false,
+        vec![],
+    );
+    crate::session::save(&session_path, &existing).unwrap();
+    let before = std::fs::read_to_string(&session_path).unwrap();
+
+    let llm = Arc::new(ScriptThenFailBackend(Mutex::new(vec![write_call("c1", "a.txt", "a\n")].into())));
+    let mut agent = undo_agent_over(&cwd, llm).await;
+    agent.set_session_path(session_path.clone());
+    agent.set_command_prompter(allow_prompter(1));
+    assert!(agent.run_turn("write then fail".into(), &cwd, CancellationToken::new()).await.is_err());
+    assert_eq!(agent.undo_ledger().marks.len(), 1, "the failed turn still changed a file");
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(!cwd.join("a.txt").exists(), "the undo itself happened");
+    assert_eq!(std::fs::read_to_string(&session_path).unwrap(), before, "stored session untouched");
+}
 
 // ----- /wiki (Phase 11b) -----
 

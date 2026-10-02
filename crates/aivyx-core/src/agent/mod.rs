@@ -370,11 +370,12 @@ pub struct Agent {
     /// never be cached. `None` (e.g. MCP sessions, which have no human)
     /// makes those commands unavailable.
     command_prompter: Option<Arc<dyn aivyx_sandbox::PermissionPrompter>>,
-    /// A note for the model about something the user did between turns
-    /// (an `/undo`), prefixed to the next user message — never sent as a
-    /// message of its own, so chat templates that require alternating
-    /// roles still work.
-    pending_note: Option<String>,
+    /// Notes for the model about what the user did between turns (each
+    /// `/undo` or `/redo`, in order), joined and prefixed to the next user
+    /// message — never sent as a message of their own, so chat templates
+    /// that require alternating roles still work. Persisted with the
+    /// session; reset by `clear_conversation`.
+    pending_notes: Vec<String>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -455,7 +456,7 @@ impl Agent {
             pre_experiment_ref: None,
             undo: crate::undo::UndoLedger::default(),
             command_prompter: None,
-            pending_note: None,
+            pending_notes: Vec::new(),
             events_tx,
         }
     }
@@ -545,7 +546,7 @@ impl Agent {
         }
         self.last_routed = None;
         self.undo.clear();
-        self.pending_note = None;
+        self.pending_notes.clear();
         self.emit(AgentEvent::ConversationCleared);
         self.persist();
         self.session_owns_slot = true;
@@ -1073,6 +1074,7 @@ impl Agent {
             self.plan_mode.set_active(true);
         }
         self.undo = state.undo;
+        self.pending_notes = state.pending_notes;
     }
 
     /// A clone of the current conversation history. Used to persist a
@@ -1114,8 +1116,19 @@ impl Agent {
             specialist_sessions,
         );
         state.undo = self.undo.clone();
+        state.pending_notes = self.pending_notes.clone();
         if let Err(err) = session::save(path, &state) {
             tracing::warn!(error = %err, "failed to persist session");
+        }
+    }
+
+    /// `persist`, but only once this process owns the session slot (B1, see
+    /// `session_owns_slot`): for state changes outside a successful turn,
+    /// such as `/undo`, which must not overwrite a real saved session from
+    /// a fresh process whose first turn failed.
+    fn persist_if_owned(&self) {
+        if self.session_owns_slot {
+            self.persist();
         }
     }
 
@@ -1887,9 +1900,11 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
-        let user_input = match self.pending_note.take() {
-            Some(note) => format!("({note})\n\n{user_input}"),
-            None => user_input,
+        let user_input = if self.pending_notes.is_empty() {
+            user_input
+        } else {
+            let notes = std::mem::take(&mut self.pending_notes).join(" ");
+            format!("({notes})\n\n{user_input}")
         };
         self.history.push(Message::text(Role::User, user_input));
         // Once per turn, not per iteration: within a turn the map rarely

@@ -74,6 +74,11 @@ pub struct SessionState {
     /// may already be pruned by the time this field shipped).
     #[serde(default)]
     pub undo: crate::undo::UndoLedger,
+    /// Notes for the model about what the user did between turns (each
+    /// `/undo` or `/redo`), not yet delivered: they prefix the next user
+    /// message. `#[serde(default)]` so older session files load with none.
+    #[serde(default)]
+    pub pending_notes: Vec<String>,
 }
 
 impl SessionState {
@@ -90,6 +95,7 @@ impl SessionState {
             plan_mode_active,
             specialist_sessions,
             undo: crate::undo::UndoLedger::default(),
+            pending_notes: Vec::new(),
         }
     }
 }

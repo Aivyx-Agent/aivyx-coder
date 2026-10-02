@@ -156,7 +156,7 @@ impl Agent {
             self.undo.pop_mark();
             self.undo.push_redo(RedoMark { mark, redo_oid });
             self.notify("Undone: nothing had changed since that turn.");
-            self.persist();
+            self.persist_if_owned();
             return;
         }
         let changed_after: HashSet<String> = match &mark.after_oid {
@@ -196,11 +196,11 @@ impl Agent {
         self.undo.pop_mark();
         self.undo.push_redo(RedoMark { mark, redo_oid });
         let list = paths.join(", ");
-        self.pending_note = Some(format!(
+        self.pending_notes.push(format!(
             "The user undid your changes from the last turn: {list}."
         ));
         self.notify(format!("Undone: {list}"));
-        self.persist();
+        self.persist_if_owned();
     }
 
     async fn redo_last_undo(&mut self) {
@@ -252,9 +252,10 @@ impl Agent {
         let redo = self.undo.pop_redo().expect("checked above");
         self.undo.push_mark_back(redo.mark);
         let list = paths.join(", ");
-        self.pending_note = Some(format!("The user restored your changes: {list}."));
+        self.pending_notes
+            .push(format!("The user restored your changes: {list}."));
         self.notify(format!("Redone: {list}"));
-        self.persist();
+        self.persist_if_owned();
     }
 
     async fn list_checkpoints(&mut self) {
