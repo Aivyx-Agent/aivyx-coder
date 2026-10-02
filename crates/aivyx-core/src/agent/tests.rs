@@ -2914,6 +2914,7 @@ async fn undo_rewinds_the_whole_turn_and_redo_brings_it_back() {
     assert!(!cwd.join("new.txt").exists());
     let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
     assert!(preview.contains("~ tracked.txt") && preview.contains("− new.txt   (will be removed)"), "{preview}");
+    assert!(preview.ends_with("\n\n(git-ignored files are not touched)"), "{preview}");
 
     agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "v2\n");

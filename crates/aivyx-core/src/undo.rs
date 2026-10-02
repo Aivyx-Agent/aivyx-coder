@@ -126,7 +126,10 @@ pub fn parse_name_status(from_to_name_status: &str) -> Vec<(String, ChangeKind)>
     out
 }
 
-pub fn preview_text(title: &str, entries: &[PreviewEntry], any_ignored: bool) -> String {
+/// The `/undo` / `/redo` confirmation text. The git-ignored caveat is
+/// always shown: checkpoint trees never contain ignored files, so whether
+/// one is affected can't be told from them.
+pub fn preview_text(title: &str, entries: &[PreviewEntry]) -> String {
     let mut text = format!("{title}\n");
     for e in entries {
         let (sym, note) = match e.kind {
@@ -134,16 +137,12 @@ pub fn preview_text(title: &str, entries: &[PreviewEntry], any_ignored: bool) ->
             ChangeKind::Removed => ("−", "   (will be removed)"),
             ChangeKind::Restored => ("+", "   (will come back)"),
         };
-        text.push_str(&format!("\n{sym} {}", e.path));
+        text.push_str(&format!("\n{sym} {}{note}", e.path));
         if e.changed_after {
             text.push_str("   ⚠ changed after the turn");
-        } else {
-            text.push_str(note);
         }
     }
-    if any_ignored {
-        text.push_str("\n\n(git-ignored files are not touched)");
-    }
+    text.push_str("\n\n(git-ignored files are not touched)");
     text
 }
 
@@ -260,18 +259,24 @@ mod tests {
             PreviewEntry { path: "stats.py".into(), kind: ChangeKind::Modified, changed_after: true },
             PreviewEntry { path: "notes.md".into(), kind: ChangeKind::Removed, changed_after: false },
             PreviewEntry { path: "old.txt".into(), kind: ChangeKind::Restored, changed_after: false },
+            PreviewEntry { path: "draft.md".into(), kind: ChangeKind::Removed, changed_after: true },
+            PreviewEntry { path: "gone.rs".into(), kind: ChangeKind::Restored, changed_after: true },
         ];
-        let text = preview_text("Undo the last turn (\"fix it\")?", &entries, true);
+        let text = preview_text("Undo the last turn (\"fix it\")?", &entries);
         assert_eq!(
             text,
             "Undo the last turn (\"fix it\")?\n\n\
              ~ stats.py   ⚠ changed after the turn\n\
              − notes.md   (will be removed)\n\
-             + old.txt   (will come back)\n\n\
+             + old.txt   (will come back)\n\
+             − draft.md   (will be removed)   ⚠ changed after the turn\n\
+             + gone.rs   (will come back)   ⚠ changed after the turn\n\n\
              (git-ignored files are not touched)"
         );
-        let plain = preview_text("t", &entries[1..2], false);
-        assert_eq!(plain, "t\n\n− notes.md   (will be removed)");
+        // The ignored-files caveat is always shown: checkpoints never
+        // contain ignored files, so there is no way to tell from them.
+        let plain = preview_text("t", &entries[1..2]);
+        assert_eq!(plain, "t\n\n− notes.md   (will be removed)\n\n(git-ignored files are not touched)");
     }
 
     #[test]

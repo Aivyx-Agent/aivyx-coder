@@ -100,18 +100,6 @@ impl Agent {
             .map(|out| parse_name_status(&out))
     }
 
-    async fn any_ignored(cwd: &Path, paths: &[String]) -> bool {
-        if paths.is_empty() {
-            return false;
-        }
-        let mut args = vec!["check-ignore", "--"];
-        args.extend(paths.iter().map(String::as_str));
-        // Exit 0 = at least one path ignored; exit 1 (an Err here) = none.
-        git(cwd, &args)
-            .await
-            .is_ok_and(|out| !out.trim().is_empty())
-    }
-
     async fn confirm(&self, tool_name: &str, preview: String) -> bool {
         let Some(prompter) = &self.command_prompter else {
             return false;
@@ -175,12 +163,7 @@ impl Agent {
                 kind,
             })
             .collect();
-        let ignored = Self::any_ignored(&cwd, &paths).await;
-        let preview = preview_text(
-            &preview_title_undo(&mark.user_text_preview),
-            &entries,
-            ignored,
-        );
+        let preview = preview_text(&preview_title_undo(&mark.user_text_preview), &entries);
         if !self.confirm("undo", preview).await {
             self.notify("Undo cancelled.");
             return;
@@ -235,8 +218,7 @@ impl Agent {
                 changed_after: false,
             })
             .collect();
-        let ignored = Self::any_ignored(&cwd, &paths).await;
-        let preview = preview_text("Redo the last undo?", &entries, ignored);
+        let preview = preview_text("Redo the last undo?", &entries);
         if !self.confirm("redo", preview).await {
             self.notify("Redo cancelled.");
             return;
