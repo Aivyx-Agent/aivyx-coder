@@ -256,15 +256,6 @@ impl ToolExecutor {
         checkpointer.latest_ref(cancellation).await
     }
 
-    /// Whether a call to `tool_name` should be preceded by a checkpoint —
-    /// `false` for an unknown/unregistered name, mirroring `dispatch`'s own
-    /// tool lookup.
-    pub fn needs_checkpoint(&self, tool_name: &str) -> bool {
-        self.registry
-            .get(tool_name)
-            .is_some_and(|t| t.needs_checkpoint())
-    }
-
     /// The most recent checkpoint ref, or `None` if no checkpointer is
     /// configured (checkpointing disabled, or `cwd` isn't a git repo) or
     /// none has been taken yet. `Agent` (Phase 11c's autonomous discard

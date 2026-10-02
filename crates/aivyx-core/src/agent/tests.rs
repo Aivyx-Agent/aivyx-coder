@@ -2682,7 +2682,8 @@ async fn undo_ledger_survives_a_session_save_and_restore() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
-    let session_path = dir.path().join("session.json");
+    let state_dir = tempfile::tempdir().unwrap();
+    let session_path = state_dir.path().join("session.json");
 
     let mut agent = undo_agent(&cwd, vec![write_call("c1", "a.txt", "one\n"), text_response("done")])
         .await;
@@ -2709,6 +2710,175 @@ async fn undo_ledger_survives_a_session_save_and_restore() {
     agent2.restore(loaded);
 
     assert_eq!(agent2.undo_ledger(), agent.undo_ledger());
+}
+
+/// Writes `sneaky.txt` but reports `mutates_outside_session() == false`,
+/// so `dispatch` takes no checkpoint for it — standing in for a delegated
+/// sub-agent, whose own executor writes files the parent never checkpoints.
+struct SneakyWriteTool;
+
+#[async_trait::async_trait]
+impl Tool for SneakyWriteTool {
+    fn name(&self) -> &str {
+        "sneaky_write"
+    }
+
+    fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "sneaky_write".to_string(),
+            description: "test".to_string(),
+            parameters_schema: serde_json::json!({}),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "sneaky_write".to_string(),
+            action: ActionKind::Read,
+            target: PermissionTarget::Other("sneaky".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        std::fs::write(ctx.cwd.join("sneaky.txt"), "s\n").unwrap();
+        Ok(ToolOutput::Ok("wrote".to_string()))
+    }
+}
+
+fn call_events(id: &str, name: &str, arguments: serde_json::Value) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId(id.to_string()),
+            name: name.to_string(),
+            arguments,
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+async fn undo_agent_with(dir: &Path, registry: ToolRegistry, responses: Vec<Vec<StreamEvent>>) -> Agent {
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(responses));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
+    );
+    let (tx, _rx) = unbounded_channel();
+    Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    )
+}
+
+#[tokio::test]
+async fn a_command_that_changes_nothing_records_no_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec("check", false)])));
+    let mut agent = undo_agent_with(
+        &cwd,
+        registry,
+        vec![
+            call_events("c1", "run_command", serde_json::json!({ "command": "check" })),
+            text_response("the check failed"),
+        ],
+    )
+    .await;
+    agent
+        .run_turn("run the check".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        agent.undo_ledger().marks.is_empty(),
+        "a command that changed no files leaves nothing to undo"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_still_records_its_mark_with_an_after_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(CancelTool));
+    let mut agent = undo_agent_with(
+        &cwd,
+        registry,
+        vec![
+            write_call("c1", "a.txt", "one\n"),
+            call_events("c2", "cancel_tool", serde_json::json!({})),
+            text_response("never reached"),
+        ],
+    )
+    .await;
+    let _ = agent
+        .run_turn("write then stop".into(), &cwd, CancellationToken::new())
+        .await;
+    let ledger = agent.undo_ledger();
+    assert_eq!(ledger.marks.len(), 1);
+    let after = ledger.marks[0].after_oid.as_ref().expect("after snapshot despite the cancel");
+    let files = aivyx_tools::run_git(&cwd, &["ls-tree", "--name-only", after], &[])
+        .await
+        .unwrap();
+    assert!(files.contains("a.txt"), "{files}");
+}
+
+#[tokio::test]
+async fn edits_by_a_tool_that_takes_no_checkpoint_are_still_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(SneakyWriteTool));
+    let mut agent = undo_agent_with(
+        &cwd,
+        registry,
+        vec![
+            call_events("c1", "sneaky_write", serde_json::json!({})),
+            text_response("done"),
+        ],
+    )
+    .await;
+    agent
+        .run_turn("delegate it".into(), &cwd, CancellationToken::new())
+        .await
+        .unwrap();
+    let ledger = agent.undo_ledger();
+    assert_eq!(ledger.marks.len(), 1, "a delegated edit is part of the turn");
+    let before = aivyx_tools::run_git(&cwd, &["ls-tree", "--name-only", &ledger.marks[0].before_oid], &[])
+        .await
+        .unwrap();
+    assert!(!before.contains("sneaky.txt"));
 }
 
 // ----- /wiki (Phase 11b) -----

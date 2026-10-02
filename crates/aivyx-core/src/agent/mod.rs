@@ -364,16 +364,6 @@ pub struct Agent {
     /// each one to. Persisted with the session (see `persist`/`restore`);
     /// reset by `clear_conversation`.
     undo: crate::undo::UndoLedger,
-    /// Set `false` at the start of every `run_turn_inner` call; flipped to
-    /// `true` the first time this turn's tool-dispatch loop records a mark
-    /// (see the batch-checkpoint block) so later mutating calls in the same
-    /// turn don't record a second mark. Consulted by `run_turn` after the
-    /// turn finishes to decide whether to take the "after" snapshot.
-    turn_mark_recorded: bool,
-    /// This turn's user text, already run through `undo::text_preview` —
-    /// cached at the start of `run_turn_inner` so the mark recorded
-    /// mid-loop doesn't need to re-derive it.
-    current_user_text: String,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -453,10 +443,22 @@ impl Agent {
             verification_touched_paths: Vec::new(),
             pre_experiment_ref: None,
             undo: crate::undo::UndoLedger::default(),
-            turn_mark_recorded: false,
-            current_user_text: String::new(),
             events_tx,
         }
+    }
+
+    /// Snapshot the worktree now for `/undo` and return `(ref, commit oid)`,
+    /// or `None` when there's no checkpointer (not a git repository) or git
+    /// fails. Uses a fresh cancellation token: it must still work right
+    /// after the user cancels a turn.
+    async fn undo_snapshot(&self, label: &str) -> Option<(String, String)> {
+        let cwd = self.executor.checkpoint_cwd()?.to_path_buf();
+        let r = self
+            .executor
+            .checkpoint_now(label, &CancellationToken::new())
+            .await?;
+        let oid = resolve_oid(&cwd, &r).await?;
+        Some((r, oid))
     }
 
     /// The `/undo` ledger — which turns changed files, and where to rewind
@@ -1509,10 +1511,15 @@ impl Agent {
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }
-        // Cloned up front: every branch below consumes `cancellation` by
-        // value, but the turn-end `/undo` snapshot after the match still
-        // needs one — `CancellationToken` is a cheap `Arc`-backed clone.
-        let cancellation_for_undo = cancellation.clone();
+        // `/undo`: snapshot the worktree as it stands when this message
+        // arrives, and again when the turn ends; the turn is undoable iff
+        // the two trees differ. Bracketing the whole turn (not the first
+        // mutating tool call) covers every way a turn changes files — /wiki
+        // and /architect running several inner turns, delegated sub-agents
+        // writing through their own executors, commands — and a cancelled
+        // turn: both snapshots use a fresh token, never the turn's own.
+        let turn_before = self.undo_snapshot("turn-start").await;
+        let turn_preview = crate::undo::text_preview(&user_input);
         // Commands are intercepted here, before the input can enter LLM
         // history — the raw `/council …` text is an instruction to aivyx,
         // not part of the conversation the model should see.
@@ -1532,22 +1539,18 @@ impl Agent {
                 },
             },
         };
-        // Turn-end `/undo` snapshot: only the plain tool-dispatch path
-        // (`run_turn_inner`) ever sets `turn_mark_recorded`, and it's
-        // cleared here right after being consumed, so this is a no-op for
-        // every other kind of turn (/council, /wiki, /architect) and for a
-        // turn that made no changes.
-        if self.turn_mark_recorded {
-            if let Some(r) = self
-                .executor
-                .checkpoint_now("turn-end", &cancellation_for_undo)
-                .await
-                && let Some(after_cwd) = self.executor.checkpoint_cwd().map(Path::to_path_buf)
-                && let Some(oid) = resolve_oid(&after_cwd, &r).await
-            {
-                self.undo.set_last_after(oid);
-            }
-            self.turn_mark_recorded = false;
+        if let Some((before_ref, before_oid)) = turn_before
+            && let Some((_, after_oid)) = self.undo_snapshot("turn-end").await
+            && let Some(cwd) = self.executor.checkpoint_cwd().map(Path::to_path_buf)
+            && tree_of(&cwd, &before_oid).await != tree_of(&cwd, &after_oid).await
+        {
+            self.undo.record(TurnMark {
+                user_text_preview: turn_preview,
+                before_ref,
+                before_oid,
+                after_oid: Some(after_oid),
+                created_unix: now_unix(),
+            });
         }
         if result.is_ok() || self.session_owns_slot {
             self.persist();
@@ -1857,11 +1860,6 @@ impl Agent {
         cwd: &Path,
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
-        // Per-turn `/undo` state: reset so a mark from an earlier turn
-        // can't bleed into this one, and cache the preview text the mark
-        // (if any) will carry.
-        self.turn_mark_recorded = false;
-        self.current_user_text = crate::undo::text_preview(&user_input);
         self.history.push(Message::text(Role::User, user_input));
         // Once per turn, not per iteration: within a turn the map rarely
         // changes materially, and re-walking on every tool round-trip would
@@ -2315,9 +2313,6 @@ impl Agent {
                 };
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
-                // Captured before the move below — needed by the
-                // `/undo` mark-recording check once `result` is known.
-                let call_name = call.name.clone();
                 let mut result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
@@ -2352,31 +2347,6 @@ impl Agent {
                 let ref_after_this_call = self.executor.latest_checkpoint_ref(&cancellation).await;
                 let minted_new_checkpoint = ref_after_this_call != last_checkpoint_ref;
                 last_checkpoint_ref = ref_after_this_call.clone();
-
-                // `/undo` mark recording: one mark per turn, taken the
-                // first time a successful call this turn needed a
-                // checkpoint. Deliberately NOT gated on
-                // `minted_new_checkpoint` — a checkpoint deduplicated
-                // against an earlier identical tree is still the correct
-                // "before" state to rewind to.
-                if matches!(result.output, ToolOutput::Ok(_))
-                    && !self.turn_mark_recorded
-                    && self.executor.needs_checkpoint(&call_name)
-                    && let (Some(r), Some(mark_cwd)) = (
-                        ref_after_this_call.clone(),
-                        self.executor.checkpoint_cwd().map(Path::to_path_buf),
-                    )
-                    && let Some(oid) = resolve_oid(&mark_cwd, &r).await
-                {
-                    self.undo.record(TurnMark {
-                        user_text_preview: self.current_user_text.clone(),
-                        before_ref: r,
-                        before_oid: oid,
-                        after_oid: None,
-                        created_unix: now_unix(),
-                    });
-                    self.turn_mark_recorded = true;
-                }
 
                 if matches!(result.output, ToolOutput::Ok(_)) && minted_new_checkpoint {
                     if batch_start_ref.is_none() {
@@ -2621,6 +2591,17 @@ fn elide(text: &str, cap: usize) -> String {
 /// commit in the first place). Used by the `/undo` mark-recording path so
 /// a `TurnMark`'s `before_ref`/`after_oid` survive a ref being pruned or
 /// moved later — the oid is a stable snapshot, the ref name is not.
+/// The tree a commit points at — compared, not commit ids, because a
+/// checkpoint of an unchanged tree can still mint a new commit (a restore
+/// clears the checkpointer's dedup cache).
+async fn tree_of(cwd: &Path, oid: &str) -> Option<String> {
+    aivyx_tools::run_git(cwd, &["rev-parse", "--verify", &format!("{oid}^{{tree}}")], &[])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) async fn resolve_oid(cwd: &Path, git_ref: &str) -> Option<String> {
     aivyx_tools::run_git(cwd, &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")], &[])
         .await
