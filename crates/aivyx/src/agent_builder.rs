@@ -1146,6 +1146,12 @@ pub(crate) async fn build_agent(
     agent.set_injection_taint(injection_taint.clone());
     // `/undo` / `/redo` confirm through the same modal as tool approvals.
     agent.set_command_prompter(Arc::clone(&prompter));
+    // With Landlock compiled in, confined child processes (the `git commit`
+    // `/commit` runs) can only write under `cwd`; `/commit` refuses up
+    // front when the git directory lies outside it.
+    if cfg!(feature = "sandbox-backend") {
+        agent.set_write_sandbox(Some(cwd.clone()));
+    }
     if let Some(mission_plan_handle) = &mission_plan {
         agent.set_mission_plan_handle(Arc::clone(mission_plan_handle));
     }

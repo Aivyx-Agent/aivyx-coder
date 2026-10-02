@@ -26,7 +26,7 @@ mod tools;
 pub mod web;
 pub mod wiki;
 
-pub use aivyx_checkpoint::{GitCheckpointer, run_git};
+pub use aivyx_checkpoint::{GitCheckpointer, exclude_pathspecs, run_git};
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use path_resolve::resolve;
@@ -258,6 +258,13 @@ impl ToolExecutor {
         self.checkpoint_cwd = Some(cwd);
         self.checkpoint_deny_paths = deny_paths;
         self.checkpointer = Some(checkpointer);
+    }
+
+    /// The deny paths `set_checkpointer_at` was given — the carve-outs any
+    /// "everything in the worktree" git operation (e.g. `/commit`'s
+    /// staging) must keep out.
+    pub fn checkpoint_deny_paths(&self) -> &[PathBuf] {
+        &self.checkpoint_deny_paths
     }
 
     /// The directory the checkpointer snapshots, if `set_checkpointer_at`

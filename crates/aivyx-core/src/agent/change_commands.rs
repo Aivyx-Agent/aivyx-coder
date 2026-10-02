@@ -14,12 +14,16 @@
 //! asks through the command prompter, and commits under the executor's
 //! confiner — so hooks run confined like any tool. Whatever it staged
 //! itself is unstaged again if the commit doesn't happen; a set the user
-//! staged by hand is never touched.
+//! staged by hand is never touched. Deny-listed files are never staged by
+//! `/commit`, and the content of one the user staged by hand is never sent
+//! to the model (its name is, marked "(contents withheld)").
 
 use std::path::{Path, PathBuf};
 
 use aivyx_llm::{ChatRequest, RouteHint};
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, UserResponse};
+use aivyx_sandbox::{
+    ActionKind, PermissionRequest, PermissionTarget, UserResponse, path_is_denied,
+};
 use aivyx_types::{Message, Role};
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +42,9 @@ const DIFF_USAGE: &str = "Use /diff, or /diff turn for just the last turn's chan
 const COMMIT_USAGE: &str = "Use /commit, or /commit -m \"message\".";
 const NOTHING_TO_COMMIT: &str = "Nothing to commit.";
 const COMMIT_CANCELLED: &str = "Commit cancelled — nothing was committed.";
+const WITHHELD: &str = " (contents withheld)";
+/// The hooks whose failure stops a `git commit`.
+const COMMIT_HOOKS: [&str; 3] = ["pre-commit", "prepare-commit-msg", "commit-msg"];
 /// Paths per `git reset`/`git rm --cached` call when unstaging, so a huge
 /// change set never overflows the argument list.
 const UNSTAGE_CHUNK: usize = 500;
@@ -108,6 +115,56 @@ async fn has_head(root: &Path) -> bool {
     git(root, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])
         .await
         .is_ok()
+}
+
+/// Unstages everything — the exact undo of a `git add -A` over an index
+/// that had nothing staged, for when what it staged can't be listed.
+async fn restore_all(root: &Path) -> Result<(), String> {
+    if has_head(root).await {
+        git(root, &["reset", "-q"]).await.map(drop)
+    } else {
+        git(root, &["read-tree", "--empty"]).await.map(drop)
+    }
+}
+
+/// `git add -A` pathspecs for the whole repository minus `deny`: absolute
+/// deny paths inside `root` as the checkpointer excludes them, and bare
+/// basename patterns (`.env`, `*.pem`) in every directory.
+fn add_pathspecs(root: &Path, deny: &[PathBuf]) -> Vec<String> {
+    let mut specs = vec![".".to_string()];
+    specs.extend(aivyx_tools::exclude_pathspecs(root, deny));
+    specs.extend(
+        deny.iter()
+            .filter(|d| d.parent() == Some(Path::new("")))
+            .filter_map(|d| d.to_str())
+            .map(|pattern| format!(":(exclude,glob)**/{pattern}")),
+    );
+    specs
+}
+
+/// Whether an executable hook that can stop a commit exists (honouring
+/// `core.hooksPath`).
+async fn has_commit_hook(root: &Path) -> bool {
+    for name in COMMIT_HOOKS {
+        let Ok(path) = git(root, &["rev-parse", "--git-path", &format!("hooks/{name}")]).await
+        else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(root.join(path.trim())) else {
+            continue;
+        };
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt as _;
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = meta.is_file();
+        if executable {
+            return true;
+        }
+    }
+    false
 }
 
 /// Unstages exactly `paths` — what `/commit` staged itself — back to
@@ -243,22 +300,45 @@ impl Agent {
             }
         };
 
-        // Stage everything only when nothing is staged yet; then every
-        // staged path is ours to unstage again.
+        if let Some(refusal) = self.sandbox_refusal(&cwd, &root).await {
+            self.notify(refusal);
+            return;
+        }
+        let deny = self.executor.checkpoint_deny_paths().to_vec();
+        let denied = |name: &str| path_is_denied(&root.join(name), &deny);
+
+        // Stage everything but deny-listed files only when nothing is
+        // staged yet; then every staged path is ours to unstage again.
         let staged_by_us = if git(&root, &["diff", "--cached", "--quiet"]).await.is_err() {
             Vec::new()
         } else {
-            if let Err(e) = git(&root, &["add", "-A"]).await {
-                self.notify(format!("Couldn't commit: {e}"));
-                return;
-            }
-            match staged_names(&root).await {
+            let specs = add_pathspecs(&root, &deny);
+            let mut args = vec!["add", "-A", "--"];
+            args.extend(specs.iter().map(String::as_str));
+            let staged = match git(&root, &args).await {
+                Ok(_) => staged_names(&root).await,
+                Err(e) => Err(e),
+            };
+            let staged = match staged {
                 Ok(names) => names,
                 Err(e) => {
+                    if let Err(e) = restore_all(&root).await {
+                        self.notify(format!("Couldn't unstage the changes: {e}"));
+                    }
                     self.notify(format!("Couldn't commit: {e}"));
                     return;
                 }
+            };
+            // Backstop for a deny entry the pathspecs can't express.
+            let (slipped, ours): (Vec<String>, Vec<String>) =
+                staged.into_iter().partition(|name| denied(name));
+            if let Err(e) = restore_staging(&root, &slipped).await {
+                let all: Vec<String> = slipped.into_iter().chain(ours).collect();
+                self.abandon_commit(&root, &all, format!("Couldn't commit: {e}"))
+                    .await;
+                return;
             }
+            ours
         };
         let files = match staged_names(&root).await {
             Ok(files) => files,
@@ -272,22 +352,41 @@ impl Agent {
             self.info(NOTHING_TO_COMMIT);
             return;
         }
+        // A deny-listed file the user staged by hand is committed, but
+        // only its name ever reaches the model or the prompt.
+        let withheld: Vec<&String> = files.iter().filter(|f| denied(f)).collect();
+        let labels: Vec<String> = files
+            .iter()
+            .map(|f| {
+                if denied(f) {
+                    format!("{f}{WITHHELD}")
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
 
         let message = match message {
             Some(message) => message,
             None => {
-                let diff = match git(
-                    &root,
-                    &[
-                        "-c",
-                        "core.quotePath=false",
-                        "diff",
-                        "--cached",
-                        "--no-renames",
-                    ],
-                )
-                .await
-                {
+                let excludes: Vec<String> = withheld
+                    .iter()
+                    .map(|f| format!(":(exclude,literal){f}"))
+                    .collect();
+                let mut args = vec![
+                    "-c",
+                    "core.quotePath=false",
+                    "diff",
+                    "--cached",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ];
+                if !excludes.is_empty() {
+                    args.extend(["--", "."]);
+                    args.extend(excludes.iter().map(String::as_str));
+                }
+                let diff = match git(&root, &args).await {
                     Ok(diff) => diff,
                     Err(e) => {
                         self.abandon_commit(&root, &staged_by_us, format!("Couldn't commit: {e}"))
@@ -295,7 +394,7 @@ impl Agent {
                         return;
                     }
                 };
-                let draft = match self.draft_commit_message(&diff, &files).await {
+                let draft = match self.draft_commit_message(&diff, &labels).await {
                     Ok(draft) => draft,
                     Err(reason) => {
                         let notice = format!(
@@ -305,7 +404,7 @@ impl Agent {
                         return;
                     }
                 };
-                if !self.confirm_commit(&draft, &files).await {
+                if !self.confirm_commit(&draft, &labels).await {
                     if let Err(e) = restore_staging(&root, &staged_by_us).await {
                         self.notify(format!("Couldn't unstage the changes: {e}"));
                     }
@@ -338,11 +437,14 @@ impl Agent {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let notice = if stderr.trim().is_empty() {
+            let said = format!("{stderr}{stdout}");
+            let said = said.trim();
+            let notice = if said.is_empty() {
                 format!("Couldn't commit: {}", output.status)
+            } else if has_commit_hook(&root).await {
+                format!("The commit hook rejected it:\n{said}")
             } else {
-                let said = format!("{stderr}{stdout}");
-                format!("The commit hook rejected it:\n{}", said.trim())
+                format!("git refused the commit:\n{said}")
             };
             self.abandon_commit(&root, &staged_by_us, notice).await;
             return;
@@ -352,7 +454,40 @@ impl Agent {
             .map(|h| h.trim().to_string())
             .unwrap_or_default();
         let subject = message.lines().next().unwrap_or_default().trim();
-        self.info(format!("Committed {hash}: {subject}"));
+        if hash.is_empty() {
+            self.info(format!("Committed: {subject}"));
+        } else {
+            self.info(format!("Committed {hash}: {subject}"));
+        }
+    }
+
+    /// Why `/commit` can't work here, when confinement is on and the git
+    /// directory (or a worktree's common directory) lies outside the
+    /// directory confined processes may write under — checked before
+    /// anything is staged.
+    async fn sandbox_refusal(&self, cwd: &Path, root: &Path) -> Option<String> {
+        let sandbox = self.write_sandbox.as_ref()?;
+        let sandbox = sandbox.canonicalize().unwrap_or_else(|_| sandbox.clone());
+        let queries: [&[&str]; 2] = [
+            &["rev-parse", "--absolute-git-dir"],
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ];
+        for args in queries {
+            let Ok(out) = git(cwd, args).await else {
+                continue;
+            };
+            let dir = PathBuf::from(out.trim());
+            let dir = dir.canonicalize().unwrap_or(dir);
+            if !dir.starts_with(&sandbox) {
+                return Some(format!(
+                    "/commit needs write access to {}, which is outside this session's sandbox \
+                     — start aivyx-coder at {}, or commit with git directly.",
+                    dir.display(),
+                    root.display()
+                ));
+            }
+        }
+        None
     }
 
     /// Unstages what `/commit` staged, then reports why it stopped.

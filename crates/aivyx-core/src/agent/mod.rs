@@ -371,6 +371,11 @@ pub struct Agent {
     /// never be cached. `None` (e.g. MCP sessions, which have no human)
     /// makes those commands unavailable.
     command_prompter: Option<Arc<dyn aivyx_sandbox::PermissionPrompter>>,
+    /// The directory OS-level confinement (Landlock) limits child-process
+    /// writes to, when it's active — so `/commit` can refuse up front
+    /// instead of failing inside a confined `git commit` that can't write
+    /// a git directory outside it. `None`: writes aren't confined.
+    write_sandbox: Option<PathBuf>,
     /// Notes for the model about what the user did between turns (each
     /// `/undo` or `/redo`, in order), joined and prefixed to the next user
     /// message — never sent as a message of their own, so chat templates
@@ -457,6 +462,7 @@ impl Agent {
             pre_experiment_ref: None,
             undo: crate::undo::UndoLedger::default(),
             command_prompter: None,
+            write_sandbox: None,
             pending_notes: Vec::new(),
             events_tx,
         }
@@ -1063,6 +1069,12 @@ impl Agent {
     /// `command_prompter` field.
     pub fn set_command_prompter(&mut self, prompter: Arc<dyn aivyx_sandbox::PermissionPrompter>) {
         self.command_prompter = Some(prompter);
+    }
+
+    /// Sets the directory confined child processes may write under (see
+    /// the `write_sandbox` field); `None` when writes aren't confined.
+    pub fn set_write_sandbox(&mut self, root: Option<PathBuf>) {
+        self.write_sandbox = root;
     }
 
     /// Enables session persistence: after each turn the full session is

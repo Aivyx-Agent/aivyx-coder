@@ -7432,3 +7432,131 @@ async fn commit_outside_a_repository_or_without_a_prompter() {
     assert_eq!(notices(&mut rx), vec!["/commit isn't available here.".to_string()]);
     assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
 }
+
+/// An undo agent whose checkpointer and executor carry `deny`.
+async fn commit_agent_with_deny(
+    dir: &Path,
+    llm: Arc<dyn LlmBackend>,
+    deny: Vec<PathBuf>,
+) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let mut executor = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        deny.clone(),
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, deny).await.unwrap()),
+    );
+    let (tx, rx) = unbounded_channel();
+    let agent = Agent::new(llm, executor, "system", AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    (agent, rx)
+}
+
+fn all_request_text(mock: &MockBackend) -> String {
+    mock.received
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.messages.iter().map(|m| m.text_content()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn commit_never_stages_or_sends_deny_listed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::create_dir(cwd.join("secrets")).unwrap();
+    std::fs::write(cwd.join("secrets/token.txt"), "tok123\n").unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) =
+        commit_agent_with_deny(&cwd, mock.clone(), vec![PathBuf::from(".env"), cwd.join("secrets")]).await;
+    agent.set_command_prompter(scripted(vec![UserResponse::Allow]));
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(git_text(&cwd, &["show", "--name-only", "--format=", "HEAD"]).await, "tracked.txt\n");
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? .env\n?? secrets/\n");
+    let sent = all_request_text(&mock);
+    assert!(!sent.contains("hunter2") && !sent.contains("tok123"), "{sent}");
+    assert!(!sent.contains(".env") && !sent.contains("secrets/"), "{sent}");
+}
+
+#[tokio::test]
+async fn commit_withholds_the_content_of_a_hand_staged_deny_listed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    git_in(&cwd, &["add", ".env", "tracked.txt"]).await;
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = commit_agent_with_deny(&cwd, mock.clone(), vec![PathBuf::from(".env")]).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(git_text(&cwd, &["show", "--name-only", "--format=", "HEAD"]).await, ".env\ntracked.txt\n");
+    let sent = all_request_text(&mock);
+    assert!(!sent.contains("hunter2"), "{sent}");
+    assert!(sent.contains("Files: .env (contents withheld), tracked.txt"), "{sent}");
+    assert!(sent.contains("+v2"), "{sent}");
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(preview.ends_with("Files:\n  .env (contents withheld)\n  tracked.txt"), "{preview}");
+}
+
+#[tokio::test]
+async fn commit_refuses_when_the_git_dir_is_outside_the_write_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/inner.txt"), "inner\n").unwrap();
+    let sub = root.join("sub");
+    let (mut agent, mut rx) = undo_agent_over(&sub, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
+    agent.set_write_sandbox(Some(sub.clone()));
+
+    agent.run_turn("/commit -m \"x\"".into(), &sub, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        notices(&mut rx),
+        vec![format!(
+            "/commit needs write access to {}, which is outside this session's sandbox — \
+             start aivyx-coder at {}, or commit with git directly.",
+            root.join(".git").display(),
+            root.display()
+        )]
+    );
+    assert_eq!(git_text(&root, &["status", "--porcelain"]).await, "?? sub/\n", "nothing staged");
+    assert_eq!(commit_count(&root).await, 1);
+
+    // Sandboxed at the root, the same commit goes through.
+    let (mut agent, _rx) = undo_agent_over(&root, Arc::new(PanickingBackend)).await;
+    agent.set_write_sandbox(Some(root.clone()));
+    agent.run_turn("/commit -m \"x\"".into(), &root, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&root).await, 2);
+}
+
+#[tokio::test]
+async fn commit_refused_by_git_itself_is_not_blamed_on_a_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    git_in(&cwd, &["config", "commit.gpgsign", "true"]).await;
+    git_in(&cwd, &["config", "gpg.program", "false"]).await;
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+
+    agent.run_turn("/commit -m \"Signed\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let notes = notices(&mut rx);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("git refused the commit:\n"), "{notes:?}");
+    assert!(notes[0].contains("gpg"), "{notes:?}");
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
+}
