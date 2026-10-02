@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod architect;
+pub mod changes;
 pub mod commands;
 pub mod council;
 pub mod delegate;
