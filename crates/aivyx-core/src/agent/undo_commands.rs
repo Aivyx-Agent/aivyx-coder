@@ -215,7 +215,11 @@ impl Agent {
             }
         };
         if changes.is_empty() {
-            self.undo.pop_redo();
+            // The turn's changes exist again (the user put them back), so
+            // the turn is undoable again — return it to the undo list.
+            if let Some(redo) = self.undo.pop_redo() {
+                self.undo.push_mark_back(redo.mark);
+            }
             self.notify("Nothing to redo — those changes are already back.");
             self.persist_if_owned();
             return;

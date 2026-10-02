@@ -3352,7 +3352,7 @@ async fn undo_with_nothing_left_to_take_back_drops_the_mark_quietly() {
 }
 
 #[tokio::test]
-async fn redo_with_the_changes_already_back_drops_the_entry_quietly() {
+async fn redo_with_the_changes_already_back_makes_the_turn_undoable_again() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
@@ -3371,6 +3371,11 @@ async fn redo_with_the_changes_already_back_drops_the_entry_quietly() {
         vec!["Nothing to redo — those changes are already back.".to_string()]
     );
     assert!(agent.undo_ledger().redo.is_empty());
+    assert_eq!(
+        agent.undo_ledger().marks.len(),
+        1,
+        "the changes exist again, so /undo can take them back again"
+    );
     assert_eq!(agent.pending_notes, notes_before, "no redo note");
     assert_eq!(prompter.seen.lock().unwrap().len(), 1, "only the /undo asked");
 }
