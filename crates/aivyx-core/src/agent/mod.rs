@@ -2293,7 +2293,6 @@ impl Agent {
             // autonomous mode; this one fires on any mutating tool
             // returning `ToolOutput::Error` within the same response,
             // regardless of mode.
-            let mut last_checkpoint_ref = self.executor.latest_checkpoint_ref(&cancellation).await;
             let mut batch_start_ref: Option<String> = None;
             let mut batch_touched_paths: Vec<String> = Vec::new();
             let mut batch_rolled_back = false;
@@ -2344,6 +2343,7 @@ impl Agent {
                 };
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
+                let checkpointed = self.executor.needs_checkpoint(&call.name);
                 let mut result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
@@ -2367,21 +2367,21 @@ impl Agent {
 
                 // Batch-checkpoint tracking, independent of the
                 // pre_experiment_ref bookkeeping above. `ToolExecutor::
-                // dispatch` checkpoints *before* running the tool, so the
-                // ref that becomes "latest" right after a successful
-                // mutating call is the snapshot of the worktree as it stood
-                // immediately before that call ran — exactly the anchor to
-                // restore to in order to undo this call (and everything
-                // after it). Only the first successful call in the batch
-                // gets to set `batch_start_ref`; later ones must not move
-                // it forward.
-                let ref_after_this_call = self.executor.latest_checkpoint_ref(&cancellation).await;
-                let minted_new_checkpoint = ref_after_this_call != last_checkpoint_ref;
-                last_checkpoint_ref = ref_after_this_call.clone();
-
-                if matches!(result.output, ToolOutput::Ok(_)) && minted_new_checkpoint {
+                // dispatch` checkpoints *before* running a `needs_checkpoint`
+                // tool the gate allowed, so after such a call succeeds the
+                // latest ref's tree is the worktree as it stood immediately
+                // before the call — exactly the anchor to restore to in
+                // order to undo this call (and everything after it). That
+                // holds even when the snapshot was deduplicated and no new
+                // ref was minted (e.g. the first edit of a turn, right after
+                // the turn-start `/undo` snapshot of the same tree), which is
+                // why this asks the executor whether the call was
+                // checkpointed instead of comparing refs. Only the first such
+                // call in the batch sets `batch_start_ref`; later ones must
+                // not move it forward.
+                if checkpointed && matches!(result.output, ToolOutput::Ok(_)) {
                     if batch_start_ref.is_none() {
-                        batch_start_ref = ref_after_this_call;
+                        batch_start_ref = self.executor.latest_checkpoint_ref(&cancellation).await;
                     }
                     // Cloned — call_description is still needed below when
                     // record_tool_result is called with it.

@@ -256,6 +256,20 @@ impl ToolExecutor {
         checkpointer.latest_ref(cancellation).await
     }
 
+    /// Whether `dispatch` checkpoints a call to `tool_name` before running
+    /// it once the gate allows it: the tool exists, its `needs_checkpoint()`
+    /// is true, and a checkpointer is configured. Lets `Agent` decide per
+    /// call whether a successful result has a pre-call snapshot, without
+    /// inferring it from a newly minted ref (which a deduplicated snapshot
+    /// never produces).
+    pub fn needs_checkpoint(&self, tool_name: &str) -> bool {
+        self.checkpointer.is_some()
+            && self
+                .registry
+                .get(tool_name)
+                .is_some_and(|tool| tool.needs_checkpoint())
+    }
+
     /// The most recent checkpoint ref, or `None` if no checkpointer is
     /// configured (checkpointing disabled, or `cwd` isn't a git repo) or
     /// none has been taken yet. `Agent` (Phase 11c's autonomous discard
@@ -1077,6 +1091,28 @@ mod tests {
         let shown = run_git(&cwd, &["show", &format!("{r}:tracked.txt")], &[]).await.unwrap();
         assert_eq!(shown, "changed\n");
         assert_eq!(executor.checkpoint_cwd(), Some(cwd.as_path()));
+    }
+
+    #[tokio::test]
+    async fn needs_checkpoint_follows_the_tool_and_the_checkpointer() {
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(WebFetchTool::new(5, false)));
+        let mut executor =
+            ToolExecutor::new(registry, Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        // No checkpointer: nothing is ever checkpointed.
+        assert!(!executor.needs_checkpoint("write_file"));
+        executor.set_checkpointer(Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+        assert!(executor.needs_checkpoint("write_file"));
+        assert!(!executor.needs_checkpoint("read_file"));
+        assert!(!executor.needs_checkpoint("web_fetch"));
+        assert!(!executor.needs_checkpoint("no_such_tool"));
     }
 
     #[tokio::test]

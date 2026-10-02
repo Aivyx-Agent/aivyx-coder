@@ -2544,11 +2544,14 @@ async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
     let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let mut executor = ToolExecutor::new(registry, gate, confiner);
-    executor.set_checkpointer(Arc::new(
-        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
-            .await
-            .unwrap(),
-    ));
+    executor.set_checkpointer_at(
+        dir.path().to_path_buf(),
+        Arc::new(
+            aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+                .await
+                .unwrap(),
+        ),
+    );
     let autonomous_mode = AutonomousMode::new();
     autonomous_mode.set_active(true);
     let mut agent = Agent::new(
@@ -3141,9 +3144,13 @@ async fn checkpointed_agent(
     let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let mut executor = ToolExecutor::new(registry, gate, confiner);
-    executor.set_checkpointer(Arc::new(
-        aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap(),
-    ));
+    // Production wiring (agent_builder.rs): `set_checkpointer_at`, which
+    // also enables the turn-start/turn-end undo snapshots. Plain
+    // `set_checkpointer` here once hid a batch-rollback regression.
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
+    );
 
     let autonomous_mode = AutonomousMode::new();
     autonomous_mode.set_active(autonomous);
@@ -3345,11 +3352,14 @@ async fn a_deny_partway_through_a_batch_does_not_roll_back_earlier_approved_call
     let gate: Arc<dyn PermissionGate> = Arc::new(DenySecondCallGate);
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let mut executor = ToolExecutor::new(registry, gate, confiner);
-    executor.set_checkpointer(Arc::new(
-        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
-            .await
-            .unwrap(),
-    ));
+    executor.set_checkpointer_at(
+        dir.path().to_path_buf(),
+        Arc::new(
+            aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+                .await
+                .unwrap(),
+        ),
+    );
     let mut agent = Agent::new(
         llm,
         executor,
@@ -3476,11 +3486,14 @@ async fn batch_rollback_notice_does_not_misattribute_a_network_call_as_an_edit()
     let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
     let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
     let mut executor = ToolExecutor::new(registry, gate, confiner);
-    executor.set_checkpointer(Arc::new(
-        aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
-            .await
-            .unwrap(),
-    ));
+    executor.set_checkpointer_at(
+        dir.path().to_path_buf(),
+        Arc::new(
+            aivyx_tools::GitCheckpointer::detect(dir.path(), vec![])
+                .await
+                .unwrap(),
+        ),
+    );
     let mut agent = Agent::new(
         llm,
         executor,
