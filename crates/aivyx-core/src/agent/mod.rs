@@ -25,10 +25,10 @@ use crate::session::{self, SessionState, Task};
 use crate::specialist_sessions::SpecialistSessionPool;
 use crate::undo::TurnMark;
 
+mod change_commands;
 #[cfg(test)]
 mod tests;
 mod types;
-mod change_commands;
 mod undo_commands;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};

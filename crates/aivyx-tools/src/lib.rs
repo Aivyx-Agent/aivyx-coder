@@ -350,6 +350,45 @@ impl ToolExecutor {
         Some(tree?.trim().to_string())
     }
 
+    /// The tree of the worktree as it would be committed on top of `base`
+    /// (a commit or tree; `None` for a repository with no commits) — for
+    /// `/diff` and `/commit`, not for checkpoints. Unlike a checkpoint, a
+    /// file `base` tracks that is now ignored or under a deny path keeps
+    /// its `base` version instead of vanishing (it is never staged, but the
+    /// index is seeded from `base`), so a clean worktree yields exactly
+    /// `base`'s tree. Uses a throwaway index under the git dir, removed
+    /// afterwards; `None` without `set_checkpointer_at` or on a git failure.
+    pub async fn worktree_tree_over(&self, base: Option<&str>) -> Option<String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cwd = self.checkpoint_cwd.as_deref()?;
+        let git_dir = run_git(cwd, &["rev-parse", "--absolute-git-dir"], &[])
+            .await
+            .ok()?;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = PathBuf::from(git_dir.trim())
+            .join(format!("aivyx-diff-index-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_file(&index);
+        let index_str = index.to_str()?.to_string();
+        let env = [("GIT_INDEX_FILE", index_str.as_str())];
+        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        add_args.extend(aivyx_checkpoint::exclude_pathspecs(
+            cwd,
+            &self.checkpoint_deny_paths,
+        ));
+        let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
+        let seeded = match base {
+            Some(base) => run_git(cwd, &["read-tree", base], &env).await.is_ok(),
+            None => true,
+        };
+        let tree = if seeded && run_git(cwd, &add_args, &env).await.is_ok() {
+            run_git(cwd, &["write-tree"], &env).await.ok()
+        } else {
+            None
+        };
+        let _ = std::fs::remove_file(&index);
+        Some(tree?.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
     /// Whether `dispatch` checkpoints a call to `tool_name` before running
     /// it once the gate allows it: the tool exists, its `needs_checkpoint()`
     /// is true, and a checkpointer is configured. Lets `Agent` decide per

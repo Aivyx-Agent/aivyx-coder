@@ -6941,6 +6941,18 @@ fn change_commands_parse() {
         parse("/commit -m \"x\""),
         Some(ChangeCommand::Commit { message: Some("x".into()) })
     );
+    assert_eq!(
+        parse("/diff all"),
+        Some(ChangeCommand::Usage("Use /diff, or /diff turn for just the last turn's changes."))
+    );
+    assert_eq!(
+        parse("/commit hello"),
+        Some(ChangeCommand::Usage("Use /commit, or /commit -m \"message\"."))
+    );
+    assert_eq!(
+        parse("/commit -m"),
+        Some(ChangeCommand::Usage("Use /commit, or /commit -m \"message\"."))
+    );
     assert_eq!(parse("/differ"), None);
     assert_eq!(parse("/commitment"), None);
     assert_eq!(parse("please /diff"), None);
@@ -7044,4 +7056,72 @@ async fn diff_without_a_checkpointer_is_not_a_repository() {
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(notices(&mut rx), vec!["Not a git repository.".to_string()]);
+}
+
+#[tokio::test]
+async fn diff_usage_hints_never_reach_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff everything".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/commit please".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        notices(&mut rx),
+        vec![
+            "Use /diff, or /diff turn for just the last turn's changes.".to_string(),
+            "Use /commit, or /commit -m \"message\".".to_string(),
+        ]
+    );
+    assert!(agent.history.iter().all(|m| m.role != Role::User), "nothing went to the model");
+}
+
+async fn git_in(cwd: &Path, args: &[&str]) {
+    let out = tokio::process::Command::new("git").args(args).current_dir(cwd).output().await.unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[tokio::test]
+async fn diff_keeps_tracked_ignored_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(cwd.join("x.log"), "first\n").unwrap();
+    git_in(&cwd, &["add", ".gitignore"]).await;
+    git_in(&cwd, &["add", "-f", "x.log"]).await;
+    git_in(&cwd, &["commit", "-q", "-m", "force-add a log"]).await;
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let events = drain(&mut rx);
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ShowDiff { .. })), "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Info(t) if t == "No uncommitted changes.")),
+        "{events:?}"
+    );
+
+    std::fs::write(cwd.join("x.log"), "second\n").unwrap();
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let text = &diffs[0].1;
+    assert!(text.contains("+second") && text.contains("-first"), "{text}");
+    assert!(!text.contains("deleted file mode"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_turn_with_a_pruned_snapshot_is_too_old() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    agent.undo.marks[0].before_oid = "f".repeat(40);
+    agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        notices(&mut rx),
+        vec!["That turn is too old to show (only the newest 50 checkpoints are kept).".to_string()]
+    );
 }

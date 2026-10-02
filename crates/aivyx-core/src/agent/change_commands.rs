@@ -18,6 +18,9 @@ use crate::changes::{DIFF_LINE_CAP, EMPTY_TREE, parse_commit_message_arg, trunca
 const NOT_A_REPO: &str = "Not a git repository.";
 const NO_UNCOMMITTED: &str = "No uncommitted changes.";
 const NO_TURN_CHANGES: &str = "No changes from the last turn to show.";
+const TOO_OLD: &str = "That turn is too old to show (only the newest 50 checkpoints are kept).";
+const DIFF_USAGE: &str = "Use /diff, or /diff turn for just the last turn's changes.";
+const COMMIT_USAGE: &str = "Use /commit, or /commit -m \"message\".";
 
 /// Which change command a message is, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,23 +29,29 @@ pub(super) enum ChangeCommand {
     Diff { turn: bool },
     /// `/commit` (draft a message) or `/commit -m "…"`.
     Commit { message: Option<String> },
+    /// `/diff …` or `/commit …` with arguments neither understands: a
+    /// usage hint, so the message never reaches the model.
+    Usage(&'static str),
 }
 
-/// `/diff`, `/diff turn`, `/commit`, `/commit -m …`. Any other argument
-/// isn't one of these commands, so the message is left alone.
+/// `/diff`, `/diff turn`, `/commit`, `/commit -m …`; any other argument
+/// to `/diff` or `/commit` is a [`ChangeCommand::Usage`] hint.
 pub(super) fn parse(user_input: &str) -> Option<ChangeCommand> {
     use crate::commands::parse_slash_command as cmd;
     if let Some(rest) = cmd(user_input, "/diff") {
         match rest {
             "" => Some(ChangeCommand::Diff { turn: false }),
             "turn" => Some(ChangeCommand::Diff { turn: true }),
-            _ => None,
+            _ => Some(ChangeCommand::Usage(DIFF_USAGE)),
         }
     } else if let Some(rest) = cmd(user_input, "/commit") {
         if rest.is_empty() {
             Some(ChangeCommand::Commit { message: None })
         } else {
-            parse_commit_message_arg(rest).map(|m| ChangeCommand::Commit { message: Some(m) })
+            Some(match parse_commit_message_arg(rest) {
+                Some(m) => ChangeCommand::Commit { message: Some(m) },
+                None => ChangeCommand::Usage(COMMIT_USAGE),
+            })
         }
     } else {
         None
@@ -59,6 +68,7 @@ impl Agent {
             ChangeCommand::Diff { turn } => self.show_diff(turn).await,
             // Task 5 replaces this with the real commit flow.
             ChangeCommand::Commit { .. } => self.notify("/commit isn't available yet."),
+            ChangeCommand::Usage(hint) => self.notify(hint),
         }
     }
 
@@ -67,13 +77,38 @@ impl Agent {
             self.notify(NOT_A_REPO);
             return;
         };
-        let (base, title, empty) = if turn {
-            let Some(mark) = self.undo.marks.last() else {
+        // The base, the "now" snapshot, the title and the nothing-to-show
+        // line. `/diff turn` compares two checkpoints (the mark's was taken
+        // by the checkpointer, so "now" must be one too); `/diff` compares
+        // HEAD with the tree a commit would get, so tracked-but-ignored and
+        // tracked-but-denied files keep their HEAD version rather than
+        // showing up as deleted.
+        let (base, now, title, empty) = if turn {
+            let Some(mark) = self.undo.marks.last().cloned() else {
                 self.info(NO_TURN_CHANGES);
                 return;
             };
+            if git(
+                &cwd,
+                &["cat-file", "-e", &format!("{}^{{commit}}", mark.before_oid)],
+            )
+            .await
+            .is_err()
+            {
+                self.notify(TOO_OLD);
+                return;
+            }
+            let now = match self
+                .executor
+                .checkpoint_now("diff", &CancellationToken::new())
+                .await
+            {
+                Some(r) => resolve_oid(&cwd, &r).await,
+                None => None,
+            };
             (
-                mark.before_oid.clone(),
+                mark.before_oid,
+                now,
                 format!(
                     "Changes from the last turn (\"{}\")",
                     mark.user_text_preview
@@ -81,19 +116,17 @@ impl Agent {
                 NO_TURN_CHANGES,
             )
         } else {
-            let base = match git(&cwd, &["rev-parse", "--verify", "HEAD"]).await {
-                Ok(head) if !head.trim().is_empty() => head.trim().to_string(),
-                _ => EMPTY_TREE.to_string(),
+            let head = match git(&cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).await {
+                Ok(head) if !head.trim().is_empty() => Some(head.trim().to_string()),
+                _ => None,
             };
-            (base, "Uncommitted changes".to_string(), NO_UNCOMMITTED)
-        };
-        let now = match self
-            .executor
-            .checkpoint_now("diff", &CancellationToken::new())
-            .await
-        {
-            Some(r) => resolve_oid(&cwd, &r).await,
-            None => None,
+            let now = self.executor.worktree_tree_over(head.as_deref()).await;
+            (
+                head.unwrap_or_else(|| EMPTY_TREE.to_string()),
+                now,
+                "Uncommitted changes".to_string(),
+                NO_UNCOMMITTED,
+            )
         };
         let Some(now) = now else {
             self.notify("Couldn't read the changes: could not snapshot the current state");
