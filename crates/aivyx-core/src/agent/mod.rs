@@ -476,8 +476,8 @@ impl Agent {
     }
 
     /// The `/undo` ledger — which turns changed files, and where to rewind
-    /// each one to. Test accessor; the real `/undo`/`/redo` commands (a
-    /// later task) will read and mutate this through dedicated methods.
+    /// each one to. Read-only; `/undo` and `/redo` (`undo_commands.rs`)
+    /// change it.
     pub fn undo_ledger(&self) -> &crate::undo::UndoLedger {
         &self.undo
     }
@@ -1051,13 +1051,14 @@ impl Agent {
         };
     }
 
-    /// Enables session persistence: after each turn the full session is
-    /// written to `path` (best-effort).
-    /// See the `command_prompter` field.
+    /// Sets the prompter `/undo` and `/redo` confirm through. See the
+    /// `command_prompter` field.
     pub fn set_command_prompter(&mut self, prompter: Arc<dyn aivyx_sandbox::PermissionPrompter>) {
         self.command_prompter = Some(prompter);
     }
 
+    /// Enables session persistence: after each turn the full session is
+    /// written to `path` (best-effort).
     pub fn set_session_path(&mut self, path: PathBuf) {
         self.session_path = Some(path);
     }
@@ -2624,19 +2625,6 @@ fn elide(text: &str, cap: usize) -> String {
     )
 }
 
-/// Best-effort human-readable description of what a tool call touched —
-/// used both for the batch-rollback notice and as the injection scan's
-/// `source` label (`record_tool_result`). Most mutating tools (`write_file`,
-/// `edit_file`, `delete_file`) take a `"path"` argument; `web_fetch`/
-/// `web_search` take `"url"`/`"query"` instead, so those are checked next —
-/// without this, a flagged `web_fetch` finding's source would read as the
-/// bare string `"web_fetch"` with no indication of which URL it came from.
-/// Anything else falls back to just the tool's name.
-/// Resolves a checkpoint ref (or any git ref) to the commit oid it names,
-/// or `None` if the ref doesn't resolve to a commit (gone, or never a
-/// commit in the first place). Used by the `/undo` mark-recording path so
-/// a `TurnMark`'s `before_ref`/`after_oid` survive a ref being pruned or
-/// moved later — the oid is a stable snapshot, the ref name is not.
 /// The tree a commit points at — compared, not commit ids, because a
 /// checkpoint of an unchanged tree can still mint a new commit (a restore
 /// clears the checkpointer's dedup cache).
@@ -2648,6 +2636,11 @@ async fn tree_of(cwd: &Path, oid: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Resolves a checkpoint ref (or any git ref) to the commit oid it names,
+/// or `None` if the ref doesn't resolve to a commit (gone, or never a
+/// commit in the first place). Used by the `/undo` mark-recording path so
+/// a `TurnMark`'s `before_oid`/`after_oid` survive a ref being pruned or
+/// moved later — the oid is a stable snapshot, the ref name is not.
 pub(crate) async fn resolve_oid(cwd: &Path, git_ref: &str) -> Option<String> {
     aivyx_tools::run_git(cwd, &["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")], &[])
         .await
@@ -2663,6 +2656,14 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Best-effort human-readable description of what a tool call touched —
+/// used both for the batch-rollback notice and as the injection scan's
+/// `source` label (`record_tool_result`). Most mutating tools (`write_file`,
+/// `edit_file`, `delete_file`) take a `"path"` argument; `web_fetch`/
+/// `web_search` take `"url"`/`"query"` instead, so those are checked next —
+/// without this, a flagged `web_fetch` finding's source would read as the
+/// bare string `"web_fetch"` with no indication of which URL it came from.
+/// Anything else falls back to just the tool's name.
 fn describe_tool_call_target(call: &ToolCall) -> String {
     if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
         return format!("{path} ({})", call.name);
