@@ -469,11 +469,11 @@ pub async fn run(
                 if let CtEvent::Key(key) = &event
                     && key.kind == KeyEventKind::Press
                 {
-                    // The /diff pager takes every key while it's open. It is
-                    // never open at the same time as a permission modal
+                    // The /diff pager takes every key but Ctrl+C while it's
+                    // open. It is never open at the same time as a permission modal
                     // (`open_permission` closes it), so this can't starve one.
                     let viewport = diff_viewport(guard.terminal().size()?.height);
-                    if app.handle_diff_key(key.code, viewport) {
+                    if app.handle_diff_key(key.code, key.modifiers, viewport) {
                         continue;
                     }
                     if app.pending_permission.is_some() {
@@ -501,6 +501,11 @@ pub async fn run(
                                 if offered {
                                     app.resolve_permission(UserResponse::AllowAlways);
                                 }
+                            }
+                            // Only the /commit modal has an `e`: cancel it and
+                            // put the draft in the input box to edit.
+                            (KeyCode::Char('e'), KeyModifiers::NONE) => {
+                                app.edit_commit_message();
                             }
                             (KeyCode::Char('n'), KeyModifiers::NONE)
                             | (KeyCode::Esc, KeyModifiers::NONE)
@@ -679,11 +684,17 @@ impl App {
 
     /// Routes a key to the `/diff` pager. Returns `false` (key not
     /// consumed) when the pager isn't open; otherwise every key is
-    /// consumed — scrolling, closing, or swallowed.
-    fn handle_diff_key(&mut self, code: KeyCode, viewport: usize) -> bool {
+    /// consumed — scrolling, closing, or swallowed — except Ctrl+C, which
+    /// closes the pager and is then handled as it always is (cancel a
+    /// running turn, or quit when idle).
+    fn handle_diff_key(&mut self, code: KeyCode, modifiers: KeyModifiers, viewport: usize) -> bool {
         let Some(view) = self.diff_view.as_mut() else {
             return false;
         };
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.diff_view = None;
+            return false;
+        }
         match diff_key(code) {
             Some(DiffKeyAction::Scroll(key)) => view.scroll(key, viewport),
             Some(DiffKeyAction::Close) => self.diff_view = None,
@@ -723,6 +734,26 @@ impl App {
         if let Some(modal) = self.pending_permission.take() {
             let _ = modal.reply_tx.send(response);
         }
+    }
+
+    /// `e` in the `/commit` modal: cancel it (the agent unstages what it
+    /// staged) and put `/commit -m "<draft>"` in the input box to edit and
+    /// send. Returns `false`, doing nothing, for any other modal.
+    fn edit_commit_message(&mut self) -> bool {
+        let Some(modal) = &self.pending_permission else {
+            return false;
+        };
+        if modal.request.tool_name != "commit" {
+            return false;
+        }
+        let draft = modal.request.arguments_preview["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        self.resolve_permission(UserResponse::Deny);
+        self.input = new_input_box();
+        self.input.insert_str(commit_edit_input(&draft));
+        true
     }
 
     /// True if the pending modal's reply channel is already closed —
@@ -879,7 +910,8 @@ impl App {
             // in the transcript so the request isn't silently lost.
             AgentEvent::ShowDiff { title, text } => {
                 if self.pending_permission.is_some() {
-                    self.transcript.push(ChatLine::Info(title));
+                    self.transcript
+                        .push(ChatLine::Info(format!("{title} — run /diff again to view")));
                 } else {
                     self.diff_view = Some(DiffView {
                         title,
@@ -1059,15 +1091,15 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
 
+        if let Some(view) = &self.diff_view {
+            render_diff_view(frame, view);
+        }
+
         // Belt-and-braces alongside the stale-modal `select!` branch in
         // `run`: that branch only clears `pending_permission` on its own
         // wakeup, so a redraw that lands in the same tick the editor
         // answered (before the branch has run) must not repaint a modal
         // whose decision is already resolved.
-        if let Some(view) = &self.diff_view {
-            render_diff_view(frame, view);
-        }
-
         if !self.pending_permission_is_stale()
             && let Some(modal) = &self.pending_permission
         {
@@ -1356,7 +1388,7 @@ fn help_text() -> String {
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
-    lines.push("  /diff view   ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
+    lines.push("  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
     lines.join("\n")
 }
 
@@ -1415,8 +1447,19 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
 /// unit), so one approval can't silently bless every future edit to a file
 /// that runs code outside Landlock's confinement scope. See audit finding
 /// M1 (2026-10-02).
+///
+/// Also `false` for the `/commit`, `/undo` and `/redo` confirmations: each
+/// is a one-off decision the agent never caches.
 fn offer_always_allow(request: &PermissionRequest) -> bool {
-    aivyx_sandbox::runs_code_later_for_request(request).is_none()
+    !matches!(request.tool_name.as_str(), "commit" | "undo" | "redo")
+        && aivyx_sandbox::runs_code_later_for_request(request).is_none()
+}
+
+/// What `e` in the `/commit` modal puts in the input box: the draft as a
+/// `/commit -m "…"` command, with its double quotes escaped the way
+/// `/commit -m` unescapes them.
+fn commit_edit_input(draft: &str) -> String {
+    format!("/commit -m \"{}\"", draft.replace('"', "\\\""))
 }
 
 /// The warning line shown above the diff/preview for a target
@@ -1494,7 +1537,9 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     let content = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(content, rows[0]);
 
-    let footer_text = if offer_always_allow(request) {
+    let footer_text = if request.tool_name == "commit" {
+        "[y] Commit    [e] Edit message    [n] / [Esc] Cancel"
+    } else if offer_always_allow(request) {
         "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny"
     } else {
         "[y] Allow    [n] / [Esc] / [Enter] Deny"
@@ -2954,7 +2999,7 @@ mod tests {
             .collect();
         assert_eq!(
             paging_lines,
-            ["  /diff view   ↑↓ PgUp/PgDn Home/End · Esc to close"],
+            ["  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close"],
             "{text}"
         );
         // Undo is an in-app command now, not a pointer to the README.
@@ -3118,12 +3163,12 @@ mod tests {
         assert_eq!(view.offset, 0);
 
         // Other keys are swallowed and leave it open.
-        assert!(app.handle_diff_key(KeyCode::Char('x'), 10));
+        assert!(app.handle_diff_key(KeyCode::Char('x'), KeyModifiers::NONE, 10));
         assert!(app.diff_view.is_some());
-        assert!(app.handle_diff_key(KeyCode::Esc, 10));
+        assert!(app.handle_diff_key(KeyCode::Esc, KeyModifiers::NONE, 10));
         assert!(app.diff_view.is_none());
         // With the pager closed, keys are not consumed.
-        assert!(!app.handle_diff_key(KeyCode::Esc, 10));
+        assert!(!app.handle_diff_key(KeyCode::Esc, KeyModifiers::NONE, 10));
     }
 
     #[test]
@@ -3157,7 +3202,7 @@ mod tests {
         assert!(app.diff_view.is_none());
         assert!(app.pending_permission.is_some());
         // Keys now reach the modal path, not the pager.
-        assert!(!app.handle_diff_key(KeyCode::Esc, 10));
+        assert!(!app.handle_diff_key(KeyCode::Esc, KeyModifiers::NONE, 10));
     }
 
     #[test]
@@ -3171,5 +3216,105 @@ mod tests {
         });
         assert!(app.diff_view.is_none());
         assert!(app.pending_permission.is_some());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Info(t)) if t == "Uncommitted changes — run /diff again to view"
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_closes_the_pager_and_falls_through_to_the_normal_handling() {
+        let mut app = App::new(None, PlanMode::new());
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "+x".into(),
+        });
+        // Not consumed: the caller goes on to cancel a turn / quit.
+        assert!(!app.handle_diff_key(KeyCode::Char('c'), KeyModifiers::CONTROL, 10));
+        assert!(app.diff_view.is_none());
+        // A plain `c` is still swallowed by the pager.
+        app.handle_agent_event(AgentEvent::ShowDiff {
+            title: "Uncommitted changes".into(),
+            text: "+x".into(),
+        });
+        assert!(app.handle_diff_key(KeyCode::Char('c'), KeyModifiers::NONE, 10));
+        assert!(app.diff_view.is_some());
+    }
+
+    fn commit_modal(draft: &str) -> (ModalRequest, oneshot::Receiver<UserResponse>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = PermissionRequest {
+            tool_name: "commit".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Other("commit".to_string()),
+            arguments_preview: serde_json::json!({ "message": draft }),
+            preview: Some(format!("{draft}\n\nFiles:\n  a.txt")),
+            diff: None,
+        };
+        (ModalRequest { request, reply_tx }, reply_rx)
+    }
+
+    #[test]
+    fn commit_edit_input_quotes_the_draft() {
+        assert_eq!(
+            commit_edit_input("Say \"hi\""),
+            "/commit -m \"Say \\\"hi\\\"\""
+        );
+        assert_eq!(commit_edit_input("Fix it"), "/commit -m \"Fix it\"");
+    }
+
+    #[test]
+    fn the_commit_modal_offers_edit_and_no_always_allow() {
+        let (modal, _rx) = commit_modal("Fix the average");
+        assert!(!offer_always_allow(&modal.request));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &modal.request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("[y] Commit"), "{rendered}");
+        assert!(rendered.contains("[e] Edit message"), "{rendered}");
+        assert!(rendered.contains("[n] / [Esc] Cancel"), "{rendered}");
+        assert!(!rendered.contains("Always"), "{rendered}");
+    }
+
+    #[test]
+    fn undo_and_redo_never_offer_always_allow() {
+        for tool in ["commit", "undo", "redo"] {
+            let request = PermissionRequest {
+                tool_name: tool.to_string(),
+                action: ActionKind::Write,
+                target: PermissionTarget::Other(format!("{tool} last turn")),
+                arguments_preview: serde_json::json!({}),
+                preview: Some("x".into()),
+                diff: None,
+            };
+            assert!(!offer_always_allow(&request), "{tool}");
+        }
+    }
+
+    #[test]
+    fn e_on_the_commit_modal_cancels_it_and_prefills_the_input() {
+        let mut app = App::new(None, PlanMode::new());
+        let (modal, mut rx) = commit_modal("Say \"hi\"");
+        app.open_permission(modal);
+        assert!(app.edit_commit_message());
+        assert!(app.pending_permission.is_none());
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "/commit -m \"Say \\\"hi\\\"\""
+        );
+    }
+
+    #[test]
+    fn e_on_any_other_modal_does_nothing() {
+        let mut app = App::new(None, PlanMode::new());
+        let (modal, mut rx) = modal_request();
+        app.open_permission(modal);
+        assert!(!app.edit_commit_message());
+        assert!(app.pending_permission.is_some());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.input.lines().join("\n"), "");
     }
 }
