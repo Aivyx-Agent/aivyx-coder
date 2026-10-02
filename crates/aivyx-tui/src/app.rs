@@ -117,6 +117,20 @@ fn cancelled_notice(iterations_used: u32) -> String {
 /// instead of the red/bold `ChatLine::Notice` a real error gets.
 const CANCELLED_TURN_MARKER: &str = "— stopped (Ctrl+C)";
 
+/// B2 part 2's decision function: whether a just-completed turn should
+/// show the "nothing was changed" plan-mode reminder, and what it says.
+/// `had_model_activity` is `false` for a command-only turn that calls
+/// `run_turn` but never touches the model (`/models`, an unconfigured
+/// `/council`, etc.) -- those must not get the reminder, since nothing
+/// about them is explained by plan mode being on.
+fn plan_mode_turn_notice(plan_mode_active: bool, had_model_activity: bool) -> Option<&'static str> {
+    if plan_mode_active && had_model_activity {
+        Some("Plan mode — nothing was changed. Press Ctrl+P to approve the plan and start.")
+    } else {
+        None
+    }
+}
+
 fn goal_achieved_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
 }
@@ -547,6 +561,15 @@ struct App {
     /// Shared with the gate (enforcement) and the agent (tool filtering +
     /// system-prompt note); the TUI owns the only toggle.
     plan_mode: PlanMode,
+    /// Set by `push_user_message` (a new turn is starting) to `false`, then
+    /// to `true` the first time this turn produces any real model output
+    /// or action (`TextDelta`/`ReasoningDelta`/`ToolCallDetected`/
+    /// `ToolResult`/`CouncilNote`/`ArchitectNote`/`SubAgentActivity`).
+    /// Read at `TurnComplete` (B2 part 2) to tell a real model turn from a
+    /// command-only one (`/models`, an unconfigured `/council`, etc.,
+    /// which call `run_turn` but never touch the model) -- the plan-mode
+    /// "nothing was changed" notice must only follow the former.
+    turn_had_model_activity: bool,
     /// The model the router last moved this conversation to, shown in the
     /// status line. `None` until routing reports a choice (always `None`
     /// with routing off).
@@ -577,6 +600,7 @@ impl App {
             mission_plan: None,
             open_specialist_sessions: Vec::new(),
             plan_mode,
+            turn_had_model_activity: false,
         }
     }
 
@@ -617,6 +641,7 @@ impl App {
     fn push_user_message(&mut self, text: String) {
         self.transcript.push(ChatLine::User(text));
         self.streaming_active = true;
+        self.turn_had_model_activity = false;
     }
 
     /// Renders the `/help` command via `help_text()` as a `ChatLine::Help`
@@ -644,6 +669,7 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
+                self.turn_had_model_activity = true;
                 if let Some(ChatLine::Assistant(existing)) = self.transcript.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -651,6 +677,7 @@ impl App {
                 }
             }
             AgentEvent::ReasoningDelta(text) => {
+                self.turn_had_model_activity = true;
                 if let Some(ChatLine::Reasoning(existing)) = self.transcript.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -658,6 +685,7 @@ impl App {
                 }
             }
             AgentEvent::ToolCallDetected(call) => {
+                self.turn_had_model_activity = true;
                 // Auto-verification calls are the agent's own doing, not
                 // the model's — labeled distinctly so the transcript never
                 // implies the model asked for this itself.
@@ -672,10 +700,19 @@ impl App {
                 )));
             }
             AgentEvent::ToolResult(result) => {
+                self.turn_had_model_activity = true;
                 self.transcript
                     .push(ChatLine::ToolResult(tool_output_text(&result.output)));
             }
-            AgentEvent::TurnComplete => self.streaming_active = false,
+            AgentEvent::TurnComplete => {
+                self.streaming_active = false;
+                if let Some(notice) =
+                    plan_mode_turn_notice(self.plan_mode.active(), self.turn_had_model_activity)
+                {
+                    self.transcript.push(ChatLine::Notice(notice.to_string()));
+                }
+                self.turn_had_model_activity = false;
+            }
             AgentEvent::Error(message) if message == CANCELLED_TURN_MARKER => {
                 self.transcript.push(ChatLine::Cancelled(message));
                 self.streaming_active = false;
@@ -710,12 +747,15 @@ impl App {
                 self.routed_model = None;
             }
             AgentEvent::CouncilNote(text) => {
+                self.turn_had_model_activity = true;
                 self.transcript.push(ChatLine::Council(text));
             }
             AgentEvent::ArchitectNote(text) => {
+                self.turn_had_model_activity = true;
                 self.transcript.push(ChatLine::Architect(text));
             }
             AgentEvent::SubAgentActivity(inner) => {
+                self.turn_had_model_activity = true;
                 self.transcript
                     .push(ChatLine::SubAgent(sub_agent_event_text(&inner)));
             }
@@ -2295,6 +2335,58 @@ mod tests {
             unreachable!()
         };
         assert_eq!(text, CANCELLED_TURN_MARKER);
+    }
+
+    #[test]
+    fn plan_mode_turn_notice_only_fires_when_both_plan_mode_and_real_activity() {
+        assert!(plan_mode_turn_notice(true, true).is_some());
+        assert_eq!(plan_mode_turn_notice(true, false), None);
+        assert_eq!(plan_mode_turn_notice(false, true), None);
+        assert_eq!(plan_mode_turn_notice(false, false), None);
+        assert!(plan_mode_turn_notice(true, true).unwrap().contains("Ctrl+P"));
+    }
+
+    #[test]
+    fn a_turn_complete_in_plan_mode_with_real_model_activity_adds_the_reminder() {
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.push_user_message("do the thing".to_string());
+        app.handle_agent_event(AgentEvent::TextDelta("sure, here's the plan".to_string()));
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+
+        let Some(ChatLine::Notice(text)) = app.transcript.last() else {
+            panic!("expected a Notice line as the last transcript entry");
+        };
+        assert!(text.contains("Plan mode"));
+        assert!(text.contains("Ctrl+P"));
+    }
+
+    #[test]
+    fn a_turn_complete_in_plan_mode_with_no_model_activity_adds_no_reminder() {
+        // A command-only turn (e.g. /models) calls run_turn and still gets
+        // a real TurnComplete, but never touches the model -- plan mode
+        // being on is irrelevant to it.
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.push_user_message("/models".to_string());
+        let len_before = app.transcript.len();
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+
+        assert_eq!(app.transcript.len(), len_before);
+    }
+
+    #[test]
+    fn a_turn_complete_outside_plan_mode_adds_no_reminder() {
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("do the thing".to_string());
+        app.handle_agent_event(AgentEvent::TextDelta("done".to_string()));
+        let len_before = app.transcript.len();
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+
+        assert_eq!(app.transcript.len(), len_before);
     }
 
     #[test]
