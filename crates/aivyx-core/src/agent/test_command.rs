@@ -184,6 +184,11 @@ impl Agent {
         command
             .args(&tests.args)
             .current_dir(cwd)
+            // Each `/test` run spawns a fresh process -- cached `.pyc`
+            // files would just be dead weight in the worktree, never
+            // reused across runs the way they would be in a long-lived
+            // interpreter.
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -269,6 +274,15 @@ impl Agent {
                 }
             }
         };
+
+        // `Cancelled` leaves it unchanged -- the user interrupted the run
+        // before it could say anything about the code, so the previous
+        // result (if any) still stands.
+        match &outcome {
+            Outcome::Exited(status) => self.last_test_passed = Some(status.success()),
+            Outcome::TimedOut | Outcome::WaitFailed(_) => self.last_test_passed = Some(false),
+            Outcome::Cancelled => {}
+        }
 
         let secs = started.elapsed().as_secs_f64();
         let summary = match outcome {

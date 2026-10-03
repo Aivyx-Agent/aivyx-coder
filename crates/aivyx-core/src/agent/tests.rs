@@ -821,6 +821,51 @@ async fn reasoning_delta_emits_but_never_enters_history() {
 }
 
 #[tokio::test]
+async fn reasoning_only_response_is_pushed_to_history_as_the_answer() {
+    // No TextDelta, no tool calls -- the model only "thought out loud".
+    // Losing that silently would leave history (and the human) with no
+    // sign the model answered at all, so the trimmed reasoning becomes
+    // the assistant's answer instead.
+    let response = vec![
+        StreamEvent::ReasoningDelta("Fixed it.".to_string()),
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ];
+    let (mut agent, mut rx, _mock) = build_agent(vec![response], ToolRegistry::new(), 10);
+
+    agent
+        .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(agent.history.last().unwrap().role, Role::Assistant);
+    assert_eq!(agent.history.last().unwrap().text_content(), "Fixed it.");
+    assert!(
+        infos(&mut rx)
+            .contains(&"(The model answered only in its thinking, shown above.)".to_string()),
+        "expected the reasoning-only Info to have been emitted"
+    );
+}
+
+#[tokio::test]
+async fn a_response_with_no_text_reasoning_or_tool_calls_says_so_and_pushes_nothing() {
+    let (mut agent, mut rx, _mock) = build_agent(vec![vec![]], ToolRegistry::new(), 10);
+
+    agent
+        .run_turn("hello".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(agent.history.len(), 1, "no assistant message should be pushed");
+    assert_eq!(agent.history[0].role, Role::User);
+    assert!(
+        infos(&mut rx).contains(&"The model ended its turn without replying.".to_string()),
+        "expected the without-replying Info to have been emitted"
+    );
+}
+
+#[tokio::test]
 async fn too_many_tool_calls_in_one_response_are_capped_but_all_recorded() {
     let mut first: Vec<StreamEvent> = (0..25)
         .map(|i| StreamEvent::ToolCallComplete(tool_call(&format!("c{i}"), "read_file")))
@@ -3083,7 +3128,7 @@ async fn undo_messages_without_repo_marks_or_prompter() {
     agent.set_command_prompter(allow());
     agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
     agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
-    let got = notices(&mut rx);
+    let got = infos(&mut rx);
     assert!(got.contains(&"Nothing to undo — no changes made in this session.".to_string()), "{got:?}");
     assert!(got.contains(&"Nothing to redo.".to_string()), "{got:?}");
 
@@ -3116,7 +3161,7 @@ async fn checkpoints_lists_changing_turns_newest_first() {
     agent.run_turn("first change".into(), &cwd, CancellationToken::new()).await.unwrap();
     agent.run_turn("second change".into(), &cwd, CancellationToken::new()).await.unwrap();
     agent.run_turn("/checkpoints".into(), &cwd, CancellationToken::new()).await.unwrap();
-    let listing = notices(&mut rx).into_iter().find(|t| t.starts_with("Undoable turns (newest first")).unwrap();
+    let listing = infos(&mut rx).into_iter().find(|t| t.starts_with("Undoable turns (newest first")).unwrap();
     let second = listing.find("\"second change\"").unwrap();
     let first = listing.find("\"first change\"").unwrap();
     assert!(second < first, "{listing}");
@@ -3198,6 +3243,62 @@ async fn two_undos_both_reach_the_model_in_order() {
         "(The user undid your changes from the last turn: b.txt. \
          The user undid your changes from the last turn: a.txt.)\n\nwhat now?"
     );
+}
+
+#[tokio::test]
+async fn undo_and_redo_success_notices_are_info_not_error() {
+    // These are routine results, not failures -- they must reach the
+    // frontend as `AgentEvent::Info` (rendered plainly), not
+    // `AgentEvent::Error` (rendered as a red `!`).
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(2));
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(infos(&mut rx).contains(&"Undone: a.txt".to_string()));
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(infos(&mut rx).contains(&"Redone: a.txt".to_string()));
+}
+
+fn deny_prompter() -> Arc<ScriptedPrompter> {
+    Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny].into()), seen: Mutex::default() })
+}
+
+#[tokio::test]
+async fn undo_cancelled_notice_is_info_not_error() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(1));
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let _ = infos(&mut rx);
+    agent.set_command_prompter(deny_prompter());
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(infos(&mut rx).contains(&"Undo cancelled.".to_string()));
+    assert_eq!(agent.undo_ledger().marks.len(), 1, "deny keeps the mark");
+}
+
+#[tokio::test]
+async fn redo_cancelled_notice_is_info_not_error() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(1));
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let _ = infos(&mut rx);
+    agent.set_command_prompter(deny_prompter());
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(infos(&mut rx).contains(&"Redo cancelled.".to_string()));
+    assert_eq!(agent.undo_ledger().redo.len(), 1, "deny keeps the redo entry");
 }
 
 #[tokio::test]
@@ -3327,7 +3428,7 @@ async fn a_new_changing_turn_after_undo_clears_redo() {
     assert!(agent.undo_ledger().redo.is_empty());
     let _ = notices(&mut rx);
     agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
-    assert!(notices(&mut rx).contains(&"Nothing to redo.".to_string()));
+    assert!(infos(&mut rx).contains(&"Nothing to redo.".to_string()));
     assert!(!cwd.join("a.txt").exists(), "the undone change stays undone");
 }
 
@@ -3408,7 +3509,7 @@ async fn undo_with_nothing_left_to_take_back_drops_the_mark_quietly() {
 
     agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(
-        notices(&mut rx),
+        infos(&mut rx),
         vec!["Nothing to undo there — that turn's changes are already gone.".to_string()]
     );
     assert!(agent.undo_ledger().marks.is_empty());
@@ -3433,7 +3534,7 @@ async fn redo_with_the_changes_already_back_makes_the_turn_undoable_again() {
 
     agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(
-        notices(&mut rx),
+        infos(&mut rx),
         vec!["Nothing to redo — those changes are already back.".to_string()]
     );
     assert!(agent.undo_ledger().redo.is_empty());
@@ -6492,6 +6593,29 @@ fn without_set_skills_the_system_prompt_has_no_skills_block() {
 }
 
 #[test]
+fn system_prompt_tells_the_model_the_test_command_when_tests_are_set() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    let tests = sh_tests("pytest");
+    let sentence = format!(
+        "This project's tests run with `{}`. After changing code, run them (with run_shell) \
+         before telling the user it works.",
+        tests.display()
+    );
+    agent.set_tests(Some(tests));
+
+    assert!(agent.system_prompt_text().contains(&sentence));
+}
+
+#[test]
+fn system_prompt_omits_the_test_command_sentence_in_plan_mode() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.set_tests(Some(sh_tests("pytest")));
+    agent.plan_mode.set_active(true);
+
+    assert!(!agent.system_prompt_text().contains("tests run with"));
+}
+
+#[test]
 fn compute_prefix_hash_is_stable_for_identical_inputs() {
     let tools = vec![ToolDefinition {
         name: "read_file".to_string(),
@@ -7297,6 +7421,26 @@ async fn commit_drafts_a_message_and_commits_everything_once_allowed() {
 }
 
 #[tokio::test]
+async fn commit_preview_warns_when_the_last_test_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock.clone()).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    agent.set_tests(Some(sh_tests("exit 1")));
+
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let seen = prompter.seen.lock().unwrap();
+    let preview = seen[0].preview.as_deref().unwrap();
+    assert!(preview.starts_with("⚠ The last /test failed.\n"), "{preview}");
+}
+
+#[tokio::test]
 async fn commit_with_a_hand_staged_set_commits_only_that() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
@@ -7797,6 +7941,61 @@ async fn test_failure_reports_the_exit_code() {
     agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
     let (_, finished) = test_events(&mut rx);
     assert!(finished[0].0.starts_with("Tests failed (exit 3, "), "{:?}", finished[0]);
+}
+
+#[tokio::test]
+async fn test_pass_then_fail_update_last_test_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, _rx) = undo_agent_with_events(&cwd, false).await;
+    assert_eq!(agent.last_test_passed(), None, "nothing has run yet");
+
+    agent.set_tests(Some(sh_tests("exit 0")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.last_test_passed(), Some(true));
+
+    agent.set_tests(Some(sh_tests("exit 1")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.last_test_passed(), Some(false));
+}
+
+#[tokio::test]
+async fn test_cancelled_or_unable_to_start_leaves_last_test_passed_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, _rx) = undo_agent_with_events(&cwd, false).await;
+
+    agent.set_tests(Some(crate::test_detect::EffectiveTests {
+        program: "definitely-not-a-real-program-xyz".into(),
+        args: vec![],
+        source: crate::test_detect::TestSource::Config,
+    }));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.last_test_passed(), None, "couldn't-start leaves it unchanged");
+
+    agent.set_tests(Some(sh_tests("sleep 30")));
+    let token = CancellationToken::new();
+    let canceller = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        canceller.cancel();
+    });
+    agent.run_turn("/test".into(), &cwd, token).await.unwrap();
+    assert_eq!(agent.last_test_passed(), None, "cancelled leaves it unchanged");
+}
+
+#[tokio::test]
+async fn test_run_does_not_write_python_bytecode() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_tests(Some(sh_tests(r#"echo "$PYTHONDONTWRITEBYTECODE""#)));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let (lines, _finished) = test_events(&mut rx);
+    assert_eq!(lines, vec!["1".to_string()]);
 }
 
 #[tokio::test]
@@ -8675,4 +8874,26 @@ async fn switching_conversations_resets_history_truncated() {
     agent.history_truncated = true;
     assert!(agent.switch_to(&x).await);
     assert!(!agent.history_truncated);
+}
+
+#[tokio::test]
+async fn clear_resets_last_test_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _rx) = store_agent(&dir.path().join("proj"), vec![]);
+    agent.last_test_passed = Some(false);
+    agent.clear_conversation();
+    assert_eq!(agent.last_test_passed(), None);
+}
+
+#[tokio::test]
+async fn switching_conversations_resets_last_test_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a1")]);
+    agent.run_turn("one".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+    agent.last_test_passed = Some(true);
+    assert!(agent.switch_to(&x).await);
+    assert_eq!(agent.last_test_passed(), None);
 }

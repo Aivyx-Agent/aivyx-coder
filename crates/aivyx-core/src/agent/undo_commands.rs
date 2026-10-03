@@ -143,7 +143,7 @@ impl Agent {
             return;
         };
         let Some(mark) = self.undo.marks.last().cloned() else {
-            self.notify(NOTHING_TO_UNDO);
+            self.info(NOTHING_TO_UNDO);
             return;
         };
         if !oid_exists(&cwd, &mark.before_oid).await {
@@ -166,7 +166,7 @@ impl Agent {
             // the mark, but there is nothing to redo and nothing to tell
             // the model.
             self.undo.pop_mark();
-            self.notify("Nothing to undo there — that turn's changes are already gone.");
+            self.info("Nothing to undo there — that turn's changes are already gone.");
             self.persist_if_owned();
             return;
         }
@@ -192,7 +192,7 @@ impl Agent {
             preview.push_str(&note);
         }
         if !self.confirm("undo", preview).await {
-            self.notify("Undo cancelled.");
+            self.info("Undo cancelled.");
             return;
         }
         if let Err(e) = self
@@ -209,7 +209,7 @@ impl Agent {
         self.pending_notes.push(format!(
             "The user undid your changes from the last turn: {list}."
         ));
-        self.notify(format!("Undone: {list}"));
+        self.info(format!("Undone: {list}"));
         self.persist_if_owned();
     }
 
@@ -218,7 +218,7 @@ impl Agent {
             return;
         };
         let Some(redo) = self.undo.redo.last().cloned() else {
-            self.notify("Nothing to redo.");
+            self.info("Nothing to redo.");
             return;
         };
         if !oid_exists(&cwd, &redo.redo_oid).await {
@@ -242,7 +242,7 @@ impl Agent {
             if let Some(redo) = self.undo.pop_redo() {
                 self.undo.push_mark_back(redo.mark);
             }
-            self.notify("Nothing to redo — those changes are already back.");
+            self.info("Nothing to redo — those changes are already back.");
             self.persist_if_owned();
             return;
         }
@@ -264,7 +264,7 @@ impl Agent {
             .collect();
         let preview = preview_text("Redo the last undo?", &entries);
         if !self.confirm("redo", preview).await {
-            self.notify("Redo cancelled.");
+            self.info("Redo cancelled.");
             return;
         }
         if let Err(e) = self
@@ -280,7 +280,7 @@ impl Agent {
         let list = paths.join(", ");
         self.pending_notes
             .push(format!("The user restored your changes: {list}."));
-        self.notify(format!("Redone: {list}"));
+        self.info(format!("Redone: {list}"));
         self.persist_if_owned();
     }
 
@@ -295,8 +295,9 @@ impl Agent {
                 missing.insert(mark.before_oid.clone());
             }
         }
-        self.notify(checkpoints_listing(
+        self.info(checkpoints_listing(
             &self.undo.marks,
+            !self.undo.redo.is_empty(),
             local_offset_secs(),
             |m| missing.contains(&m.before_oid),
         ));

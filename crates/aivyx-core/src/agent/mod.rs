@@ -451,6 +451,15 @@ pub struct Agent {
     /// How long `/test` may run. Always [`test_command::TEST_TIMEOUT`]
     /// outside tests.
     pub(super) test_timeout: std::time::Duration,
+    /// The outcome of the most recent `/test` run: `Some(true)` passed,
+    /// `Some(false)` failed or timed out, `None` if `/test` was never run,
+    /// or its run was cancelled or couldn't start (nothing was actually
+    /// learned about the code in either of those last two cases, so the
+    /// previous value, if any, is left alone). Read by `/commit`'s preview
+    /// to warn before committing on top of a known-failing test run; reset
+    /// by `clear_conversation`/`switch_to` since it no longer describes the
+    /// conversation now in progress.
+    last_test_passed: Option<bool>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -537,6 +546,7 @@ impl Agent {
             pending_notes: Vec::new(),
             tests: None,
             test_timeout: test_command::TEST_TIMEOUT,
+            last_test_passed: None,
             events_tx,
         }
     }
@@ -660,6 +670,7 @@ impl Agent {
         self.last_routed = None;
         self.undo.clear();
         self.pending_notes.clear();
+        self.last_test_passed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.history_truncated = false;
         if targets_store {
@@ -703,6 +714,12 @@ impl Agent {
 
     pub fn tests(&self) -> Option<&crate::test_detect::EffectiveTests> {
         self.tests.as_ref()
+    }
+
+    /// The outcome of the most recent `/test` run — see the
+    /// `last_test_passed` field's doc comment.
+    pub fn last_test_passed(&self) -> Option<bool> {
+        self.last_test_passed
     }
 
     /// Enables enforced verification (Phase 12 Part B): `command_name` must
@@ -1414,6 +1431,7 @@ impl Agent {
         self.last_routed = None;
         self.undo.clear();
         self.pending_notes.clear();
+        self.last_test_passed = None;
 
         let specialist_sessions = state.specialist_sessions.clone();
         let plan_mode_active = state.plan_mode_active;
@@ -1594,6 +1612,19 @@ impl Agent {
         if self.verification.is_some() && !self.plan_mode.active() {
             system.push_str("\n\n");
             system.push_str(VERIFICATION_PROMPT);
+        } else if let Some(tests) = &self.tests
+            && !self.plan_mode.active()
+        {
+            // Verification (above) already tells the model to run tests
+            // after edits -- without it configured, the model has no way
+            // to know a test command even exists unless told here. Not
+            // shown in plan mode: no edits happen there, so running tests
+            // is moot.
+            system.push_str(&format!(
+                "\n\nThis project's tests run with `{}`. After changing code, run them (with \
+                 run_shell) before telling the user it works.",
+                tests.display()
+            ));
         }
         if self.autonomous_mode.active() {
             system.push_str("\n\n");
@@ -2463,6 +2494,7 @@ impl Agent {
             };
 
             let mut assistant_text = String::new();
+            let mut reasoning_text = String::new();
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut finish_reason = None;
 
@@ -2485,13 +2517,21 @@ impl Agent {
                         }
                     }
                     Ok(StreamEvent::ReasoningDelta(text)) => {
-                        // Deliberately not accumulated into `assistant_text`
-                        // and no size-cap check — reasoning never enters
-                        // `self.history`, so there's no unbounded-growth
-                        // risk on this side to guard against. See
+                        // Deliberately kept separate from `assistant_text`
+                        // -- reasoning only enters `self.history` as a
+                        // last resort, when the response carried nothing
+                        // else at all (see below). Capped the same way
+                        // `assistant_text` is, but by simply stopping
+                        // accumulation rather than failing the turn: a
+                        // response this is ever used for already has
+                        // nothing else, so there's nothing to lose by
+                        // truncating it instead of erroring out. See
                         // docs/superpowers/specs/
                         // 2026-07-19-reasoning-visibility-design.md.
-                        self.emit(AgentEvent::ReasoningDelta(text));
+                        self.emit(AgentEvent::ReasoningDelta(text.clone()));
+                        if reasoning_text.len() < MAX_ASSISTANT_TEXT_BYTES {
+                            reasoning_text.push_str(&text);
+                        }
                     }
                     Ok(StreamEvent::ToolCallComplete(call)) => {
                         self.emit(AgentEvent::ToolCallDetected(call.clone()));
@@ -2672,6 +2712,26 @@ impl Agent {
             }
             for (call, _) in &malformed_blocks {
                 assistant_content.push(ContentBlock::ToolCall(call.clone()));
+            }
+            // A response with no text, no tool calls and no malformed
+            // blocks would otherwise leave nothing in history and no sign
+            // the model answered at all. If it reasoned but said nothing
+            // "out loud", surface the trimmed reasoning as the answer
+            // instead of silently losing it; if it reasoned not even that,
+            // say so explicitly rather than ending the turn without a
+            // trace.
+            if assistant_content.is_empty() {
+                let reasoning_trimmed = reasoning_text.trim();
+                if reasoning_trimmed.is_empty() {
+                    self.emit(AgentEvent::Info(
+                        "The model ended its turn without replying.".to_string(),
+                    ));
+                } else {
+                    assistant_content.push(ContentBlock::Text(reasoning_trimmed.to_string()));
+                    self.emit(AgentEvent::Info(
+                        "(The model answered only in its thinking, shown above.)".to_string(),
+                    ));
+                }
             }
             if !assistant_content.is_empty() {
                 self.history.push(Message {

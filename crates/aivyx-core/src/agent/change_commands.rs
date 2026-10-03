@@ -578,12 +578,19 @@ impl Agent {
             return false;
         };
         let listing: Vec<String> = files.iter().map(|f| format!("  {f}")).collect();
+        let mut preview = format!("{draft}\n\nFiles:\n{}", listing.join("\n"));
+        if self.last_test_passed == Some(false) {
+            // A real warning, not a block -- committing on top of a known
+            // failure is the user's call, but they should see it before
+            // approving.
+            preview = format!("⚠ The last /test failed.\n{preview}");
+        }
         let request = PermissionRequest {
             tool_name: "commit".to_string(),
             action: ActionKind::Write,
             target: PermissionTarget::Other("commit".to_string()),
             arguments_preview: serde_json::json!({ "message": draft }),
-            preview: Some(format!("{draft}\n\nFiles:\n{}", listing.join("\n"))),
+            preview: Some(preview),
             diff: None,
         };
         !matches!(prompter.prompt(&request).await, UserResponse::Deny)

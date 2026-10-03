@@ -153,11 +153,16 @@ pub fn text_preview(user_text: &str) -> String {
 
 pub fn checkpoints_listing(
     marks: &[TurnMark],
+    redo_waiting: bool,
     local_offset_secs: i32,
     is_pruned: impl Fn(&TurnMark) -> bool,
 ) -> String {
     if marks.is_empty() {
-        return "Nothing to undo — no changes made in this session.".to_string();
+        return if redo_waiting {
+            "Nothing to undo — /redo puts back what the last /undo removed.".to_string()
+        } else {
+            "Nothing to undo — no changes made in this session.".to_string()
+        };
     }
     let mut text = "Undoable turns (newest first — /undo takes back the top one):".to_string();
     for (i, m) in marks.iter().rev().enumerate() {
@@ -281,7 +286,7 @@ mod tests {
         a.user_text_preview = "first".into();
         let mut b = mark(1_000 + 3_600);
         b.user_text_preview = "second".into();
-        let text = checkpoints_listing(&[a.clone(), b], 0, |m| m.created_unix == a.created_unix);
+        let text = checkpoints_listing(&[a.clone(), b], false, 0, |m| m.created_unix == a.created_unix);
         assert_eq!(
             text,
             "Undoable turns (newest first — /undo takes back the top one):\n\
@@ -289,8 +294,20 @@ mod tests {
              2  00:16 · \"first\"   too old to undo"
         );
         assert_eq!(
-            checkpoints_listing(&[], 0, |_| false),
+            checkpoints_listing(&[], false, 0, |_| false),
             "Nothing to undo — no changes made in this session."
+        );
+    }
+
+    #[test]
+    fn checkpoints_listing_with_no_marks_but_a_redo_waiting_points_at_redo() {
+        // No undoable turns right now, but `/redo` has something to put
+        // back -- the generic "no changes made in this session" text would
+        // be misleading (changes *were* made; they were undone), and would
+        // also hide that `/redo` is available.
+        assert_eq!(
+            checkpoints_listing(&[], true, 0, |_| false),
+            "Nothing to undo — /redo puts back what the last /undo removed."
         );
     }
 }
