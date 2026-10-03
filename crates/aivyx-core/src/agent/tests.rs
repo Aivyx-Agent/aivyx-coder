@@ -8461,3 +8461,57 @@ async fn resume_sets_plan_mode_to_exactly_the_resumed_conversations_value() {
         "switching into a Plan-mode conversation must turn Plan mode on"
     );
 }
+
+// ---- sessions per project: fix round 2 ----
+
+#[tokio::test]
+async fn attach_store_and_resume_marks_the_resumed_conversation_current_before_any_turn() {
+    // Regression test for the critical startup-ordering bug: calling
+    // `restore_session` before `set_session_store` (as `agent_builder.rs`
+    // originally did) left `current_session_id()` at `None` right after
+    // setup, which is exactly what `/sessions` reads to mark a
+    // conversation `(current)` -- so a resumed session never showed as
+    // current even before any turn ran.
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let id = store.list()[0].id.clone();
+    let state = store.load(&id).unwrap();
+
+    let (mut agent2, _rx2) =
+        build_agent_with_backend(Arc::new(MockBackend::new(vec![text_response("b")])), store_dir.join("unused.json"));
+    agent2.attach_store_and_resume(crate::session::SessionStore::new(store_dir.clone()), Some(state));
+
+    assert_eq!(
+        agent2.current_session_id(),
+        Some(id.as_str()),
+        "the resumed conversation's id must be current immediately after setup, before any turn"
+    );
+}
+
+#[tokio::test]
+async fn attach_store_and_resume_continues_the_same_file_after_one_turn() {
+    // Companion to the test above: the same forking bug also meant the
+    // next successful turn minted a brand new file (a silent fork of the
+    // resumed conversation) instead of overwriting the one that was
+    // resumed.
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let id = store.list()[0].id.clone();
+    let state = store.load(&id).unwrap();
+
+    let (mut agent2, _rx2) =
+        build_agent_with_backend(Arc::new(MockBackend::new(vec![text_response("b")])), store_dir.join("unused.json"));
+    agent2.attach_store_and_resume(crate::session::SessionStore::new(store_dir.clone()), Some(state));
+    agent2.run_turn("more".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    let list = store.list();
+    assert_eq!(list.len(), 1, "the resumed conversation must not be forked into a second file");
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].turns, 2);
+}

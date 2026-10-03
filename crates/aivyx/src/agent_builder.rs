@@ -1505,13 +1505,16 @@ pub(crate) async fn build_agent(
                 Some(id) => store.load(&id),
                 None => None,
             };
-            if let Some(state) = &restored {
-                agent.restore_session(state.clone());
-                if let Some(pool) = &specialist_session_pool {
-                    pool.seed_dehydrated(state.specialist_sessions.clone());
-                }
+            if let Some(state) = &restored
+                && let Some(pool) = &specialist_session_pool
+            {
+                pool.seed_dehydrated(state.specialist_sessions.clone());
             }
-            agent.set_session_store(store);
+            // `set_session_store` must run before `restore_session` adopts
+            // the resumed `meta.id` -- see `Agent::attach_store_and_resume`'s
+            // own doc comment for the critical bug this single call fixes
+            // (every `--resume` silently forking into a second file).
+            agent.attach_store_and_resume(store, restored.clone());
             restored
         }
         None => {

@@ -116,9 +116,14 @@ resumed Plan mode only ever turns *on* — it never overrides an explicit
 `--plan` flag by turning it off.
 
 Upgrading from an older `aivyx-coder` that used one session file per
-project (`<project-key>.json`): the first time a project's store is set
-up, that legacy file is migrated into the new per-conversation layout
-automatically (and removed) — no manual action is needed.
+project (`<project-key>.json`): whenever that legacy file is found present
+(not just the first time — e.g. an older build run again later writes it
+again), it's migrated into the new per-conversation layout automatically.
+A legacy file that still parses is loaded and saved as a proper
+conversation, then removed; one that no longer parses (corrupted, or from
+an incompatible older version) is kept, not discarded — it's moved into
+the new folder unchanged so nothing is silently lost. No manual action is
+needed either way.
 
 The status line shows a live context-budget indicator (`ctx 6.1k/8.2k (74%)`,
 colored green/amber/red) once the backend reports token usage. When the

@@ -579,12 +579,18 @@ impl Agent {
     }
 
     /// Starts a fresh conversation: clears `history` and the shared task
-    /// list, persists the now-empty session (so a crash immediately after
-    /// doesn't reload the old conversation via `--resume`), and emits
-    /// `ConversationCleared` so the frontend resets its own display state.
-    /// Also resets the `mission_plan` handle to a pristine `MissionPlan` and
-    /// calls `close_all()` on the `specialist_session_pool`, when either is
-    /// set (`[team] enabled = true`) — see those fields' own doc comments.
+    /// list, persists (so a crash immediately after doesn't reload stale
+    /// content via `--resume`) -- with a `Store` target, that means saving
+    /// the *outgoing* conversation under its own id and leaving the
+    /// now-empty one unpersisted until its first real turn; with a `File`
+    /// target (or none), it means overwriting the single project file
+    /// with the now-empty session, same as before `Store` existed -- see
+    /// the `With a Store target...` paragraph below for the full
+    /// difference. Emits `ConversationCleared` so the frontend resets its
+    /// own display state. Also resets the `mission_plan` handle to a
+    /// pristine `MissionPlan` and calls `close_all()` on the
+    /// `specialist_session_pool`, when either is set (`[team] enabled =
+    /// true`) — see those fields' own doc comments.
     /// Never calls the model — this is the `AgentState`-tier `/clear`
     /// command's entire implementation. `plan_mode` is deliberately
     /// untouched: it's a mode setting, not conversation content.
@@ -1267,6 +1273,27 @@ impl Agent {
         } else {
             Some(meta.first_user_text)
         };
+    }
+
+    /// Fix-round regression fix: `set_session_store` then `restore_session`,
+    /// as one call, so a caller can never get the order wrong. A caller
+    /// that did `restore_session` first and `set_session_store` second
+    /// (as `agent_builder.rs` originally did) silently forked every
+    /// `--resume`d conversation into a second file: `restore_session`'s
+    /// `Some(SessionTarget::Store { id, .. })` match only adopts the
+    /// resumed `meta.id` when the target is *already* `Store` -- called
+    /// before `set_session_store`, `self.session_target` is still `None`,
+    /// so the match silently does nothing, and the following
+    /// `set_session_store` then resets `id` to `None` regardless. The next
+    /// persist mints a brand new id instead of overwriting the resumed
+    /// file, and `current_session_id()` (which `/sessions` reads to mark
+    /// the current conversation `(current)`) stays `None` the whole time
+    /// in between.
+    pub fn attach_store_and_resume(&mut self, store: SessionStore, restored: Option<SessionState>) {
+        self.set_session_store(store);
+        if let Some(state) = restored {
+            self.restore_session(state);
+        }
     }
 
     /// Switches to conversation `id` without restarting the process

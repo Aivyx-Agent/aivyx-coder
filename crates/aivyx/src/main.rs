@@ -302,10 +302,11 @@ async fn main() -> anyhow::Result<()> {
     let mut settings = Settings::load()?;
     settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
 
-    let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
-    let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
-    let mut built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
-
+    // Checked before `build_agent` (which does real, non-trivial work --
+    // migrating a legacy session file, restoring one, probing a backend --
+    // none of which should run just to immediately bail on a flag
+    // combination `cli` alone already rules out). Split from the rest of
+    // this frontend's own setup below, which genuinely needs `settings`.
     if cli.mcp_server {
         if cli.plan {
             anyhow::bail!("--mcp-server and --plan cannot be used together");
@@ -316,6 +317,13 @@ async fn main() -> anyhow::Result<()> {
         if cli.resume.is_some() {
             anyhow::bail!("--mcp-server and --resume cannot be used together");
         }
+    }
+
+    let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
+    let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
+    let mut built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
+
+    if cli.mcp_server {
         let Some(max_access_level_str) = settings.mcp_server.max_access_level.as_deref() else {
             anyhow::bail!(
                 "--mcp-server requires [mcp_server].max_access_level to be set in config.toml \

@@ -842,6 +842,23 @@ impl App {
             .collect()
     }
 
+    /// The display-state reset shared by `ConversationCleared` and
+    /// `SessionSwitched`: both leave this agent holding a different (one
+    /// empty, one freshly resumed) conversation than whatever the
+    /// transcript was showing, so both start from the same blank slate.
+    /// `SessionSwitched`'s own arm fills `transcript`/`tasks` back in
+    /// right after calling this, from the switched-to conversation's
+    /// history instead of leaving them empty.
+    fn reset_conversation_display(&mut self) {
+        self.transcript.clear();
+        self.tasks.clear();
+        self.mission_plan = None;
+        self.open_specialist_sessions.clear();
+        self.context_usage = None;
+        self.streaming_active = false;
+        self.routed_model = None;
+    }
+
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => {
@@ -916,13 +933,7 @@ impl App {
                 self.open_specialist_sessions = sessions;
             }
             AgentEvent::ConversationCleared => {
-                self.transcript.clear();
-                self.tasks.clear();
-                self.mission_plan = None;
-                self.open_specialist_sessions.clear();
-                self.context_usage = None;
-                self.streaming_active = false;
-                self.routed_model = None;
+                self.reset_conversation_display();
             }
             AgentEvent::CouncilNote(text) => {
                 self.turn_had_model_activity = true;
@@ -985,13 +996,7 @@ impl App {
             // "Resumed conversation…" line) follows this one, so no
             // notice is pushed here.
             AgentEvent::SessionSwitched { history, tasks } => {
-                self.transcript.clear();
-                self.tasks.clear();
-                self.mission_plan = None;
-                self.open_specialist_sessions.clear();
-                self.context_usage = None;
-                self.streaming_active = false;
-                self.routed_model = None;
+                self.reset_conversation_display();
                 self.transcript = seed_transcript(&history);
                 self.tasks = tasks;
             }
