@@ -7998,3 +7998,31 @@ async fn test_run_goes_through_the_confiner() {
 
     assert!(confiner.was_called());
 }
+
+// ---- /test fix round 2 ----
+
+// Review finding 1 (IMPORTANT): the per-call `read_capped_line` future
+// accumulates a partial line in a *function-local* `buf`; if the other
+// stream's `select!` branch wins while this one is mid-line (suspended on
+// a later `fill_buf().await` within the *same* call), the future — and
+// the bytes it already consumed from the reader but hasn't returned yet —
+// is dropped. Those bytes are gone forever: already removed from the
+// `BufReader`, never handed back to the caller. Reproduces as a stdout
+// line silently losing its leading bytes whenever a stderr line completes
+// while stdout is mid-line (or vice versa).
+#[tokio::test]
+async fn test_stream_is_cancel_safe_across_select_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_tests(Some(sh_tests(
+        "printf abc; sleep 0.2; echo x >&2; sleep 0.2; echo def",
+    )));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let (lines, finished) = test_events(&mut rx);
+    assert!(lines.contains(&"abcdef".to_string()), "{lines:?}");
+    assert!(lines.contains(&"x".to_string()), "{lines:?}");
+    assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
+}

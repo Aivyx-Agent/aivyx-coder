@@ -19,7 +19,7 @@ const MAX_LINE_CHARS: usize = 2000;
 /// Per-line cap *while reading*, in bytes — generous relative to
 /// `MAX_LINE_CHARS` (which `clip` applies afterwards, in chars, for
 /// display) so this only ever bites a line with no newline for a very
-/// long time, not an ordinary over-long one. Keeps `read_capped_line`'s
+/// long time, not an ordinary over-long one. Keeps `CappedLines`'s
 /// buffer bounded for output like `yes | tr -d '\n'`, which never hits a
 /// newline at all.
 const MAX_LINE_BYTES: usize = 4 * MAX_LINE_CHARS;
@@ -44,67 +44,106 @@ enum Outcome {
     WaitFailed(String),
 }
 
-/// Reads one line from `reader`, tolerant of non-UTF-8 bytes (decoded with
-/// `String::from_utf8_lossy` instead of failing) and bounded in memory: at
-/// most `cap` bytes of the line are kept, with the rest discarded while
-/// still reading through to the real newline — so a line that never ends
-/// (`yes | tr -d '\n'`) can't grow the buffer without bound. Strips a
-/// trailing `\n` (and `\r\n`).
+/// Wraps a reader with a persistent, cancel-safe line reader: tolerant of
+/// non-UTF-8 bytes (decoded with `String::from_utf8_lossy` instead of
+/// failing) and bounded in memory (at most `cap` bytes of the current
+/// line are kept, the rest discarded while still reading through to the
+/// real newline, so a line that never ends — `yes | tr -d '\n'` — can't
+/// grow the buffer without bound).
 ///
-/// Returns `None` only once the stream is truly exhausted: real EOF with
-/// no bytes left to return, or an I/O error, which is treated like EOF
-/// (the stream is closed) rather than stopping the drain early — see
-/// `drain_capped_tail` in `aivyx-tools/src/process.rs`, which the old
-/// `BufReader::lines()` violated by returning `Ok(None)` on an `Err`,
-/// looking identical to real EOF to its caller — the actual bug: a
-/// non-UTF-8 line made `.lines()` return `Err(InvalidData)`, which this
-/// module's old `_ => { out_open = false; None }` handling treated as
-/// EOF, so draining stopped while the child was still writing and the
-/// child then blocked on a full pipe.
-async fn read_capped_line<R>(reader: &mut R, cap: usize) -> Option<String>
+/// The partial-line accumulator (`buf`) lives in `self`, not in a
+/// `next_line` call's own stack frame — load-bearing for `tokio::select!`:
+/// each iteration of `run_tests`'s drain loop calls `next_line()` on both
+/// `stdout`/`stderr` concurrently, and whichever one doesn't win that
+/// `select!` has its in-flight future *dropped*. Every await point inside
+/// `next_line` (`fill_buf().await`) is reached only once the previous
+/// `fill_buf` result has already been folded into `self.buf` and consumed
+/// from the reader — so a drop at that point loses nothing: the next call
+/// to `next_line()` resumes from `self.buf` exactly where the dropped one
+/// left off. An earlier version kept this accumulator as a local `let mut
+/// buf` inside a free `read_capped_line` function instead; a fresh call
+/// was made each drain-loop iteration, so a drop mid-call (after one or
+/// more fill_buf/consume cycles within that same call, each of which had
+/// already appended to that call's *local* `buf`) silently discarded
+/// those already-consumed-but-not-yet-returned bytes — reproduced as a
+/// stdout line losing its leading bytes whenever a stderr line completed
+/// first while stdout was mid-line (or vice versa).
+struct CappedLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl<R> CappedLines<R>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        let (done, used) = match reader.fill_buf().await {
-            Ok([]) => {
-                // Real EOF.
-                return if buf.is_empty() {
-                    None
-                } else {
-                    Some(finish_capped_line(buf))
-                };
-            }
-            Ok(available) => {
-                if let Some(i) = available.iter().position(|&b| b == b'\n') {
-                    if buf.len() < cap {
-                        let take = (cap - buf.len()).min(i + 1);
-                        buf.extend_from_slice(&available[..take]);
-                    }
-                    (true, i + 1)
-                } else {
-                    if buf.len() < cap {
-                        let take = (cap - buf.len()).min(available.len());
-                        buf.extend_from_slice(&available[..take]);
-                    }
-                    (false, available.len())
+    fn new(reader: R, cap: usize) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Reads one line. Strips a trailing `\n` (and `\r\n`). Returns `None`
+    /// only once the stream is truly exhausted: real EOF with no bytes
+    /// left to return, or an I/O error, which is treated like EOF (the
+    /// stream is closed) rather than stopping the drain early — see
+    /// `drain_capped_tail` in `aivyx-tools/src/process.rs`, which the old
+    /// `BufReader::lines()` violated by returning `Ok(None)` on an `Err`,
+    /// looking identical to real EOF to its caller — the actual bug: a
+    /// non-UTF-8 line made `.lines()` return `Err(InvalidData)`, which the
+    /// old `_ => { out_open = false; None }` handling here treated as EOF,
+    /// so draining stopped while the child was still writing and the
+    /// child then blocked on a full pipe.
+    async fn next_line(&mut self) -> Option<String> {
+        loop {
+            let (done, used) = match self.reader.fill_buf().await {
+                Ok([]) => {
+                    // Real EOF.
+                    return if self.buf.is_empty() {
+                        None
+                    } else {
+                        Some(finish_capped_line(std::mem::take(&mut self.buf)))
+                    };
                 }
+                Ok(available) => {
+                    if let Some(i) = available.iter().position(|&b| b == b'\n') {
+                        if self.buf.len() < self.cap {
+                            let take = (self.cap - self.buf.len()).min(i + 1);
+                            self.buf.extend_from_slice(&available[..take]);
+                        }
+                        (true, i + 1)
+                    } else {
+                        if self.buf.len() < self.cap {
+                            let take = (self.cap - self.buf.len()).min(available.len());
+                            self.buf.extend_from_slice(&available[..take]);
+                        }
+                        (false, available.len())
+                    }
+                }
+                Err(_) => {
+                    // Treat an I/O error as the stream being closed,
+                    // exactly like `drain_capped_tail` — never silently
+                    // stop draining a pipe that's still open.
+                    return if self.buf.is_empty() {
+                        None
+                    } else {
+                        Some(finish_capped_line(std::mem::take(&mut self.buf)))
+                    };
+                }
+            };
+            // Nothing above awaited since `used` bytes were taken from
+            // `self.reader`'s internal buffer, so this `consume` and the
+            // `self.buf` append above are already both done by the time
+            // execution can next suspend (at the top of the loop) — a
+            // drop there loses only bytes the reader hasn't handed out
+            // yet, never ones already folded into `self.buf`.
+            self.reader.consume(used);
+            if done {
+                return Some(finish_capped_line(std::mem::take(&mut self.buf)));
             }
-            Err(_) => {
-                // Treat an I/O error as the stream being closed, exactly
-                // like `drain_capped_tail` — never silently stop draining
-                // a pipe that's still open.
-                return if buf.is_empty() {
-                    None
-                } else {
-                    Some(finish_capped_line(buf))
-                };
-            }
-        };
-        reader.consume(used);
-        if done {
-            return Some(finish_capped_line(buf));
         }
     }
 }
@@ -169,8 +208,8 @@ impl Agent {
                 return;
             }
         };
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped"));
-        let mut stderr = BufReader::new(child.stderr.take().expect("piped"));
+        let mut stdout = CappedLines::new(BufReader::new(child.stdout.take().expect("piped")), MAX_LINE_BYTES);
+        let mut stderr = CappedLines::new(BufReader::new(child.stderr.take().expect("piped")), MAX_LINE_BYTES);
         let (mut out_open, mut err_open) = (true, true);
         let mut tail: VecDeque<String> = VecDeque::with_capacity(NOTE_LINES);
         let deadline = tokio::time::sleep(self.test_timeout);
@@ -182,11 +221,11 @@ impl Agent {
         let mut stopped: Option<Outcome> = None;
         while out_open || err_open {
             let line = tokio::select! {
-                line = read_capped_line(&mut stdout, MAX_LINE_BYTES), if out_open => match line {
+                line = stdout.next_line(), if out_open => match line {
                     Some(line) => Some(line),
                     None => { out_open = false; None }
                 },
-                line = read_capped_line(&mut stderr, MAX_LINE_BYTES), if err_open => match line {
+                line = stderr.next_line(), if err_open => match line {
                     Some(line) => Some(line),
                     None => { err_open = false; None }
                 },
@@ -268,5 +307,28 @@ impl Agent {
         ));
         self.persist_if_owned();
         self.emit(AgentEvent::TestFinished { summary, tail });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Review finding 2 (MINOR): a direct unit test of `CappedLines` over
+    // an in-memory reader, so the cap is exercised deterministically
+    // rather than only inferred from `clip()` already truncating the
+    // *display* string downstream (which `test_caps_a_very_long_line_...`
+    // in `agent/tests.rs` can't tell apart from the read itself being
+    // uncapped).
+    #[tokio::test]
+    async fn next_line_caps_bytes_kept_but_still_finds_the_next_line() {
+        let data: &[u8] = b"aaaaaaaaaaaa\nnext\n";
+        let mut lines = CappedLines::new(BufReader::new(data), 4);
+
+        let first = lines.next_line().await.unwrap();
+        assert_eq!(first, "aaaa", "{first:?}");
+        let second = lines.next_line().await.unwrap();
+        assert_eq!(second, "next", "{second:?}");
+        assert!(lines.next_line().await.is_none());
     }
 }
