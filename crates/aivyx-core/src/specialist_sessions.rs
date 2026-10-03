@@ -469,6 +469,16 @@ async fn run_bounded_exchange(
         Err(err) => ToolOutput::Error(format!("specialist turn failed: {err}")),
         Ok(()) => {
             let mut text = drained;
+            if text.trim().is_empty()
+                && let Some(fallback) = agent.last_assistant_text()
+            {
+                // `accumulated` is TextDelta-only -- a reasoning-only final
+                // reply never produces one, even though `agent`'s own
+                // history does have an answer (see `delegate.rs`'s
+                // identical fallback and `Agent::last_assistant_text`'s
+                // doc comment).
+                text = fallback;
+            }
             if injection_hit {
                 text.push_str(INJECTION_CUTOFF_NOTICE);
             } else if cap_hit {

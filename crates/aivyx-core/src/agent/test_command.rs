@@ -45,6 +45,22 @@ enum Outcome {
     WaitFailed(String),
 }
 
+/// What `outcome` says about `last_test_passed`: `None` means "leave it
+/// alone" (`Cancelled` -- the user interrupted it, learning nothing about
+/// the code; `WaitFailed` -- a real I/O error waiting on the child, which
+/// is a statement about this machine, not about the code under test),
+/// `Some(_)` is the new value. A pure, non-process-touching function
+/// specifically so this mapping is unit-testable without having to
+/// provoke a real `child.wait()` I/O failure (impractical to do portably
+/// and deterministically).
+fn last_test_passed_for(outcome: &Outcome) -> Option<bool> {
+    match outcome {
+        Outcome::Exited(status) => Some(status.success()),
+        Outcome::TimedOut => Some(false),
+        Outcome::Cancelled | Outcome::WaitFailed(_) => None,
+    }
+}
+
 /// Wraps a reader with a persistent, cancel-safe line reader: tolerant of
 /// non-UTF-8 bytes (decoded with `String::from_utf8_lossy` instead of
 /// failing) and bounded in memory (at most `cap` bytes of the current
@@ -275,13 +291,8 @@ impl Agent {
             }
         };
 
-        // `Cancelled` leaves it unchanged -- the user interrupted the run
-        // before it could say anything about the code, so the previous
-        // result (if any) still stands.
-        match &outcome {
-            Outcome::Exited(status) => self.last_test_passed = Some(status.success()),
-            Outcome::TimedOut | Outcome::WaitFailed(_) => self.last_test_passed = Some(false),
-            Outcome::Cancelled => {}
+        if let Some(passed) = last_test_passed_for(&outcome) {
+            self.last_test_passed = Some(passed);
         }
 
         let secs = started.elapsed().as_secs_f64();
@@ -341,5 +352,20 @@ mod tests {
         let second = lines.next_line().await.unwrap();
         assert_eq!(second, "next", "{second:?}");
         assert!(lines.next_line().await.is_none());
+    }
+
+    #[test]
+    fn last_test_passed_for_leaves_cancelled_and_wait_failed_unchanged() {
+        // Neither outcome says anything about the code under test:
+        // `Cancelled` means the user interrupted it, `WaitFailed` means
+        // this machine failed to reap the child -- an I/O error, not a
+        // test result.
+        assert_eq!(last_test_passed_for(&Outcome::Cancelled), None);
+        assert_eq!(last_test_passed_for(&Outcome::WaitFailed("reap failed".into())), None);
+    }
+
+    #[test]
+    fn last_test_passed_for_timed_out_counts_as_failed() {
+        assert_eq!(last_test_passed_for(&Outcome::TimedOut), Some(false));
     }
 }

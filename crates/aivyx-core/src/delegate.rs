@@ -305,6 +305,12 @@ impl Tool for DelegateTaskTool {
         let cap_hit = paused && !is_injection_tainted();
         let injection_hit = paused && is_injection_tainted();
 
+        // Captured before `drop(sub_agent)` below, since it reads the
+        // sub-agent's own history -- see `Agent::last_assistant_text`'s
+        // doc comment for why `accumulated` (TextDelta-only) can come up
+        // empty even though the sub-agent did answer.
+        let last_assistant_text = sub_agent.last_assistant_text();
+
         // Dropping the sub-agent drops its `sub_tx` (the only remaining
         // sender), closing the channel so `forward_task`'s `recv()` loop
         // ends and it can be awaited to completion.
@@ -317,6 +323,11 @@ impl Tool for DelegateTaskTool {
                 let mut text = Arc::try_unwrap(accumulated)
                     .map(|m| m.into_inner().unwrap())
                     .unwrap_or_default();
+                if text.trim().is_empty()
+                    && let Some(fallback) = last_assistant_text
+                {
+                    text = fallback;
+                }
                 if injection_hit {
                     text.push_str(INJECTION_CUTOFF_NOTICE);
                 } else if cap_hit {
@@ -458,6 +469,34 @@ mod tests {
             }
         }
         assert!(saw_wrapped_text_delta);
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_only_sub_agent_reply_still_reaches_the_parent() {
+        // The sub-agent's final response carries only `ReasoningDelta`, no
+        // `TextDelta` and no tool calls -- `accumulated` (built purely from
+        // `TextDelta`) stays empty, so without a fallback to the
+        // sub-agent's own history this would wrongly look like the
+        // sub-agent said nothing at all.
+        let dir = tempfile::tempdir().unwrap();
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![vec![
+            StreamEvent::ReasoningDelta("the auth module uses JWTs".to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tool = DelegateTaskTool::new(base_config(mock, tx, ToolRegistry::new(), 10));
+
+        let output = tool
+            .execute(delegate_call("explain the auth module"), &exec_ctx(dir.path()))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&output, ToolOutput::Ok(text) if text == "the auth module uses JWTs"),
+            "unexpected output: {output:?}"
+        );
     }
 
     #[tokio::test]

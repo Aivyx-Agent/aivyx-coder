@@ -778,7 +778,7 @@ async fn run_turn_stops_issuing_new_read_class_tool_calls_after_mid_turn_taint()
 }
 
 #[tokio::test]
-async fn reasoning_delta_emits_but_never_enters_history() {
+async fn reasoning_delta_emits_but_stays_out_of_history_when_the_response_has_text() {
     let response = vec![
         StreamEvent::ReasoningDelta("Let me think about this".to_string()),
         StreamEvent::TextDelta("Here's my answer".to_string()),
@@ -812,7 +812,9 @@ async fn reasoning_delta_emits_but_never_enters_history() {
         .collect();
     assert!(
         !history_text.contains("Let me think about this"),
-        "reasoning content must never enter Agent's own history: {history_text}"
+        "reasoning content must stay out of history once the response also has real text \
+         (only a reasoning-only response falls back to it -- see \
+         reasoning_only_response_is_pushed_to_history_as_the_answer): {history_text}"
     );
     assert!(
         history_text.contains("Here's my answer"),
@@ -7962,19 +7964,24 @@ async fn test_pass_then_fail_update_last_test_passed() {
 
 #[tokio::test]
 async fn test_cancelled_or_unable_to_start_leaves_last_test_passed_unchanged() {
+    // Seeded to non-`None` values before each case -- starting (and
+    // staying) at `None` would pass even if `run_tests` wrongly reset the
+    // field on these paths, since `None` is also the untouched default.
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, _rx) = undo_agent_with_events(&cwd, false).await;
 
+    agent.last_test_passed = Some(true);
     agent.set_tests(Some(crate::test_detect::EffectiveTests {
         program: "definitely-not-a-real-program-xyz".into(),
         args: vec![],
         source: crate::test_detect::TestSource::Config,
     }));
     agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
-    assert_eq!(agent.last_test_passed(), None, "couldn't-start leaves it unchanged");
+    assert_eq!(agent.last_test_passed(), Some(true), "couldn't-start leaves it unchanged");
 
+    agent.last_test_passed = Some(false);
     agent.set_tests(Some(sh_tests("sleep 30")));
     let token = CancellationToken::new();
     let canceller = token.clone();
@@ -7983,7 +7990,7 @@ async fn test_cancelled_or_unable_to_start_leaves_last_test_passed_unchanged() {
         canceller.cancel();
     });
     agent.run_turn("/test".into(), &cwd, token).await.unwrap();
-    assert_eq!(agent.last_test_passed(), None, "cancelled leaves it unchanged");
+    assert_eq!(agent.last_test_passed(), Some(false), "cancelled leaves it unchanged");
 }
 
 #[tokio::test]

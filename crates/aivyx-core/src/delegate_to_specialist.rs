@@ -332,6 +332,12 @@ impl Tool for DelegateToSpecialistTool {
         let cap_hit = paused && !is_injection_tainted();
         let injection_hit = paused && is_injection_tainted();
 
+        // Captured before `drop(specialist)` below -- see `delegate.rs`'s
+        // identical `last_assistant_text` capture for why `accumulated`
+        // (TextDelta-only) can come up empty even though the specialist
+        // did answer (a reasoning-only final reply).
+        let last_assistant_text = specialist.last_assistant_text();
+
         // Dropping the specialist drops its `sub_tx` (the only remaining
         // sender), closing the channel so `forward_task`'s `recv()` loop
         // ends and it can be awaited to completion.
@@ -344,6 +350,11 @@ impl Tool for DelegateToSpecialistTool {
                 let mut text = Arc::try_unwrap(accumulated)
                     .map(|m| m.into_inner().unwrap())
                     .unwrap_or_default();
+                if text.trim().is_empty()
+                    && let Some(fallback) = last_assistant_text
+                {
+                    text = fallback;
+                }
                 if injection_hit {
                     text.push_str(INJECTION_CUTOFF_NOTICE);
                 } else if cap_hit {

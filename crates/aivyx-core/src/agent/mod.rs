@@ -579,6 +579,26 @@ impl Agent {
         self.last_turn_paused
     }
 
+    /// The text of the most recent assistant message in history, if any
+    /// and if it has text content (a message whose content is only tool
+    /// calls returns `None`, not `Some("")`). Delegation call sites
+    /// (`delegate.rs`, `delegate_to_specialist.rs`,
+    /// `specialist_sessions.rs`) fall back to this when the `TextDelta`
+    /// stream they accumulate from turns out empty -- which now happens
+    /// for a reasoning-only final reply, since that reasoning is folded
+    /// into history as the answer (see `run_turn_inner`'s
+    /// `ReasoningDelta` handling) without ever being streamed as
+    /// `TextDelta`.
+    pub fn last_assistant_text(&self) -> Option<String> {
+        let text = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)?
+            .text_content();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
     /// Returns a clone of this agent's shared `InjectionTaint` handle — a
     /// read-only peek (`InjectionTaint::current()`) is enough for a caller
     /// that owns `agent: Agent` directly and drives its own outer
