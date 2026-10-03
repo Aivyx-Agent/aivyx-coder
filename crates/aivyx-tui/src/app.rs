@@ -357,6 +357,9 @@ pub async fn run(
     let tests_line = aivyx_core::test_detect::status_line(agent.tests());
     let mut app = App::new(restored, plan_mode);
     app.tests_line = tests_line;
+    // Read before `autonomous` moves into the background task below --
+    // there is no other point after this where it's still available.
+    app.autonomous = autonomous.is_some();
     if autonomous.is_some()
         && let Some(t) = agent.tests()
     {
@@ -676,6 +679,14 @@ struct App {
     /// the welcome hint and appended to `/help`. Defaults to an empty
     /// string here; `run()` always overwrites it before the first render.
     tests_line: String,
+    /// Whether this run was started with `--auto` — `run()` sets this from
+    /// `autonomous.is_some()` before that `Option` moves into the
+    /// background task, since nothing after that point can still ask it.
+    /// Changes the welcome hint (`first_message_hint`) and the status
+    /// line's idle text: there is no input box to type into and no
+    /// per-call approval, so both must stop describing a human-driven
+    /// session.
+    autonomous: bool,
 }
 
 impl App {
@@ -683,7 +694,9 @@ impl App {
         let (transcript, tasks) = match restored {
             Some(state) => {
                 let mut transcript = seed_transcript(&state.history);
-                transcript.push(ChatLine::Notice(format!(
+                // `Info` (dim), not `Notice` (red/bold) -- resuming a
+                // session is routine, not a warning.
+                transcript.push(ChatLine::Info(format!(
                     "resumed previous session ({} messages restored)",
                     state.history.len()
                 )));
@@ -706,6 +719,7 @@ impl App {
             cancel_requested: false,
             diff_view: None,
             tests_line: String::new(),
+            autonomous: false,
         }
     }
 
@@ -1041,7 +1055,7 @@ impl App {
             .flat_map(chat_line_to_lines)
             .collect();
         if !self.transcript.iter().any(|l| matches!(l, ChatLine::User(_))) {
-            lines.extend(first_message_hint(&self.tests_line));
+            lines.extend(first_message_hint(&self.tests_line, self.autonomous));
         }
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
@@ -1129,6 +1143,8 @@ impl App {
 
         let base = if self.streaming_active {
             "streaming... (Ctrl+C to cancel)"
+        } else if self.autonomous {
+            "autonomous run — Ctrl+C to stop"
         } else {
             "ready — Enter to send, Ctrl+C to quit"
         };
@@ -1477,21 +1493,35 @@ fn help_text(tests_line: &str) -> String {
     lines.join("\n")
 }
 
-/// Shown until the first message: what to type, and what happens next.
-fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
+/// Shown until the first message: what to type, and what happens next --
+/// or, while `autonomous` (`--auto`), the very different fact that there
+/// is nothing to type at all: the run drives itself, edits and
+/// pre-approved commands are approved automatically, and the goal already
+/// came from the CLI invocation.
+fn first_message_hint(tests_line: &str, autonomous: bool) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    [
-        "",
-        "Ask for a change or a question about this project, for example:",
-        "  \"the tests in calc.py fail — find out why and fix it\"",
-        "  \"explain how the config file is loaded\"",
-        "Every file edit and command waits for your approval ([y] to allow).",
-        tests_line,
-        "/help lists commands · Ctrl+C quits",
-    ]
-    .into_iter()
-    .map(|t| Line::from(t.to_string()).style(dim))
-    .collect()
+    let lines: &[&str] = if autonomous {
+        &[
+            "",
+            "Autonomous run — edits and pre-approved commands are approved automatically.",
+            "Ctrl+C stops the run.",
+            tests_line,
+        ]
+    } else {
+        &[
+            "",
+            "Ask for a change or a question about this project, for example:",
+            "  \"the tests fail — find out why and fix it\"",
+            "  \"explain how the config file is loaded\"",
+            "Every file edit and command waits for your approval ([y] to allow).",
+            tests_line,
+            "/help lists commands · Ctrl+C quits",
+        ]
+    };
+    lines
+        .iter()
+        .map(|t| Line::from(t.to_string()).style(dim))
+        .collect()
 }
 
 /// A path as the person reads it: relative to the project directory when
@@ -3152,7 +3182,7 @@ mod tests {
     fn help_and_welcome_show_the_test_command() {
         let line = "Tests: `cargo test` (detected from Cargo.toml) — run them with /test";
         assert!(help_text(line).ends_with(line));
-        let hint: Vec<String> = first_message_hint(line)
+        let hint: Vec<String> = first_message_hint(line, false)
             .into_iter()
             .map(|l| l.to_string())
             .collect();
@@ -3506,5 +3536,72 @@ mod tests {
         assert!(app.pending_permission.is_some());
         assert!(rx.try_recv().is_err());
         assert_eq!(app.input.lines().join("\n"), "");
+    }
+
+    #[test]
+    fn welcome_hint_example_no_longer_names_a_file() {
+        let hint: Vec<String> = first_message_hint("tests line", false)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            hint.iter()
+                .any(|l| l == "  \"the tests fail — find out why and fix it\""),
+            "{hint:?}"
+        );
+        assert!(!hint.iter().any(|l| l.contains("calc.py")), "{hint:?}");
+    }
+
+    #[test]
+    fn autonomous_welcome_hint_replaces_the_interactive_example() {
+        let hint: Vec<String> = first_message_hint("tests line", true)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(hint.iter().any(|l| {
+            l == "Autonomous run — edits and pre-approved commands are approved automatically."
+        }));
+        assert!(hint.iter().any(|l| l == "Ctrl+C stops the run."));
+        assert!(hint.iter().any(|l| l == "tests line"));
+        // None of the interactive-only lines (there's no input box to type
+        // into, and no per-call approval prompt, during an autonomous run).
+        assert!(!hint.iter().any(|l| l.contains("Ask for a change")));
+        assert!(!hint.iter().any(|l| l.contains("waits for your approval")));
+        assert!(!hint.iter().any(|l| l.contains("/help lists commands")));
+    }
+
+    #[test]
+    fn autonomous_status_line_replaces_the_idle_hint() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("autonomous run — Ctrl+C to stop"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("ready — Enter to send"), "{rendered}");
+    }
+
+    #[test]
+    fn resumed_session_line_is_info_not_notice() {
+        let state = SessionState::new(
+            vec![Message::text(Role::User, "hi")],
+            Vec::new(),
+            false,
+            Vec::new(),
+        );
+        let app = App::new(Some(state), PlanMode::new());
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Info(t))
+                if t.contains("resumed previous session (1 messages restored)")
+        ));
+        assert!(!app
+            .transcript
+            .iter()
+            .any(|l| matches!(l, ChatLine::Notice(_))));
     }
 }

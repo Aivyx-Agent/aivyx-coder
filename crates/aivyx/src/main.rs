@@ -187,15 +187,13 @@ struct Cli {
     acp: bool,
 
     /// Run as an MCP (Model Context Protocol) server over stdin/stdout,
-    /// for delegation from another local MCP client (e.g. aivyx-pa). Requires
-    /// [mcp_server].max_access_level to be configured in config.toml first
-    /// -- refuses to start otherwise, matching --auto's own posture for
-    /// its required test command: [verification].command, or one detected
-    /// in the project. Mutually exclusive with
-    /// --acp/--plan/--auto/--resume: this frontend has no human to show a
-    /// modal to, no editor session to embed in, and no unattended-goal
-    /// concept of its own (each MCP call is its own bounded, isolated
-    /// session).
+    /// for delegation from another local MCP client (e.g. aivyx-pa).
+    /// Requires [mcp_server].max_access_level to be configured in
+    /// config.toml first -- refuses to start otherwise. Mutually
+    /// exclusive with --acp/--plan/--auto/--resume: this frontend has no
+    /// human to show a modal to, no editor session to embed in, and no
+    /// unattended-goal concept of its own (each MCP call is its own
+    /// bounded, isolated session)
     #[arg(long)]
     mcp_server: bool,
 
