@@ -411,17 +411,30 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     // the ones this frontend intercepts rather than just
                     // advertises.
                     if let Some(local) = acp_local_command(&text) {
-                        let update = match local {
-                            LocalCommand::Help => help_update(),
+                        let mut updates = Vec::new();
+                        match local {
+                            LocalCommand::Help => updates.push(help_update()),
                             LocalCommand::Clear => {
                                 session.agent.clear_conversation();
-                                clear_update()
+                                // `clear_conversation` emits
+                                // `ConversationCleared`, which
+                                // `translate_and_merge` turns into resetting
+                                // the tracked tasks/mission/specialist
+                                // sessions and an empty Plan, so the
+                                // editor's Plan panel clears too. Drained
+                                // here, not left for the next turn.
+                                while let Ok(event) = session.events_rx.try_recv() {
+                                    updates.extend(session.translate_and_merge(&event));
+                                }
+                                updates.push(clear_update());
                             }
-                        };
-                        let _ = spawn_connection.send_notification(SessionNotification::new(
-                            session.session_id.clone(),
-                            update,
-                        ));
+                        }
+                        for update in updates {
+                            let _ = spawn_connection.send_notification(SessionNotification::new(
+                                session.session_id.clone(),
+                                update,
+                            ));
+                        }
                         return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     }
                     let cancellation = CancellationToken::new();

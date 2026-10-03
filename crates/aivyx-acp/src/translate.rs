@@ -223,18 +223,14 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         AgentEvent::SubAgentActivity(inner) => return translate_event(session_id, inner),
         // Turn-terminal (handled by `terminal_stop_reason` instead) or
         // deliberately non-notification events — not surfaced as a
-        // SessionUpdate. `ConversationCleared` is only ever emitted by the
-        // TUI's `/clear` interception (see the design spec's scope note —
-        // this frontend doesn't wire that command up), but the match must
-        // still be exhaustive.
+        // SessionUpdate.
         AgentEvent::TurnComplete
         | AgentEvent::TurnPaused(_)
         | AgentEvent::ContextUsage { .. }
-        // `Session` now owns display state (`tasks`/`mission_plan`/
-        // `open_specialist_sessions`) that `ConversationCleared` does not
-        // reset -- currently latent since ACP never receives this event
-        // today (only the TUI's `/clear` interception emits it), but
-        // worth revisiting if `/clear` is ever wired into ACP.
+        // `Agent::clear_conversation` emits this; over ACP that's the
+        // locally-handled `/clear` (`session.rs`). Resetting the tracked
+        // Plan state it implies is `translate_event_with_state`'s job --
+        // this stateless function has no state to reset.
         | AgentEvent::ConversationCleared
         // Model-routing announcements are a TUI status-line concern; ACP
         // has no equivalent surface for them.
@@ -270,8 +266,12 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
 /// Session-aware wrapper around `translate_event`: `TasksUpdated`/
 /// `MissionsUpdated`/`SpecialistSessionsUpdated` update the relevant
 /// tracked value and return the full re-merged `Plan`
-/// (`build_merged_plan`); every other event passes straight through to
-/// `translate_event`, unchanged. Takes the three tracked-state slots by
+/// (`build_merged_plan`); `ConversationCleared` empties all three (the
+/// agent has already cleared its own tasks, mission and specialist
+/// sessions) and returns the now-empty `Plan`, so the editor's Plan panel
+/// clears and the next `set_tasks` isn't merged with a dead mission or
+/// closed specialist sessions; every other event passes straight through
+/// to `translate_event`, unchanged. Takes the three tracked-state slots by
 /// `&mut` directly (not a `&mut Session`) so this whole mechanism stays
 /// testable with plain values, no `Agent`/`Session` construction needed
 /// -- `Session::translate_and_merge` in `session.rs` is a thin wrapper
@@ -288,6 +288,11 @@ pub(crate) fn translate_event_with_state(
         AgentEvent::MissionsUpdated(plan) => *mission_plan = Some(plan.clone()),
         AgentEvent::SpecialistSessionsUpdated(sessions) => {
             *open_specialist_sessions = sessions.clone();
+        }
+        AgentEvent::ConversationCleared => {
+            tasks.clear();
+            *mission_plan = None;
+            open_specialist_sessions.clear();
         }
         other => return translate_event(session_id, other),
     }
@@ -794,6 +799,66 @@ mod tests {
             plan.entries[0].content,
             "[Specialist: reviewer] session open"
         );
+    }
+
+    #[test]
+    fn conversation_cleared_resets_tracked_state_and_sends_an_empty_plan() {
+        let mut tasks = vec![Task {
+            id: 1,
+            text: "old task".to_string(),
+            status: TaskStatus::InProgress,
+        }];
+        let mut mission_plan = Some(MissionPlan {
+            mission: "old mission".to_string(),
+            steps: vec![MissionStep {
+                id: 1,
+                member: "implementer".to_string(),
+                task: "old step".to_string(),
+                status: StepStatus::Pending,
+                notes: None,
+            }],
+            summary: None,
+        });
+        let mut open_specialist_sessions = vec![SpecialistSessionSummary {
+            session_id: "abc123".to_string(),
+            member: "reviewer".to_string(),
+        }];
+
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::ConversationCleared,
+        )
+        .expect("a cleared conversation must clear the editor's Plan panel");
+        let SessionUpdate::Plan(plan) = update else {
+            panic!("expected Plan");
+        };
+        assert!(plan.entries.is_empty(), "{plan:?}");
+        assert!(tasks.is_empty());
+        assert_eq!(mission_plan, None);
+        assert!(open_specialist_sessions.is_empty());
+
+        // The next set_tasks shows only the new task, not the dead mission
+        // steps or the closed specialist session.
+        let update = translate_event_with_state(
+            &sid(),
+            &mut tasks,
+            &mut mission_plan,
+            &mut open_specialist_sessions,
+            &AgentEvent::TasksUpdated(vec![Task {
+                id: 1,
+                text: "new task".to_string(),
+                status: TaskStatus::Pending,
+            }]),
+        )
+        .unwrap();
+        let SessionUpdate::Plan(plan) = update else {
+            panic!("expected Plan");
+        };
+        let contents: Vec<&str> = plan.entries.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, vec!["[Task] new task"]);
     }
 
     #[test]
