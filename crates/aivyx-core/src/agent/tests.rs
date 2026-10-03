@@ -7489,6 +7489,34 @@ async fn commit_cancelled_while_drafting_commits_nothing_and_restores_staging() 
     assert_eq!(infos(&mut rx), vec!["Commit cancelled — nothing was committed.".to_string()]);
 }
 
+#[tokio::test]
+async fn undo_after_commit_says_the_commit_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![write_call("c1", "a.txt", "a\n"), text_response("done")]).await;
+    let prompter = scripted(vec![UserResponse::Deny, UserResponse::Deny]);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    // Before committing: no note.
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let before = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(!before.contains("committed"), "{before}");
+
+    agent.run_turn("/commit -m \"Add a\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let after = prompter.seen.lock().unwrap()[1].preview.clone().unwrap();
+    let hash = git_text(&cwd, &["rev-parse", "--short", "HEAD"]).await;
+    assert!(
+        after.ends_with(&format!(
+            "These changes are committed ({}) — /undo only changes your files; the commit stays.",
+            hash.trim()
+        )),
+        "{after}"
+    );
+}
+
 /// An undo agent whose checkpointer and executor carry `deny`.
 async fn commit_agent_with_deny(
     dir: &Path,

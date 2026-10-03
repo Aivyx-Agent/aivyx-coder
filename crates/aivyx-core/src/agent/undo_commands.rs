@@ -54,6 +54,24 @@ async fn oid_exists(cwd: &Path, oid: &str) -> bool {
         .is_ok()
 }
 
+/// When HEAD already holds exactly what the turn left in `paths` — the turn
+/// was `/commit`ted — say so: `/undo` rewinds only the files, so the commit
+/// stays and the rewind shows up as uncommitted changes.
+async fn committed_note(cwd: &Path, after_oid: Option<&str>, paths: &[String]) -> Option<String> {
+    let after = after_oid?;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut args = vec!["diff", "--quiet", "--no-ext-diff", "--no-textconv", "HEAD", after, "--"];
+    args.extend(paths.iter().map(String::as_str));
+    git(cwd, &args).await.ok()?;
+    let hash = git(cwd, &["rev-parse", "--short", "HEAD"]).await.ok()?;
+    Some(format!(
+        "These changes are committed ({}) — /undo only changes your files; the commit stays.",
+        hash.trim()
+    ))
+}
+
 /// The local UTC offset, in seconds, for `/checkpoints` times.
 fn local_offset_secs() -> i32 {
     chrono::Local::now().offset().local_minus_utc()
@@ -168,7 +186,11 @@ impl Agent {
                 kind,
             })
             .collect();
-        let preview = preview_text(&preview_title_undo(&mark.user_text_preview), &entries);
+        let mut preview = preview_text(&preview_title_undo(&mark.user_text_preview), &entries);
+        if let Some(note) = committed_note(&cwd, mark.after_oid.as_deref(), &paths).await {
+            preview.push_str("\n\n");
+            preview.push_str(&note);
+        }
         if !self.confirm("undo", preview).await {
             self.notify("Undo cancelled.");
             return;
