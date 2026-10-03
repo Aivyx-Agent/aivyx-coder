@@ -579,8 +579,10 @@ impl Agent {
         self.last_turn_paused
     }
 
-    /// The text of the most recent assistant message in history, if any
-    /// and if it has text content (a message whose content is only tool
+    /// The text of the most recent assistant message of the latest turn
+    /// (only messages after the last user message count, so a session
+    /// that persists across queries never hands back an earlier answer),
+    /// if it has text content (a message whose content is only tool
     /// calls returns `None`, not `Some("")`). Delegation call sites
     /// (`delegate.rs`, `delegate_to_specialist.rs`,
     /// `specialist_sessions.rs`) fall back to this when the `TextDelta`
@@ -594,6 +596,7 @@ impl Agent {
             .history
             .iter()
             .rev()
+            .take_while(|m| m.role != Role::User)
             .find(|m| m.role == Role::Assistant)?
             .text_content();
         if text.is_empty() { None } else { Some(text) }

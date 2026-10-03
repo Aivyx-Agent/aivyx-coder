@@ -8904,3 +8904,21 @@ async fn switching_conversations_resets_last_test_passed() {
     assert!(agent.switch_to(&x).await);
     assert_eq!(agent.last_test_passed(), None);
 }
+
+#[tokio::test]
+async fn last_assistant_text_never_returns_an_earlier_turns_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _rx) = undo_agent_with_script(
+        dir.path(),
+        false,
+        vec![
+            text_response("the first answer"),
+            vec![StreamEvent::Done { finish_reason: FinishReason::Stop }],
+        ],
+    )
+    .await;
+    agent.run_turn("first".into(), dir.path(), CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.last_assistant_text().as_deref(), Some("the first answer"));
+    agent.run_turn("second".into(), dir.path(), CancellationToken::new()).await.unwrap();
+    assert_eq!(agent.last_assistant_text(), None, "the second turn produced no reply");
+}
