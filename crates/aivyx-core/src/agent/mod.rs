@@ -26,6 +26,7 @@ use crate::specialist_sessions::SpecialistSessionPool;
 use crate::undo::TurnMark;
 
 mod change_commands;
+mod session_commands;
 mod test_command;
 #[cfg(test)]
 mod tests;
@@ -241,6 +242,14 @@ pub struct Agent {
     /// turn starts a brand new one, which must go through the same B1 gate
     /// a truly fresh process would.
     session_owns_slot: bool,
+    /// Whether `/resume N` is available: set by `enable_session_switching`.
+    /// `false` (the default) always refuses `/resume`, regardless of
+    /// whether a `Store` session target is configured -- a frontend that
+    /// can't redraw its own transcript/task panel from
+    /// `AgentEvent::SessionSwitched` (ACP, MCP) must never call it, since
+    /// an in-process switch with no redraw would leave the display
+    /// silently showing the wrong conversation.
+    session_switching: bool,
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
     plan_mode: PlanMode,
@@ -466,6 +475,7 @@ impl Agent {
             session_target: None,
             first_user_text: None,
             session_owns_slot: false,
+            session_switching: false,
             plan_mode,
             autonomous_mode,
             injection_taint: InjectionTaint::new(),
@@ -1185,6 +1195,16 @@ impl Agent {
         }
     }
 
+    /// Enables `/resume N`'s in-process conversation switch (see
+    /// `switch_to`). Only a frontend able to redraw its own display state
+    /// from `AgentEvent::SessionSwitched` should ever call this -- the
+    /// TUI build does (Task 4); ACP and MCP sessions never do, so
+    /// `/resume` keeps refusing there regardless of whether a `Store`
+    /// session target is configured.
+    pub fn enable_session_switching(&mut self) {
+        self.session_switching = true;
+    }
+
     /// Seeds history and tasks from a resumed session, replacing whatever
     /// the agent currently holds. Call before the first turn. Restores Plan
     /// mode too, but only ever turns it *on* — a session saved while Plan
@@ -1214,17 +1234,95 @@ impl Agent {
     /// that already owned a different, real conversation would silently
     /// adopt the old id and overwrite that still-open conversation's file
     /// on the next persist, rather than starting a fresh one. `created_unix`
-    /// is always taken from `meta` too (`0` when the id is empty — the
-    /// same "nothing real yet" value `set_session_store` starts with —
-    /// since `persist` fills in a real one the next time it mints an id).
+    /// is taken from `meta` when it names a real id; when the id is empty,
+    /// `created_unix` falls back to `now_unix()` instead of staying at `0`
+    /// -- a fix-round addition (the id being empty already means "nothing
+    /// real to continue addressing," but a persist that follows still
+    /// needs *some* real creation time, not the sentinel `set_session_store`
+    /// starts with). Likewise, an empty `meta.first_user_text` (a file that
+    /// predates `SessionMeta`, or any other state with no header) is
+    /// derived from `state`'s own history the same way
+    /// `SessionStore::migrate_legacy` already derives it for the legacy
+    /// single-file layout -- the preview of the first `Role::User` message,
+    /// or empty if there is none -- rather than left as `None` to be
+    /// silently overwritten by whatever the *next* turn happens to be.
     pub fn restore_session(&mut self, state: SessionState) {
         let meta = state.meta.clone();
         self.restore(state);
         if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target {
             *id = (!meta.id.is_empty()).then(|| meta.id.clone());
-            *created_unix = meta.created_unix;
+            *created_unix = if meta.id.is_empty() {
+                now_unix()
+            } else {
+                meta.created_unix
+            };
         }
-        self.first_user_text = (!meta.first_user_text.is_empty()).then_some(meta.first_user_text);
+        self.first_user_text = Some(if meta.first_user_text.is_empty() {
+            self.history
+                .iter()
+                .find(|m| m.role == Role::User)
+                .map(|m| preview_text(&m.text_content()))
+                .unwrap_or_default()
+        } else {
+            meta.first_user_text
+        });
+    }
+
+    /// Switches to conversation `id` without restarting the process
+    /// (`/resume N`'s underlying primitive): saves the current
+    /// conversation first (`persist_if_owned` -- a no-op if this process
+    /// never owned the slot, the same B1 rule as everywhere else), loads
+    /// `id` from the session store, resets every piece of per-conversation
+    /// state `clear_conversation` also resets -- tasks, the mission plan,
+    /// open specialist sessions, router stickiness, the undo ledger,
+    /// pending notes -- but deliberately *without* `clear_conversation`'s
+    /// own persist (there is nothing empty to save here) or its
+    /// `ConversationCleared` event (the destination conversation's real
+    /// content is what the frontend should show, not an empty state), then
+    /// restores the loaded state and seeds any dehydrated specialist
+    /// sessions it carried. Returns whether the switch actually happened:
+    /// `false` means there's no `Store` target, or `id` doesn't name a
+    /// loadable conversation (`AgentEvent::Error` already explains why;
+    /// nothing else changed).
+    async fn switch_to(&mut self, id: &str) -> bool {
+        self.persist_if_owned();
+        let Some(store) = self.session_store().cloned() else {
+            return false;
+        };
+        let Some(state) = store.load(id) else {
+            self.notify("Couldn't load that conversation.");
+            return false;
+        };
+
+        self.tasks.lock().unwrap().clear();
+        if let Some(mission_plan) = &self.mission_plan {
+            *mission_plan.lock().unwrap() = MissionPlan {
+                mission: String::new(),
+                steps: vec![],
+                summary: None,
+            };
+        }
+        if let Some(pool) = &self.specialist_session_pool {
+            pool.close_all();
+        }
+        if let Some(router) = &self.router {
+            router.forget_session(&self.route_session);
+        }
+        self.last_routed = None;
+        self.undo.clear();
+        self.pending_notes.clear();
+
+        let specialist_sessions = state.specialist_sessions.clone();
+        self.restore_session(state);
+        if let Some(pool) = &self.specialist_session_pool {
+            pool.seed_dehydrated(specialist_sessions);
+        }
+
+        self.emit(AgentEvent::SessionSwitched {
+            history: self.history.clone(),
+            tasks: self.tasks.lock().unwrap().clone(),
+        });
+        true
     }
 
     /// A clone of the current conversation history. Used to persist a
@@ -1746,6 +1844,13 @@ impl Agent {
         // `/test` runs the project's tests directly — never a model turn.
         if test_command::parse(&user_input) {
             self.run_tests(cwd, cancellation.clone()).await;
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+        // `/sessions` and `/resume N` act on the session store directly —
+        // never a model turn.
+        if let Some(command) = session_commands::parse(&user_input) {
+            self.run_session_command(command).await;
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }

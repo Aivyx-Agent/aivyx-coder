@@ -10,6 +10,7 @@ pub mod editor_context;
 pub mod mission_tools;
 pub mod routing_commands;
 pub mod session;
+pub mod session_list;
 pub mod specialist_enforcement;
 pub mod specialist_sessions;
 pub mod test_detect;

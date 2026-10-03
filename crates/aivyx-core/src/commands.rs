@@ -57,7 +57,17 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "/clear",
-        description: "Start a fresh conversation (clears history and tasks)",
+        description: "Start a new conversation (the old one stays in /sessions)",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/sessions",
+        description: "List this project's saved conversations",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
+        name: "/resume",
+        description: "Switch to saved conversation N (/resume N)",
         tier: CommandTier::AgentState,
     },
     CommandInfo {

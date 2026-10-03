@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use aivyx_llm::LlmError;
-use aivyx_types::{MissionPlan, ToolCall, ToolResult};
+use aivyx_types::{Message, MissionPlan, ToolCall, ToolResult};
 use thiserror::Error;
 
 use crate::session::Task;
@@ -116,6 +116,18 @@ pub enum AgentEvent {
     TestFinished {
         summary: String,
         tail: String,
+    },
+    /// `/resume N` switched the active conversation in place, without
+    /// restarting the process: the frontend should redraw its own display
+    /// state (transcript, task panel, context-usage indicator) from
+    /// `history`/`tasks` -- the same reset `ConversationCleared` asks for,
+    /// but with the resumed conversation's real content instead of an
+    /// empty one. Carries the full snapshot rather than making the
+    /// frontend separately query `Agent`, mirroring `TasksUpdated`'s own
+    /// "carries the full new list" precedent.
+    SessionSwitched {
+        history: Vec<Message>,
+        tasks: Vec<Task>,
     },
 }
 

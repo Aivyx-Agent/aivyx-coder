@@ -975,6 +975,10 @@ impl App {
             AgentEvent::TestFinished { summary, .. } => {
                 self.transcript.push(ChatLine::Info(summary));
             }
+            // Compile-only until Task 4 (the real TUI rebuild for
+            // `/resume N`'s in-process switch): `enable_session_switching`
+            // is never called yet, so this never actually fires here.
+            AgentEvent::SessionSwitched { .. } => {}
         }
     }
 
@@ -1320,7 +1324,8 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         | AgentEvent::ModelRouted { .. }
         | AgentEvent::ConversationCleared
         | AgentEvent::MissionsUpdated(_)
-        | AgentEvent::SpecialistSessionsUpdated(_) => String::new(),
+        | AgentEvent::SpecialistSessionsUpdated(_)
+        | AgentEvent::SessionSwitched { .. } => String::new(),
     }
 }
 

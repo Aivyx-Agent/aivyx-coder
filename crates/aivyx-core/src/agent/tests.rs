@@ -8229,3 +8229,135 @@ async fn b1_a_failed_turn_in_an_already_owned_store_conversation_updates_the_sam
     assert_eq!(list[0].first_user_text, "one");
     assert_eq!(list[0].turns, 2);
 }
+
+// ---- /sessions and /resume N ----
+
+#[tokio::test]
+async fn sessions_lists_saved_conversations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, mut rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("first".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    agent.run_turn("/sessions".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let text = infos(&mut rx).join("\n");
+    assert!(text.contains("1  today ") && text.contains("· 1 turn · \"first\"  (current)"), "{text}");
+}
+
+#[tokio::test]
+async fn resume_n_switches_conversations_and_restores_history_tasks_and_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, mut rx) = store_agent(&store_dir, vec![text_response("a"), text_response("b")]);
+    agent.enable_session_switching();
+    agent.run_turn("older chat".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    agent.tasks.lock().unwrap().push(crate::session::Task {
+        id: 1, text: "task from older".into(), status: crate::session::TaskStatus::Pending,
+    });
+    // Also give the older conversation a non-empty undo ledger, so
+    // switching back to it (below) can prove the ledger round-trips
+    // through a store-backed switch the same way tasks/history do.
+    agent.undo.record(crate::undo::TurnMark {
+        user_text_preview: "older chat".into(),
+        before_ref: "refs/aivyx/checkpoints/older".into(),
+        before_oid: "0".repeat(40),
+        after_oid: None,
+        created_unix: 0,
+    });
+    agent.clear_conversation();
+    agent.run_turn("newer chat".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+
+    agent.run_turn("/resume 2".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let events = drain(&mut rx);
+    let switched = events.iter().find_map(|e| match e {
+        AgentEvent::SessionSwitched { history, tasks } => Some((history.clone(), tasks.clone())),
+        _ => None,
+    }).expect("SessionSwitched");
+    assert_eq!(switched.0[0].text_content(), "older chat");
+    assert_eq!(switched.1.len(), 1);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Info(t) if t == "Resumed conversation 2 (1 turn)")));
+    assert_eq!(agent.history[0].text_content(), "older chat");
+    assert_eq!(agent.undo.marks.len(), 1, "the older conversation's undo ledger came back too");
+    // The newer conversation was kept, and switching back works.
+    let store = crate::session::SessionStore::new(store_dir);
+    assert_eq!(store.list().len(), 2);
+}
+
+#[tokio::test]
+async fn resume_out_of_range_and_bad_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, mut rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.enable_session_switching();
+    agent.run_turn("only".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    for (input, expected) in [
+        ("/resume 0", "There are only 1 saved conversations for this project (see /sessions)."),
+        ("/resume 5", "There are only 1 saved conversations for this project (see /sessions)."),
+        ("/resume", "Use /resume N — /sessions lists them."),
+        ("/resume two", "Use /resume N — /sessions lists them."),
+    ] {
+        agent.run_turn(input.into(), Path::new("."), CancellationToken::new()).await.unwrap();
+        assert_eq!(infos(&mut rx), vec![expected.to_string()], "{input}");
+    }
+}
+
+#[tokio::test]
+async fn resume_is_refused_where_switching_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, mut rx) = store_agent(&dir.path().join("proj"), vec![]);
+    agent.run_turn("/resume 1".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["/resume isn't available here.".to_string()]);
+}
+
+#[tokio::test]
+async fn resume_is_refused_with_no_store_even_when_switching_is_enabled() {
+    let (tx, mut rx) = unbounded_channel();
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(ToolRegistry::new(), gate, confiner);
+    let mut agent = Agent::new(
+        Arc::new(MockBackend::new(vec![])),
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    agent.enable_session_switching();
+    agent.run_turn("/resume 1".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["/resume isn't available here.".to_string()]);
+}
+
+#[tokio::test]
+async fn restore_session_derives_first_user_text_and_created_unix_when_meta_is_empty() {
+    // The fix-round resolution: a `restore_session`d state whose `meta`
+    // predates `SessionMeta` (or is otherwise empty) must not leave
+    // `first_user_text`/`created_unix` at their uninformative defaults --
+    // it derives them from the history the same way `migrate_legacy`
+    // already does for the legacy single-file layout.
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("ok")]);
+    let before = now_unix();
+
+    let state = crate::session::SessionState::new(
+        vec![user_msg("derived from history"), assistant_msg("ok")],
+        vec![],
+        false,
+        vec![],
+    );
+    assert!(state.meta.first_user_text.is_empty());
+    assert_eq!(state.meta.created_unix, 0);
+
+    agent.restore_session(state);
+    agent.run_turn("next".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    let list = crate::session::SessionStore::new(store_dir).list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].first_user_text, "derived from history");
+    assert!(list[0].created_unix >= before, "{list:?}");
+}

@@ -256,7 +256,12 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // should update what the editor's Plan panel shows.
         | AgentEvent::TasksUpdated(_)
         | AgentEvent::MissionsUpdated(_)
-        | AgentEvent::SpecialistSessionsUpdated(_) => return None,
+        | AgentEvent::SpecialistSessionsUpdated(_)
+        // `/resume N` is unavailable over ACP (`enable_session_switching`
+        // is never called there — this frontend has no redraw path for an
+        // in-process switch), so this never actually fires here either;
+        // compile-only until Task 4.
+        | AgentEvent::SessionSwitched { .. } => return None,
     };
     let _ = session_id; // session_id threading happens at the SessionNotification wrapper in Task 5
     Some(update)
