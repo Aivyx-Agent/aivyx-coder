@@ -183,8 +183,16 @@ Home/End, Esc); **`/diff turn`** shows just the last turn's changes.
 uncommitted change (`.gitignore` respected) — with a message the model drafts
 from the diff: approve it, press **e** to edit it, or cancel (your staging is
 left exactly as it was). `/commit -m "message"` commits with your own message
-straight away. Commits use your git identity and run your hooks.
-`/commit` never stages files on your deny list, and if you stage one yourself it's committed but its contents are never sent to the model. If aivyx-coder is sandboxed and was started in a subfolder of the repository, `/commit` can't write the repository's `.git` and says so — start it at the repository root, or commit with git.
+straight away. Ctrl+C cancels a commit at any point before it lands. Commits
+use your git identity and run your hooks — inside the sandbox, so a hook that
+writes outside the project (pre-commit's cache, gpg signing) may fail there.
+`/commit` never stages files on your deny list, and if you stage one yourself
+it's committed but its contents are never sent to the model; `/diff` never
+shows them either. If aivyx-coder is sandboxed and the repository's `.git`
+lies outside the folder it was started in (a subfolder of the repository, or
+a linked worktree), `/commit` can't write it and says so — start it at the
+repository root, or commit with git. `/undo` after `/commit` rewinds only
+your files, never the commit; its preview says so.
 
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx-coder --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
@@ -1735,6 +1743,10 @@ Every tool call passes through the gate before it runs:
    calls get the same `-c core.fsmonitor=false` prefix, as defense in depth
    against a config entry that predates this block or was written by the
    user themselves — the user's own hooks still run intentionally either way.
+   The user-typed `/diff` and `/commit` commands also run some git
+   unconfined (reading diffs; staging and unstaging): every such call has
+   `-c core.fsmonitor=false`, and every diff `--no-ext-diff --no-textconv`;
+   the commit itself runs confined, like `git_commit`.
 3. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
    no side effect on its own, so prompting on every read would make the tool
    unusable. This auto-allow is **not** scoped to the project's working
