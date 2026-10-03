@@ -150,7 +150,8 @@ struct Cli {
     /// pre-approved commands auto-resolve, and the loop continues on its
     /// own until the goal is achieved (every task marked done) or the
     /// [autonomous] budget is exhausted. Mutually exclusive with --plan and
-    /// --resume. Requires [verification].command to be configured.
+    /// --resume. Requires a test command: [verification].command, or one
+    /// detected in the project.
     #[arg(long)]
     auto: Option<String>,
 
@@ -172,7 +173,8 @@ struct Cli {
     /// for delegation from another local MCP client (e.g. aivyx-pa). Requires
     /// [mcp_server].max_access_level to be configured in config.toml first
     /// -- refuses to start otherwise, matching --auto's own posture for
-    /// its required [verification].command. Mutually exclusive with
+    /// its required test command: [verification].command, or one detected
+    /// in the project. Mutually exclusive with
     /// --acp/--plan/--auto/--resume: this frontend has no human to show a
     /// modal to, no editor session to embed in, and no unattended-goal
     /// concept of its own (each MCP call is its own bounded, isolated

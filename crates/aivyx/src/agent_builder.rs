@@ -41,6 +41,58 @@ use crate::{
     build_system_prompt,
 };
 
+/// The `allowed_commands` entry name synthesized for `--auto` when no
+/// `[verification] command` is configured but a test command was
+/// detected in the project (`aivyx_core::test_detect`). Never seeded in
+/// any other mode — interactive, ACP, and MCP-server sessions never turn
+/// on automatic verification from detection.
+pub(crate) const DETECTED_TESTS_ENTRY: &str = "detected-tests";
+
+/// What `--auto` verifies with, and the `allowed_commands` entry to add
+/// for it when it was detected rather than configured.
+#[derive(Debug)]
+pub(crate) struct AutoVerification {
+    pub command_name: String,
+    pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
+}
+
+/// `--auto`'s test-command resolution: a configured name always wins (and,
+/// if it matches no real `allowed_commands` entry, still disables
+/// verification with a warning further down — unchanged from before this
+/// existed); absent that, a detected command becomes a synthetic
+/// `detected-tests` entry so `run_command`'s own trust tier still applies
+/// to it; absent both, `--auto` cannot proceed; see README's "Enforced
+/// verification"/"Autonomous mode" for why a deterministic verify step is
+/// what makes auto-approving edits defensible at all.
+pub(crate) fn auto_verification(
+    configured_name: Option<&str>,
+    tests: Option<&aivyx_core::test_detect::EffectiveTests>,
+) -> anyhow::Result<AutoVerification> {
+    if let Some(name) = configured_name {
+        return Ok(AutoVerification {
+            command_name: name.to_string(),
+            synthetic_entry: None,
+        });
+    }
+    match tests {
+        Some(tests) if matches!(tests.source, aivyx_core::test_detect::TestSource::Detected(_)) => {
+            Ok(AutoVerification {
+                command_name: DETECTED_TESTS_ENTRY.to_string(),
+                synthetic_entry: Some(aivyx_config::AllowedCommand {
+                    name: DETECTED_TESTS_ENTRY.to_string(),
+                    program: tests.program.clone(),
+                    args: tests.args.clone(),
+                    timeout_secs: Some(600),
+                }),
+            })
+        }
+        _ => anyhow::bail!(
+            "--auto needs a test command: set [verification] command in config.toml, or run it \
+             in a project with a recognised test setup."
+        ),
+    }
+}
+
 /// Everything a frontend needs to start driving a fully-configured
 /// `Agent` — the exact set of values `main.rs`'s TUI path used to build
 /// inline before handing off to `aivyx_tui::run`.
@@ -271,17 +323,22 @@ pub(crate) async fn build_agent(
     // when the process is launched from a path involving a symlink.
     let cwd = std::env::current_dir()?.canonicalize()?;
 
-    let command_specs: Vec<CommandSpec> = settings
-        .permissions
-        .allowed_commands
-        .iter()
-        .map(|c| CommandSpec {
-            name: c.name.clone(),
-            program: c.program.clone(),
-            args: c.args.clone(),
-            timeout: Duration::from_secs(c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)),
-        })
-        .collect();
+    // The effective test command for this session (`/test` in every mode;
+    // --auto's fallback, resolved just below). `[verification] command`
+    // wins whenever it names a real `allowed_commands` entry; otherwise
+    // `test_detect::detect` looks for a recognised test setup in `cwd`.
+    // Resolved against the *configured* `allowed_commands` list only — the
+    // synthetic `detected-tests` entry added further down (under --auto
+    // only) must never feed back into this lookup.
+    let configured_test_command = settings.verification.command.as_deref().and_then(|name| {
+        settings
+            .permissions
+            .allowed_commands
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| (c.program.clone(), c.args.clone()))
+    });
+    let tests = aivyx_core::test_detect::EffectiveTests::resolve(configured_test_command, &cwd);
 
     // One handle shared between the `set_tasks` tool (the model-facing
     // mutator) and the agent (which renders and persists the list).
@@ -293,30 +350,6 @@ pub(crate) async fn build_agent(
     // `goal_achieved` in `aivyx-tui/src/app.rs`).
     let mut mission_plan: Option<Arc<std::sync::Mutex<aivyx_types::MissionPlan>>> = None;
     let mut specialist_session_pool: Option<aivyx_core::SpecialistSessionPool> = None;
-
-    // Each configured command is pre-approved in two forms: the direct
-    // `(program, args)` invocation `run_command` uses, and the `sh -c
-    // "<program> <args>"` form `run_shell` always wraps commands in — the
-    // two tools have genuinely different invocation shapes (direct exec vs.
-    // shell-interpreted), so a single natural config entry (e.g. `program =
-    // "cargo", args = ["test"]`) needs both to be recognized by either tool
-    // without requiring the user to write it out twice in different shapes.
-    //
-    // Every arg is shell-escaped before joining — a naive `args.join(" ")`
-    // would let an arg containing a shell metacharacter (e.g. `program =
-    // "grep", args = ["-rn", "TODO|FIXME", "."]`, a harmless regex under
-    // direct execve) turn into live, unconfirmed shell syntax the moment
-    // the reconstructed `sh -c` form is looked up in the Always-Allow cache.
-    let mut pre_approved_commands: Vec<(String, Vec<String>)> = Vec::new();
-    for spec in &command_specs {
-        pre_approved_commands.push((spec.program.clone(), spec.args.clone()));
-        let mut shell_form = shell_escape::escape(spec.program.as_str().into()).into_owned();
-        for arg in &spec.args {
-            shell_form.push(' ');
-            shell_form.push_str(&shell_escape::escape(arg.as_str().into()));
-        }
-        pre_approved_commands.push(("sh".to_string(), vec!["-c".to_string(), shell_form]));
-    }
 
     // One shared flag, three consumers: the gate enforces it, the agent
     // filters tools + annotates the system prompt by it, the TUI toggles it.
@@ -349,13 +382,73 @@ pub(crate) async fn build_agent(
     let injection_taint = InjectionTaint::new();
     // Auto-approving edits is only defensible because deterministic
     // verification is the safety net — without it, "autonomous" would mean
-    // "unchecked." Refuse to start rather than run degraded.
-    if cli.auto.is_some() && settings.verification.command.is_none() {
-        anyhow::bail!(
-            "--auto requires [verification].command to be configured — auto-approving edits \
-             with no verification check is not supported"
-        );
+    // "unchecked." Refuse to start rather than run degraded. A configured
+    // `[verification] command` always wins; absent that, a detected test
+    // command becomes `--auto`'s fallback via a synthetic `allowed_commands`
+    // entry (`DETECTED_TESTS_ENTRY`) — see `auto_verification`.
+    let auto = if cli.auto.is_some() {
+        Some(auto_verification(
+            settings.verification.command.as_deref(),
+            tests.as_ref(),
+        )?)
+    } else {
+        None
+    };
+
+    // `settings.permissions.allowed_commands`, extended with `--auto`'s
+    // synthetic `detected-tests` entry when one was produced above. Every
+    // consumer of the allowed-commands trust tier (`command_specs` below,
+    // and therefore `pre_approved_commands`/the Always-Allow cache seed and
+    // `RunCommandTool`'s own registration further down) is built from this
+    // single extended list, so the synthetic entry is honored everywhere
+    // `run_command` itself is, not just by the verification call site.
+    let mut allowed_commands = settings.permissions.allowed_commands.clone();
+    if let Some(auto) = &auto {
+        allowed_commands.extend(auto.synthetic_entry.clone());
     }
+
+    let command_specs: Vec<CommandSpec> = allowed_commands
+        .iter()
+        .map(|c| CommandSpec {
+            name: c.name.clone(),
+            program: c.program.clone(),
+            args: c.args.clone(),
+            timeout: Duration::from_secs(c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)),
+        })
+        .collect();
+
+    // Each configured command is pre-approved in two forms: the direct
+    // `(program, args)` invocation `run_command` uses, and the `sh -c
+    // "<program> <args>"` form `run_shell` always wraps commands in — the
+    // two tools have genuinely different invocation shapes (direct exec vs.
+    // shell-interpreted), so a single natural config entry (e.g. `program =
+    // "cargo", args = ["test"]`) needs both to be recognized by either tool
+    // without requiring the user to write it out twice in different shapes.
+    //
+    // Every arg is shell-escaped before joining — a naive `args.join(" ")`
+    // would let an arg containing a shell metacharacter (e.g. `program =
+    // "grep", args = ["-rn", "TODO|FIXME", "."]`, a harmless regex under
+    // direct execve) turn into live, unconfirmed shell syntax the moment
+    // the reconstructed `sh -c` form is looked up in the Always-Allow cache.
+    let mut pre_approved_commands: Vec<(String, Vec<String>)> = Vec::new();
+    for spec in &command_specs {
+        pre_approved_commands.push((spec.program.clone(), spec.args.clone()));
+        let mut shell_form = shell_escape::escape(spec.program.as_str().into()).into_owned();
+        for arg in &spec.args {
+            shell_form.push(' ');
+            shell_form.push_str(&shell_escape::escape(arg.as_str().into()));
+        }
+        pre_approved_commands.push(("sh".to_string(), vec!["-c".to_string(), shell_form]));
+    }
+
+    // What `agent.set_verification` (further down) and the sub-agent
+    // verification config below it both use: the configured name in every
+    // non-`--auto` mode, or `--auto`'s resolved `command_name` (configured,
+    // or the synthetic `detected-tests` entry) when `--auto` is active.
+    let verification_command: Option<String> = match &auto {
+        Some(auto) => Some(auto.command_name.clone()),
+        None => settings.verification.command.clone(),
+    };
 
     // Cloned before the move below -- also seeds every specialist's own
     // scoped gate (see `specialist_enforcement_ingredients` further down),
@@ -744,9 +837,7 @@ pub(crate) async fn build_agent(
     // parent's own edits would — mirrors the `agent.set_verification(...)`
     // call below, resolved once here so both call sites agree without
     // duplicating the allowed_commands-membership check.
-    let verification = settings
-        .verification
-        .command
+    let verification = verification_command
         .as_ref()
         .filter(|command| command_specs.iter().any(|spec| &spec.name == *command))
         .map(|command| {
@@ -1290,13 +1381,19 @@ pub(crate) async fn build_agent(
                 }
             }
         }
-    } else if let Some(command) = &settings.verification.command {
+    } else if let Some(command) = &verification_command {
         tracing::warn!(
             command = %command,
             "verification.command does not match any [[permissions.allowed_commands]] \
              entry name — enforced verification is disabled until this is fixed"
         );
     }
+
+    // `/test` resolves to this same effective command in every frontend and
+    // mode (interactive, ACP, MCP-server, `--auto`) — only automatic,
+    // after-edit verification is gated on detection vs. configuration
+    // (above), and only under `--auto`.
+    agent.set_tests(tests.clone());
 
     // Persistence is always on (it's what makes `--resume` possible after a
     // crash or an interrupted slow-model turn); only *restoring* is opt-in.
@@ -1817,5 +1914,41 @@ tool_allowlist = []
         render_skills_listing(&loader, &injection_taint);
 
         assert!(injection_taint.current().is_none());
+    }
+
+    fn detected(program: &str) -> aivyx_core::test_detect::EffectiveTests {
+        aivyx_core::test_detect::EffectiveTests {
+            program: program.into(),
+            args: vec!["test".into()],
+            source: aivyx_core::test_detect::TestSource::Detected("detected from Cargo.toml".into()),
+        }
+    }
+
+    #[test]
+    fn auto_uses_the_configured_name_first() {
+        let auto = auto_verification(Some("tests"), Some(&detected("cargo"))).unwrap();
+        assert_eq!(auto.command_name, "tests");
+        assert!(auto.synthetic_entry.is_none());
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_detected_command() {
+        let auto = auto_verification(None, Some(&detected("cargo"))).unwrap();
+        assert_eq!(auto.command_name, DETECTED_TESTS_ENTRY);
+        let entry = auto.synthetic_entry.unwrap();
+        assert_eq!(entry.name, DETECTED_TESTS_ENTRY);
+        assert_eq!(entry.program, "cargo");
+        assert_eq!(entry.args, vec!["test".to_string()]);
+        assert_eq!(entry.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn auto_refuses_with_nothing_configured_or_found() {
+        let err = auto_verification(None, None).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "--auto needs a test command: set [verification] command in config.toml, or run it \
+             in a project with a recognised test setup."
+        );
     }
 }

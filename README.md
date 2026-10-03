@@ -194,6 +194,32 @@ a linked worktree), `/commit` can't write it and says so — start it at the
 repository root, or commit with git. `/undo` after `/commit` rewinds only
 your files, never the commit; its preview says so.
 
+**`/test`** runs the project's test command: `[verification] command` when
+configured, else whatever's detected in the project folder (first match
+wins):
+
+| Marker | Command |
+|---|---|
+| `Cargo.toml` | `cargo test` |
+| `go.mod` | `go test ./...` |
+| `package.json` (pnpm lockfile) | `pnpm test` |
+| `package.json` (yarn lockfile) | `yarn test` |
+| `package.json` (otherwise) | `npm test` |
+| pytest markers (`pytest.ini`, `[tool.pytest]` in `pyproject.toml`, `conftest.py`) | `python3 -m pytest` |
+| Python test files (`test_*.py`/`*_test.py`, or a `tests/` folder of `.py` files) | `python3 -m unittest` |
+| `Makefile` with a `test:` target | `make test` |
+
+The startup/`/help` line and `/test` itself both show which one and why
+(`` Tests: `cargo test` (detected from Cargo.toml) — run them with /test ``).
+It needs no approval prompt — `/test` runs confined the same way
+`run_command` does, with no model involved in choosing the command. Ctrl+C
+cancels; it's killed after a 10-minute timeout otherwise. The TUI keeps the
+last 200 output lines visible; the result and the last 80 lines are handed
+to the model with your next message, same as any other tool output, so
+they're scanned for prompt-injection markers on the way in like everything
+else that re-enters context (see "Known limitations"). With nothing
+configured or detected, `/test` says so instead of running anything.
+
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx-coder --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a
 task list (the task panel becomes the reviewable plan), but tools that touch
@@ -229,7 +255,11 @@ immediately preceding verification attempt
 newly-introduced regression apart from an already-known failure without
 re-deriving that context from raw output each time. This is a coarse,
 framework-agnostic line-set comparison, not real test-parsing, and says so
-explicitly in the note itself.
+explicitly in the note itself. Detection (see `/test` above) never turns
+this on by itself in an interactive session — only `--auto` falls back to
+a detected command for automatic, after-edit verification; without
+`[verification] command` configured, an interactive session gets `/test`
+but no auto-run-and-retry loop.
 
 `scoped_command` (optional): another `[[permissions.allowed_commands]]`
 entry name, whose `args` may contain the literal token `"{touched_paths}"`
@@ -302,8 +332,11 @@ retries, autonomous mode goes one step further than the interactive loud
 notice: it rewinds the worktree to the checkpoint taken before that batch
 of edits, discarding the failed experiment, and continues with remaining
 budget. Because auto-approving edits is only safe with a deterministic
-keep/discard signal, `--auto` refuses to start unless `[verification]
-command` is configured. Config:
+keep/discard signal, `--auto` verifies with the configured `[verification]
+command` when there is one, else whatever `/test` would use — a detected
+test command, announced at startup as
+`` Verifying with `cargo test` (detected from Cargo.toml) `` — and refuses
+to start only when neither exists. Config:
 
 ```toml
 [autonomous]
