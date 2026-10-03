@@ -2999,6 +2999,57 @@ async fn undo_agent_with_script(
     (agent, rx)
 }
 
+/// Records whether `confine()` was invoked, without altering the command —
+/// lets a test assert a code path actually went through the executor's
+/// confiner (same pattern as `aivyx_tools::lsp::tests::SpyConfiner`).
+struct RecordingConfiner {
+    called: std::sync::atomic::AtomicBool,
+}
+
+impl RecordingConfiner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            called: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn was_called(&self) -> bool {
+        self.called.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ExecutionConfiner for RecordingConfiner {
+    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+        self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+        command
+    }
+}
+
+/// `undo_agent_with_script` with a caller-chosen confiner instead of
+/// `NoopConfiner` — for tests that need to assert the executor's confiner
+/// was actually consulted (e.g. `/test`, which confines directly rather
+/// than through a `Tool`).
+async fn undo_agent_with_confiner(
+    confiner: Arc<dyn ExecutionConfiner>,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![text_response("ok")]));
+    let executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), confiner);
+    let (tx, rx) = unbounded_channel();
+    let agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    (agent, rx)
+}
+
 fn notices(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
@@ -7847,4 +7898,103 @@ async fn the_test_note_reaches_the_model_with_the_next_message() {
     let text = first_user.text_content();
     assert!(text.contains("FAILED test_add"), "{text}");
     assert!(text.ends_with("fix the failing test"), "{text}");
+}
+
+// ---- /test fix round ----
+
+// Review finding 1 (IMPORTANT): `BufReader::lines()` treats a non-UTF-8
+// line as EOF, so the drain loop stops reading that pipe while the child
+// is still writing — the child then blocks on a full pipe and the run
+// hangs until `test_timeout`. A low timeout here means a regression fails
+// fast instead of hanging for the real 10-minute default.
+#[tokio::test]
+async fn test_survives_invalid_utf8_and_keeps_draining() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.test_timeout = std::time::Duration::from_secs(20);
+    agent.set_tests(Some(sh_tests("printf '\\377\\n'; echo after")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let (lines, finished) = test_events(&mut rx);
+    assert!(lines.iter().any(|l| l == "after"), "{lines:?}");
+    assert_eq!(finished.len(), 1);
+    assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
+}
+
+// Same bug, worse consequence: once stuck "after EOF", thousands of lines
+// written after the bad byte never drain at all, and the real-world
+// failure mode is "Tests timed out after 10 min" with all of it lost.
+#[tokio::test]
+async fn test_drains_output_after_an_invalid_byte_without_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.test_timeout = std::time::Duration::from_secs(20);
+    agent.set_tests(Some(sh_tests(
+        "printf '\\377\\n'; i=0; while [ $i -lt 3000 ]; do echo line$i; i=$((i+1)); done",
+    )));
+    let started = std::time::Instant::now();
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+
+    let (lines, finished) = test_events(&mut rx);
+    assert!(lines.iter().any(|l| l == "line2999"), "{lines:?}");
+    assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
+}
+
+// Review finding 2 (MINOR): a line with no newline could grow the
+// in-memory buffer without bound. The rewrite caps bytes kept per line
+// while it keeps reading through to the real newline; `clip` still
+// truncates the resulting (already-capped) string for display.
+#[tokio::test]
+async fn test_caps_a_very_long_line_and_keeps_going() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_tests(Some(sh_tests(
+        "head -c 300000 /dev/zero | tr '\\0' 'a'; echo; echo done",
+    )));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let (lines, finished) = test_events(&mut rx);
+    assert!(lines.iter().any(|l| l.ends_with('…')), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "done"), "{lines:?}");
+    assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
+}
+
+// Review finding 4 (MINOR): a second `/test` run used to stack a second
+// stale note alongside the first instead of replacing it.
+#[tokio::test]
+async fn a_second_test_run_replaces_the_stale_test_note() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, _rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_tests(Some(sh_tests("echo first")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.set_tests(Some(sh_tests("echo second")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(agent.pending_notes.len(), 1, "{:?}", agent.pending_notes);
+    assert!(agent.pending_notes[0].contains("second"), "{:?}", agent.pending_notes);
+}
+
+// Review finding 5 (MINOR): `/test` confines its child directly (not
+// through a `Tool`), so nothing previously proved the executor's confiner
+// is actually consulted.
+#[tokio::test]
+async fn test_run_goes_through_the_confiner() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let confiner = RecordingConfiner::new();
+    let (mut agent, _rx) = undo_agent_with_confiner(confiner.clone()).await;
+    agent.set_tests(Some(sh_tests("echo hi")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert!(confiner.was_called());
 }
