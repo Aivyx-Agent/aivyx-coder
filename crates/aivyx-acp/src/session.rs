@@ -87,7 +87,7 @@ use agent_client_protocol::schema::v1::{
     SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason,
 };
-use agent_client_protocol::{Agent as AcpAgentBuilder, Result, Stdio};
+use agent_client_protocol::{Agent as AcpAgentBuilder, Client, ConnectionTo, Responder, Result, Stdio};
 use aivyx_core::{Agent, AgentEvent, SpecialistSessionSummary};
 use aivyx_sandbox::{InjectionFinding, PlanMode};
 use aivyx_types::{MissionPlan, Task};
@@ -217,6 +217,40 @@ fn terminal_auth_method() -> agent_client_protocol::schema::v1::AuthMethod {
     agent_client_protocol::schema::v1::AuthMethod::Terminal(terminal_auth)
 }
 
+/// The `code`/`plan` modes `session/new` offers.
+fn session_modes() -> SessionModeState {
+    SessionModeState::new(
+        SessionModeId::new(MODE_CODE),
+        vec![
+            SessionMode::new(SessionModeId::new(MODE_CODE), "Code"),
+            SessionMode::new(SessionModeId::new(MODE_PLAN), "Plan").description(
+                "Read-only: the model can read, search, and build a task list, but cannot edit files or run commands.",
+            ),
+        ],
+    )
+}
+
+/// Answers `session/new`, then tells the editor's command picker what this
+/// agent supports (see `commands.rs`'s `available_commands_update` doc
+/// comment for which commands and why). The response goes first: an
+/// editor that registers the session when this response arrives (Zed
+/// does) drops a `session/update` for a session id it hasn't seen yet.
+/// Both calls post to the same outgoing channel, so call order is wire
+/// order.
+fn respond_then_advertise(
+    responder: Responder<NewSessionResponse>,
+    connection: &ConnectionTo<Client>,
+    session_id: SessionId,
+) -> Result<()> {
+    let responded =
+        responder.respond(NewSessionResponse::new(session_id.clone()).modes(session_modes()));
+    let _ = connection.send_notification(SessionNotification::new(
+        session_id,
+        available_commands_update(),
+    ));
+    responded
+}
+
 /// A minimal ACP server for when no `config.toml` exists yet:
 /// `initialize` advertises the same `terminal` auth method `run()` does,
 /// but `session/new` always fails with `auth_required` -- there is no
@@ -335,24 +369,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 });
                 drop(guard);
                 new_session_exists.store(true, Ordering::Release);
-                // Tells the editor's own command picker what this agent
-                // supports before the first prompt ever goes out — see
-                // `commands.rs`'s `available_commands_update` doc comment
-                // for exactly which commands that is and why.
-                let _ = connection.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    available_commands_update(),
-                ));
-                let modes = SessionModeState::new(
-                    SessionModeId::new(MODE_CODE),
-                    vec![
-                        SessionMode::new(SessionModeId::new(MODE_CODE), "Code"),
-                        SessionMode::new(SessionModeId::new(MODE_PLAN), "Plan").description(
-                            "Read-only: the model can read, search, and build a task list, but cannot edit files or run commands.",
-                        ),
-                    ],
-                );
-                responder.respond(NewSessionResponse::new(session_id).modes(modes))
+                respond_then_advertise(responder, &connection, session_id)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -515,6 +532,63 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ResourceLink, TextContent};
+
+    /// Zed registers a session when the `session/new` response arrives and
+    /// drops updates for a session it doesn't know yet, so the advertised
+    /// command list has to follow the response on the wire. Reads the
+    /// agent's raw output, so the order checked is the order sent.
+    #[tokio::test]
+    async fn new_session_response_goes_out_before_the_command_list() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (agent_writer, client_reader) = tokio::io::duplex(65536);
+        let (mut client_writer, agent_reader) = tokio::io::duplex(65536);
+        let transport = agent_client_protocol::ByteStreams::new(
+            agent_writer.compat_write(),
+            agent_reader.compat(),
+        );
+        let agent_task = tokio::spawn(async move {
+            AcpAgentBuilder
+                .builder()
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, connection| {
+                        respond_then_advertise(responder, &connection, SessionId::new("s-1"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(transport)
+                .await
+        });
+
+        client_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\
+                  \"params\":{\"cwd\":\"/\",\"mcpServers\":[]}}\n",
+            )
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(client_reader).lines();
+        let mut next = async || -> serde_json::Value {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the agent should answer within 5s")
+                .unwrap()
+                .expect("the agent closed its output early");
+            serde_json::from_str(&line).unwrap()
+        };
+        let first = next().await;
+        let second = next().await;
+        agent_task.abort();
+
+        assert_eq!(first["id"], 1, "the response must come first: {first} then {second}");
+        assert_eq!(first["result"]["sessionId"], "s-1", "{first}");
+        assert_eq!(second["method"], "session/update", "{second}");
+        assert_eq!(
+            second["params"]["update"]["sessionUpdate"], "available_commands_update",
+            "{second}"
+        );
+    }
 
     #[test]
     fn concatenates_only_text_blocks_with_newlines() {
