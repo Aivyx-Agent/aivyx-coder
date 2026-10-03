@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::edit_blocks::{self, BlockParse};
 use crate::editor_context;
-use crate::session::{self, SessionState, Task};
+use crate::session::{self, SESSIONS_KEPT, SessionMeta, SessionState, SessionStore, Task, count_turns, preview_text};
 use crate::specialist_sessions::SpecialistSessionPool;
 use crate::undo::TurnMark;
 
@@ -164,6 +164,21 @@ struct KvCacheConfig {
     build_hash: String,
 }
 
+/// Where `persist()` writes the session. `File` is today's single-file-
+/// per-project layout (`set_session_path`); `Store` is one file per
+/// conversation (`set_session_store`) -- `id` is `None` until the first
+/// successful persist mints one (`SessionStore::new_id`), after which
+/// every later persist in this conversation reuses it and overwrites the
+/// same file.
+enum SessionTarget {
+    File(PathBuf),
+    Store {
+        store: SessionStore,
+        id: Option<String>,
+        created_unix: i64,
+    },
+}
+
 pub struct Agent {
     llm: std::sync::Arc<dyn LlmBackend>,
     executor: ToolExecutor,
@@ -198,7 +213,15 @@ pub struct Agent {
     /// is reset. Set via `set_specialist_session_pool_handle`.
     specialist_session_pool: Option<SpecialistSessionPool>,
     /// Where the session is persisted after each turn; `None` disables it.
-    session_path: Option<PathBuf>,
+    session_target: Option<SessionTarget>,
+    /// The raw text of the first real user turn of the current conversation
+    /// (via `preview_text`) -- `SessionMeta::first_user_text` when
+    /// persisting into a `Store`. Set once per conversation, from
+    /// `run_turn`'s `turn_preview` computation (after slash commands that
+    /// are intercepted before that point, so those never seed it); reset by
+    /// `clear_conversation` and by switching conversations, and seeded from
+    /// `state.meta.first_user_text` by `restore_session`.
+    first_user_text: Option<String>,
     /// Set the first time this `Agent` instance successfully persists
     /// (a successful turn, or `clear_conversation`'s deliberate empty-state
     /// save) -- i.e. once this process has actually written to the session
@@ -211,7 +234,12 @@ pub struct Agent {
     /// single failed message. A `--resume`d session owns the slot from the
     /// start (`restore()` sets it): its history in memory *is* the stored
     /// history, so saving it — e.g. after an `/undo` right after resuming —
-    /// can only add to what's there, never clobber it.
+    /// can only add to what's there, never clobber it. With a `Store`
+    /// target, `clear_conversation` resets this to `false` instead of doing
+    /// the empty-state save described above -- the old conversation is
+    /// left exactly as it was (under its own id), and the next successful
+    /// turn starts a brand new one, which must go through the same B1 gate
+    /// a truly fresh process would.
     session_owns_slot: bool,
     /// Read at every request assembly (tool list + system-prompt note); the
     /// gate holds its own clone for enforcement, and the TUI toggles it.
@@ -435,7 +463,8 @@ impl Agent {
             tasks,
             mission_plan: None,
             specialist_session_pool: None,
-            session_path: None,
+            session_target: None,
+            first_user_text: None,
             session_owns_slot: false,
             plan_mode,
             autonomous_mode,
@@ -550,7 +579,21 @@ impl Agent {
     /// covers compaction only): this wipes `history` without evicting any
     /// Always-Allow cache entries the wiped calls justified, the same class
     /// of staleness `compact_if_needed` guards against for compaction.
+    ///
+    /// With a `Store` target (sessions-per-project), `/clear` starts a new
+    /// conversation rather than overwriting the old one: the outgoing
+    /// conversation is saved under its own id first (`persist_if_owned`,
+    /// same B1 rule as everywhere else — nothing is written if this
+    /// process never owned the slot), then the id is cleared along with
+    /// `first_user_text`, so the *next* successful turn mints a fresh file
+    /// instead of reusing this one. With a `File` target (or no target),
+    /// today's behaviour is unchanged: the now-empty state is persisted
+    /// (overwriting the single project file) and the slot is marked owned.
     pub fn clear_conversation(&mut self) {
+        let targets_store = matches!(self.session_target, Some(SessionTarget::Store { .. }));
+        if targets_store {
+            self.persist_if_owned();
+        }
         self.history.clear();
         self.tasks.lock().unwrap().clear();
         if let Some(mission_plan) = &self.mission_plan {
@@ -570,8 +613,16 @@ impl Agent {
         self.undo.clear();
         self.pending_notes.clear();
         self.emit(AgentEvent::ConversationCleared);
-        self.persist();
-        self.session_owns_slot = true;
+        if targets_store {
+            if let Some(SessionTarget::Store { id, .. }) = &mut self.session_target {
+                *id = None;
+            }
+            self.first_user_text = None;
+            self.session_owns_slot = false;
+        } else {
+            self.persist();
+            self.session_owns_slot = true;
+        }
     }
 
     /// Enables `/council` (Phase 11a). The caller builds the seats — each
@@ -1096,9 +1147,42 @@ impl Agent {
     }
 
     /// Enables session persistence: after each turn the full session is
-    /// written to `path` (best-effort).
+    /// written to `path` (best-effort). The legacy single-file-per-project
+    /// layout — unchanged from before `SessionTarget` existed.
     pub fn set_session_path(&mut self, path: PathBuf) {
-        self.session_path = Some(path);
+        self.session_target = Some(SessionTarget::File(path));
+    }
+
+    /// Enables session persistence into one file per conversation: the
+    /// first successful persist mints a new id in `store` (via
+    /// `SessionStore::new_id`); every later persist in the same
+    /// conversation reuses it and overwrites the same file.
+    pub fn set_session_store(&mut self, store: SessionStore) {
+        self.session_target = Some(SessionTarget::Store {
+            store,
+            id: None,
+            created_unix: 0,
+        });
+    }
+
+    /// The `SessionStore` persistence is targeting, if any — `None` both
+    /// when persistence is disabled and when it's `set_session_path`'s
+    /// legacy single-file mode.
+    pub fn session_store(&self) -> Option<&SessionStore> {
+        match &self.session_target {
+            Some(SessionTarget::Store { store, .. }) => Some(store),
+            _ => None,
+        }
+    }
+
+    /// The current conversation's id, once persistence has minted one
+    /// (`None` before the first successful persist, or outside `Store`
+    /// mode).
+    pub fn current_session_id(&self) -> Option<&str> {
+        match &self.session_target {
+            Some(SessionTarget::Store { id: Some(id), .. }) => Some(id.as_str()),
+            _ => None,
+        }
     }
 
     /// Seeds history and tasks from a resumed session, replacing whatever
@@ -1115,6 +1199,27 @@ impl Agent {
         self.undo = state.undo;
         self.session_owns_slot = true;
         self.pending_notes = state.pending_notes;
+    }
+
+    /// `restore`, plus — when persisting into a `Store` — adopting
+    /// `state.meta` as the current conversation: later persists overwrite
+    /// this same file (by id) instead of minting a new one, and
+    /// `first_user_text` is seeded from the resumed conversation's own
+    /// first turn rather than waiting for a new one. A `meta.id` of `""`
+    /// (a file that predates `SessionMeta`, or the legacy single-file
+    /// layout before migration) is treated as "no id yet" — the same as a
+    /// fresh conversation — since there's nothing real to continue
+    /// addressing by id.
+    pub fn restore_session(&mut self, state: SessionState) {
+        let meta = state.meta.clone();
+        self.restore(state);
+        if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target
+            && !meta.id.is_empty()
+        {
+            *id = Some(meta.id.clone());
+            *created_unix = meta.created_unix;
+        }
+        self.first_user_text = Some(meta.first_user_text);
     }
 
     /// A clone of the current conversation history. Used to persist a
@@ -1139,8 +1244,12 @@ impl Agent {
 
     /// Best-effort snapshot to disk. A persistence failure is logged, never
     /// propagated — losing a save must not fail the user's turn.
-    fn persist(&self) {
-        let Some(path) = &self.session_path else {
+    ///
+    /// `&mut self`: `Store` mode mints a new conversation id (and records
+    /// `created_unix`) the first time this conversation persists, which
+    /// must stick for every later persist in the same conversation.
+    fn persist(&mut self) {
+        let Some(target) = &mut self.session_target else {
             return;
         };
         let tasks = self.tasks.lock().unwrap().clone();
@@ -1157,8 +1266,32 @@ impl Agent {
         );
         state.undo = self.undo.clone();
         state.pending_notes = self.pending_notes.clone();
-        if let Err(err) = session::save(path, &state) {
-            tracing::warn!(error = %err, "failed to persist session");
+
+        match target {
+            SessionTarget::File(path) => {
+                if let Err(err) = session::save(path, &state) {
+                    tracing::warn!(error = %err, "failed to persist session");
+                }
+            }
+            SessionTarget::Store { store, id, created_unix } => {
+                if id.is_none() {
+                    *id = Some(SessionStore::new_id(now_unix_ms()));
+                    *created_unix = now_unix();
+                }
+                let id = id.clone().unwrap_or_default();
+                state.meta = SessionMeta {
+                    id,
+                    created_unix: *created_unix,
+                    updated_unix: now_unix(),
+                    first_user_text: self.first_user_text.clone().unwrap_or_default(),
+                    turns: count_turns(&state.history),
+                };
+                if let Err(err) = store.save(&state) {
+                    tracing::warn!(error = %err, "failed to persist session");
+                } else {
+                    store.prune(SESSIONS_KEPT);
+                }
+            }
         }
     }
 
@@ -1166,7 +1299,7 @@ impl Agent {
     /// `session_owns_slot`): for state changes outside a successful turn,
     /// such as `/undo`, which must not overwrite a real saved session from
     /// a fresh process whose first turn failed.
-    fn persist_if_owned(&self) {
+    fn persist_if_owned(&mut self) {
         if self.session_owns_slot {
             self.persist();
         }
@@ -1612,6 +1745,9 @@ impl Agent {
         }
         let turn_before = self.undo_snapshot("turn-start").await;
         let turn_preview = crate::undo::text_preview(&user_input);
+        if self.first_user_text.is_none() {
+            self.first_user_text = Some(preview_text(&user_input));
+        }
         // Commands are intercepted here, before the input can enter LLM
         // history — the raw `/council …` text is an instruction to aivyx,
         // not part of the conversation the model should see.
@@ -2737,6 +2873,46 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Last value `now_unix_ms` returned in this process, so two calls in
+/// quick succession (e.g. two fresh `Agent`s each minting a conversation id
+/// for a mocked, no-network turn) never see the same millisecond collapse
+/// their ids' ordering into whatever a hash happens to produce -- see
+/// `now_unix_ms`'s own doc comment.
+static LAST_SESSION_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Millisecond-resolution now, for `SessionStore::new_id` (which keys on
+/// milliseconds so two conversations started close together still get
+/// distinct, time-ordered ids). `pub(super)` so `agent_builder.rs` (Task 4)
+/// can mint an id outside a persist call too, e.g. to show it before the
+/// first turn ever runs.
+///
+/// Monotonic within this process: a plain wall-clock read is only
+/// millisecond-resolution, and two conversations can genuinely be minted
+/// faster than that (a mocked backend in tests, or just a fast machine) --
+/// `SessionStore::list`'s newest-first sort ties on `updated_unix`
+/// (second-resolution) and falls back to comparing ids, so two ids sharing
+/// a millisecond would otherwise sort by their random hash suffix instead
+/// of creation order. Bumping past the last value seen (via a
+/// compare-and-swap retry loop) makes every call in this process strictly
+/// greater than the one before it, so id order always matches call order,
+/// while still tracking real time whenever the clock has actually moved on.
+pub(super) fn now_unix_ms() -> i64 {
+    let real = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    loop {
+        let last = LAST_SESSION_MS.load(std::sync::atomic::Ordering::Relaxed);
+        let next = real.max(last + 1);
+        if LAST_SESSION_MS
+            .compare_exchange(last, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 /// Best-effort human-readable description of what a tool call touched —

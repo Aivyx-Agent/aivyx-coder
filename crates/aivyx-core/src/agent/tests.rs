@@ -8056,3 +8056,86 @@ async fn test_stream_is_cancel_safe_across_select_branches() {
     assert!(lines.contains(&"x".to_string()), "{lines:?}");
     assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
 }
+
+// ---- sessions per project ----
+
+fn store_agent(store_dir: &Path, responses: Vec<Vec<StreamEvent>>) -> (Agent, UnboundedReceiver<AgentEvent>) {
+    let (mut agent, rx) = build_agent_with_backend(
+        Arc::new(MockBackend::new(responses)),
+        store_dir.join("unused.json"),
+    );
+    agent.set_session_store(crate::session::SessionStore::new(store_dir.to_path_buf()));
+    (agent, rx)
+}
+
+#[tokio::test]
+async fn a_failed_first_turn_creates_no_conversation_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = build_agent_with_backend(Arc::new(FailingBackend), store_dir.join("unused.json"));
+    agent.set_session_store(crate::session::SessionStore::new(store_dir.clone()));
+    let _ = agent.run_turn("hello".into(), Path::new("."), CancellationToken::new()).await;
+    assert!(crate::session::SessionStore::new(store_dir).list().is_empty());
+}
+
+#[tokio::test]
+async fn two_fresh_agents_make_two_conversations() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    for text in ["first chat", "second chat"] {
+        let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("ok")]);
+        agent.run_turn(text.into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    }
+    let list = crate::session::SessionStore::new(store_dir).list();
+    assert_eq!(list.len(), 2);
+    let firsts: Vec<&str> = list.iter().map(|m| m.first_user_text.as_str()).collect();
+    assert_eq!(firsts, vec!["second chat", "first chat"]);
+    assert!(list.iter().all(|m| m.turns == 1));
+}
+
+#[tokio::test]
+async fn later_turns_update_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a"), text_response("b")]);
+    agent.run_turn("one".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    agent.run_turn("two".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let list = crate::session::SessionStore::new(store_dir).list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].turns, 2);
+    assert_eq!(list[0].first_user_text, "one");
+}
+
+#[tokio::test]
+async fn clear_keeps_the_old_conversation_and_the_next_turn_starts_a_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a"), text_response("b")]);
+    agent.run_turn("before clear".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    agent.clear_conversation();
+    let store = crate::session::SessionStore::new(store_dir);
+    assert_eq!(store.list().len(), 1, "/clear alone writes nothing new");
+    assert_eq!(store.list()[0].first_user_text, "before clear");
+    agent.run_turn("after clear".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let firsts: Vec<String> = store.list().into_iter().map(|m| m.first_user_text).collect();
+    assert_eq!(firsts, vec!["after clear".to_string(), "before clear".to_string()]);
+}
+
+#[tokio::test]
+async fn restore_session_continues_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let id = store.list()[0].id.clone();
+
+    let (mut agent2, _rx2) = store_agent(&store_dir, vec![text_response("b")]);
+    agent2.restore_session(store.load(&id).unwrap());
+    agent2.run_turn("more".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let list = store.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].turns, 2);
+    assert_eq!(list[0].first_user_text, "original");
+}
