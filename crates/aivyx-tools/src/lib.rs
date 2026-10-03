@@ -767,6 +767,7 @@ mod tests {
             program: "true".to_string(),
             args: vec![],
             timeout: std::time::Duration::from_secs(5),
+            env: Vec::new(),
         }])));
         let prompter = Arc::new(CountingAlwaysAllowPrompter(AtomicUsize::new(0)));
         let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(

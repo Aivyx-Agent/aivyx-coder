@@ -16,7 +16,9 @@
 //! itself is unstaged again if the commit doesn't happen; a set the user
 //! staged by hand is never touched. Deny-listed files are never staged by
 //! `/commit`, and the content of one the user staged by hand is never sent
-//! to the model (its name is, marked "(contents withheld)").
+//! to the model (its name is, marked "(contents withheld)"). A staged file
+//! git can't diff as text is marked "(binary)", or "(binary, new)" if it's
+//! new to the repository.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,12 @@ const COMMIT_USAGE: &str = "Use /commit, or /commit -m \"message\".";
 const NOTHING_TO_COMMIT: &str = "Nothing to commit.";
 const COMMIT_CANCELLED: &str = "Commit cancelled — nothing was committed.";
 const WITHHELD: &str = " (contents withheld)";
+/// Matches the change summary's own `(binary)` marking style
+/// (`changes::summary_line`) but with extra leading space, so it reads as
+/// a distinct annotation in the file listing rather than running into the
+/// filename.
+const BINARY: &str = "   (binary)";
+const BINARY_NEW: &str = "   (binary, new)";
 /// How long `git commit` (hooks included) may run — the git_commit tool's
 /// own limit.
 const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -111,6 +119,53 @@ async fn staged_names(root: &Path) -> Result<Vec<String>, String> {
         .split('\0')
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+        .collect())
+}
+
+/// `(binary)`/`(binary, new)` suffixes, keyed by path, for every staged
+/// file whose diff is binary — `git diff --numstat`'s `-\t-` convention,
+/// the same one `changes::parse_numstat` already uses for the per-turn
+/// change summary's own `(binary)` marking. A binary file already tracked
+/// before this change is `(binary)`; one new to the repository (never
+/// committed before) is `(binary, new)`.
+async fn staged_binary_suffixes(
+    root: &Path,
+) -> Result<std::collections::HashMap<String, &'static str>, String> {
+    let numstat = git(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--cached",
+            "--numstat",
+            "--no-renames",
+        ],
+    )
+    .await?;
+    let name_status = git(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--cached",
+            "--name-status",
+            "--no-renames",
+        ],
+    )
+    .await?;
+    Ok(crate::changes::parse_numstat(&numstat, &name_status)
+        .into_iter()
+        .filter(|c| c.added.is_none() || c.removed.is_none())
+        .map(|c| {
+            let suffix = if c.status == crate::changes::ChangeStatus::Added {
+                BINARY_NEW
+            } else {
+                BINARY
+            };
+            (c.path, suffix)
+        })
         .collect())
 }
 
@@ -359,23 +414,33 @@ impl Agent {
             self.info(NOTHING_TO_COMMIT);
             return;
         }
-        // A deny-listed file the user staged by hand is committed, but
-        // only its name ever reaches the model or the prompt.
-        let withheld: Vec<&String> = files.iter().filter(|f| denied(f)).collect();
-        let labels: Vec<String> = files
-            .iter()
-            .map(|f| {
-                if denied(f) {
-                    format!("{f}{WITHHELD}")
-                } else {
-                    f.clone()
-                }
-            })
-            .collect();
-
         let message = match message {
             Some(message) => message,
             None => {
+                // A deny-listed file the user staged by hand is committed,
+                // but only its name ever reaches the model or the prompt.
+                let withheld: Vec<&String> = files.iter().filter(|f| denied(f)).collect();
+                let binary = match staged_binary_suffixes(&root).await {
+                    Ok(binary) => binary,
+                    Err(e) => {
+                        self.abandon_commit(&root, &staged_by_us, format!("Couldn't commit: {e}"))
+                            .await;
+                        return;
+                    }
+                };
+                let labels: Vec<String> = files
+                    .iter()
+                    .map(|f| {
+                        let mut label = f.clone();
+                        if denied(f) {
+                            label.push_str(WITHHELD);
+                        }
+                        if let Some(suffix) = binary.get(f) {
+                            label.push_str(suffix);
+                        }
+                        label
+                    })
+                    .collect();
                 let excludes: Vec<String> = withheld
                     .iter()
                     .map(|f| format!(":(exclude,literal){f}"))

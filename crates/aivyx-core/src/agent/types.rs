@@ -252,6 +252,7 @@ mod tests {
                 program: "pytest".to_string(),
                 args: vec!["{touched_paths}".to_string()],
                 timeout: Duration::from_secs(30),
+                env: Vec::new(),
             },
             confiner: Arc::new(NoopConfiner),
         };

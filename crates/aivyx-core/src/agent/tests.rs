@@ -2568,6 +2568,7 @@ async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), "exit 1".to_string()], // always fails
         timeout: Duration::from_secs(5),
+        env: Vec::new(),
     }])));
 
     let write_call = vec![
@@ -4454,6 +4455,7 @@ fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
             if exit_ok { "exit 0" } else { "exit 1" }.to_string(),
         ],
         timeout: Duration::from_secs(5),
+        env: Vec::new(),
     }
 }
 
@@ -4785,6 +4787,7 @@ async fn run_scoped_verification_reports_pass_and_records_history() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 0".to_string()],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4812,6 +4815,7 @@ async fn run_scoped_verification_reports_failure_for_a_nonzero_exit() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 1".to_string()],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4843,6 +4847,7 @@ async fn run_scoped_verification_substitutes_touched_paths_into_argv() {
                 "{touched_paths}".to_string(),
             ],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4869,6 +4874,7 @@ fn set_scoped_verification_attaches_to_an_already_configured_verification() {
             program: "pytest".to_string(),
             args: vec!["{touched_paths}".to_string()],
             timeout: Duration::from_secs(30),
+            env: Vec::new(),
         },
         Arc::new(NoopConfiner),
     );
@@ -4889,6 +4895,7 @@ fn set_scoped_verification_before_set_verification_is_a_harmless_no_op() {
             program: "pytest".to_string(),
             args: vec![],
             timeout: Duration::from_secs(30),
+            env: Vec::new(),
         },
         Arc::new(NoopConfiner),
     );
@@ -4958,6 +4965,7 @@ fn stateful_verify_command_spec(name: &str, script: &str) -> CommandSpec {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), script.to_string()],
         timeout: Duration::from_secs(5),
+        env: Vec::new(),
     }
 }
 
@@ -5234,6 +5242,7 @@ async fn a_failing_scoped_run_skips_the_full_command_this_iteration() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 1".to_string()],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5281,6 +5290,7 @@ async fn a_passing_scoped_run_is_confirmed_by_a_full_run_that_can_still_fail() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 0".to_string()],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5319,6 +5329,7 @@ async fn run_verification_attempt_falls_back_to_full_only_when_no_paths_are_touc
             // Would leave a marker file if it ever ran — proves it doesn't.
             args: vec!["-c".to_string(), "touch scoped_ran".to_string()],
             timeout: Duration::from_secs(5),
+            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5553,6 +5564,7 @@ async fn a_dropped_compacted_tool_call_requires_a_fresh_confirmation_on_reissue(
         program: "true".to_string(),
         args: vec![],
         timeout: Duration::from_secs(5),
+        env: Vec::new(),
     }])));
 
     let prompter = Arc::new(CountingAlwaysAllowPrompter(
@@ -7440,6 +7452,57 @@ async fn commit_preview_warns_when_the_last_test_failed() {
     let seen = prompter.seen.lock().unwrap();
     let preview = seen[0].preview.as_deref().unwrap();
     assert!(preview.starts_with("⚠ The last /test failed.\n"), "{preview}");
+}
+
+#[tokio::test]
+async fn commit_preview_marks_a_binary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("logo.png"), [0u8, 1, 2, 3]).unwrap();
+    git_in(&cwd, &["add", "logo.png"]).await;
+    git_in(&cwd, &["commit", "-q", "-m", "add logo"]).await;
+    std::fs::write(cwd.join("logo.png"), [4u8, 5, 6, 7]).unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let seen = prompter.seen.lock().unwrap();
+    let preview = seen[0].preview.as_deref().unwrap();
+    assert!(
+        preview.contains("  logo.png   (binary)"),
+        "a modified (already-tracked) binary file must be marked plain \"(binary)\": {preview}"
+    );
+    assert!(
+        !preview.contains("tracked.txt   (binary"),
+        "a text file must never be marked binary: {preview}"
+    );
+}
+
+#[tokio::test]
+async fn commit_preview_marks_an_untracked_binary_file_as_new() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    // A real compiled-Python artefact shape: untracked, NUL bytes.
+    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let seen = prompter.seen.lock().unwrap();
+    let preview = seen[0].preview.as_deref().unwrap();
+    assert!(
+        preview.contains("  x.pyc   (binary, new)"),
+        "an untracked binary file must be marked \"(binary, new)\": {preview}"
+    );
 }
 
 #[tokio::test]

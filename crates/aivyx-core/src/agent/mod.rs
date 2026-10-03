@@ -1930,6 +1930,7 @@ impl Agent {
         let mut command = tokio::process::Command::new(&scoped.spec.program);
         command
             .args(&args)
+            .envs(scoped.spec.env.iter().cloned())
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

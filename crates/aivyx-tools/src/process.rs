@@ -27,6 +27,15 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     pub timeout: Duration,
+    /// Extra `KEY=VALUE` pairs applied on top of the spawned process's
+    /// inherited environment (via `.envs(...)`, never replacing it — see
+    /// README's "Known limitations" on env vars being inherited by
+    /// default). Empty for every configured `allowed_commands` entry;
+    /// non-empty today only for the synthetic `detected-tests` entry
+    /// `--auto` builds (`PYTHONDONTWRITEBYTECODE=1`, so an unattended
+    /// verification run doesn't leave `__pycache__`/`.pyc` files behind in
+    /// the project).
+    pub env: Vec<(String, String)>,
 }
 
 enum RunOutcome {

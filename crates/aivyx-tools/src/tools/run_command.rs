@@ -110,6 +110,7 @@ impl Tool for RunCommandTool {
         let mut command = tokio::process::Command::new(&spec.program);
         command
             .args(&spec.args)
+            .envs(spec.env.iter().cloned())
             .current_dir(&ctx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -132,6 +133,23 @@ mod tests {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             timeout,
+            env: Vec::new(),
+        }
+    }
+
+    fn spec_with_env(
+        name: &str,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        env: &[(&str, &str)],
+    ) -> CommandSpec {
+        CommandSpec {
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..spec(name, program, args, timeout)
         }
     }
 
@@ -158,6 +176,22 @@ mod tests {
         };
         assert!(text.contains("exit status: 0 (success)"));
         assert!(text.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn spec_env_is_applied_to_the_spawned_process() {
+        let tool = RunCommandTool::new(vec![spec_with_env(
+            "echo_env",
+            "sh",
+            &["-c", "echo $FOO"],
+            Duration::from_secs(5),
+            &[("FOO", "bar")],
+        )]);
+
+        let ToolOutput::Ok(text) = run_tool(&tool, "echo_env").await.unwrap() else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("bar"));
     }
 
     #[tokio::test]
