@@ -437,8 +437,22 @@ impl SessionStore {
         metas
     }
 
+    /// Loads the conversation `id` names. A loaded `meta.id` of `""`
+    /// (a file that predates `SessionMeta`, or a hand-copied file) is
+    /// filled in with the requested `id` -- the same substitution `list()`
+    /// already makes from the file's stem, applied here from the caller's
+    /// own request instead, so a loaded state's `meta.id` always names the
+    /// file it actually came from. This matters to callers like
+    /// `Agent::restore_session`, which trusts `state.meta.id` to decide
+    /// whether it's resuming a real, addressable conversation or starting
+    /// fresh -- an empty id there would be misread as the latter even
+    /// though a real file, at a real path, was just loaded.
     pub fn load(&self, id: &str) -> Option<SessionState> {
-        load(&self.path_for(id))
+        let mut state = load(&self.path_for(id))?;
+        if state.meta.id.is_empty() {
+            state.meta.id = id.to_string();
+        }
+        Some(state)
     }
 
     /// Saves `state` to the path its own `meta.id` names -- callers set
@@ -898,5 +912,23 @@ mod tests {
         let b = SessionStore::new_id(1000);
         assert!(a.starts_with("1000-") && a.len() == "1000-".len() + 8);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn store_load_fills_in_an_empty_meta_id_from_the_requested_id() {
+        // A file with no `SessionMeta` (or a hand-copied one) has
+        // `meta.id == ""` on disk -- `list()` already papers over this by
+        // substituting the file's stem (see its own doc comment); `load`
+        // must do the same, since a caller like `restore_session` trusts
+        // the returned `state.meta.id` to be the id of the file it asked
+        // for, not an empty string that would be misread as "no id yet".
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("proj"));
+        let state = SessionState::new(vec![Message::text(Role::User, "hi")], vec![], false, vec![]);
+        assert!(state.meta.id.is_empty());
+        save(&store.path_for("stem-id"), &state).unwrap();
+
+        let loaded = store.load("stem-id").expect("file should load");
+        assert_eq!(loaded.meta.id, "stem-id");
     }
 }

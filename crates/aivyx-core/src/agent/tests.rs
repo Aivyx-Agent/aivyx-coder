@@ -8139,3 +8139,93 @@ async fn restore_session_continues_the_same_file() {
     assert_eq!(list[0].turns, 2);
     assert_eq!(list[0].first_user_text, "original");
 }
+
+// ---- sessions per project: fix round ----
+
+#[tokio::test]
+async fn restore_session_with_an_empty_meta_id_starts_a_new_file_not_the_previous_one() {
+    // `restore_session` must treat an empty `meta.id` as "no id yet" even
+    // when this agent already had a real id from an earlier conversation
+    // in the same process -- otherwise the next persist silently
+    // overwrites the previously open conversation's file instead of
+    // starting a fresh one.
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a"), text_response("b")]);
+    agent.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let original_id = store.list()[0].id.clone();
+
+    let empty_meta_state = crate::session::SessionState::new(
+        vec![user_msg("resumed but untracked")],
+        vec![],
+        false,
+        vec![],
+    );
+    assert!(empty_meta_state.meta.id.is_empty());
+    agent.restore_session(empty_meta_state);
+    agent.run_turn("after restore".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    let list = store.list();
+    assert_eq!(list.len(), 2, "the new conversation must not overwrite the previously open one");
+    let original = list
+        .iter()
+        .find(|m| m.id == original_id)
+        .expect("original file must survive unchanged");
+    assert_eq!(original.first_user_text, "original");
+    assert_eq!(original.turns, 1);
+}
+
+#[tokio::test]
+async fn b1_clear_on_a_fresh_store_agent_that_never_owned_a_conversation_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("unused")]);
+    agent.clear_conversation();
+    assert!(crate::session::SessionStore::new(store_dir).list().is_empty());
+}
+
+#[tokio::test]
+async fn b1_a_failed_turn_right_after_clear_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("before clear".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    agent.clear_conversation();
+
+    // `clear_conversation` reset this agent's own `session_owns_slot` to
+    // `false` (Store mode) -- swap in a failing backend, the same way the
+    // original b1_ tests do, to prove a failed turn right after `/clear`
+    // still respects that reset and writes nothing.
+    agent.llm = Arc::new(FailingBackend);
+    let err = agent
+        .run_turn("hello".into(), Path::new("."), CancellationToken::new())
+        .await;
+    assert!(err.is_err());
+
+    let store = crate::session::SessionStore::new(store_dir);
+    assert_eq!(store.list().len(), 1, "only the pre-clear conversation exists");
+    assert_eq!(store.list()[0].first_user_text, "before clear");
+}
+
+#[tokio::test]
+async fn b1_a_failed_turn_in_an_already_owned_store_conversation_updates_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("one".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let id = store.list()[0].id.clone();
+
+    agent.llm = Arc::new(FailingBackend);
+    let err = agent
+        .run_turn("two".into(), Path::new("."), CancellationToken::new())
+        .await;
+    assert!(err.is_err());
+
+    let list = store.list();
+    assert_eq!(list.len(), 1, "the failed turn must not mint a new file");
+    assert_eq!(list[0].id, id);
+    assert_eq!(list[0].first_user_text, "one");
+    assert_eq!(list[0].turns, 2);
+}

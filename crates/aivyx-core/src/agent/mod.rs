@@ -1209,17 +1209,22 @@ impl Agent {
     /// (a file that predates `SessionMeta`, or the legacy single-file
     /// layout before migration) is treated as "no id yet" — the same as a
     /// fresh conversation — since there's nothing real to continue
-    /// addressing by id.
+    /// addressing by id, and *unconditionally* overwrites whatever id this
+    /// agent already had: without that, resuming such a file onto an agent
+    /// that already owned a different, real conversation would silently
+    /// adopt the old id and overwrite that still-open conversation's file
+    /// on the next persist, rather than starting a fresh one. `created_unix`
+    /// is always taken from `meta` too (`0` when the id is empty — the
+    /// same "nothing real yet" value `set_session_store` starts with —
+    /// since `persist` fills in a real one the next time it mints an id).
     pub fn restore_session(&mut self, state: SessionState) {
         let meta = state.meta.clone();
         self.restore(state);
-        if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target
-            && !meta.id.is_empty()
-        {
-            *id = Some(meta.id.clone());
+        if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target {
+            *id = (!meta.id.is_empty()).then(|| meta.id.clone());
             *created_unix = meta.created_unix;
         }
-        self.first_user_text = Some(meta.first_user_text);
+        self.first_user_text = (!meta.first_user_text.is_empty()).then_some(meta.first_user_text);
     }
 
     /// A clone of the current conversation history. Used to persist a
@@ -1275,8 +1280,9 @@ impl Agent {
             }
             SessionTarget::Store { store, id, created_unix } => {
                 if id.is_none() {
-                    *id = Some(SessionStore::new_id(now_unix_ms()));
-                    *created_unix = now_unix();
+                    let ms = now_unix_ms();
+                    *id = Some(SessionStore::new_id(ms));
+                    *created_unix = ms / 1000;
                 }
                 let id = id.clone().unwrap_or_default();
                 state.meta = SessionMeta {
@@ -2884,9 +2890,13 @@ static LAST_SESSION_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::Atomic
 
 /// Millisecond-resolution now, for `SessionStore::new_id` (which keys on
 /// milliseconds so two conversations started close together still get
-/// distinct, time-ordered ids). `pub(super)` so `agent_builder.rs` (Task 4)
-/// can mint an id outside a persist call too, e.g. to show it before the
-/// first turn ever runs.
+/// distinct, time-ordered ids). `pub(super)`, not `pub` -- only
+/// `aivyx-core`'s own `agent` module and its siblings in this crate need
+/// it (today, just `persist` below); `agent_builder.rs` lives in a
+/// different crate (`crates/aivyx`) and couldn't call this even if it
+/// wanted to, so minting an id before the first turn ever runs, if that's
+/// ever needed there, would have to go through a new `pub` method on
+/// `Agent` instead of this function directly.
 ///
 /// Monotonic within this process: a plain wall-clock read is only
 /// millisecond-resolution, and two conversations can genuinely be minted
