@@ -165,19 +165,45 @@ struct KvCacheConfig {
     build_hash: String,
 }
 
-/// Where `persist()` writes the session. `File` is today's single-file-
+/// Where `persist()` writes the session. `File` is the single-file-
 /// per-project layout (`set_session_path`); `Store` is one file per
 /// conversation (`set_session_store`) -- `id` is `None` until the first
 /// successful persist mints one (`SessionStore::new_id`), after which
 /// every later persist in this conversation reuses it and overwrites the
 /// same file.
+///
+/// Several processes (two TUIs, a TUI and an ACP editor) can hold the
+/// same conversation, so `Store` also tracks what this process last saw
+/// of it: `known_revision` is the `SessionMeta::revision` it last loaded
+/// or wrote (a higher one on disk means another process wrote the file
+/// since, and `persist` forks instead of overwriting), and
+/// `saved_fingerprint` identifies the state it last loaded or wrote (an
+/// unchanged state is not written again, so merely viewing a
+/// conversation never touches its file).
 enum SessionTarget {
     File(PathBuf),
     Store {
         store: SessionStore,
         id: Option<String>,
         created_unix: i64,
+        known_revision: u64,
+        saved_fingerprint: Option<u64>,
     },
+}
+
+/// Shown once when `persist` finds that another process wrote the
+/// current conversation since this one last loaded or saved it, and
+/// saves this process's version as a new conversation instead.
+const FORKED_CONVERSATION_NOTICE: &str = "This conversation was changed by another aivyx-coder window, so it \
+                                          was saved as a new conversation (see /sessions).";
+
+/// Identifies a session's content, ignoring its header (`meta`), so
+/// `persist` can tell whether anything changed since the last load or
+/// save. Stable within a process, which is all it is compared across.
+fn state_fingerprint(state: &SessionState) -> u64 {
+    let mut state = state.clone();
+    state.meta = SessionMeta::default();
+    session::fnv1a(&serde_json::to_vec(&state).unwrap_or_default())
 }
 
 pub struct Agent {
@@ -633,9 +659,18 @@ impl Agent {
         self.undo.clear();
         self.pending_notes.clear();
         self.emit(AgentEvent::ConversationCleared);
+        self.history_truncated = false;
         if targets_store {
-            if let Some(SessionTarget::Store { id, .. }) = &mut self.session_target {
+            if let Some(SessionTarget::Store {
+                id,
+                known_revision,
+                saved_fingerprint,
+                ..
+            }) = &mut self.session_target
+            {
                 *id = None;
+                *known_revision = 0;
+                *saved_fingerprint = None;
             }
             self.first_user_text = None;
             self.session_owns_slot = false;
@@ -1182,6 +1217,8 @@ impl Agent {
             store,
             id: None,
             created_unix: 0,
+            known_revision: 0,
+            saved_fingerprint: None,
         });
     }
 
@@ -1261,9 +1298,16 @@ impl Agent {
     pub fn restore_session(&mut self, state: SessionState) {
         let meta = state.meta.clone();
         self.restore(state);
-        if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target {
+        if let Some(SessionTarget::Store {
+            id,
+            created_unix,
+            known_revision,
+            ..
+        }) = &mut self.session_target
+        {
             *id = (!meta.id.is_empty()).then(|| meta.id.clone());
             *created_unix = meta.created_unix;
+            *known_revision = meta.revision;
         }
         self.first_user_text = if meta.first_user_text.is_empty() {
             self.history
@@ -1273,6 +1317,26 @@ impl Agent {
         } else {
             Some(meta.first_user_text)
         };
+        self.mark_current_state_saved();
+    }
+
+    /// Records the state `persist` would write right now as already on
+    /// disk (`Store` mode with an id only), so the next persist writes
+    /// nothing unless the conversation actually changes. Called after
+    /// loading a conversation: a conversation that is only looked at is
+    /// never rewritten, which keeps its `updated_unix` (and its place in
+    /// `/sessions`) and never clobbers another process's newer turns.
+    fn mark_current_state_saved(&mut self) {
+        if !matches!(self.session_target, Some(SessionTarget::Store { id: Some(_), .. })) {
+            if let Some(SessionTarget::Store { saved_fingerprint, .. }) = &mut self.session_target {
+                *saved_fingerprint = None;
+            }
+            return;
+        }
+        let fingerprint = state_fingerprint(&self.snapshot_state());
+        if let Some(SessionTarget::Store { saved_fingerprint, .. }) = &mut self.session_target {
+            *saved_fingerprint = Some(fingerprint);
+        }
     }
 
     /// Fix-round regression fix: `set_session_store` then `restore_session`,
@@ -1349,11 +1413,13 @@ impl Agent {
 
         let specialist_sessions = state.specialist_sessions.clone();
         let plan_mode_active = state.plan_mode_active;
+        self.history_truncated = false;
         self.restore_session(state);
         self.plan_mode.set_active(plan_mode_active);
         if let Some(pool) = &self.specialist_session_pool {
             pool.seed_dehydrated(specialist_sessions);
         }
+        self.mark_current_state_saved();
 
         self.emit(AgentEvent::SessionSwitched {
             history: self.history.clone(),
@@ -1382,16 +1448,9 @@ impl Agent {
         self.history = history;
     }
 
-    /// Best-effort snapshot to disk. A persistence failure is logged, never
-    /// propagated — losing a save must not fail the user's turn.
-    ///
-    /// `&mut self`: `Store` mode mints a new conversation id (and records
-    /// `created_unix`) the first time this conversation persists, which
-    /// must stick for every later persist in the same conversation.
-    fn persist(&mut self) {
-        let Some(target) = &mut self.session_target else {
-            return;
-        };
+    /// The session as `persist` would write it, minus `meta` (which only
+    /// `Store` mode fills in).
+    fn snapshot_state(&self) -> SessionState {
         let tasks = self.tasks.lock().unwrap().clone();
         let specialist_sessions = self
             .specialist_session_pool
@@ -1406,33 +1465,88 @@ impl Agent {
         );
         state.undo = self.undo.clone();
         state.pending_notes = self.pending_notes.clone();
+        state
+    }
 
+    /// Best-effort snapshot to disk. A persistence failure is logged, never
+    /// propagated — losing a save must not fail the user's turn.
+    ///
+    /// `&mut self`: `Store` mode mints a new conversation id (and records
+    /// `created_unix`) the first time this conversation persists, which
+    /// must stick for every later persist in the same conversation.
+    ///
+    /// In `Store` mode another process may hold the same conversation, so
+    /// a save is guarded twice. A state identical to the one last loaded
+    /// or saved is not written at all. And before overwriting an existing
+    /// conversation, its on-disk `revision` is compared with the one this
+    /// process last loaded or wrote: if it is higher, another process has
+    /// written the file since, so this process's version is saved as a new
+    /// conversation (fresh id and `created_unix`, same first user text)
+    /// rather than overwriting those turns, and the user is told once.
+    /// Every save writes the next revision. A conversation file that has
+    /// disappeared (pruned or deleted) is simply written again.
+    fn persist(&mut self) {
+        if self.session_target.is_none() {
+            return;
+        }
+        let mut state = self.snapshot_state();
+        let first_user_text = self.first_user_text.clone().unwrap_or_default();
+        let Some(target) = &mut self.session_target else {
+            return;
+        };
+
+        let mut forked = false;
         match target {
             SessionTarget::File(path) => {
                 if let Err(err) = session::save(path, &state) {
                     tracing::warn!(error = %err, "failed to persist session");
                 }
             }
-            SessionTarget::Store { store, id, created_unix } => {
+            SessionTarget::Store {
+                store,
+                id,
+                created_unix,
+                known_revision,
+                saved_fingerprint,
+            } => {
+                let fingerprint = state_fingerprint(&state);
+                if id.is_some() && *saved_fingerprint == Some(fingerprint) {
+                    return;
+                }
+                if let Some(current) = id.as_deref()
+                    && store
+                        .load_meta(current)
+                        .is_some_and(|on_disk| on_disk.revision > *known_revision)
+                {
+                    *id = None;
+                    forked = true;
+                }
                 if id.is_none() {
                     let ms = now_unix_ms();
                     *id = Some(SessionStore::new_id(ms));
                     *created_unix = ms / 1000;
+                    *known_revision = 0;
                 }
-                let id = id.clone().unwrap_or_default();
+                let revision = *known_revision + 1;
                 state.meta = SessionMeta {
-                    id,
+                    id: id.clone().unwrap_or_default(),
                     created_unix: *created_unix,
                     updated_unix: now_unix(),
-                    first_user_text: self.first_user_text.clone().unwrap_or_default(),
+                    first_user_text,
                     turns: count_turns(&state.history),
+                    revision,
                 };
                 if let Err(err) = store.save(&state) {
                     tracing::warn!(error = %err, "failed to persist session");
                 } else {
+                    *known_revision = revision;
+                    *saved_fingerprint = Some(fingerprint);
                     store.prune(SESSIONS_KEPT);
                 }
             }
+        }
+        if forked {
+            self.info(FORKED_CONVERSATION_NOTICE);
         }
     }
 

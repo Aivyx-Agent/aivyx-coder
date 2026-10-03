@@ -8515,3 +8515,164 @@ async fn attach_store_and_resume_continues_the_same_file_after_one_turn() {
     assert_eq!(list[0].id, id);
     assert_eq!(list[0].turns, 2);
 }
+
+// ---- sessions per project: two processes on one conversation ----
+
+const FORK_NOTICE: &str = "This conversation was changed by another aivyx-coder window, so it was saved as a new \
+                           conversation (see /sessions).";
+
+fn history_texts(state: &crate::session::SessionState) -> Vec<String> {
+    state.history.iter().map(Message::text_content).collect()
+}
+
+#[tokio::test]
+async fn a_conversation_written_by_another_process_is_forked_not_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut a, mut rx_a) =
+        store_agent(&store_dir, vec![text_response("a1"), text_response("a2"), text_response("a3")]);
+    a.run_turn("from A".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+
+    let (mut b, _rx_b) = store_agent(&store_dir, vec![text_response("b1")]);
+    b.restore_session(store.load(&x).unwrap());
+    b.run_turn("from B".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    drain(&mut rx_a);
+    a.run_turn("A again".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    let on_disk = history_texts(&store.load(&x).unwrap());
+    assert!(on_disk.contains(&"from B".to_string()), "B's turn must survive on disk: {on_disk:?}");
+    assert!(!on_disk.contains(&"A again".to_string()), "A must not overwrite X: {on_disk:?}");
+
+    let list = store.list();
+    assert_eq!(list.len(), 2);
+    let forked = list.iter().find(|m| m.id != x).unwrap();
+    assert_eq!(a.current_session_id(), Some(forked.id.as_str()));
+    assert_eq!(forked.first_user_text, "from A");
+    let forked_texts = history_texts(&store.load(&forked.id).unwrap());
+    assert!(forked_texts.contains(&"A again".to_string()));
+    assert!(!forked_texts.contains(&"from B".to_string()));
+    assert_eq!(infos(&mut rx_a).iter().filter(|t| *t == FORK_NOTICE).count(), 1);
+
+    // Later turns continue the fork quietly: no second notice, no third file.
+    a.run_turn("A third".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    assert_eq!(store.list().len(), 2);
+    assert!(infos(&mut rx_a).iter().all(|t| t != FORK_NOTICE));
+}
+
+#[tokio::test]
+async fn a_look_only_clear_does_not_overwrite_another_processs_newer_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut a, _rx_a) = store_agent(&store_dir, vec![text_response("a1")]);
+    a.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+
+    let (mut viewer, _rx_v) = store_agent(&store_dir, vec![]);
+    viewer.restore_session(store.load(&x).unwrap());
+
+    let (mut b, _rx_b) = store_agent(&store_dir, vec![text_response("b1")]);
+    b.restore_session(store.load(&x).unwrap());
+    b.run_turn("from B".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let after_b = std::fs::read(store.path_for(&x)).unwrap();
+
+    viewer.clear_conversation();
+
+    assert_eq!(std::fs::read(store.path_for(&x)).unwrap(), after_b, "the viewer wrote nothing");
+    assert_eq!(store.list().len(), 1);
+}
+
+#[tokio::test]
+async fn a_look_only_switch_away_does_not_overwrite_another_processs_newer_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut a, _rx_a) = store_agent(&store_dir, vec![text_response("a1"), text_response("a2")]);
+    a.run_turn("conversation Y".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let y = store.list()[0].id.clone();
+    a.clear_conversation();
+    a.run_turn("conversation X".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+    assert_ne!(x, y);
+
+    let (mut viewer, _rx_v) = store_agent(&store_dir, vec![]);
+    viewer.restore_session(store.load(&x).unwrap());
+
+    let (mut b, _rx_b) = store_agent(&store_dir, vec![text_response("b1")]);
+    b.restore_session(store.load(&x).unwrap());
+    b.run_turn("from B".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let after_b = std::fs::read(store.path_for(&x)).unwrap();
+
+    assert!(viewer.switch_to(&y).await);
+
+    assert_eq!(std::fs::read(store.path_for(&x)).unwrap(), after_b, "the viewer wrote nothing to X");
+    assert_eq!(store.list().len(), 2);
+}
+
+#[tokio::test]
+async fn restoring_and_clearing_immediately_leaves_the_file_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut a, _rx_a) = store_agent(&store_dir, vec![text_response("a1")]);
+    a.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+    let before_meta = store.load(&x).unwrap().meta;
+    let before = std::fs::read(store.path_for(&x)).unwrap();
+    let before_mtime = std::fs::metadata(store.path_for(&x)).unwrap().modified().unwrap();
+
+    let (mut viewer, _rx_v) = store_agent(&store_dir, vec![]);
+    viewer.restore_session(store.load(&x).unwrap());
+    viewer.clear_conversation();
+
+    // A rewrite in the same second can reproduce identical bytes, so the
+    // file's own mtime is the proof that nothing was written at all.
+    assert_eq!(std::fs::metadata(store.path_for(&x)).unwrap().modified().unwrap(), before_mtime);
+
+    let after_meta = store.load(&x).unwrap().meta;
+    assert_eq!(after_meta.updated_unix, before_meta.updated_unix);
+    assert_eq!(after_meta.revision, before_meta.revision);
+    assert_eq!(std::fs::read(store.path_for(&x)).unwrap(), before);
+}
+
+#[tokio::test]
+async fn each_save_of_the_same_conversation_bumps_its_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut a, _rx_a) =
+        store_agent(&store_dir, vec![text_response("a1"), text_response("a2"), text_response("a3")]);
+    let mut revisions = Vec::new();
+    for text in ["one", "two", "three"] {
+        a.run_turn(text.into(), Path::new("."), CancellationToken::new()).await.unwrap();
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        revisions.push(list[0].revision);
+    }
+    assert_eq!(revisions, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn clear_resets_history_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut agent, _rx) = store_agent(&dir.path().join("proj"), vec![]);
+    agent.history_truncated = true;
+    agent.clear_conversation();
+    assert!(!agent.history_truncated);
+}
+
+#[tokio::test]
+async fn switching_conversations_resets_history_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a1")]);
+    agent.run_turn("one".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let x = store.list()[0].id.clone();
+    agent.history_truncated = true;
+    assert!(agent.switch_to(&x).await);
+    assert!(!agent.history_truncated);
+}

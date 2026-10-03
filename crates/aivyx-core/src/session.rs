@@ -137,6 +137,14 @@ pub struct SessionMeta {
     pub updated_unix: i64,
     pub first_user_text: String,
     pub turns: usize,
+    /// How many times this conversation's file has been written. Each
+    /// save writes one more than the revision the saving agent last
+    /// loaded or wrote, so an agent that finds a higher revision on disk
+    /// than it knows about can tell another process wrote the file in
+    /// the meantime (see `Agent::persist`). `#[serde(default)]` so files
+    /// written before this field existed load as revision 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// How many conversations `SessionStore::prune` keeps per project, newest
@@ -251,7 +259,7 @@ pub fn memory_dir_path() -> Option<PathBuf> {
 
 /// FNV-1a, inlined because the session key must be stable across program
 /// versions — `std`'s `DefaultHasher` explicitly does not guarantee that.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         hash ^= u64::from(b);
@@ -455,6 +463,14 @@ impl SessionStore {
         Some(state)
     }
 
+    /// Just the header of conversation `id`, or `None` when its file is
+    /// missing or unusable. Loads the whole file (headers aren't stored
+    /// separately) but hands back only `meta`, with the same empty-id
+    /// substitution `load` makes.
+    pub fn load_meta(&self, id: &str) -> Option<SessionMeta> {
+        self.load(id).map(|state| state.meta)
+    }
+
     /// Saves `state` to the path its own `meta.id` names -- callers set
     /// `state.meta.id` (and the rest of `meta`) before calling this, the
     /// same way the free `save(path, state)` takes its path from the
@@ -535,6 +551,7 @@ impl SessionStore {
                         .map(|m| preview_text(&m.text_content()))
                         .unwrap_or_default(),
                     turns: count_turns(&state.history),
+                    revision: 0,
                 };
                 self.save(&state)?;
                 std::fs::remove_file(legacy)?;
@@ -768,6 +785,7 @@ mod tests {
             updated_unix: updated,
             first_user_text: first.into(),
             turns: 1,
+            revision: 0,
         };
         s
     }

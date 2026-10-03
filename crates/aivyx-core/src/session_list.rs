@@ -105,6 +105,7 @@ mod tests {
                 updated_unix: NOW,
                 first_user_text: "fix it".into(),
                 turns: 6,
+                revision: 0,
             },
             SessionMeta {
                 id: "a".into(),
@@ -112,6 +113,7 @@ mod tests {
                 updated_unix: NOW - 86_400,
                 first_user_text: "hello".into(),
                 turns: 1,
+                revision: 0,
             },
         ];
         assert_eq!(
