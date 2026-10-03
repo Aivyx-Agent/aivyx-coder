@@ -43,6 +43,9 @@ const COMMIT_USAGE: &str = "Use /commit, or /commit -m \"message\".";
 const NOTHING_TO_COMMIT: &str = "Nothing to commit.";
 const COMMIT_CANCELLED: &str = "Commit cancelled — nothing was committed.";
 const WITHHELD: &str = " (contents withheld)";
+/// How long `git commit` (hooks included) may run — the git_commit tool's
+/// own limit.
+const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The hooks whose failure stops a `git commit`.
 const COMMIT_HOOKS: [&str; 3] = ["pre-commit", "prepare-commit-msg", "commit-msg"];
 /// Paths per `git reset`/`git rm --cached` call when unstaging, so a huge
@@ -186,10 +189,14 @@ async fn restore_staging(root: &Path, paths: &[String]) -> Result<(), String> {
 }
 
 impl Agent {
-    pub(super) async fn run_change_command(&mut self, command: ChangeCommand) {
+    pub(super) async fn run_change_command(
+        &mut self,
+        command: ChangeCommand,
+        cancellation: CancellationToken,
+    ) {
         match command {
             ChangeCommand::Diff { turn } => self.show_diff(turn).await,
-            ChangeCommand::Commit { message } => self.commit(message).await,
+            ChangeCommand::Commit { message } => self.commit(message, &cancellation).await,
             ChangeCommand::Usage(hint) => self.notify(hint),
         }
     }
@@ -261,6 +268,8 @@ impl Agent {
                 "core.quotePath=false",
                 "diff",
                 "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
                 &base,
                 &now,
             ],
@@ -283,12 +292,16 @@ impl Agent {
         });
     }
 
-    async fn commit(&mut self, message: Option<String>) {
+    async fn commit(&mut self, message: Option<String>, cancellation: &CancellationToken) {
         let Some(cwd) = self.executor.checkpoint_cwd().map(Path::to_path_buf) else {
             self.notify(NOT_A_REPO);
             return;
         };
-        if message.is_none() && self.command_prompter.is_none() {
+        // Both forms need a human at the keyboard: `/commit -m` skips the
+        // modal because the user typed the message, which only holds where
+        // there *is* a user (TUI, ACP) — never for a delegated sub-agent or
+        // an MCP session, whatever its executor is given.
+        if self.command_prompter.is_none() {
             self.notify("/commit isn't available here.");
             return;
         }
@@ -394,8 +407,18 @@ impl Agent {
                         return;
                     }
                 };
-                let draft = match self.draft_commit_message(&diff, &labels).await {
+                let draft = match self
+                    .draft_commit_message(&diff, &labels, cancellation)
+                    .await
+                {
                     Ok(draft) => draft,
+                    Err(_) if cancellation.is_cancelled() => {
+                        if let Err(e) = restore_staging(&root, &staged_by_us).await {
+                            self.notify(format!("Couldn't unstage the changes: {e}"));
+                        }
+                        self.info(COMMIT_CANCELLED);
+                        return;
+                    }
                     Err(reason) => {
                         let notice = format!(
                             "Couldn't draft a message ({reason}) — commit with /commit -m \"…\"."
@@ -404,7 +427,7 @@ impl Agent {
                         return;
                     }
                 };
-                if !self.confirm_commit(&draft, &labels).await {
+                if cancellation.is_cancelled() || !self.confirm_commit(&draft, &labels).await {
                     if let Err(e) = restore_staging(&root, &staged_by_us).await {
                         self.notify(format!("Couldn't unstage the changes: {e}"));
                     }
@@ -415,6 +438,11 @@ impl Agent {
             }
         };
 
+        if cancellation.is_cancelled() {
+            self.abandon_commit(&root, &staged_by_us, COMMIT_CANCELLED.to_string())
+                .await;
+            return;
+        }
         let confiner = self.executor.confiner();
         let args = [
             "commit".to_string(),
@@ -422,10 +450,29 @@ impl Agent {
             "-m".into(),
             message.clone(),
         ];
-        let output = aivyx_tools::confined_git(&args, &root, confiner.as_ref())
-            .kill_on_drop(true)
-            .output()
-            .await;
+        let mut command = aivyx_tools::confined_git(&args, &root, confiner.as_ref());
+        command.kill_on_drop(true);
+        // Bounded and cancellable like the git_commit tool: a hook that hangs
+        // must not wedge the session (dropping the future kills git).
+        let output = tokio::select! {
+            output = tokio::time::timeout(COMMIT_TIMEOUT, command.output()) => match output {
+                Ok(output) => output,
+                Err(_) => {
+                    self.abandon_commit(
+                        &root,
+                        &staged_by_us,
+                        format!("Couldn't commit: git took longer than {}s", COMMIT_TIMEOUT.as_secs()),
+                    )
+                    .await;
+                    return;
+                }
+            },
+            _ = cancellation.cancelled() => {
+                self.abandon_commit(&root, &staged_by_us, COMMIT_CANCELLED.to_string())
+                    .await;
+                return;
+            }
+        };
         let output = match output {
             Ok(output) => output,
             Err(e) => {
@@ -499,7 +546,12 @@ impl Agent {
     }
 
     /// One no-tools request for a commit message; the reason on failure.
-    async fn draft_commit_message(&self, diff: &str, files: &[String]) -> Result<String, String> {
+    async fn draft_commit_message(
+        &self,
+        diff: &str,
+        files: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<String, String> {
         let budget = (self.context_limit as usize) * 4 / 3;
         let user = trim_diff_for_prompt(diff, files, budget);
         let chars = COMMIT_DRAFT_PROMPT.chars().count() + user.chars().count();
@@ -512,7 +564,7 @@ impl Agent {
             session: None,
             estimated_prompt_tokens: (chars / 4) as u32,
         });
-        match collect_text(self.llm.as_ref(), request, &CancellationToken::new()).await {
+        match collect_text(self.llm.as_ref(), request, cancellation).await {
             Ok(text) => {
                 let draft = strip_think(&text).trim().to_string();
                 if draft.is_empty() {

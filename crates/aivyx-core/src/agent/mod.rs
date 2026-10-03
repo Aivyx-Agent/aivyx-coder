@@ -1582,7 +1582,7 @@ impl Agent {
         }
         // `/diff` and `/commit` likewise act on the worktree directly.
         if let Some(command) = change_commands::parse(&user_input) {
-            self.run_change_command(command).await;
+            self.run_change_command(command, cancellation.clone()).await;
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }
@@ -1642,6 +1642,8 @@ impl Agent {
                 "core.quotePath=false",
                 "diff",
                 "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
                 format,
                 before_oid,
                 after_oid,

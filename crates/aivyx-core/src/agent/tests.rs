@@ -6978,6 +6978,28 @@ async fn diff_shows_tracked_edits_and_untracked_files() {
 }
 
 #[tokio::test]
+async fn diff_never_runs_a_repo_configured_external_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let marker = cwd.join("ext-diff-ran");
+    let script = cwd.join("ext.sh");
+    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git_in(&cwd, &["config", "diff.external", script.to_str().unwrap()]).await;
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(!marker.exists(), "/diff ran the repo's external diff program");
+    let diffs = shown_diffs(&mut rx);
+    assert!(diffs[0].1.contains("+v2"), "{diffs:?}");
+}
+
+#[tokio::test]
 async fn diff_in_a_clean_repo_says_so() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
@@ -7302,6 +7324,7 @@ async fn commit_rejected_by_a_hook_reports_it_and_restores_staging() {
     let status_before = git_text(&cwd, &["status", "--porcelain"]).await;
     let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
 
+    agent.set_command_prompter(scripted(vec![]));
     agent.run_turn("/commit -m \"Blocked\"".into(), &cwd, CancellationToken::new()).await.unwrap();
 
     let notes = notices(&mut rx);
@@ -7433,6 +7456,39 @@ async fn commit_outside_a_repository_or_without_a_prompter() {
     assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
 }
 
+#[tokio::test]
+async fn commit_with_a_message_still_needs_a_human() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let before = commit_count(&cwd).await;
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.run_turn("/commit -m \"sneaky\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["/commit isn't available here.".to_string()]);
+    assert_eq!(commit_count(&cwd).await, before, "nothing committed");
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "?? new.txt\n");
+}
+
+#[tokio::test]
+async fn commit_cancelled_while_drafting_commits_nothing_and_restores_staging() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let before = commit_count(&cwd).await;
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    let cancellation = CancellationToken::new();
+    cancellation.cancel(); // the user pressed Ctrl+C while the draft was being written
+    agent.run_turn("/commit".into(), &cwd, cancellation).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, before, "nothing committed");
+    assert_eq!(git_text(&cwd, &["diff", "--cached", "--name-only"]).await, "", "staging restored");
+    assert!(prompter.seen.lock().unwrap().is_empty(), "no prompt after a cancel");
+    assert_eq!(infos(&mut rx), vec!["Commit cancelled — nothing was committed.".to_string()]);
+}
+
 /// An undo agent whose checkpointer and executor carry `deny`.
 async fn commit_agent_with_deny(
     dir: &Path,
@@ -7536,6 +7592,7 @@ async fn commit_refuses_when_the_git_dir_is_outside_the_write_sandbox() {
 
     // Sandboxed at the root, the same commit goes through.
     let (mut agent, _rx) = undo_agent_over(&root, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
     agent.set_write_sandbox(Some(root.clone()));
     agent.run_turn("/commit -m \"x\"".into(), &root, CancellationToken::new()).await.unwrap();
     assert_eq!(commit_count(&root).await, 2);
@@ -7551,6 +7608,7 @@ async fn commit_refused_by_git_itself_is_not_blamed_on_a_hook() {
     std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
     let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
 
+    agent.set_command_prompter(scripted(vec![]));
     agent.run_turn("/commit -m \"Signed\"".into(), &cwd, CancellationToken::new()).await.unwrap();
 
     let notes = notices(&mut rx);
