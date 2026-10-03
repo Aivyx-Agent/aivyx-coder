@@ -180,7 +180,19 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
                 "{title}\n\n{fence}diff\n{text}\n{fence}"
             )))
         }
-        AgentEvent::TestOutput(_) | AgentEvent::TestFinished { .. } => return None,
+        // Streaming every line would flood the editor's chat; the result
+        // line plus the last lines, fenced, is what the person needs.
+        AgentEvent::TestOutput(_) => return None,
+        AgentEvent::TestFinished { summary, tail } => {
+            if tail.is_empty() {
+                SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{summary}")))
+            } else {
+                let fence = "`".repeat(longest_backtick_run(tail).max(2) + 1);
+                SessionUpdate::AgentMessageChunk(text_chunk(format!(
+                    "\n\n{summary}\n\n{fence}text\n{tail}\n{fence}"
+                )))
+            }
+        }
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
             AcpToolCall::new(call.id.0.clone(), call.name.clone())
                 .kind(tool_kind(&call.name))
@@ -369,6 +381,31 @@ mod tests {
             }
             other => panic!("expected AgentMessageChunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_output_is_not_streamed_but_the_result_carries_a_fenced_tail() {
+        assert!(translate_event(&sid(), &AgentEvent::TestOutput("x".into())).is_none());
+        let update = translate_event(
+            &sid(),
+            &AgentEvent::TestFinished {
+                summary: "Tests failed (exit 1, 2.0 s)".into(),
+                tail: "a ``` b\nFAILED".into(),
+            },
+        )
+        .unwrap();
+        let text = match update {
+            SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
+                ContentBlock::Text(t) => t.text,
+                other => panic!("expected Text content, got {other:?}"),
+            },
+            other => panic!("expected AgentMessageChunk, got {other:?}"),
+        };
+        assert!(
+            text.starts_with("\n\nTests failed (exit 1, 2.0 s)\n\n````text\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("FAILED\n````"), "{text}");
     }
 
     #[test]

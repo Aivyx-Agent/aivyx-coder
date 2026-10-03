@@ -234,7 +234,14 @@ enum ChatLine {
     /// change summary) — dim and unprefixed: not an error, so never the
     /// red/bold `Notice` style.
     Info(String),
+    /// `/test` output as it streams: only the newest
+    /// [`TEST_VISIBLE_LINES`] are kept, `dropped` counts the rest.
+    TestOutput { lines: std::collections::VecDeque<String>, dropped: usize },
 }
+
+/// `/test` output lines kept visible in a `ChatLine::TestOutput` block
+/// before the oldest start being dropped (and counted in `dropped`).
+const TEST_VISIBLE_LINES: usize = 200;
 
 /// Configures an unattended `--auto` session (ROADMAP.md Phase 11c). `tasks`
 /// is a clone of the same `Arc<Mutex<Vec<Task>>>` handle already shared
@@ -343,6 +350,18 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+
+    // Computed from `agent` before it moves into the background task below
+    // — there is no other point after this where the render loop (which
+    // owns `app`) still has access to it.
+    let tests_line = aivyx_core::test_detect::status_line(agent.tests());
+    let mut app = App::new(restored, plan_mode);
+    app.tests_line = tests_line;
+    if autonomous.is_some()
+        && let Some(t) = agent.tests()
+    {
+        app.transcript.push(ChatLine::Info(t.auto_line()));
+    }
 
     let background_cancellation = Arc::clone(&active_cancellation);
     tokio::spawn(async move {
@@ -455,7 +474,6 @@ pub async fn run(
     std::io::stdout().flush().ok();
 
     let mut guard = TerminalGuard::init()?;
-    let mut app = App::new(restored, plan_mode);
     let mut crossterm_events = EventStream::new();
 
     loop {
@@ -540,6 +558,13 @@ pub async fn run(
                                 }
                                 if aivyx_core::commands::parse_slash_command(&text, "/help").is_some() {
                                     app.show_help();
+                                } else if aivyx_core::commands::parse_slash_command(&text, "/test").is_some()
+                                    && active_cancellation.lock().unwrap().is_some()
+                                {
+                                    app.transcript.push(ChatLine::Info(
+                                        "Wait for the reply to finish (or press Ctrl+C) first."
+                                            .to_string(),
+                                    ));
                                 } else {
                                     app.push_user_message(text.clone());
                                     let _ = input_tx.send(text);
@@ -643,6 +668,11 @@ struct App {
     /// The full-screen `/diff` pager, while it's open. Never open at the
     /// same time as `pending_permission`.
     diff_view: Option<DiffView>,
+    /// `aivyx_core::test_detect::status_line(agent.tests())`, computed once
+    /// in `run()` before `agent` moves into the background task — shown in
+    /// the welcome hint and appended to `/help`. Defaults to an empty
+    /// string here; `run()` always overwrites it before the first render.
+    tests_line: String,
 }
 
 impl App {
@@ -672,6 +702,7 @@ impl App {
             turn_had_model_activity: false,
             cancel_requested: false,
             diff_view: None,
+            tests_line: String::new(),
         }
     }
 
@@ -790,7 +821,7 @@ impl App {
     /// (U4/U5) -- deliberately not `Notice` (see that variant's doc
     /// comment).
     fn show_help(&mut self) {
-        self.transcript.push(ChatLine::Help(help_text()));
+        self.transcript.push(ChatLine::Help(help_text(&self.tests_line)));
     }
 
     /// Slash-command suggestions for the input box's current
@@ -927,8 +958,23 @@ impl App {
                     });
                 }
             }
-            AgentEvent::TestOutput(line) => self.transcript.push(ChatLine::Info(line)),
-            AgentEvent::TestFinished { summary, .. } => self.transcript.push(ChatLine::Info(summary)),
+            AgentEvent::TestOutput(line) => {
+                if let Some(ChatLine::TestOutput { lines, dropped }) = self.transcript.last_mut() {
+                    lines.push_back(line);
+                    if lines.len() > TEST_VISIBLE_LINES {
+                        lines.pop_front();
+                        *dropped += 1;
+                    }
+                } else {
+                    self.transcript.push(ChatLine::TestOutput {
+                        lines: std::collections::VecDeque::from([line]),
+                        dropped: 0,
+                    });
+                }
+            }
+            AgentEvent::TestFinished { summary, .. } => {
+                self.transcript.push(ChatLine::Info(summary));
+            }
         }
     }
 
@@ -970,7 +1016,7 @@ impl App {
             .flat_map(chat_line_to_lines)
             .collect();
         if !self.transcript.iter().any(|l| matches!(l, ChatLine::User(_))) {
-            lines.extend(first_message_hint());
+            lines.extend(first_message_hint(&self.tests_line));
         }
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
@@ -1388,7 +1434,7 @@ fn new_input_box() -> TextArea<'static> {
 /// one line pointing at the real undo mechanism (git-ref checkpoints) --
 /// included unconditionally since there is no in-app undo command yet;
 /// remove this line if one is ever added.
-fn help_text() -> String {
+fn help_text(tests_line: &str) -> String {
     let mut lines = vec!["Available commands:".to_string()];
     for cmd in aivyx_core::commands::COMMANDS {
         lines.push(format!("  {} — {}", cmd.name, cmd.description));
@@ -1400,11 +1446,13 @@ fn help_text() -> String {
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
     lines.push("  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
+    lines.push(String::new());
+    lines.push(tests_line.to_string());
     lines.join("\n")
 }
 
 /// Shown until the first message: what to type, and what happens next.
-fn first_message_hint() -> Vec<Line<'static>> {
+fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     [
         "",
@@ -1412,10 +1460,11 @@ fn first_message_hint() -> Vec<Line<'static>> {
         "  \"the tests in calc.py fail — find out why and fix it\"",
         "  \"explain how the config file is loaded\"",
         "Every file edit and command waits for your approval ([y] to allow).",
+        tests_line,
         "/help lists commands · Ctrl+C quits",
     ]
     .into_iter()
-    .map(|t| Line::from(t).style(dim))
+    .map(|t| Line::from(t.to_string()).style(dim))
     .collect()
 }
 
@@ -1735,6 +1784,14 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
         ),
+        ChatLine::TestOutput { lines, dropped } => {
+            let mut text = String::new();
+            if *dropped > 0 {
+                text.push_str(&format!("… {dropped} earlier lines\n"));
+            }
+            text.push_str(&Vec::from(lines.clone()).join("\n"));
+            prefixed_lines(&text, "  │ ", Style::default().fg(Color::DarkGray))
+        }
     }
 }
 
@@ -2994,7 +3051,7 @@ mod tests {
 
     #[test]
     fn help_text_lists_real_keybindings_and_the_undo_commands() {
-        let text = help_text();
+        let text = help_text("");
         assert!(text.contains("Keys:"));
         assert!(text.contains("Enter") && text.contains("send"));
         assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
@@ -3016,6 +3073,40 @@ mod tests {
         // Undo is an in-app command now, not a pointer to the README.
         assert!(text.contains("/undo") && text.contains("/redo") && text.contains("/checkpoints"));
         assert!(!text.contains("Worktree checkpoints"));
+    }
+
+    #[test]
+    fn help_and_welcome_show_the_test_command() {
+        let line = "Tests: `cargo test` (detected from Cargo.toml) — run them with /test";
+        assert!(help_text(line).ends_with(line));
+        let hint: Vec<String> = first_message_hint(line)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(hint.iter().any(|l| l == line), "{hint:?}");
+    }
+
+    #[test]
+    fn test_output_streams_into_one_block_that_keeps_the_last_200_lines() {
+        let mut app = App::new(None, PlanMode::new());
+        for i in 1..=250 {
+            app.handle_agent_event(AgentEvent::TestOutput(format!("line{i}")));
+        }
+        assert_eq!(app.transcript.len(), 1);
+        let ChatLine::TestOutput { lines, dropped } = &app.transcript[0] else {
+            panic!("expected a TestOutput block");
+        };
+        assert_eq!(lines.len(), 200);
+        assert_eq!(*dropped, 50);
+        assert_eq!(lines.front().unwrap(), "line51");
+
+        app.handle_agent_event(AgentEvent::TestFinished {
+            summary: "Tests passed (1.0 s)".into(),
+            tail: String::new(),
+        });
+        app.handle_agent_event(AgentEvent::TestOutput("again".into()));
+        assert!(matches!(&app.transcript[1], ChatLine::Info(t) if t == "Tests passed (1.0 s)"));
+        assert!(matches!(&app.transcript[2], ChatLine::TestOutput { lines, .. } if lines.len() == 1));
     }
 
     #[test]
