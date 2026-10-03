@@ -311,7 +311,11 @@ profile: `write_file`/`edit_file` are auto-allowed only when the resolved
 target is inside the process's `cwd` (a new boundary check — file edits
 have no Landlock scoping the way spawned commands do) and outside
 `deny_paths`; `run_command` is auto-allowed only for a pre-seeded
-`allowed_commands` entry; `run_shell`, `git_commit`, and `repl_start` are
+`allowed_commands` entry (under `--auto` with no `[verification] command`
+configured, this includes the synthetic `detected-tests` entry — see
+"Enforced verification"/`/test` above — but that grants the model no new
+capability, since auto-verify already runs that exact command itself);
+`run_shell`, `git_commit`, and `repl_start` are
 hidden from the model entirely and denied at the gate as a backstop if
 invoked anyway (`git_commit`'s target is never cacheable, so it falls out
 of the same cache-miss-denies rule with no special-casing). `repl_send`/
@@ -333,10 +337,14 @@ notice: it rewinds the worktree to the checkpoint taken before that batch
 of edits, discarding the failed experiment, and continues with remaining
 budget. Because auto-approving edits is only safe with a deterministic
 keep/discard signal, `--auto` verifies with the configured `[verification]
-command` when there is one, else whatever `/test` would use — a detected
-test command, announced at startup as
-`` Verifying with `cargo test` (detected from Cargo.toml) `` — and refuses
-to start only when neither exists. Config:
+command` when there is one and it names a real `allowed_commands` entry,
+else whatever `/test` would use — a detected test command, announced at
+startup as `` Verifying with `cargo test` (detected from Cargo.toml) ``.
+It refuses to start outright, rather than silently running unverified or
+verifying with the wrong thing, in any of three cases: nothing is
+configured or detected; `[verification] command` names no real entry (a
+typo must never be mistaken for "use detection instead"); or detection
+would need the name `detected-tests` and an entry already has it. Config:
 
 ```toml
 [autonomous]
@@ -1821,7 +1829,12 @@ Every tool call passes through the gate before it runs:
 6. **Pre-approved commands**: entries in `permissions.allowed_commands` are
    seeded into the Always-Allow cache at startup, so a command you already
    trusted by writing it into config runs without a prompt. This is the
-   command-level allowlist tier.
+   command-level allowlist tier. Under `--auto` with no `[verification]
+   command` configured, a detected test command is seeded the same way, as
+   a synthetic `detected-tests` entry (see "Autonomous mode" above) — this
+   lets the model run that one command via `run_command` too, but grants no
+   new capability, since auto-verify already runs it unconditionally after
+   every batch of edits.
 
 **Files that run code later** (`runs_code_later`, audit finding M1,
 2026-10-02): a shell startup file (`~/.bashrc`, `~/.zshrc`, `~/.profile`,
@@ -2067,8 +2080,11 @@ Deliberately not (yet) addressed — documented rather than hidden:
   said X" from "a file said X." The system prompt instructs the model to treat
   such content as data, not instructions, but this is a mitigation, not a
   guarantee. Be especially careful pointing the agent at untrusted repositories
-  while `allowed_commands` is configured, since a pre-approved command runs
-  without a per-invocation prompt. The heuristic injection scan (phrase-list
+  while `allowed_commands` is configured — including, under `--auto`, the
+  synthetic `detected-tests` entry added automatically when no
+  `[verification] command` is set (see "Autonomous mode" above) — since a
+  pre-approved command runs without a per-invocation prompt. The heuristic
+  injection scan (phrase-list
   matching over tool results as they re-enter context, `aivyx-injection-guard`)
   runs in every mode, on top of the mitigation above, but it's a
   pattern-based heuristic, not a structural fix, and its response to a hit

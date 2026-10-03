@@ -12,6 +12,13 @@ const MAX_READ_BYTES: u64 = 256 * 1024;
 pub const NO_TESTS_FOUND: &str =
     "No test command found — set [verification] command in config.toml";
 
+/// How long `/test` may run, in seconds, before it's killed — the single
+/// source of truth for both `agent/test_command.rs`'s own `TEST_TIMEOUT`
+/// and the `timeout_secs` on the synthetic `detected-tests`
+/// `allowed_commands` entry `--auto` adds when it falls back to a
+/// detected command (`agent_builder.rs`'s `auto_verification`).
+pub const TEST_TIMEOUT_SECS: u64 = 600;
+
 /// What detection found: a command (direct exec, no shell) and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedTests {
@@ -309,5 +316,14 @@ mod tests {
             source: TestSource::Config,
         };
         assert_eq!(tests.display(), r#"sh -c 'pytest -k '\''a b'\''' ''"#);
+    }
+
+    /// `TEST_TIMEOUT_SECS` is the single source of truth for /test's
+    /// 10-minute timeout — `agent/test_command.rs`'s `TEST_TIMEOUT` and the
+    /// synthetic `detected-tests` entry's `timeout_secs` (`agent_builder.rs`'s
+    /// `auto_verification`) both read it rather than each hard-coding `600`.
+    #[test]
+    fn test_timeout_secs_is_ten_minutes() {
+        assert_eq!(TEST_TIMEOUT_SECS, 600);
     }
 }

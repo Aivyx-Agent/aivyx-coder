@@ -56,19 +56,46 @@ pub(crate) struct AutoVerification {
     pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
 }
 
-/// `--auto`'s test-command resolution: a configured name always wins (and,
-/// if it matches no real `allowed_commands` entry, still disables
-/// verification with a warning further down — unchanged from before this
-/// existed); absent that, a detected command becomes a synthetic
-/// `detected-tests` entry so `run_command`'s own trust tier still applies
-/// to it; absent both, `--auto` cannot proceed; see README's "Enforced
-/// verification"/"Autonomous mode" for why a deterministic verify step is
-/// what makes auto-approving edits defensible at all.
+/// `--auto`'s test-command resolution: a configured name must resolve to
+/// a real `allowed_commands` entry, or `--auto` refuses to start outright
+/// — a typo'd name silently falling back to a detected command would
+/// leave the startup announcement (`EffectiveTests::auto_line`, driven by
+/// `tests`, which already fell back to detection) disagreeing with what
+/// verification would actually have run, had the name matched. (Review
+/// finding, Important, review of 604b0b7: this overrides an earlier,
+/// looser plan that kept today's warn-and-disable behaviour for `--auto`
+/// too — interactive/ACP/MCP-server runs still keep that behaviour,
+/// unchanged, since none of them call this function.) Absent a configured
+/// name, a detected command becomes a synthetic `detected-tests` entry so
+/// `run_command`'s own trust tier still applies to it — unless an entry
+/// already has that exact name, in which case `--auto` refuses rather
+/// than silently adding a confusing second, synthetic one of the same
+/// name. Absent both a configured name and a detected command, `--auto`
+/// cannot proceed either. See README's "Enforced verification"/
+/// "Autonomous mode" for why a deterministic verify step is what makes
+/// auto-approving edits defensible at all.
+///
+/// Because of the two refusals above, whenever this returns `Ok`,
+/// `command_name` is guaranteed to name an entry that's actually present
+/// in the allowed-commands list the caller builds from
+/// `synthetic_entry` (`effective_allowed_commands`) — so the
+/// `verification` tuple built from it downstream never silently
+/// mismatches, and `agent.tests()`'s own announcement (built from the
+/// same `tests` this function was given) always describes the same
+/// command that ends up enabled.
 pub(crate) fn auto_verification(
     configured_name: Option<&str>,
+    allowed_command_names: &[String],
     tests: Option<&aivyx_core::test_detect::EffectiveTests>,
 ) -> anyhow::Result<AutoVerification> {
     if let Some(name) = configured_name {
+        if !allowed_command_names.iter().any(|n| n == name) {
+            anyhow::bail!(
+                "--auto: [verification] command = \"{name}\" doesn't match any \
+                 [[permissions.allowed_commands]] entry name — fix the name, or remove it to \
+                 use the detected test command."
+            );
+        }
         return Ok(AutoVerification {
             command_name: name.to_string(),
             synthetic_entry: None,
@@ -76,13 +103,20 @@ pub(crate) fn auto_verification(
     }
     match tests {
         Some(tests) if matches!(tests.source, aivyx_core::test_detect::TestSource::Detected(_)) => {
+            if allowed_command_names.iter().any(|n| n == DETECTED_TESTS_ENTRY) {
+                anyhow::bail!(
+                    "--auto: an [[permissions.allowed_commands]] entry is already named \
+                     \"{DETECTED_TESTS_ENTRY}\" — set [verification] command = \
+                     \"{DETECTED_TESTS_ENTRY}\" to use it, or rename it."
+                );
+            }
             Ok(AutoVerification {
                 command_name: DETECTED_TESTS_ENTRY.to_string(),
                 synthetic_entry: Some(aivyx_config::AllowedCommand {
                     name: DETECTED_TESTS_ENTRY.to_string(),
                     program: tests.program.clone(),
                     args: tests.args.clone(),
-                    timeout_secs: Some(600),
+                    timeout_secs: Some(aivyx_core::test_detect::TEST_TIMEOUT_SECS),
                 }),
             })
         }
@@ -91,6 +125,26 @@ pub(crate) fn auto_verification(
              in a project with a recognised test setup."
         ),
     }
+}
+
+/// `configured`, extended with `--auto`'s synthetic `detected-tests` entry
+/// when `auto_verification` produced one. A small pure helper (Review
+/// finding, Minor, review of 604b0b7) so the allowed-commands-list-plus-
+/// optional-synthetic-entry construction `build_agent` needs is testable
+/// on its own, independent of `Settings`/`Cli`/the rest of agent
+/// construction. Every consumer of the allowed-commands trust tier
+/// (`command_specs`, and therefore `pre_approved_commands`/the
+/// Always-Allow cache seed and `RunCommandTool`'s own registration) is
+/// built from this single list in `build_agent`, so the synthetic entry
+/// (when present) is honored everywhere `run_command` itself is, not just
+/// at the verification call site.
+pub(crate) fn effective_allowed_commands(
+    configured: &[aivyx_config::AllowedCommand],
+    synthetic_entry: Option<&aivyx_config::AllowedCommand>,
+) -> Vec<aivyx_config::AllowedCommand> {
+    let mut allowed = configured.to_vec();
+    allowed.extend(synthetic_entry.cloned());
+    allowed
 }
 
 /// Everything a frontend needs to start driving a fully-configured
@@ -383,29 +437,31 @@ pub(crate) async fn build_agent(
     // Auto-approving edits is only defensible because deterministic
     // verification is the safety net — without it, "autonomous" would mean
     // "unchecked." Refuse to start rather than run degraded. A configured
-    // `[verification] command` always wins; absent that, a detected test
-    // command becomes `--auto`'s fallback via a synthetic `allowed_commands`
-    // entry (`DETECTED_TESTS_ENTRY`) — see `auto_verification`.
+    // `[verification] command` always wins, but must actually name a real
+    // entry (see `auto_verification`'s own doc comment); absent a
+    // configured name, a detected test command becomes `--auto`'s
+    // fallback via a synthetic `allowed_commands` entry
+    // (`DETECTED_TESTS_ENTRY`).
+    let allowed_command_names: Vec<String> = settings
+        .permissions
+        .allowed_commands
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
     let auto = if cli.auto.is_some() {
         Some(auto_verification(
             settings.verification.command.as_deref(),
+            &allowed_command_names,
             tests.as_ref(),
         )?)
     } else {
         None
     };
 
-    // `settings.permissions.allowed_commands`, extended with `--auto`'s
-    // synthetic `detected-tests` entry when one was produced above. Every
-    // consumer of the allowed-commands trust tier (`command_specs` below,
-    // and therefore `pre_approved_commands`/the Always-Allow cache seed and
-    // `RunCommandTool`'s own registration further down) is built from this
-    // single extended list, so the synthetic entry is honored everywhere
-    // `run_command` itself is, not just by the verification call site.
-    let mut allowed_commands = settings.permissions.allowed_commands.clone();
-    if let Some(auto) = &auto {
-        allowed_commands.extend(auto.synthetic_entry.clone());
-    }
+    let allowed_commands = effective_allowed_commands(
+        &settings.permissions.allowed_commands,
+        auto.as_ref().and_then(|a| a.synthetic_entry.as_ref()),
+    );
 
     let command_specs: Vec<CommandSpec> = allowed_commands
         .iter()
@@ -1924,31 +1980,106 @@ tool_allowlist = []
         }
     }
 
+    fn names(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn auto_uses_the_configured_name_first() {
-        let auto = auto_verification(Some("tests"), Some(&detected("cargo"))).unwrap();
+        let auto =
+            auto_verification(Some("tests"), &names(&["tests"]), Some(&detected("cargo")))
+                .unwrap();
         assert_eq!(auto.command_name, "tests");
         assert!(auto.synthetic_entry.is_none());
     }
 
     #[test]
     fn auto_falls_back_to_the_detected_command() {
-        let auto = auto_verification(None, Some(&detected("cargo"))).unwrap();
+        let auto = auto_verification(None, &names(&[]), Some(&detected("cargo"))).unwrap();
         assert_eq!(auto.command_name, DETECTED_TESTS_ENTRY);
         let entry = auto.synthetic_entry.unwrap();
         assert_eq!(entry.name, DETECTED_TESTS_ENTRY);
         assert_eq!(entry.program, "cargo");
         assert_eq!(entry.args, vec!["test".to_string()]);
-        assert_eq!(entry.timeout_secs, Some(600));
+        assert_eq!(
+            entry.timeout_secs,
+            Some(aivyx_core::test_detect::TEST_TIMEOUT_SECS)
+        );
     }
 
     #[test]
     fn auto_refuses_with_nothing_configured_or_found() {
-        let err = auto_verification(None, None).unwrap_err().to_string();
+        let err = auto_verification(None, &names(&[]), None).unwrap_err().to_string();
         assert_eq!(
             err,
             "--auto needs a test command: set [verification] command in config.toml, or run it \
              in a project with a recognised test setup."
         );
+    }
+
+    /// Review finding (Important, review of 604b0b7): a typo'd
+    /// `[verification] command` must not silently fall through to
+    /// detection under `--auto` — that would leave the TUI announcing
+    /// "Verifying with <detected command>" while the configured name (not
+    /// the detected one) is what `agent.set_verification` would actually
+    /// have used, had it matched. Refusing to start keeps the
+    /// announcement and the enabled verification in agreement in every
+    /// case `--auto` actually runs.
+    #[test]
+    fn auto_refuses_when_the_configured_name_matches_no_entry() {
+        let err = auto_verification(Some("tset"), &names(&["tests"]), Some(&detected("cargo")))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "--auto: [verification] command = \"tset\" doesn't match any \
+             [[permissions.allowed_commands]] entry name — fix the name, or remove it to use \
+             the detected test command."
+        );
+    }
+
+    /// Review finding (Minor, review of 604b0b7): if the user already has
+    /// an `allowed_commands` entry literally named `detected-tests`,
+    /// silently adding a *second*, synthetic one of the same name would
+    /// either shadow it or collide in the Always-Allow cache depending on
+    /// lookup order — ambiguous either way. Refuse instead of guessing.
+    #[test]
+    fn auto_refuses_when_detected_tests_name_is_already_taken() {
+        let err = auto_verification(
+            None,
+            &names(&[DETECTED_TESTS_ENTRY]),
+            Some(&detected("cargo")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "--auto: an [[permissions.allowed_commands]] entry is already named \
+             \"detected-tests\" — set [verification] command = \"detected-tests\" to use it, or \
+             rename it."
+        );
+    }
+
+    #[test]
+    fn effective_allowed_commands_without_auto_is_exactly_the_configured_list() {
+        let configured = vec![allowed_command("lint", "cargo", &["clippy"])];
+        assert_eq!(effective_allowed_commands(&configured, None), configured);
+    }
+
+    #[test]
+    fn effective_allowed_commands_with_detection_fallback_appends_detected_tests() {
+        let configured = vec![allowed_command("lint", "cargo", &["clippy"])];
+        let synthetic = allowed_command(DETECTED_TESTS_ENTRY, "cargo", &["test"]);
+        let result = effective_allowed_commands(&configured, Some(&synthetic));
+        assert_eq!(result, vec![configured[0].clone(), synthetic]);
+    }
+
+    fn allowed_command(name: &str, program: &str, args: &[&str]) -> aivyx_config::AllowedCommand {
+        aivyx_config::AllowedCommand {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            timeout_secs: None,
+        }
     }
 }

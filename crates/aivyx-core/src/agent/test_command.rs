@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use super::Agent;
 use crate::agent::AgentEvent;
 
-pub(super) const TEST_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const TEST_TIMEOUT: Duration =
+    Duration::from_secs(crate::test_detect::TEST_TIMEOUT_SECS);
 const NOTE_LINES: usize = 80;
 const MAX_LINE_CHARS: usize = 2000;
 /// Per-line cap *while reading*, in bytes — generous relative to

@@ -1002,7 +1002,7 @@ impl Default for PermissionSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllowedCommand {
     pub name: String,
     pub program: String,
