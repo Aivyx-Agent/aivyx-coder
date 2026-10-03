@@ -94,6 +94,9 @@ use aivyx_types::{MissionPlan, Task};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::commands::{
+    LocalCommand, acp_local_command, available_commands_update, clear_update, help_update,
+};
 use crate::prompter::{AcpPrompter, PrompterInstaller};
 
 const MODE_CODE: &str = "code";
@@ -332,6 +335,14 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 });
                 drop(guard);
                 new_session_exists.store(true, Ordering::Release);
+                // Tells the editor's own command picker what this agent
+                // supports before the first prompt ever goes out — see
+                // `commands.rs`'s `available_commands_update` doc comment
+                // for exactly which commands that is and why.
+                let _ = connection.send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    available_commands_update(),
+                ));
                 let modes = SessionModeState::new(
                     SessionModeId::new(MODE_CODE),
                     vec![
@@ -376,6 +387,26 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                         ));
                     };
                     let text = extract_prompt_text(&req.prompt);
+                    // `/help` and `/clear` are handled entirely here --
+                    // neither ever reaches `Agent::run_turn` or the model.
+                    // See `commands.rs`'s own doc comments for why these
+                    // two (of all `AgentState`/`FrontendOnly` commands) are
+                    // the ones this frontend intercepts rather than just
+                    // advertises.
+                    if let Some(local) = acp_local_command(&text) {
+                        let update = match local {
+                            LocalCommand::Help => help_update(),
+                            LocalCommand::Clear => {
+                                session.agent.clear_conversation();
+                                clear_update()
+                            }
+                        };
+                        let _ = spawn_connection.send_notification(SessionNotification::new(
+                            session.session_id.clone(),
+                            update,
+                        ));
+                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    }
                     let cancellation = CancellationToken::new();
                     // Scoped so the `run` future (which mutably borrows
                     // `session.agent` for `Agent::run_turn`'s duration) is

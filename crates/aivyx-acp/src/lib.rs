@@ -1,6 +1,7 @@
 //! ACP server frontend for aivyx-coder's `Agent` core. See
 //! `docs/superpowers/specs/2026-07-20-acp-editor-integration-design.md`.
 
+mod commands;
 mod prompter;
 mod session;
 mod translate;
