@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk, SessionUpdate,
     TextContent,
 };
-use aivyx_core::commands::{COMMANDS, CommandInfo, CommandTier, parse_slash_command};
+use aivyx_core::commands::{COMMANDS, CommandInfo, parse_slash_command};
 
 /// The exact reply ACP gives for `/clear` — identical wording to the TUI's
 /// own `/clear` handler (`aivyx-tui/src/app.rs`), kept as a separate copy
@@ -19,22 +19,20 @@ use aivyx_core::commands::{COMMANDS, CommandInfo, CommandTier, parse_slash_comma
 pub(crate) const CLEAR_REPLY: &str = "New conversation — the previous one is in /sessions.";
 
 /// Whether `cmd` is one this frontend exposes to the editor's command
-/// picker: every `AgentState`-tier command except `/resume` (ACP has no
-/// in-process session-switch redraw path — see `translate.rs`'s own note
-/// on `AgentEvent::SessionSwitched`), plus `/help` itself (`FrontendOnly`,
-/// now handled locally — see `acp_local_command` below — instead of being
-/// forwarded to `Agent::run_turn`). `/quit` (also `FrontendOnly`, and
-/// meaningless over ACP — there is no process for the editor to quit via a
-/// slash command) and every `AgentTurn`-tier command (`/council`, `/wiki`,
-/// `/architect`) are excluded: those still reach the model fine as plain
-/// prompt text through `run_turn`, they're just not surfaced as a picker
-/// entry.
+/// picker: every command except `/resume` and `/quit`. `/resume` is
+/// excluded because ACP has no in-process session-switch redraw path (see
+/// `translate.rs`'s own note on `AgentEvent::SessionSwitched`); `/quit` is
+/// excluded because it's meaningless over ACP — there is no process for
+/// the editor to quit via a slash command. Every `AgentTurn`-tier command
+/// (`/council`, `/wiki`, `/architect`) *is* advertised: they already reach
+/// the model fine as plain prompt text through `run_turn` (unchanged by
+/// this module), and the editor's command picker is how a user discovers
+/// them at all — there's no other affordance. `/help` and `/clear`
+/// (`AgentState`/`FrontendOnly`) are advertised too, despite being handled
+/// locally (see `acp_local_command` below) rather than forwarded to
+/// `run_turn`.
 fn is_advertised(cmd: &CommandInfo) -> bool {
-    match cmd.tier {
-        CommandTier::AgentState => cmd.name != "/resume",
-        CommandTier::FrontendOnly => cmd.name == "/help",
-        CommandTier::AgentTurn => false,
-    }
+    cmd.name != "/resume" && cmd.name != "/quit"
 }
 
 /// The commands `available_commands_update` advertises, as plain
@@ -149,10 +147,13 @@ mod tests {
     }
 
     #[test]
-    fn advertised_commands_excludes_agent_turn_commands() {
+    fn advertised_commands_includes_agent_turn_commands() {
         let names = advertised_names();
-        for excluded in ["council", "wiki", "architect"] {
-            assert!(!names.contains(&excluded.to_string()), "{names:?}");
+        for expected in ["council", "wiki", "architect"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "expected {expected} in {names:?}"
+            );
         }
     }
 
@@ -200,10 +201,9 @@ mod tests {
                 cmd.name
             );
         }
-        // Excluded tiers/commands must not leak in regardless.
+        // Excluded commands must not leak in regardless.
         assert!(!text.contains("/resume"));
         assert!(!text.contains("/quit"));
-        assert!(!text.contains("/council"));
         // No TUI-only Keys section.
         assert!(!text.contains("Keys:"));
     }
