@@ -432,6 +432,13 @@ pub fn runs_code_later(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// A user-typed command confirmation (`/undo`, `/redo`, `/commit`), not a
+/// tool call: each answer is for that one decision only, so frontends never
+/// offer "always" allow/deny for it (nothing would be remembered anyway).
+pub fn is_one_off_command(request: &PermissionRequest) -> bool {
+    matches!(request.tool_name.as_str(), "commit" | "undo" | "redo")
+}
+
 /// `runs_code_later` scoped to a `PermissionRequest`: only meaningful for
 /// `Write`/`Delete`/`Move` (a `Read` of a shell startup file has no
 /// write-time consequence to warn about), and for `Move` checks the
@@ -467,6 +474,27 @@ impl PermissionGate for AlwaysDenyGate {
         PermissionDecision::Deny(Some(
             "no permission gate is configured (fail-closed default)".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod one_off_command_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_user_commands_are_one_off() {
+        let req = |name: &str| PermissionRequest {
+            tool_name: name.to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Other(name.to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        for name in ["commit", "undo", "redo"] {
+            assert!(is_one_off_command(&req(name)), "{name}");
+        }
+        assert!(!is_one_off_command(&req("write_file")));
     }
 }
 

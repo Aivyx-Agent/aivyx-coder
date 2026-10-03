@@ -37,7 +37,8 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
         "Allow",
         PermissionOptionKind::AllowOnce,
     )];
-    if aivyx_sandbox::runs_code_later_for_request(request).is_none() {
+    let one_off = aivyx_sandbox::is_one_off_command(request);
+    if !one_off && aivyx_sandbox::runs_code_later_for_request(request).is_none() {
         options.push(PermissionOption::new(
             ALLOW_ALWAYS,
             "Always Allow",
@@ -49,11 +50,13 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
         "Deny",
         PermissionOptionKind::RejectOnce,
     ));
-    options.push(PermissionOption::new(
-        REJECT_ALWAYS,
-        "Always Deny",
-        PermissionOptionKind::RejectAlways,
-    ));
+    if !one_off {
+        options.push(PermissionOption::new(
+            REJECT_ALWAYS,
+            "Always Deny",
+            PermissionOptionKind::RejectAlways,
+        ));
+    }
     options
 }
 
@@ -384,6 +387,27 @@ mod tests {
             SelectedPermissionOutcome::new(ALLOW_ALWAYS),
         ));
         assert_eq!(acp_response_to_user_response(response), UserResponse::AllowAlways);
+    }
+
+    #[test]
+    fn user_commands_offer_only_allow_and_deny() {
+        for name in ["commit", "undo", "redo"] {
+            let request = PermissionRequest {
+                tool_name: name.to_string(),
+                action: aivyx_sandbox::ActionKind::Write,
+                target: PermissionTarget::Other(name.to_string()),
+                arguments_preview: serde_json::json!({}),
+                preview: None,
+                diff: None,
+            };
+            let kinds: Vec<PermissionOptionKind> =
+                options_for(&request).into_iter().map(|o| o.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![PermissionOptionKind::AllowOnce, PermissionOptionKind::RejectOnce],
+                "{name}"
+            );
+        }
     }
 
     #[test]

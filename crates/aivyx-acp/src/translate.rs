@@ -143,6 +143,11 @@ fn build_merged_plan(
     Plan::new(entries)
 }
 
+/// The longest run of consecutive backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    text.split(|c| c != '`').map(str::len).max().unwrap_or(0)
+}
+
 pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Option<SessionUpdate> {
     let update = match event {
         AgentEvent::TextDelta(text) => SessionUpdate::AgentMessageChunk(text_chunk(text.clone())),
@@ -159,13 +164,22 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // renders it, as a transcript line rather than a fatal condition.
         AgentEvent::CouncilNote(text)
         | AgentEvent::ArchitectNote(text)
-        | AgentEvent::Error(text)
-        | AgentEvent::Info(text) => SessionUpdate::AgentMessageChunk(text_chunk(text.clone())),
+        | AgentEvent::Error(text) => SessionUpdate::AgentMessageChunk(text_chunk(text.clone())),
+        // Its own paragraph: an Info (e.g. the change summary) arrives right
+        // after the model's reply and must not run into its last sentence.
+        AgentEvent::Info(text) => {
+            SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{text}")))
+        }
         // No pager over ACP: the diff goes to the client as a fenced block
-        // its own markdown renderer can highlight.
-        AgentEvent::ShowDiff { title, text } => SessionUpdate::AgentMessageChunk(text_chunk(
-            format!("{title}\n\n```diff\n{text}\n```"),
-        )),
+        // its own markdown renderer can highlight — fenced with more
+        // backticks than any run inside it, so a diff of markdown can't
+        // close the block early.
+        AgentEvent::ShowDiff { title, text } => {
+            let fence = "`".repeat(longest_backtick_run(text).max(2) + 1);
+            SessionUpdate::AgentMessageChunk(text_chunk(format!(
+                "{title}\n\n{fence}diff\n{text}\n{fence}"
+            )))
+        }
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
             AcpToolCall::new(call.id.0.clone(), call.name.clone())
                 .kind(tool_kind(&call.name))
@@ -302,6 +316,29 @@ mod tests {
     }
 
     #[test]
+    fn a_diff_containing_a_backtick_fence_gets_a_longer_one() {
+        let diff = translate_event(
+            &sid(),
+            &AgentEvent::ShowDiff {
+                title: "t".to_string(),
+                text: "+```rust\n+fn x() {}\n+```".to_string(),
+            },
+        )
+        .unwrap();
+        match diff {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                assert_eq!(
+                    chunk.content,
+                    ContentBlock::Text(TextContent::new(
+                        "t\n\n````diff\n+```rust\n+fn x() {}\n+```\n````"
+                    ))
+                );
+            }
+            other => panic!("expected AgentMessageChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn info_and_show_diff_become_message_text() {
         let info =
             translate_event(&sid(), &AgentEvent::Info("Changed: a.txt".to_string())).unwrap();
@@ -309,7 +346,7 @@ mod tests {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 assert_eq!(
                     chunk.content,
-                    ContentBlock::Text(TextContent::new("Changed: a.txt"))
+                    ContentBlock::Text(TextContent::new("\n\nChanged: a.txt"))
                 );
             }
             other => panic!("expected AgentMessageChunk, got {other:?}"),

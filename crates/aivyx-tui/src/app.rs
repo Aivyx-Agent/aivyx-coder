@@ -1458,7 +1458,7 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
 /// Also `false` for the `/commit`, `/undo` and `/redo` confirmations: each
 /// is a one-off decision the agent never caches.
 fn offer_always_allow(request: &PermissionRequest) -> bool {
-    !matches!(request.tool_name.as_str(), "commit" | "undo" | "redo")
+    !aivyx_sandbox::is_one_off_command(request)
         && aivyx_sandbox::runs_code_later_for_request(request).is_none()
 }
 
