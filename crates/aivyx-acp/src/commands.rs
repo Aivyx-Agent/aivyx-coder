@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk, SessionUpdate,
     TextContent,
 };
-use aivyx_core::commands::{COMMANDS, CommandInfo, parse_slash_command};
+use aivyx_core::commands::{COMMANDS, CommandInfo, CommandTier, parse_slash_command};
 
 /// The exact reply ACP gives for `/clear` — identical wording to the TUI's
 /// own `/clear` handler (`aivyx-tui/src/app.rs`), kept as a separate copy
@@ -19,20 +19,22 @@ use aivyx_core::commands::{COMMANDS, CommandInfo, parse_slash_command};
 pub(crate) const CLEAR_REPLY: &str = "New conversation — the previous one is in /sessions.";
 
 /// Whether `cmd` is one this frontend exposes to the editor's command
-/// picker: every command except `/resume` and `/quit`. `/resume` is
-/// excluded because ACP has no in-process session-switch redraw path (see
-/// `translate.rs`'s own note on `AgentEvent::SessionSwitched`); `/quit` is
-/// excluded because it's meaningless over ACP — there is no process for
-/// the editor to quit via a slash command. Every `AgentTurn`-tier command
-/// (`/council`, `/wiki`, `/architect`) *is* advertised: they already reach
-/// the model fine as plain prompt text through `run_turn` (unchanged by
-/// this module), and the editor's command picker is how a user discovers
-/// them at all — there's no other affordance. `/help` and `/clear`
-/// (`AgentState`/`FrontendOnly`) are advertised too, despite being handled
-/// locally (see `acp_local_command` below) rather than forwarded to
-/// `run_turn`.
+/// picker: every `AgentTurn`- and `AgentState`-tier command except
+/// `/resume`, plus `/help`. Going by tier means a new `FrontendOnly`
+/// command (a TUI key-driven affordance like `/quit`) stays unadvertised
+/// unless this frontend learns to handle it. `AgentTurn` commands
+/// (`/council`, `/wiki`, `/architect`) reach the model as plain prompt
+/// text through `run_turn`, and `AgentState` commands are intercepted at
+/// the top of `run_turn` the same way; the editor's command picker is how
+/// a user discovers them at all. `/resume` is excluded because ACP has no
+/// in-process session-switch redraw path (see `translate.rs`'s note on
+/// `AgentEvent::SessionSwitched`). `/help` is `FrontendOnly` but handled
+/// locally here (see `acp_local_command` below), as is `/clear`.
 fn is_advertised(cmd: &CommandInfo) -> bool {
-    cmd.name != "/resume" && cmd.name != "/quit"
+    match cmd.tier {
+        CommandTier::AgentTurn | CommandTier::AgentState => cmd.name != "/resume",
+        CommandTier::FrontendOnly => cmd.name == "/help",
+    }
 }
 
 /// The commands `available_commands_update` advertises, as plain
@@ -61,13 +63,16 @@ pub(crate) fn available_commands_update() -> SessionUpdate {
 /// (`Ctrl+P`, the approval prompt's `y`/`a`/`n`, …) that have no meaning in
 /// an editor, which drives its own UI instead. Lists exactly the commands
 /// `advertised_commands` advertises, so this text can never claim a
-/// command ACP doesn't actually support.
+/// command ACP doesn't actually support. Rendered as a markdown list,
+/// after a leading blank line (as `translate.rs` gives `Info` chunks), so
+/// an editor that renders agent messages as markdown shows one command per
+/// line instead of folding the listing into a single paragraph.
 pub(crate) fn acp_help_text() -> String {
-    let mut lines = vec!["Available commands:".to_string()];
+    let mut text = "\n\nAvailable commands:\n".to_string();
     for cmd in COMMANDS.iter().filter(|cmd| is_advertised(cmd)) {
-        lines.push(format!("  {} — {}", cmd.name, cmd.description));
+        text.push_str(&format!("\n- `{}` — {}", cmd.name, cmd.description));
     }
-    lines.join("\n")
+    text
 }
 
 /// The two slash commands this frontend intercepts before `Agent::run_turn`
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn acp_help_text_lists_the_advertised_commands_only() {
         let text = acp_help_text();
-        assert!(text.starts_with("Available commands:"));
+        assert!(text.contains("Available commands:"));
         for cmd in COMMANDS.iter().filter(|c| is_advertised(c)) {
             assert!(
                 text.contains(cmd.name) && text.contains(cmd.description),
@@ -209,6 +214,38 @@ mod tests {
     }
 
     #[test]
+    fn is_advertised_goes_by_tier_not_a_deny_list() {
+        use aivyx_core::commands::CommandTier;
+        let info = |name, tier| CommandInfo {
+            name,
+            description: "d",
+            tier,
+        };
+        assert!(is_advertised(&info("/future-turn", CommandTier::AgentTurn)));
+        assert!(is_advertised(&info("/future-state", CommandTier::AgentState)));
+        // A frontend-only command is the TUI's own business unless it's
+        // one this frontend handles itself.
+        assert!(!is_advertised(&info("/future-key", CommandTier::FrontendOnly)));
+        assert!(is_advertised(&info("/help", CommandTier::FrontendOnly)));
+        assert!(!is_advertised(&info("/resume", CommandTier::AgentState)));
+    }
+
+    #[test]
+    fn acp_help_text_is_a_markdown_list_after_a_blank_line() {
+        let text = acp_help_text();
+        assert!(text.starts_with("\n\nAvailable commands:\n\n"), "{text:?}");
+        let undo = COMMANDS.iter().find(|c| c.name == "/undo").unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == format!("- `/undo` — {}", undo.description)),
+            "{text}"
+        );
+        for line in text.lines().skip_while(|l| !l.starts_with("- ")) {
+            assert!(line.starts_with("- `/"), "{line:?} in {text}");
+        }
+    }
+
+    #[test]
     fn help_update_carries_the_help_text() {
         let SessionUpdate::AgentMessageChunk(chunk) = help_update() else {
             panic!("expected an AgentMessageChunk");
@@ -216,7 +253,7 @@ mod tests {
         let ContentBlock::Text(text) = chunk.content else {
             panic!("expected a text content block");
         };
-        assert!(text.text.starts_with("Available commands:"));
+        assert_eq!(text.text, acp_help_text());
     }
 
     #[test]
