@@ -689,10 +689,10 @@ struct App {
     /// Whether this run was started with `--auto` — `run()` sets this from
     /// `autonomous.is_some()` before that `Option` moves into the
     /// background task, since nothing after that point can still ask it.
-    /// Changes the welcome hint (`first_message_hint`) and the status
-    /// line's idle text: there is no input box to type into and no
-    /// per-call approval, so both must stop describing a human-driven
-    /// session.
+    /// Changes the status line's idle text: there is no input box to type
+    /// into and no per-call approval, so it must stop describing a
+    /// human-driven session. (The welcome hint never shows in such a run --
+    /// see `seed_autonomous_goal`.)
     autonomous: bool,
 }
 
@@ -854,8 +854,18 @@ impl App {
     /// hint disappear, via its own existing "no `ChatLine::User` yet"
     /// rule -- and is its own method so `run()`'s wiring is unit-testable
     /// without going through the background task.
+    ///
+    /// The goal hides the welcome hint, so the two lines an autonomous run
+    /// needs to say before anything happens -- nothing waits for approval,
+    /// and how to stop it -- follow it as `Info`.
     fn seed_autonomous_goal(&mut self, goal: String) {
         self.transcript.push(ChatLine::User(goal));
+        self.transcript.push(ChatLine::Info(
+            "Autonomous run — edits and pre-approved commands are approved automatically."
+                .to_string(),
+        ));
+        self.transcript
+            .push(ChatLine::Info("Ctrl+C stops the run.".to_string()));
     }
 
     /// Renders the `/help` command via `help_text()` as a `ChatLine::Help`
@@ -1094,7 +1104,7 @@ impl App {
             .flat_map(chat_line_to_lines)
             .collect();
         if !self.transcript.iter().any(|l| matches!(l, ChatLine::User(_))) {
-            lines.extend(first_message_hint(&self.tests_line, self.autonomous));
+            lines.extend(first_message_hint(&self.tests_line));
         }
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
@@ -1532,31 +1542,21 @@ fn help_text(tests_line: &str) -> String {
     lines.join("\n")
 }
 
-/// Shown until the first message: what to type, and what happens next --
-/// or, while `autonomous` (`--auto`), the very different fact that there
-/// is nothing to type at all: the run drives itself, edits and
-/// pre-approved commands are approved automatically, and the goal already
-/// came from the CLI invocation.
-fn first_message_hint(tests_line: &str, autonomous: bool) -> Vec<Line<'static>> {
+/// Shown until the first message: what to type, and what happens next.
+/// An `--auto` run never shows it -- its goal is seeded as the first
+/// message (see `App::seed_autonomous_goal`, which adds that run's own
+/// lines instead).
+fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
-    let lines: &[&str] = if autonomous {
-        &[
-            "",
-            "Autonomous run — edits and pre-approved commands are approved automatically.",
-            "Ctrl+C stops the run.",
-            tests_line,
-        ]
-    } else {
-        &[
-            "",
-            "Ask for a change or a question about this project, for example:",
-            "  \"the tests fail — find out why and fix it\"",
-            "  \"explain how the config file is loaded\"",
-            "Every file edit and command waits for your approval ([y] to allow).",
-            tests_line,
-            "/help lists commands · Ctrl+C quits",
-        ]
-    };
+    let lines: &[&str] = &[
+        "",
+        "Ask for a change or a question about this project, for example:",
+        "  \"the tests fail — find out why and fix it\"",
+        "  \"explain how the config file is loaded\"",
+        "Every file edit and command waits for your approval ([y] to allow).",
+        tests_line,
+        "/help lists commands · Ctrl+C quits",
+    ];
     lines
         .iter()
         .map(|t| Line::from(t.to_string()).style(dim))
@@ -3221,7 +3221,7 @@ mod tests {
     fn help_and_welcome_show_the_test_command() {
         let line = "Tests: `cargo test` (detected from Cargo.toml) — run them with /test";
         assert!(help_text(line).ends_with(line));
-        let hint: Vec<String> = first_message_hint(line, false)
+        let hint: Vec<String> = first_message_hint(line)
             .into_iter()
             .map(|l| l.to_string())
             .collect();
@@ -3579,7 +3579,7 @@ mod tests {
 
     #[test]
     fn welcome_hint_example_no_longer_names_a_file() {
-        let hint: Vec<String> = first_message_hint("tests line", false)
+        let hint: Vec<String> = first_message_hint("tests line")
             .into_iter()
             .map(|l| l.to_string())
             .collect();
@@ -3589,24 +3589,6 @@ mod tests {
             "{hint:?}"
         );
         assert!(!hint.iter().any(|l| l.contains("calc.py")), "{hint:?}");
-    }
-
-    #[test]
-    fn autonomous_welcome_hint_replaces_the_interactive_example() {
-        let hint: Vec<String> = first_message_hint("tests line", true)
-            .into_iter()
-            .map(|l| l.to_string())
-            .collect();
-        assert!(hint.iter().any(|l| {
-            l == "Autonomous run — edits and pre-approved commands are approved automatically."
-        }));
-        assert!(hint.iter().any(|l| l == "Ctrl+C stops the run."));
-        assert!(hint.iter().any(|l| l == "tests line"));
-        // None of the interactive-only lines (there's no input box to type
-        // into, and no per-call approval prompt, during an autonomous run).
-        assert!(!hint.iter().any(|l| l.contains("Ask for a change")));
-        assert!(!hint.iter().any(|l| l.contains("waits for your approval")));
-        assert!(!hint.iter().any(|l| l.contains("/help lists commands")));
     }
 
     #[test]
@@ -3661,8 +3643,37 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("find the bug and fix it"), "{rendered}");
-        assert!(!rendered.contains("Autonomous run —"), "{rendered}");
         assert!(!rendered.contains("Ask for a change"), "{rendered}");
+    }
+
+    /// The seeded goal hides the welcome hint, so what an autonomous run
+    /// needs to say up front goes into the transcript right after it.
+    #[test]
+    fn autonomous_goal_is_followed_by_the_autonomous_run_lines() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        app.seed_autonomous_goal("find the bug and fix it".to_string());
+
+        let tail: Vec<&ChatLine> = app.transcript.iter().rev().take(3).collect();
+        assert!(
+            matches!(tail[2], ChatLine::User(g) if g == "find the bug and fix it"),
+            "the goal comes first"
+        );
+        assert!(
+            matches!(tail[1], ChatLine::Info(t)
+                if t == "Autonomous run — edits and pre-approved commands are approved automatically."),
+            "then the approval line, as Info"
+        );
+        assert!(
+            matches!(tail[0], ChatLine::Info(t) if t == "Ctrl+C stops the run."),
+            "then how to stop it, as Info"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("Autonomous run — edits"), "{rendered}");
+        assert!(rendered.contains("Ctrl+C stops the run."), "{rendered}");
     }
 
     /// Regression test: the status line used to always show the idle
