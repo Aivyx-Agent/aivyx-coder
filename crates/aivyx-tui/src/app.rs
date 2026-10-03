@@ -431,13 +431,13 @@ pub async fn run(
                     // AgentState tier: never touches run_turn, never calls
                     // the model. Order matters — clear_conversation's own
                     // ConversationCleared event must be emitted (and thus
-                    // received by the render loop) before this notify's
-                    // Error event, or the confirmation message would be
-                    // wiped by the clear that follows it. mpsc channels
-                    // preserve send order, so calling these sequentially
-                    // here is sufficient.
+                    // received by the render loop) before this info
+                    // notice's Info event, or the confirmation message
+                    // would be wiped by the clear that follows it. mpsc
+                    // channels preserve send order, so calling these
+                    // sequentially here is sufficient.
                     agent.clear_conversation();
-                    agent.notify("Conversation cleared.");
+                    agent.info("New conversation — the previous one is in /sessions.");
                     continue;
                 }
                 let cancellation = CancellationToken::new();
@@ -558,7 +558,10 @@ pub async fn run(
                                 }
                                 if aivyx_core::commands::parse_slash_command(&text, "/help").is_some() {
                                     app.show_help();
-                                } else if aivyx_core::commands::parse_slash_command(&text, "/test").is_some()
+                                } else if (aivyx_core::commands::parse_slash_command(&text, "/test")
+                                    .is_some()
+                                    || aivyx_core::commands::parse_slash_command(&text, "/resume")
+                                        .is_some())
                                     && active_cancellation.lock().unwrap().is_some()
                                 {
                                     app.transcript.push(ChatLine::Info(
@@ -975,10 +978,23 @@ impl App {
             AgentEvent::TestFinished { summary, .. } => {
                 self.transcript.push(ChatLine::Info(summary));
             }
-            // Compile-only until Task 4 (the real TUI rebuild for
-            // `/resume N`'s in-process switch): `enable_session_switching`
-            // is never called yet, so this never actually fires here.
-            AgentEvent::SessionSwitched { .. } => {}
+            // `/resume N`'s in-process switch: reset exactly as
+            // `ConversationCleared` does, then rebuild from the newly
+            // switched-to conversation's own history/tasks instead of
+            // leaving them empty. The agent's own `Info` event (the
+            // "Resumed conversation…" line) follows this one, so no
+            // notice is pushed here.
+            AgentEvent::SessionSwitched { history, tasks } => {
+                self.transcript.clear();
+                self.tasks.clear();
+                self.mission_plan = None;
+                self.open_specialist_sessions.clear();
+                self.context_usage = None;
+                self.streaming_active = false;
+                self.routed_model = None;
+                self.transcript = seed_transcript(&history);
+                self.tasks = tasks;
+            }
         }
     }
 
@@ -3070,6 +3086,17 @@ mod tests {
         assert!(app.tasks.is_empty());
         assert_eq!(app.context_usage, None);
         assert!(!app.streaming_active);
+    }
+
+    #[test]
+    fn session_switched_rebuilds_the_transcript() {
+        let mut app = App::new(None, PlanMode::new());
+        app.transcript.push(ChatLine::Info("old".into()));
+        app.handle_agent_event(AgentEvent::SessionSwitched {
+            history: vec![Message::text(Role::User, "older chat")],
+            tasks: vec![],
+        });
+        assert!(matches!(&app.transcript[..], [ChatLine::User(t)] if t == "older chat"));
     }
 
     #[test]

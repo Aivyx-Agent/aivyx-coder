@@ -569,8 +569,12 @@ impl Agent {
 
     /// Sends a neutral informational line into the transcript
     /// (`AgentEvent::Info`) — for things that are neither errors nor model
-    /// output, like the per-turn change summary.
-    pub(crate) fn info(&self, text: impl Into<String>) {
+    /// output, like the per-turn change summary. `pub`, not `pub(crate)`,
+    /// so a frontend (the TUI's `/clear` handler) can send its own notice
+    /// through the same neutral channel instead of `notify`'s `Error`
+    /// event, which would misrepresent a routine confirmation as a
+    /// failure.
+    pub fn info(&self, text: impl Into<String>) {
         self.emit(AgentEvent::Info(text.into()));
     }
 

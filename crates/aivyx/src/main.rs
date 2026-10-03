@@ -55,6 +55,24 @@ mod tests {
     fn validate_mcp_server_session_limits_accepts_real_defaults() {
         assert!(validate_mcp_server_session_limits(1800, 8).is_ok());
     }
+
+    #[test]
+    fn resume_flag_forms() {
+        assert_eq!(Cli::try_parse_from(["aivyx-coder"]).unwrap().resume, None);
+        assert_eq!(
+            Cli::try_parse_from(["aivyx-coder", "--resume"]).unwrap().resume,
+            Some(None)
+        );
+        assert_eq!(
+            Cli::try_parse_from(["aivyx-coder", "--resume=2"]).unwrap().resume,
+            Some(Some(2))
+        );
+        assert_eq!(
+            Cli::try_parse_from(["aivyx-coder", "--resume=0"]).unwrap().resume,
+            Some(Some(0))
+        );
+        assert!(Cli::try_parse_from(["aivyx-coder", "--resume=x"]).is_err());
+    }
 }
 
 /// Applied when an `allowed_commands` entry doesn't set its own
@@ -135,11 +153,10 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
-    /// Resume the previous session for this directory (conversation history
-    /// and task list). Without this flag a fresh session starts — and its
-    /// first completed turn replaces the stored one.
-    #[arg(long)]
-    resume: bool,
+    /// Resume a saved conversation for this project: the latest with bare
+    /// --resume, or number N from /sessions with --resume=N.
+    #[arg(long, value_name = "N", num_args = 0..=1, require_equals = true)]
+    resume: Option<Option<usize>>,
 
     /// Start in plan mode: the model can only read, search, and build a
     /// task list until you approve with Ctrl+P in the TUI.
@@ -241,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         if cli.auto.is_some() {
             anyhow::bail!("--acp and --auto cannot be used together");
         }
-        if cli.resume {
+        if cli.resume.is_some() {
             anyhow::bail!(
                 "--acp and --resume cannot be used together (the editor manages its own \
                  conversation view; resumed history would be invisible to it)"
@@ -287,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
     let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
-    let built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
+    let mut built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
 
     if cli.mcp_server {
         if cli.plan {
@@ -296,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
         if cli.auto.is_some() {
             anyhow::bail!("--mcp-server and --auto cannot be used together");
         }
-        if cli.resume {
+        if cli.resume.is_some() {
             anyhow::bail!("--mcp-server and --resume cannot be used together");
         }
         let Some(max_access_level_str) = settings.mcp_server.max_access_level.as_deref() else {
@@ -357,6 +374,12 @@ async fn main() -> anyhow::Result<()> {
         mission_plan: built.mission_plan.clone(),
         specialist_session_pool: built.specialist_session_pool.clone(),
     });
+    // Only the TUI can redraw its transcript from `AgentEvent::SessionSwitched`
+    // (`handle_agent_event` rebuilds it from the resumed history) -- ACP and
+    // `--mcp-server` never reach this line (ACP returns earlier above;
+    // `--mcp-server` returns just above this), so `/resume` keeps refusing
+    // there regardless of a configured `Store` session target.
+    built.agent.enable_session_switching();
     aivyx_tui::run(
         built.agent,
         built.events_rx,

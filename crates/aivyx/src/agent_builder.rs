@@ -340,6 +340,39 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
     }
 }
 
+/// Resolves `--resume`'s CLI value against this project's actual saved
+/// conversations (`list`, already newest-first — the same order
+/// `/sessions`/`/resume N` number from). Pure and independently testable
+/// so `build_agent` itself doesn't need a real `SessionStore` on disk to
+/// exercise this logic: `None` (no flag) resumes nothing; `Some(None)`
+/// (bare `--resume`) picks the newest conversation, or logs today's
+/// "no resumable session" info line and resumes nothing when there isn't
+/// one (not an error -- starting fresh is the right fallback); `Some(Some(n))`
+/// picks the `n`th listed, 1-based to match `/sessions`'s own numbering,
+/// and bails with the exact same out-of-range message `/resume N` uses in
+/// the TUI (so `--resume=N` and `/resume N` are indistinguishable to the
+/// user) when `n` is `0` or past the end.
+fn pick_resume(
+    list: &[session::SessionMeta],
+    resume: Option<Option<usize>>,
+) -> anyhow::Result<Option<String>> {
+    match resume {
+        None => Ok(None),
+        Some(None) => match list.first() {
+            Some(meta) => Ok(Some(meta.id.clone())),
+            None => {
+                tracing::info!("--resume: no resumable session found, starting fresh");
+                Ok(None)
+            }
+        },
+        Some(Some(n)) if n >= 1 && n <= list.len() => Ok(Some(list[n - 1].id.clone())),
+        Some(Some(_)) => anyhow::bail!(
+            "There are only {} saved conversations for this project (see /sessions).",
+            list.len()
+        ),
+    }
+}
+
 /// Builds `Agent` + every collaborator it needs, identically regardless
 /// of which frontend is asking — only `prompter` differs between the TUI
 /// (`TuiPrompter`) and ACP (`AcpPrompter`) call sites.
@@ -417,7 +450,7 @@ pub(crate) async fn build_agent(
     if cli.auto.is_some() && cli.plan {
         anyhow::bail!("--auto and --plan cannot be used together");
     }
-    if cli.auto.is_some() && cli.resume {
+    if cli.auto.is_some() && cli.resume.is_some() {
         anyhow::bail!("--auto and --resume cannot be used together (not supported yet)");
     }
     if let Some(goal) = cli.auto.as_deref()
@@ -1456,24 +1489,29 @@ pub(crate) async fn build_agent(
 
     // Persistence is always on (it's what makes `--resume` possible after a
     // crash or an interrupted slow-model turn); only *restoring* is opt-in.
-    let restored = match session::session_file_path(&cwd) {
-        Some(path) => {
-            let restored = if cli.resume {
-                let state = session::load(&path);
-                if state.is_none() {
-                    tracing::info!(path = %path.display(), "--resume: no resumable session found, starting fresh");
-                }
-                state
-            } else {
-                None
+    // One file per conversation (`SessionStore`), not the legacy single
+    // file -- `migrate_legacy` below moves any pre-existing legacy file
+    // into the store the first (and every later, see its own doc comment)
+    // time this project's store is set up, before `list()` is ever read.
+    let restored = match session::SessionStore::for_project(&cwd) {
+        Some(store) => {
+            if let Some(legacy) = session::session_file_path(&cwd)
+                && let Err(err) = store.migrate_legacy(&legacy)
+            {
+                tracing::warn!(error = %err, "legacy session migration failed");
+            }
+            let list = store.list();
+            let restored = match pick_resume(&list, cli.resume)? {
+                Some(id) => store.load(&id),
+                None => None,
             };
             if let Some(state) = &restored {
-                agent.restore(state.clone());
+                agent.restore_session(state.clone());
                 if let Some(pool) = &specialist_session_pool {
                     pool.seed_dehydrated(state.specialist_sessions.clone());
                 }
             }
-            agent.set_session_path(path);
+            agent.set_session_store(store);
             restored
         }
         None => {
@@ -1525,6 +1563,29 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metas(n: usize) -> Vec<aivyx_core::session::SessionMeta> {
+        (0..n)
+            .map(|i| aivyx_core::session::SessionMeta {
+                id: format!("id{i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pick_resume_cases() {
+        assert_eq!(pick_resume(&metas(3), None).unwrap(), None);
+        assert_eq!(pick_resume(&metas(3), Some(None)).unwrap(), Some("id0".into()));
+        assert_eq!(pick_resume(&metas(0), Some(None)).unwrap(), None);
+        assert_eq!(pick_resume(&metas(3), Some(Some(2))).unwrap(), Some("id1".into()));
+        for bad in [0, 4] {
+            assert_eq!(
+                pick_resume(&metas(3), Some(Some(bad))).unwrap_err().to_string(),
+                "There are only 3 saved conversations for this project (see /sessions)."
+            );
+        }
+    }
 
     /// Regression test for the final-review fix that gave the `/props`
     /// probe client an explicit timeout (previously it could hang the

@@ -96,14 +96,29 @@ starts. Re-run it any time with `aivyx-coder --setup`; see
 [First-run setup](#first-run-setup) below for details.
 
 Sessions persist automatically: after every completed turn the conversation
-history and task list are saved (one session per project directory, keyed by
-the canonicalized cwd, under `~/.local/state/aivyx-coder/sessions/`, written
-`0600` since they embed file contents and command output read during the
-session). `aivyx-coder --resume` restores the previous session for the current
-directory — transcript, task list, and Plan mode's on/off state, and all;
-without the flag a fresh session starts and its first completed turn
-replaces the stored one. A resumed Plan mode only ever turns *on* — it
-never overrides an explicit `--plan` flag by turning it off.
+history and task list are saved as their own file, one per *conversation*
+(not just per project) under
+`~/.local/state/aivyx-coder/sessions/<project-key>/`, keyed by the
+canonicalized cwd, written `0600` since they embed file contents and
+command output read during the session. Each project keeps its newest 20
+conversations; older ones are pruned automatically. `/sessions` lists them
+(newest first, with a 1-based number, when it was last touched, how many
+turns, and a short preview of its first message), and `/resume N` switches
+the running TUI to one of them in place — no restart needed. `/clear`
+starts a fresh conversation rather than overwriting the current one: the
+old one stays listed in `/sessions` and stays resumable.
+
+`aivyx-coder --resume` (bare) restores the most recently touched
+conversation for the current directory on startup — transcript, task list,
+and Plan mode's on/off state, and all; `--resume=N` restores the Nth one
+`/sessions` would list. Without the flag a fresh conversation starts. A
+resumed Plan mode only ever turns *on* — it never overrides an explicit
+`--plan` flag by turning it off.
+
+Upgrading from an older `aivyx-coder` that used one session file per
+project (`<project-key>.json`): the first time a project's store is set
+up, that legacy file is migrated into the new per-conversation layout
+automatically (and removed) — no manual action is needed.
 
 The status line shows a live context-budget indicator (`ctx 6.1k/8.2k (74%)`,
 colored green/amber/red) once the backend reports token usage. When the
@@ -1518,6 +1533,13 @@ as the editor's own permission UI instead of a modal.
 extension, then point it at the same `aivyx-coder --acp` command — no
 aivyx-specific VS Code extension exists or is needed.
 
+An ACP session's conversation is saved into the same per-project session
+store as the TUI's (and counts against that project's newest-20 limit),
+but it can't be *switched* from inside the editor — `/resume` there always
+answers "/resume isn't available here." (the editor manages its own
+conversation view, which an in-place swap would leave not reflecting the
+switched-to history).
+
 **Not yet supported over ACP**: `--auto` (autonomous mode), `--resume`
 (TUI-only — the editor manages its own conversation view, so resumed
 history would be invisible to it; `--acp --resume` is rejected at
@@ -1669,7 +1691,9 @@ below for exact forms):
 | `/wiki` | needs the model | Regenerates stale wiki pages, or `/wiki <page>` forces one named page. |
 | `/architect` | needs the model | Has the configured architect model produce a plan for `/architect <task>`, then hands it to the primary model to execute. |
 | `/models`, `/model` | agent state, no model call | Model routing: list candidates, refresh, explain the last choice, pin or unpin a model. See "Model routing" above. |
-| `/clear` | agent state, no model call | Starts a fresh conversation — clears history and the task list, keeps plan mode as-is. |
+| `/clear` | agent state, no model call | Starts a fresh conversation — clears history and the task list, keeps plan mode as-is; the old conversation stays listed in `/sessions`. |
+| `/sessions` | agent state, no model call | Lists this project's saved conversations, newest first, numbered for `/resume N`. |
+| `/resume N` | agent state, no model call | Switches the running conversation to the Nth one `/sessions` lists — TUI only; refused in ACP. |
 | `/help` | frontend only | Lists all of the above, plus the real keybindings (Enter, Ctrl+C, Ctrl+P, y/a/n) and a pointer to worktree checkpoints as the way to undo an edit. |
 | `/quit` | frontend only | Exits `aivyx-coder` (same as Ctrl+C). |
 
