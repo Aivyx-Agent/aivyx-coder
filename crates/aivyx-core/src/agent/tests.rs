@@ -7455,6 +7455,52 @@ async fn commit_preview_warns_when_the_last_test_failed() {
 }
 
 #[tokio::test]
+async fn commit_with_a_message_warns_when_the_last_test_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
+    agent.set_tests(Some(sh_tests("exit 1")));
+
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    agent.run_turn("/commit -m \"Anyway\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    let hash = git_text(&cwd, &["rev-parse", "--short", "HEAD"]).await;
+    assert_eq!(
+        infos(&mut rx),
+        vec!["⚠ The last /test failed.".to_string(), format!("Committed {}: Anyway", hash.trim())],
+        "a warning, not a block"
+    );
+}
+
+#[tokio::test]
+async fn commit_without_binary_labels_still_commits_when_the_binary_check_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    let (mut agent, mut rx) =
+        undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    super::change_commands::FAIL_BINARY_SUFFIXES.with(|f| f.set(true));
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    super::change_commands::FAIL_BINARY_SUFFIXES.with(|f| f.set(false));
+
+    assert_eq!(notices(&mut rx), Vec::<String>::new());
+    assert_eq!(commit_count(&cwd).await, 2, "committed without the labels");
+    let seen = prompter.seen.lock().unwrap();
+    let preview = seen[0].preview.as_deref().unwrap();
+    assert!(preview.contains("  x.pyc"), "{preview}");
+    assert!(!preview.contains("(binary"), "{preview}");
+}
+
+#[tokio::test]
 async fn commit_preview_marks_a_binary_file() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;

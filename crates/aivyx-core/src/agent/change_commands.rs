@@ -96,6 +96,9 @@ pub(super) fn parse(user_input: &str) -> Option<ChangeCommand> {
     }
 }
 
+/// Shown before a commit made while the last `/test` run failed.
+const LAST_TEST_FAILED: &str = "⚠ The last /test failed.";
+
 async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     aivyx_tools::run_git(cwd, args, &[]).await
 }
@@ -131,6 +134,10 @@ async fn staged_names(root: &Path) -> Result<Vec<String>, String> {
 async fn staged_binary_suffixes(
     root: &Path,
 ) -> Result<std::collections::HashMap<String, &'static str>, String> {
+    #[cfg(test)]
+    if FAIL_BINARY_SUFFIXES.with(std::cell::Cell::get) {
+        return Err("injected failure".to_string());
+    }
     let numstat = git(
         root,
         &[
@@ -171,6 +178,14 @@ async fn staged_binary_suffixes(
             (c.path, suffix)
         })
         .collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes `staged_binary_suffixes` fail, for tests of `/commit`'s
+    /// fallback (a `#[tokio::test]` runs on one thread).
+    pub(super) static FAIL_BINARY_SUFFIXES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 async fn has_head(root: &Path) -> bool {
@@ -419,19 +434,23 @@ impl Agent {
             return;
         }
         let message = match message {
-            Some(message) => message,
+            Some(message) => {
+                // The same warning the confirm dialog shows; with `-m`
+                // there is no dialog, so it goes into the transcript
+                // instead. A warning, not a block.
+                if self.last_test_passed == Some(false) {
+                    self.info(LAST_TEST_FAILED);
+                }
+                message
+            }
             None => {
                 // A deny-listed file the user staged by hand is committed,
                 // but only its name ever reaches the model or the prompt.
                 let withheld: Vec<&String> = files.iter().filter(|f| denied(f)).collect();
-                let binary = match staged_binary_suffixes(&root).await {
-                    Ok(binary) => binary,
-                    Err(e) => {
-                        self.abandon_commit(&root, &staged_by_us, format!("Couldn't commit: {e}"))
-                            .await;
-                        return;
-                    }
-                };
+                // The `(binary)` labels only annotate the preview; if
+                // they can't be worked out, the commit goes ahead without
+                // them.
+                let binary = staged_binary_suffixes(&root).await.unwrap_or_default();
                 let labels: Vec<String> = files
                     .iter()
                     .map(|f| {
@@ -652,7 +671,7 @@ impl Agent {
             // A real warning, not a block -- committing on top of a known
             // failure is the user's call, but they should see it before
             // approving.
-            preview = format!("⚠ The last /test failed.\n{preview}");
+            preview = format!("{LAST_TEST_FAILED}\n{preview}");
         }
         let request = PermissionRequest {
             tool_name: "commit".to_string(),
