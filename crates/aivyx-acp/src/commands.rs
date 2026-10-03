@@ -222,10 +222,16 @@ mod tests {
             tier,
         };
         assert!(is_advertised(&info("/future-turn", CommandTier::AgentTurn)));
-        assert!(is_advertised(&info("/future-state", CommandTier::AgentState)));
+        assert!(is_advertised(&info(
+            "/future-state",
+            CommandTier::AgentState
+        )));
         // A frontend-only command is the TUI's own business unless it's
         // one this frontend handles itself.
-        assert!(!is_advertised(&info("/future-key", CommandTier::FrontendOnly)));
+        assert!(!is_advertised(&info(
+            "/future-key",
+            CommandTier::FrontendOnly
+        )));
         assert!(is_advertised(&info("/help", CommandTier::FrontendOnly)));
         assert!(!is_advertised(&info("/resume", CommandTier::AgentState)));
     }
