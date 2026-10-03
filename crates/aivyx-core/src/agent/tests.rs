@@ -8266,6 +8266,13 @@ async fn resume_n_switches_conversations_and_restores_history_tasks_and_undo() {
     });
     agent.clear_conversation();
     agent.run_turn("newer chat".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let newer_id = agent.current_session_id().unwrap().to_string();
+    // Give the *newer* (still-active) conversation a task too, right
+    // before switching away from it -- it must be saved with the outgoing
+    // file, not leak into the conversation we're switching to.
+    agent.tasks.lock().unwrap().push(crate::session::Task {
+        id: 2, text: "task from newer".into(), status: crate::session::TaskStatus::Pending,
+    });
     drain(&mut rx);
 
     agent.run_turn("/resume 2".into(), Path::new("."), CancellationToken::new()).await.unwrap();
@@ -8276,12 +8283,40 @@ async fn resume_n_switches_conversations_and_restores_history_tasks_and_undo() {
     }).expect("SessionSwitched");
     assert_eq!(switched.0[0].text_content(), "older chat");
     assert_eq!(switched.1.len(), 1);
+    assert_eq!(switched.1[0].text, "task from older");
+    assert!(
+        !switched.1.iter().any(|t| t.text == "task from newer"),
+        "the newer conversation's task must not leak into the one we switched to"
+    );
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Info(t) if t == "Resumed conversation 2 (1 turn)")));
     assert_eq!(agent.history[0].text_content(), "older chat");
     assert_eq!(agent.undo.marks.len(), 1, "the older conversation's undo ledger came back too");
-    // The newer conversation was kept, and switching back works.
+
+    // The newer conversation's outgoing file was saved (with its task),
+    // not overwritten or dropped, when we switched away from it.
     let store = crate::session::SessionStore::new(store_dir);
     assert_eq!(store.list().len(), 2);
+    let newer_saved = store
+        .load(&newer_id)
+        .expect("the newer conversation's own file must still exist");
+    assert_eq!(newer_saved.history[0].text_content(), "newer chat");
+    assert_eq!(newer_saved.tasks.len(), 1);
+    assert_eq!(newer_saved.tasks[0].text, "task from newer");
+
+    // Switching back works: its history and task return.
+    let newer_n = store
+        .list()
+        .iter()
+        .position(|m| m.id == newer_id)
+        .expect("still listed")
+        + 1;
+    agent
+        .run_turn(format!("/resume {newer_n}"), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(agent.history[0].text_content(), "newer chat");
+    assert_eq!(agent.tasks.lock().unwrap().len(), 1);
+    assert_eq!(agent.tasks.lock().unwrap()[0].text, "task from newer");
 }
 
 #[tokio::test]
@@ -8333,16 +8368,19 @@ async fn resume_is_refused_with_no_store_even_when_switching_is_enabled() {
 }
 
 #[tokio::test]
-async fn restore_session_derives_first_user_text_and_created_unix_when_meta_is_empty() {
+async fn restore_session_derives_first_user_text_from_history_when_meta_is_empty() {
     // The fix-round resolution: a `restore_session`d state whose `meta`
     // predates `SessionMeta` (or is otherwise empty) must not leave
-    // `first_user_text`/`created_unix` at their uninformative defaults --
-    // it derives them from the history the same way `migrate_legacy`
-    // already does for the legacy single-file layout.
+    // `first_user_text` at its uninformative default -- it derives it from
+    // the history the same way `migrate_legacy` already does for the
+    // legacy single-file layout. (`created_unix` is deliberately not
+    // asserted here: `persist` always re-mints it whenever `id` is `None`,
+    // which `restore_session` sets whenever `meta.id` is empty, so any
+    // value `restore_session` itself produced would be overwritten before
+    // ever being read -- see its own doc comment.)
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("proj");
     let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("ok")]);
-    let before = now_unix();
 
     let state = crate::session::SessionState::new(
         vec![user_msg("derived from history"), assistant_msg("ok")],
@@ -8351,7 +8389,6 @@ async fn restore_session_derives_first_user_text_and_created_unix_when_meta_is_e
         vec![],
     );
     assert!(state.meta.first_user_text.is_empty());
-    assert_eq!(state.meta.created_unix, 0);
 
     agent.restore_session(state);
     agent.run_turn("next".into(), Path::new("."), CancellationToken::new()).await.unwrap();
@@ -8359,5 +8396,68 @@ async fn restore_session_derives_first_user_text_and_created_unix_when_meta_is_e
     let list = crate::session::SessionStore::new(store_dir).list();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].first_user_text, "derived from history");
-    assert!(list[0].created_unix >= before, "{list:?}");
+}
+
+#[tokio::test]
+async fn restore_session_leaves_first_user_text_none_when_history_has_no_user_message() {
+    // Fix-round regression: an empty derived preview (no `Role::User`
+    // message anywhere in the restored history) must stay `None`, not
+    // become `Some("")` -- `Some("")` would satisfy `run_turn`'s
+    // `if self.first_user_text.is_none()` check and permanently suppress
+    // recording the *next* real turn's own text.
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("ok")]);
+
+    let state = crate::session::SessionState::new(
+        vec![assistant_msg("a stray reply with no preceding user turn")],
+        vec![],
+        false,
+        vec![],
+    );
+    assert!(state.meta.first_user_text.is_empty());
+
+    agent.restore_session(state);
+    assert_eq!(
+        agent.first_user_text, None,
+        "an empty derived preview must stay None"
+    );
+
+    agent.run_turn("the real first turn".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let list = crate::session::SessionStore::new(store_dir).list();
+    assert_eq!(list[0].first_user_text, "the real first turn");
+}
+
+#[tokio::test]
+async fn resume_sets_plan_mode_to_exactly_the_resumed_conversations_value() {
+    // Controller decision: Plan mode is per-conversation on a /resume
+    // switch, turning OFF as well as on -- unlike startup `restore`/
+    // `--resume`, which only ever turn it on (to protect an explicit
+    // `--plan` flag).
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, mut rx) = store_agent(&store_dir, vec![text_response("a"), text_response("b")]);
+    agent.enable_session_switching();
+
+    // Conversation 1: saved in Act mode (today's default).
+    agent.run_turn("act mode chat".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    agent.clear_conversation();
+
+    // Conversation 2: saved while Plan mode is active.
+    agent.plan_mode.set_active(true);
+    agent.run_turn("plan mode chat".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+
+    // list() is newest first: [plan mode chat, act mode chat].
+    agent.run_turn("/resume 2".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    assert!(
+        !agent.plan_mode.active(),
+        "switching into an Act-mode conversation must turn Plan mode off"
+    );
+
+    agent.run_turn("/resume 1".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    assert!(
+        agent.plan_mode.active(),
+        "switching into a Plan-mode conversation must turn Plan mode on"
+    );
 }

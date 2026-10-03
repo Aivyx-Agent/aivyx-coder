@@ -1234,38 +1234,35 @@ impl Agent {
     /// that already owned a different, real conversation would silently
     /// adopt the old id and overwrite that still-open conversation's file
     /// on the next persist, rather than starting a fresh one. `created_unix`
-    /// is taken from `meta` when it names a real id; when the id is empty,
-    /// `created_unix` falls back to `now_unix()` instead of staying at `0`
-    /// -- a fix-round addition (the id being empty already means "nothing
-    /// real to continue addressing," but a persist that follows still
-    /// needs *some* real creation time, not the sentinel `set_session_store`
-    /// starts with). Likewise, an empty `meta.first_user_text` (a file that
-    /// predates `SessionMeta`, or any other state with no header) is
-    /// derived from `state`'s own history the same way
-    /// `SessionStore::migrate_legacy` already derives it for the legacy
-    /// single-file layout -- the preview of the first `Role::User` message,
-    /// or empty if there is none -- rather than left as `None` to be
-    /// silently overwritten by whatever the *next* turn happens to be.
+    /// is always taken from `meta` too (`0` when the id is empty — the same
+    /// "nothing real yet" value `set_session_store` starts with — since
+    /// `persist` re-mints a real one itself whenever `id` is `None`, before
+    /// `created_unix` is ever read back out; a `now_unix()` fallback here
+    /// would just be dead code, always overwritten before use). An empty
+    /// `meta.first_user_text` (a file that predates `SessionMeta`, or any
+    /// other state with no header) is derived from `state`'s own history
+    /// the same way `SessionStore::migrate_legacy` already derives it for
+    /// the legacy single-file layout -- the preview of the first
+    /// `Role::User` message. Fix-round correction: when there is no such
+    /// message, this must stay `None`, not become `Some("")` -- `Some("")`
+    /// would satisfy `run_turn`'s `if self.first_user_text.is_none()` check
+    /// for "nothing recorded yet" and permanently suppress recording the
+    /// next real turn's own text.
     pub fn restore_session(&mut self, state: SessionState) {
         let meta = state.meta.clone();
         self.restore(state);
         if let Some(SessionTarget::Store { id, created_unix, .. }) = &mut self.session_target {
             *id = (!meta.id.is_empty()).then(|| meta.id.clone());
-            *created_unix = if meta.id.is_empty() {
-                now_unix()
-            } else {
-                meta.created_unix
-            };
+            *created_unix = meta.created_unix;
         }
-        self.first_user_text = Some(if meta.first_user_text.is_empty() {
+        self.first_user_text = if meta.first_user_text.is_empty() {
             self.history
                 .iter()
                 .find(|m| m.role == Role::User)
                 .map(|m| preview_text(&m.text_content()))
-                .unwrap_or_default()
         } else {
-            meta.first_user_text
-        });
+            Some(meta.first_user_text)
+        };
     }
 
     /// Switches to conversation `id` without restarting the process
@@ -1280,10 +1277,17 @@ impl Agent {
     /// `ConversationCleared` event (the destination conversation's real
     /// content is what the frontend should show, not an empty state), then
     /// restores the loaded state and seeds any dehydrated specialist
-    /// sessions it carried. Returns whether the switch actually happened:
-    /// `false` means there's no `Store` target, or `id` doesn't name a
-    /// loadable conversation (`AgentEvent::Error` already explains why;
-    /// nothing else changed).
+    /// sessions it carried. Also sets Plan mode to *exactly* the resumed
+    /// conversation's own `plan_mode_active` -- unlike `restore`/`--resume`
+    /// (which only ever turn Plan mode *on*, to protect an explicit
+    /// `--plan` flag at startup), a controller decision for this,
+    /// in-process switch: Plan mode is a per-conversation setting here, so
+    /// switching into an Act-mode conversation must turn Plan mode back
+    /// *off* too, not just leave whatever the outgoing conversation left
+    /// it at. Returns whether the switch actually happened: `false` means
+    /// there's no `Store` target, or `id` doesn't name a loadable
+    /// conversation (`AgentEvent::Error` already explains why; nothing
+    /// else changed).
     async fn switch_to(&mut self, id: &str) -> bool {
         self.persist_if_owned();
         let Some(store) = self.session_store().cloned() else {
@@ -1313,7 +1317,9 @@ impl Agent {
         self.pending_notes.clear();
 
         let specialist_sessions = state.specialist_sessions.clone();
+        let plan_mode_active = state.plan_mode_active;
         self.restore_session(state);
+        self.plan_mode.set_active(plan_mode_active);
         if let Some(pool) = &self.specialist_session_pool {
             pool.seed_dehydrated(specialist_sessions);
         }
