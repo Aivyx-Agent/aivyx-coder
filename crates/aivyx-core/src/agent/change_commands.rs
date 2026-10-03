@@ -140,6 +140,8 @@ async fn staged_binary_suffixes(
             "--cached",
             "--numstat",
             "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
         ],
     )
     .await?;
@@ -152,6 +154,8 @@ async fn staged_binary_suffixes(
             "--cached",
             "--name-status",
             "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
         ],
     )
     .await?;

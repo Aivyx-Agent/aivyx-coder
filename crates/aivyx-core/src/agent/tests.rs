@@ -7506,6 +7506,35 @@ async fn commit_preview_marks_an_untracked_binary_file_as_new() {
 }
 
 #[tokio::test]
+async fn commit_preview_never_runs_a_repo_textconv_and_still_sees_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let marker = cwd.join("textconv-ran");
+    let script = cwd.join("conv.sh");
+    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\necho text\n", marker.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git_in(&cwd, &["config", "diff.conv.textconv", script.to_str().unwrap()]).await;
+    std::fs::write(cwd.join(".gitattributes"), "*.pyc diff=conv\n").unwrap();
+    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
+    let prompter = scripted(vec![UserResponse::Deny]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert!(!marker.exists(), "the /commit preview ran the repo's textconv program");
+    let seen = prompter.seen.lock().unwrap();
+    let preview = seen[0].preview.as_deref().unwrap();
+    assert!(preview.contains("  x.pyc   (binary, new)"), "{preview}");
+}
+
+#[tokio::test]
 async fn commit_with_a_hand_staged_set_commits_only_that() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
