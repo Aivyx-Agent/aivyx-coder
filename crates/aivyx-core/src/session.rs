@@ -8,8 +8,10 @@
 //! each conversation within that project is its own file,
 //! `<created_unix_ms>-<8 hex>.json` (mode 0600). `SessionStore` is the
 //! handle onto one project's directory: `list`/`load`/`save`/`prune` and
-//! `migrate_legacy` (which moves the old single-file layout in the first
-//! time the new layout is used). The free `load`/`save` functions below
+//! `migrate_legacy` (which moves the old single-file layout in whenever
+//! that legacy file exists -- not just the first time -- so a legacy
+//! file that reappears, or survives an earlier failed migration, is never
+//! stranded). The free `load`/`save` functions below
 //! still operate on a single path each — `SessionStore` is built on top of
 //! them, not a replacement for them, since existing call sites still use
 //! the legacy single-file path directly (that path is now reached via
@@ -291,12 +293,7 @@ pub fn load(path: &Path) -> Option<SessionState> {
 /// now propagates as a real `Err` instead of being discarded.
 pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
+        ensure_private_dir(parent)?;
     }
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -337,6 +334,20 @@ pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     if let Err(err) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
+    }
+    Ok(())
+}
+
+/// Creates `dir` (and any missing parents) if it doesn't exist, and sets
+/// its mode to `0700` either way -- shared by `save` (the file's parent
+/// directory) and `SessionStore::migrate_legacy` (the store's directory,
+/// which may or may not already exist by the time migration runs).
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -448,13 +459,28 @@ impl SessionStore {
         }
     }
 
-    /// One-time migration from the legacy single-file layout
-    /// (`<project-key>.json`) to this store's directory. Does nothing
-    /// (`Ok(false)`) unless `legacy` is a regular file and `self.dir`
-    /// doesn't exist yet -- once the directory exists, migration has
-    /// already happened (or this project never had a legacy file), and
-    /// running it again must be a safe no-op, not a second conversation
-    /// appearing from nowhere.
+    /// One-time-per-reappearance migration from the legacy single-file
+    /// layout (`<project-key>.json`) into this store's directory. Does
+    /// nothing (`Ok(false)`) unless `legacy` is a regular file --
+    /// deliberately *not* conditioned on whether `self.dir` already
+    /// exists.
+    ///
+    /// Earlier, this also required `!self.dir.exists()`, on the
+    /// assumption that the directory's existence alone proved migration
+    /// had already happened. That assumption broke if `self.save` below
+    /// ever failed after `self.dir` was created (disk full, permissions):
+    /// the legacy file would survive, but every later call would see the
+    /// directory already there and return `Ok(false)` forever --
+    /// stranding that conversation for good. Checking only `legacy`
+    /// itself fixes that (a failed save simply gets retried next time,
+    /// since the legacy file is still there to find), and also means a
+    /// legacy file that *reappears* after migration -- e.g. an older
+    /// aivyx-coder build, or an ACP process still on one, writing it again
+    /// -- gets migrated too, instead of being silently ignored because
+    /// the directory already exists. The cost is a theoretical duplicate
+    /// entry if a save succeeds but the subsequent `remove_file` fails;
+    /// that's acceptable, since nothing is lost, unlike the stranding
+    /// above.
     ///
     /// A `legacy` file that parses as a `SessionState` is loaded, given a
     /// derived `SessionMeta` (timestamps from the file's own mtime, since
@@ -465,7 +491,7 @@ impl SessionStore {
     /// mtime-derived id, so a corrupt-but-maybe-recoverable file is never
     /// silently lost.
     pub fn migrate_legacy(&self, legacy: &Path) -> std::io::Result<bool> {
-        if !legacy.is_file() || self.dir.exists() {
+        if !legacy.is_file() {
             return Ok(false);
         }
 
@@ -480,12 +506,7 @@ impl SessionStore {
         let mtime_secs = mtime_ms / 1000;
         let id = Self::new_id(mtime_ms);
 
-        std::fs::create_dir_all(&self.dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        ensure_private_dir(&self.dir)?;
 
         match load(legacy) {
             Some(mut state) => {
@@ -804,8 +825,43 @@ mod tests {
         assert_eq!(list[0].turns, 2);
         assert!(list[0].updated_unix > 0);
         assert_eq!(store.load(&list[0].id).unwrap().history.len(), 3);
-        // Second run: the directory exists, nothing happens.
+        // Second run: the legacy file is gone (migrated away above), so
+        // there's nothing left to migrate -- Ok(false), regardless of the
+        // directory now existing.
         assert!(!store.migrate_legacy(&legacy).unwrap());
+    }
+
+    #[test]
+    fn migrate_runs_again_if_the_legacy_file_reappears_even_though_the_directory_exists() {
+        // An older aivyx-coder build (or an ACP process still on one) can
+        // write the legacy single file again after this project's
+        // directory already exists. Migration must still pick it up --
+        // not strand it forever just because `self.dir` is no longer
+        // empty -- and the result is both conversations listed, not one
+        // silently dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("proj.json");
+        let store = SessionStore::new(dir.path().join("proj"));
+        store.save(&meta_state("1-aaaaaaaa", 1, "existing")).unwrap();
+
+        let reappeared = SessionState::new(
+            vec![Message::text(Role::User, "a reappeared legacy conversation")],
+            vec![],
+            false,
+            vec![],
+        );
+        save(&legacy, &reappeared).unwrap();
+
+        assert!(store.migrate_legacy(&legacy).unwrap());
+        assert!(!legacy.exists());
+
+        let list = store.list();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|m| m.id == "1-aaaaaaaa" && m.first_user_text == "existing"));
+        assert!(
+            list.iter()
+                .any(|m| m.first_user_text == "a reappeared legacy conversation")
+        );
     }
 
     #[test]
