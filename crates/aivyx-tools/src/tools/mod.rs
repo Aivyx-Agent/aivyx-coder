@@ -64,3 +64,23 @@ pub use set_tasks::SetTasksTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
+
+/// A bounded, *unconfined* git read for a permission preview or a branch
+/// lookup — run before the user approves anything, so it must never run a
+/// program the repository's own config names (a confined command can write
+/// `.git/config`): fsmonitor, hooks and the repository's filter drivers are
+/// switched off. Diffs should still add `--no-ext-diff --no-textconv`.
+/// `None` on any failure.
+pub(crate) fn unconfined_git_capture(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(aivyx_checkpoint::unconfined_git_args_blocking(cwd))
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}

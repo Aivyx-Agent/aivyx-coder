@@ -201,15 +201,15 @@ pub fn confined_git(
 /// bounded read here, and both commands are local metadata operations.
 fn build_preview(cwd: &Path, pathspecs: &[String]) -> String {
     let mut preview = String::new();
-    let mut stat_args = vec!["diff", "HEAD", "--stat", "--"];
+    let mut stat_args = vec!["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--stat", "--"];
     stat_args.extend(pathspecs.iter().map(String::as_str));
-    if let Some(stat) = run_git_capture(cwd, &stat_args)
+    if let Some(stat) = super::unconfined_git_capture(cwd, &stat_args)
         && !stat.trim().is_empty()
     {
         preview.push_str("Changes vs HEAD:\n");
         preview.push_str(&stat);
     }
-    if let Some(status) = run_git_capture(cwd, &["status", "--short"]) {
+    if let Some(status) = super::unconfined_git_capture(cwd, &["status", "--short"]) {
         preview.push_str("\nWorking tree status:\n");
         preview.push_str(&status);
     }
@@ -223,18 +223,6 @@ fn build_preview(cwd: &Path, pathspecs: &[String]) -> String {
     preview
 }
 
-fn run_git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +245,29 @@ mod tests {
         let args: Vec<_> = command.as_std().get_args().collect();
         assert_eq!(args, ["-c", "core.fsmonitor=false", "status"]);
         assert_eq!(command.as_std().get_current_dir(), Some(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn the_preview_never_runs_repo_configured_programs() {
+        // The preview runs before the user approves, outside the sandbox: a
+        // .git/config planted by an earlier confined command must not make
+        // it run anything.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let marks = tempfile::tempdir().unwrap();
+        let fsmonitor = marks.path().join("fsmonitor-ran");
+        let clean = marks.path().join("clean-ran");
+        git(&cwd, &["config", "core.fsmonitor", &format!("sh -c 'touch {}; exit 1' --", fsmonitor.display())]).await;
+        git(&cwd, &["config", "filter.evil.clean", &format!("sh -c 'touch {}; cat'", clean.display())]).await;
+        std::fs::write(cwd.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+
+        let preview = build_preview(&cwd, &[]);
+
+        assert!(preview.contains("tracked.txt"), "{preview}");
+        assert!(!fsmonitor.exists(), "the preview ran the repo's fsmonitor");
+        assert!(!clean.exists(), "the preview ran the repo's clean filter");
     }
 
     #[tokio::test]

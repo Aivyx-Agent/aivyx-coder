@@ -140,16 +140,7 @@ fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::C
 /// fixed and not model-influenced, so this is a bounded, local metadata
 /// read, not the confiner-bypass this task fixes below.
 fn current_branch(cwd: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    super::unconfined_git_capture(cwd, &["branch", "--show-current"]).map(|s| s.trim().to_string())
 }
 
 /// Same query as `current_branch` above, but for `execute` (post-approval),
@@ -175,7 +166,7 @@ async fn current_branch_confined(ctx: &ToolExecutionContext) -> Option<String> {
 /// `output.status.success()` gate already treats as "nothing to show."
 fn build_preview(cwd: &Path, remote: &str, branch: &str) -> String {
     let range = format!("{remote}/{branch}..HEAD");
-    let mut preview = match run_git_capture(cwd, &["log", "--oneline", &range]) {
+    let mut preview = match super::unconfined_git_capture(cwd, &["log", "--oneline", &range]) {
         Some(log) if !log.trim().is_empty() => format!("Commits to push:\n{log}"),
         _ => "No commits ahead of the remote yet (or this is the first push).".to_string(),
     };
@@ -186,18 +177,6 @@ fn build_preview(cwd: &Path, remote: &str, branch: &str) -> String {
     preview
 }
 
-fn run_git_capture(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
 
 #[cfg(test)]
 mod tests {

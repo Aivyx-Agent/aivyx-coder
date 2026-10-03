@@ -156,16 +156,7 @@ fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::C
 }
 
 fn current_branch(cwd: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    super::unconfined_git_capture(cwd, &["branch", "--show-current"]).map(|s| s.trim().to_string())
 }
 
 #[cfg(test)]

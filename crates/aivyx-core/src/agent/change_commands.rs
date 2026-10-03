@@ -134,10 +134,19 @@ async fn restore_all(root: &Path) -> Result<(), String> {
 /// `core.hooksPath`).
 async fn has_commit_hook(root: &Path) -> bool {
     for name in COMMIT_HOOKS {
-        let Ok(path) = git(root, &["rev-parse", "--git-path", &format!("hooks/{name}")]).await
+        // Plain git, not `run_git`: its `core.hooksPath=/dev/null` override
+        // would hide the very hooks this looks for. `rev-parse` runs nothing.
+        let Ok(output) = tokio::process::Command::new("git")
+            .args(["rev-parse", "--git-path", &format!("hooks/{name}")])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
         else {
             continue;
         };
+        let path = String::from_utf8_lossy(&output.stdout).into_owned();
         let Ok(meta) = std::fs::metadata(root.join(path.trim())) else {
             continue;
         };

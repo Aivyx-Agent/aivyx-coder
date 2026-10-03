@@ -1744,9 +1744,18 @@ Every tool call passes through the gate before it runs:
    against a config entry that predates this block or was written by the
    user themselves — the user's own hooks still run intentionally either way.
    The user-typed `/diff` and `/commit` commands also run some git
-   unconfined (reading diffs; staging and unstaging): every such call has
-   `-c core.fsmonitor=false`, and every diff `--no-ext-diff --no-textconv`;
-   the commit itself runs confined, like `git_commit`.
+   unconfined (reading diffs; staging and unstaging), as do the pre-write
+   checkpoint, `/undo`'s restore, and the `git_commit`/`git_push`/
+   `git_branch` approval previews. The gate's block stops *tools* writing
+   `.git`, but a confined, approved command may still write anything under
+   the project — `.git/config`, `.git/hooks` and `.gitattributes`
+   included. So every unconfined git call switches off fsmonitor, hooks
+   (`core.hooksPath=/dev/null` — plumbing like `update-ref` would otherwise
+   run `reference-transaction`) and commit signing, and turns off every
+   filter driver defined in the repository's *own* config (filters from
+   your global config, such as git-lfs, still apply); every unconfined diff
+   adds `--no-ext-diff --no-textconv`. The commit itself runs confined, like
+   `git_commit`, so your own hooks still run there.
 3. **Reads** (`read_file`/`grep`/`glob`) → auto-allowed, no prompt. A read has
    no side effect on its own, so prompting on every read would make the tool
    unusable. This auto-allow is **not** scoped to the project's working
