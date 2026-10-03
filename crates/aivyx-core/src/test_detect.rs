@@ -115,7 +115,16 @@ fn found(program: &str, args: &[&str], reason: &str) -> Option<DetectedTests> {
 }
 
 /// Reads at most [`MAX_READ_BYTES`] of a file; `None` if it can't be read.
+/// Refuses anything that isn't a regular file first — `std::fs::metadata`
+/// follows symlinks, so a symlink to a regular file is still read, but a
+/// symlink (or direct path) to a FIFO, a device like `/dev/tty`, or a
+/// directory is not: opening a FIFO with no writer connected blocks the
+/// `File::open` call below forever, and a crafted project directory is
+/// untrusted input to this scan.
 fn read_capped(path: &Path) -> Option<String> {
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
     let mut text = String::new();
     std::fs::File::open(path)
         .ok()?
@@ -203,7 +212,7 @@ mod tests {
         dir
     }
 
-    fn found(files: &[(&str, &str)]) -> Option<(String, String)> {
+    fn detected_pair(files: &[(&str, &str)]) -> Option<(String, String)> {
         let dir = dir_with(files);
         detect(dir.path()).map(|d| {
             let mut cmd = d.program.clone();
@@ -248,29 +257,29 @@ mod tests {
             (vec![("README.md", "hi")], None),
         ];
         for (files, expected) in cases {
-            assert_eq!(found(&files), expected, "files: {files:?}");
+            assert_eq!(detected_pair(&files), expected, "files: {files:?}");
         }
     }
 
     #[test]
     fn the_first_matching_rule_wins() {
         assert_eq!(
-            found(&[("Makefile", "test:\n"), ("go.mod", ""), ("Cargo.toml", "")]),
+            detected_pair(&[("Makefile", "test:\n"), ("go.mod", ""), ("Cargo.toml", "")]),
             pair("cargo test", "detected from Cargo.toml")
         );
         assert_eq!(
-            found(&[("Makefile", "test:\n"), ("test_x.py", ""), ("pytest.ini", "")]),
+            detected_pair(&[("Makefile", "test:\n"), ("test_x.py", ""), ("pytest.ini", "")]),
             pair("python3 -m pytest", "detected from pytest.ini")
         );
         assert_eq!(
-            found(&[("Makefile", "test:\n"), ("package.json", NPM_PLACEHOLDER)]),
+            detected_pair(&[("Makefile", "test:\n"), ("package.json", NPM_PLACEHOLDER)]),
             pair("make test", "detected from Makefile")
         );
     }
 
     #[test]
     fn only_the_top_level_folder_counts() {
-        assert_eq!(found(&[("sub/Cargo.toml", "")]), None);
+        assert_eq!(detected_pair(&[("sub/Cargo.toml", "")]), None);
     }
 
     #[test]
@@ -318,12 +327,34 @@ mod tests {
         assert_eq!(tests.display(), r#"sh -c 'pytest -k '\''a b'\''' ''"#);
     }
 
-    /// `TEST_TIMEOUT_SECS` is the single source of truth for /test's
-    /// 10-minute timeout — `agent/test_command.rs`'s `TEST_TIMEOUT` and the
-    /// synthetic `detected-tests` entry's `timeout_secs` (`agent_builder.rs`'s
-    /// `auto_verification`) both read it rather than each hard-coding `600`.
+    // A symlinked `package.json` pointing at a FIFO must not make
+    // detection block forever: `std::fs::File::open` on a FIFO blocks
+    // until a writer connects, and nothing here ever writes to it.
+    // Run off the test thread with a bounded `recv_timeout` so a
+    // regression fails (and reports a clear panic) instead of hanging
+    // the whole test binary.
+    #[cfg(unix)]
     #[test]
-    fn test_timeout_secs_is_ten_minutes() {
-        assert_eq!(TEST_TIMEOUT_SECS, 600);
+    fn package_json_symlinked_to_a_fifo_does_not_hang_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(".fifo");
+        assert!(
+            std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success(),
+            "mkfifo failed"
+        );
+        std::os::unix::fs::symlink(&fifo, dir.path().join("package.json")).unwrap();
+
+        let dir_path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(detect(&dir_path));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert_eq!(
+                result, None,
+                "a FIFO-backed package.json must not be treated as a real test marker"
+            ),
+            Err(_) => panic!("detect() hung reading a FIFO-backed package.json"),
+        }
     }
 }

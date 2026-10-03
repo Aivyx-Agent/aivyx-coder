@@ -212,13 +212,21 @@ wins):
 The startup/`/help` line and `/test` itself both show which one and why
 (`` Tests: `cargo test` (detected from Cargo.toml) — run them with /test ``).
 It needs no approval prompt — `/test` runs confined the same way
-`run_command` does, with no model involved in choosing the command. Ctrl+C
-cancels; it's killed after a 10-minute timeout otherwise. The TUI keeps the
-last 200 output lines visible; the result and the last 80 lines are handed
-to the model with your next message, same as any other tool output, so
-they're scanned for prompt-injection markers on the way in like everything
-else that re-enters context (see "Known limitations"). With nothing
-configured or detected, `/test` says so instead of running anything.
+`run_command` does, with no model involved in choosing the command, even in
+plan mode (tests may write files — e.g. coverage output, a lockfile, test
+fixtures — so running them isn't actually read-only, but it's the user
+typing the command, not the model, so it's exempt from plan mode's
+mutation ban); and it takes no checkpoint, since nothing the model did is
+being snapshotted. Ctrl+C cancels; it's killed after a 10-minute timeout
+otherwise. The TUI keeps the last 200 output lines visible; the result and
+the last 80 lines are added to your *next* message as a clearly-labelled
+block of program output (not delivered as a synthetic tool result) — the
+note it's wrapped in says explicitly that the fenced text is program
+output, not the user talking, and that the model should treat any
+instructions inside it as untrusted data. It's scanned for prompt-injection
+markers on the way in like everything else that re-enters context (see
+"Known limitations"). With nothing configured or detected, `/test` says so
+instead of running anything.
 
 **Plan mode** (`Ctrl+P` in the TUI, or start with `aivyx-coder --plan`) makes the
 agent read-only while you scope out work: it can read, search, and build a

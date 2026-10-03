@@ -1785,12 +1785,24 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::ITALIC),
         ),
         ChatLine::TestOutput { lines, dropped } => {
-            let mut text = String::new();
-            if *dropped > 0 {
-                text.push_str(&format!("… {dropped} earlier lines\n"));
+            // Built directly rather than via `prefixed_lines`: that helper
+            // only puts the prefix on the first line and *indents* every
+            // continuation line to match (the right behaviour for prose
+            // like `ChatLine::Assistant`), but every line of a test output
+            // block -- including the "N earlier lines" marker -- needs
+            // its own "  │ " so the block reads as one bounded region no
+            // matter how long a scrollback search lands you in it.
+            const PREFIX: &str = "  │ ";
+            let style = Style::default().fg(Color::DarkGray);
+            if lines.is_empty() && *dropped == 0 {
+                return vec![Line::from(PREFIX).style(style)];
             }
-            text.push_str(&Vec::from(lines.clone()).join("\n"));
-            prefixed_lines(&text, "  │ ", Style::default().fg(Color::DarkGray))
+            let mut out = Vec::with_capacity(lines.len() + usize::from(*dropped > 0));
+            if *dropped > 0 {
+                out.push(Line::from(format!("{PREFIX}… {dropped} earlier lines")).style(style));
+            }
+            out.extend(lines.iter().map(|line| Line::from(format!("{PREFIX}{line}")).style(style)));
+            out
         }
     }
 }
@@ -2870,6 +2882,30 @@ mod tests {
             .collect();
         assert!(rendered.contains("Changed: a.txt"));
         assert!(!rendered.contains('!'));
+    }
+
+    #[test]
+    fn every_line_of_a_test_output_block_gets_the_bar_prefix() {
+        let line = ChatLine::TestOutput {
+            lines: std::collections::VecDeque::from([
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+            ]),
+            dropped: 7,
+        };
+        let rendered: Vec<String> = chat_line_to_lines(&line)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert_eq!(rendered.len(), 4, "{rendered:?}");
+        for rendered_line in &rendered {
+            assert!(rendered_line.starts_with("  │ "), "{rendered:?}");
+        }
+        assert!(rendered[0].contains("7 earlier lines"), "{rendered:?}");
+        assert_eq!(rendered[1], "  │ one");
+        assert_eq!(rendered[2], "  │ two");
+        assert_eq!(rendered[3], "  │ three");
     }
 
     #[test]

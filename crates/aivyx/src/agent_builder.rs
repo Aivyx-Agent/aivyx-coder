@@ -61,11 +61,10 @@ pub(crate) struct AutoVerification {
 /// — a typo'd name silently falling back to a detected command would
 /// leave the startup announcement (`EffectiveTests::auto_line`, driven by
 /// `tests`, which already fell back to detection) disagreeing with what
-/// verification would actually have run, had the name matched. (Review
-/// finding, Important, review of 604b0b7: this overrides an earlier,
-/// looser plan that kept today's warn-and-disable behaviour for `--auto`
-/// too — interactive/ACP/MCP-server runs still keep that behaviour,
-/// unchanged, since none of them call this function.) Absent a configured
+/// verification would actually have run, had the name matched.
+/// (Interactive/ACP/MCP-server runs keep today's warn-and-disable
+/// behaviour unchanged — only `--auto` refuses outright, since none of
+/// the other frontends call this function.) Absent a configured
 /// name, a detected command becomes a synthetic `detected-tests` entry so
 /// `run_command`'s own trust tier still applies to it — unless an entry
 /// already has that exact name, in which case `--auto` refuses rather
@@ -128,11 +127,11 @@ pub(crate) fn auto_verification(
 }
 
 /// `configured`, extended with `--auto`'s synthetic `detected-tests` entry
-/// when `auto_verification` produced one. A small pure helper (Review
-/// finding, Minor, review of 604b0b7) so the allowed-commands-list-plus-
-/// optional-synthetic-entry construction `build_agent` needs is testable
-/// on its own, independent of `Settings`/`Cli`/the rest of agent
-/// construction. Every consumer of the allowed-commands trust tier
+/// when `auto_verification` produced one. A small pure helper so the
+/// allowed-commands-list-plus-optional-synthetic-entry construction
+/// `build_agent` needs is testable on its own, independent of
+/// `Settings`/`Cli`/the rest of agent construction. Every consumer of the
+/// allowed-commands trust tier
 /// (`command_specs`, and therefore `pre_approved_commands`/the
 /// Always-Allow cache seed and `RunCommandTool`'s own registration) is
 /// built from this single list in `build_agent`, so the synthetic entry
@@ -1445,10 +1444,14 @@ pub(crate) async fn build_agent(
         );
     }
 
-    // `/test` resolves to this same effective command in every frontend and
-    // mode (interactive, ACP, MCP-server, `--auto`) — only automatic,
+    // `/test` resolves to this same effective command in every mode this
+    // agent runs under (interactive, ACP, `--auto`) — only automatic,
     // after-edit verification is gated on detection vs. configuration
-    // (above), and only under `--auto`.
+    // (above), and only under `--auto`. An MCP-server session is a
+    // separate `Agent` built by `aivyx-mcp-server`'s own
+    // `build_session_agent`, which never calls `set_tests`, so `/test`
+    // there always says "No test command…" — intended, since an MCP
+    // session has no human typing slash commands in the first place.
     agent.set_tests(tests.clone());
 
     // Persistence is always on (it's what makes `--resume` possible after a
@@ -2017,8 +2020,7 @@ tool_allowlist = []
         );
     }
 
-    /// Review finding (Important, review of 604b0b7): a typo'd
-    /// `[verification] command` must not silently fall through to
+    /// A typo'd `[verification] command` must not silently fall through to
     /// detection under `--auto` — that would leave the TUI announcing
     /// "Verifying with <detected command>" while the configured name (not
     /// the detected one) is what `agent.set_verification` would actually
@@ -2038,9 +2040,9 @@ tool_allowlist = []
         );
     }
 
-    /// Review finding (Minor, review of 604b0b7): if the user already has
-    /// an `allowed_commands` entry literally named `detected-tests`,
-    /// silently adding a *second*, synthetic one of the same name would
+    /// If the user already has an `allowed_commands` entry literally
+    /// named `detected-tests`, silently adding a *second*, synthetic one
+    /// of the same name would
     /// either shadow it or collide in the Always-Allow cache depending on
     /// lookup order — ambiguous either way. Refuse instead of guessing.
     #[test]

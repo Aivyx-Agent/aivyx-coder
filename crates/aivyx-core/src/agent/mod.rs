@@ -587,12 +587,6 @@ impl Agent {
         self.architect = Some(architect);
     }
 
-    /// Enables enforced verification (Phase 12 Part B): `command_name` must
-    /// name an entry the `run_command` tool was built with (the caller's
-    /// responsibility to keep in sync with `[[permissions.allowed_commands]]`
-    /// — see `main.rs`'s startup validation warning). `max_retries` is
-    /// clamped to a minimum of 1, matching the same "a misconfigured 0 would
-    /// otherwise be silently wrong" reasoning as `max_tool_iterations`.
     /// The command `/test` runs — resolved once at startup (see
     /// `aivyx_core::test_detect::EffectiveTests::resolve`).
     pub fn set_tests(&mut self, tests: Option<crate::test_detect::EffectiveTests>) {
@@ -603,6 +597,12 @@ impl Agent {
         self.tests.as_ref()
     }
 
+    /// Enables enforced verification (Phase 12 Part B): `command_name` must
+    /// name an entry the `run_command` tool was built with (the caller's
+    /// responsibility to keep in sync with `[[permissions.allowed_commands]]`
+    /// — see `main.rs`'s startup validation warning). `max_retries` is
+    /// clamped to a minimum of 1, matching the same "a misconfigured 0 would
+    /// otherwise be silently wrong" reasoning as `max_tool_iterations`.
     pub fn set_verification(&mut self, command_name: String, max_retries: u32) {
         self.verification = Some(VerificationConfig {
             command_name,
