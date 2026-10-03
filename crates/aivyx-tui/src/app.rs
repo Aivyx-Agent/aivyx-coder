@@ -360,6 +360,13 @@ pub async fn run(
     // Read before `autonomous` moves into the background task below --
     // there is no other point after this where it's still available.
     app.autonomous = autonomous.is_some();
+    if let Some(auto) = autonomous.as_ref() {
+        // The autonomous driver below calls `agent.run_turn` directly,
+        // never `push_user_message` -- without this, the goal never
+        // becomes a real `ChatLine::User` and the welcome hint (gated on
+        // one existing) never clears for the whole run.
+        app.seed_autonomous_goal(auto.goal.clone());
+    }
     if autonomous.is_some()
         && let Some(t) = agent.tests()
     {
@@ -834,6 +841,23 @@ impl App {
         self.cancel_requested = false;
     }
 
+    /// Seeds an autonomous (`--auto`) run's goal into the transcript as a
+    /// `ChatLine::User` line, exactly as if it had been typed. `run()`
+    /// calls this once, before the background task starts, since that's
+    /// the only point where the goal text is still available to the
+    /// render loop's own `App` -- the autonomous driver calls
+    /// `agent.run_turn` directly and never goes through
+    /// `push_user_message`. Deliberately doesn't set `streaming_active`
+    /// itself (unlike `push_user_message`): the real busy state only
+    /// starts once `handle_agent_event` sees the first event of the first
+    /// turn, same as any other turn. This is also what makes the welcome
+    /// hint disappear, via its own existing "no `ChatLine::User` yet"
+    /// rule -- and is its own method so `run()`'s wiring is unit-testable
+    /// without going through the background task.
+    fn seed_autonomous_goal(&mut self, goal: String) {
+        self.transcript.push(ChatLine::User(goal));
+    }
+
     /// Renders the `/help` command via `help_text()` as a `ChatLine::Help`
     /// (U4/U5) -- deliberately not `Notice` (see that variant's doc
     /// comment).
@@ -877,6 +901,15 @@ impl App {
         match event {
             AgentEvent::TextDelta(text) => {
                 self.turn_had_model_activity = true;
+                // The autonomous driver never calls `push_user_message`
+                // (the only other place that sets this), so without this
+                // the status line would show the idle autonomous text
+                // even while the model is actively working. Interactive
+                // mode already has `streaming_active` set from the
+                // keypress that sent the turn, so this is a no-op there.
+                if self.autonomous {
+                    self.streaming_active = true;
+                }
                 if let Some(ChatLine::Assistant(existing)) = self.transcript.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -885,6 +918,9 @@ impl App {
             }
             AgentEvent::ReasoningDelta(text) => {
                 self.turn_had_model_activity = true;
+                if self.autonomous {
+                    self.streaming_active = true;
+                }
                 if let Some(ChatLine::Reasoning(existing)) = self.transcript.last_mut() {
                     existing.push_str(&text);
                 } else {
@@ -893,6 +929,9 @@ impl App {
             }
             AgentEvent::ToolCallDetected(call) => {
                 self.turn_had_model_activity = true;
+                if self.autonomous {
+                    self.streaming_active = true;
+                }
                 // Auto-verification calls are the agent's own doing, not
                 // the model's — labeled distinctly so the transcript never
                 // implies the model asked for this itself.
@@ -3603,5 +3642,53 @@ mod tests {
             .transcript
             .iter()
             .any(|l| matches!(l, ChatLine::Notice(_))));
+    }
+
+    /// Regression test for the real driver -- `run()`'s autonomous branch
+    /// calls `agent.run_turn` directly, never `push_user_message`, so
+    /// unless the goal itself lands in the transcript as a real
+    /// `ChatLine::User`, the welcome hint's own "no `ChatLine::User` yet"
+    /// rule never clears and it stays glued under the growing transcript
+    /// for the whole run.
+    #[test]
+    fn autonomous_goal_seeded_into_the_transcript_clears_the_welcome_hint() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        app.seed_autonomous_goal("find the bug and fix it".to_string());
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("find the bug and fix it"), "{rendered}");
+        assert!(!rendered.contains("Autonomous run —"), "{rendered}");
+        assert!(!rendered.contains("Ask for a change"), "{rendered}");
+    }
+
+    /// Regression test: the status line used to always show the idle
+    /// autonomous text, even while the model was actively working,
+    /// because none of `TextDelta`/`ReasoningDelta`/`ToolCallDetected`
+    /// ever set `streaming_active` on the autonomous path (only
+    /// `push_user_message`, interactive-only, did).
+    #[test]
+    fn autonomous_status_line_tracks_real_busy_state_from_events() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        app.seed_autonomous_goal("find the bug and fix it".to_string());
+
+        let render = |app: &App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            render_to_string(&terminal)
+        };
+
+        app.handle_agent_event(AgentEvent::TextDelta("thinking...".to_string()));
+        let busy = render(&app);
+        assert!(busy.contains("streaming... (Ctrl+C to cancel)"), "{busy}");
+        assert!(!busy.contains("autonomous run — Ctrl+C to stop"), "{busy}");
+
+        app.handle_agent_event(AgentEvent::TurnComplete);
+        let idle = render(&app);
+        assert!(idle.contains("autonomous run — Ctrl+C to stop"), "{idle}");
     }
 }
