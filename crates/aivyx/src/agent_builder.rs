@@ -373,6 +373,28 @@ fn pick_resume(
     }
 }
 
+/// Loads the conversation `--resume`/`--resume=N` picks from `list`. A
+/// conversation that fails to load is an error for `--resume=N` (the
+/// user asked for that one, so starting fresh would quietly ignore the
+/// request) but only logged for bare `--resume`, which starts fresh.
+fn load_resumed(
+    store: &session::SessionStore,
+    list: &[session::SessionMeta],
+    resume: Option<Option<usize>>,
+) -> anyhow::Result<Option<session::SessionState>> {
+    let Some(id) = pick_resume(list, resume)? else {
+        return Ok(None);
+    };
+    match (store.load(&id), resume) {
+        (Some(state), _) => Ok(Some(state)),
+        (None, Some(Some(n))) => anyhow::bail!("Couldn't load saved conversation {n}."),
+        (None, _) => {
+            tracing::warn!(id = %id, "--resume: the newest conversation couldn't be loaded, starting fresh");
+            Ok(None)
+        }
+    }
+}
+
 /// Builds `Agent` + every collaborator it needs, identically regardless
 /// of which frontend is asking — only `prompter` differs between the TUI
 /// (`TuiPrompter`) and ACP (`AcpPrompter`) call sites.
@@ -1501,10 +1523,7 @@ pub(crate) async fn build_agent(
                 tracing::warn!(error = %err, "legacy session migration failed");
             }
             let list = store.list();
-            let restored = match pick_resume(&list, cli.resume)? {
-                Some(id) => store.load(&id),
-                None => None,
-            };
+            let restored = load_resumed(&store, &list, cli.resume)?;
             if let Some(state) = &restored
                 && let Some(pool) = &specialist_session_pool
             {
@@ -1574,6 +1593,34 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn an_explicit_resume_whose_conversation_fails_to_load_is_an_error() {
+        use aivyx_core::session::{SessionMeta, SessionState, SessionStore};
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("proj"));
+        let mut state = SessionState::new(
+            vec![aivyx_types::Message::text(aivyx_types::Role::User, "hi")],
+            vec![],
+            false,
+            vec![],
+        );
+        state.meta = SessionMeta {
+            id: "1-aaaaaaaa".into(),
+            ..Default::default()
+        };
+        store.save(&state).unwrap();
+        let list = store.list();
+        // The file goes bad between listing and loading.
+        std::fs::write(store.path_for("1-aaaaaaaa"), "{not json").unwrap();
+
+        assert_eq!(
+            load_resumed(&store, &list, Some(Some(1))).unwrap_err().to_string(),
+            "Couldn't load saved conversation 1."
+        );
+        assert!(load_resumed(&store, &list, Some(None)).unwrap().is_none());
+        assert!(load_resumed(&store, &list, None).unwrap().is_none());
     }
 
     #[test]

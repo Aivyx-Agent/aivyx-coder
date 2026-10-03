@@ -610,9 +610,8 @@ impl Agent {
     /// the *outgoing* conversation under its own id and leaving the
     /// now-empty one unpersisted until its first real turn; with a `File`
     /// target (or none), it means overwriting the single project file
-    /// with the now-empty session, same as before `Store` existed -- see
-    /// the `With a Store target...` paragraph below for the full
-    /// difference. Emits `ConversationCleared` so the frontend resets its
+    /// with the now-empty session -- see the `With a Store target...`
+    /// paragraph below for the full difference. Emits `ConversationCleared` so the frontend resets its
     /// own display state. Also resets the `mission_plan` handle to a
     /// pristine `MissionPlan` and calls `close_all()` on the
     /// `specialist_session_pool`, when either is set (`[team] enabled =
@@ -632,9 +631,12 @@ impl Agent {
     /// same B1 rule as everywhere else — nothing is written if this
     /// process never owned the slot), then the id is cleared along with
     /// `first_user_text`, so the *next* successful turn mints a fresh file
-    /// instead of reusing this one. With a `File` target (or no target),
-    /// today's behaviour is unchanged: the now-empty state is persisted
-    /// (overwriting the single project file) and the slot is marked owned.
+    /// instead of reusing this one. That outgoing save writes nothing if
+    /// the conversation is unchanged since it was loaded or last saved
+    /// (see `persist`). With a `File` target (or no target), the now-empty
+    /// state is persisted (overwriting the single project file) and the
+    /// slot is marked owned. Either way the history-truncated note is
+    /// reset, since the new conversation has lost nothing.
     pub fn clear_conversation(&mut self) {
         let targets_store = matches!(self.session_target, Some(SessionTarget::Store { .. }));
         if targets_store {
@@ -1203,7 +1205,7 @@ impl Agent {
 
     /// Enables session persistence: after each turn the full session is
     /// written to `path` (best-effort). The legacy single-file-per-project
-    /// layout — unchanged from before `SessionTarget` existed.
+    /// layout: every persist overwrites the one file.
     pub fn set_session_path(&mut self, path: PathBuf) {
         self.session_target = Some(SessionTarget::File(path));
     }
@@ -1290,8 +1292,8 @@ impl Agent {
     /// other state with no header) is derived from `state`'s own history
     /// the same way `SessionStore::migrate_legacy` already derives it for
     /// the legacy single-file layout -- the preview of the first
-    /// `Role::User` message. Fix-round correction: when there is no such
-    /// message, this must stay `None`, not become `Some("")` -- `Some("")`
+    /// `Role::User` message. When there is no such message it stays
+    /// `None`, not `Some("")` -- `Some("")`
     /// would satisfy `run_turn`'s `if self.first_user_text.is_none()` check
     /// for "nothing recorded yet" and permanently suppress recording the
     /// next real turn's own text.
@@ -1339,12 +1341,11 @@ impl Agent {
         }
     }
 
-    /// Fix-round regression fix: `set_session_store` then `restore_session`,
-    /// as one call, so a caller can never get the order wrong. A caller
-    /// that did `restore_session` first and `set_session_store` second
-    /// (as `agent_builder.rs` originally did) silently forked every
-    /// `--resume`d conversation into a second file: `restore_session`'s
-    /// `Some(SessionTarget::Store { id, .. })` match only adopts the
+    /// `set_session_store` then `restore_session`, as one call, so a
+    /// caller can never get the order wrong. The other order would
+    /// silently fork every `--resume`d conversation into a second file:
+    /// `restore_session`'s `Some(SessionTarget::Store { id, .. })` match
+    /// only adopts the
     /// resumed `meta.id` when the target is *already* `Store` -- called
     /// before `set_session_store`, `self.session_target` is still `None`,
     /// so the match silently does nothing, and the following
@@ -1375,11 +1376,14 @@ impl Agent {
     /// sessions it carried. Also sets Plan mode to *exactly* the resumed
     /// conversation's own `plan_mode_active` -- unlike `restore`/`--resume`
     /// (which only ever turn Plan mode *on*, to protect an explicit
-    /// `--plan` flag at startup), a controller decision for this,
-    /// in-process switch: Plan mode is a per-conversation setting here, so
+    /// `--plan` flag at startup). In an in-process switch Plan mode is a
+    /// per-conversation setting, so
     /// switching into an Act-mode conversation must turn Plan mode back
     /// *off* too, not just leave whatever the outgoing conversation left
-    /// it at. Returns whether the switch actually happened: `false` means
+    /// it at. The history-truncated note is reset too (it described the
+    /// outgoing conversation), and the loaded state is recorded as saved,
+    /// so switching away again without a change writes nothing. Returns
+    /// whether the switch actually happened: `false` means
     /// there's no `Store` target, or `id` doesn't name a loadable
     /// conversation (`AgentEvent::Error` already explains why; nothing
     /// else changed).

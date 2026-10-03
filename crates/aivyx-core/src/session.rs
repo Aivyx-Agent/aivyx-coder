@@ -4,19 +4,16 @@
 //!
 //! **Layout.** Each project gets its own directory,
 //! `<state>/sessions/<project-key>/` (mode 0700, `<project-key>` exactly
-//! the stem `session_file_path` used to name the single legacy file), and
+//! the stem of the legacy single file `session_file_path` names), and
 //! each conversation within that project is its own file,
 //! `<created_unix_ms>-<8 hex>.json` (mode 0600). `SessionStore` is the
 //! handle onto one project's directory: `list`/`load`/`save`/`prune` and
-//! `migrate_legacy` (which moves the old single-file layout in whenever
-//! that legacy file exists -- not just the first time -- so a legacy
-//! file that reappears, or survives an earlier failed migration, is never
-//! stranded). The free `load`/`save` functions below
-//! still operate on a single path each — `SessionStore` is built on top of
-//! them, not a replacement for them, since existing call sites still use
-//! the legacy single-file path directly (that path is now reached via
-//! `sessions_root()` + `project_key()`, re-expressed so the key logic
-//! exists exactly once).
+//! `migrate_legacy`, which moves the legacy single file in whenever it
+//! exists, so a legacy file that reappears, or whose migration failed
+//! part-way, is never stranded. The free `load`/`save` functions operate
+//! on a single path each; `SessionStore` is built on them, and the
+//! legacy single-file path is reached through `sessions_root()` +
+//! `project_key()`, so the key logic exists exactly once.
 
 use std::path::{Path, PathBuf};
 
@@ -171,9 +168,8 @@ pub fn session_file_path(cwd: &Path) -> Option<PathBuf> {
 /// canonicalized `cwd`'s last path component (human-readable, sanitized,
 /// truncated), plus a hash of the full canonicalized path so distinct
 /// directories that happen to share a last component never collide.
-/// Unchanged from `session_file_path`'s own key logic before this
-/// function existed -- re-expressing it here keeps that logic in exactly
-/// one place.
+/// The key must stay stable across versions, or existing projects would
+/// lose their saved conversations.
 pub fn project_key(cwd: &Path) -> String {
     // Canonicalize so `/home/u/proj` and `/home/u/./proj` (or a symlinked
     // path) key to the same session; fall back to the raw path if the
@@ -287,18 +283,14 @@ pub fn load(path: &Path) -> Option<SessionState> {
 /// project -- never collide on the temp name), `fsync`'d, then `rename`d
 /// over `path`. A reader (`load`) therefore never observes a partially
 /// written file, and a crash mid-write leaves the previous contents (or
-/// nothing) rather than a truncated one -- unlike the previous
-/// truncate-in-place implementation, which had a real window where a
-/// concurrent `load` (or a crash) could observe a half-written file.
+/// nothing) rather than a truncated one.
 ///
 /// The temp file is opened with mode `0600` set at `open()` time (via
 /// `OpenOptions::mode`, Unix-only) rather than written with the process's
-/// default umask and then `chmod`'d afterward -- the latter has a real
-/// window where the file is observable at a wider mode, plus (as it was
-/// previously written here) a silent failure mode if the `chmod` itself
-/// errors. `rename` preserves the temp file's mode, so the final file is
-/// `0600` too. Any I/O error -- including a failure to apply the mode --
-/// now propagates as a real `Err` instead of being discarded.
+/// default umask and then `chmod`'d afterward, which would leave a window
+/// where the file is observable at a wider mode. `rename` preserves the
+/// temp file's mode, so the final file is `0600` too. Any I/O error --
+/// including a failure to apply the mode -- is returned as an `Err`.
 pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -476,7 +468,22 @@ impl SessionStore {
     /// same way the free `save(path, state)` takes its path from the
     /// caller rather than inferring one.
     pub fn save(&self, state: &SessionState) -> std::io::Result<()> {
+        self.ensure_dirs()?;
         save(&self.path_for(&state.meta.id), state)
+    }
+
+    /// Creates the store's directory at mode `0700`, and its parent (the
+    /// sessions root) at `0700` too when that doesn't exist yet, so the
+    /// project directory names inside it (which embed each project's
+    /// directory name) aren't listable by other users. An existing parent
+    /// is left as it is.
+    fn ensure_dirs(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.dir.parent()
+            && !parent.exists()
+        {
+            ensure_private_dir(parent)?;
+        }
+        ensure_private_dir(&self.dir)
     }
 
     /// Deletes every conversation past the newest `keep` (by `list`'s
@@ -489,33 +496,23 @@ impl SessionStore {
         }
     }
 
-    /// One-time-per-reappearance migration from the legacy single-file
-    /// layout (`<project-key>.json`) into this store's directory. Does
-    /// nothing (`Ok(false)`) unless `legacy` is a regular file --
-    /// deliberately *not* conditioned on whether `self.dir` already
-    /// exists.
-    ///
-    /// Earlier, this also required `!self.dir.exists()`, on the
-    /// assumption that the directory's existence alone proved migration
-    /// had already happened. That assumption broke if `self.save` below
-    /// ever failed after `self.dir` was created (disk full, permissions):
-    /// the legacy file would survive, but every later call would see the
-    /// directory already there and return `Ok(false)` forever --
-    /// stranding that conversation for good. Checking only `legacy`
-    /// itself fixes that (a failed save simply gets retried next time,
-    /// since the legacy file is still there to find), and also means a
-    /// legacy file that *reappears* after migration -- e.g. an older
-    /// aivyx-coder build, or an ACP process still on one, writing it again
-    /// -- gets migrated too, instead of being silently ignored because
-    /// the directory already exists. The cost is a theoretical duplicate
-    /// entry if a save succeeds but the subsequent `remove_file` fails;
-    /// that's acceptable, since nothing is lost, unlike the stranding
-    /// above.
+    /// Moves the legacy single-file layout (`<project-key>.json`) into
+    /// this store's directory. Does nothing (`Ok(false)`) unless `legacy`
+    /// is a regular file, and runs whenever it is -- whether or not
+    /// `self.dir` already exists. Keying on the legacy file alone means a
+    /// migration whose save failed (disk full, permissions) is retried on
+    /// the next start rather than stranding the conversation, and a legacy
+    /// file written again later (by an older aivyx-coder build) is picked
+    /// up too. The cost is a possible duplicate entry if the save succeeds
+    /// but removing the legacy file fails, which loses nothing.
     ///
     /// A `legacy` file that parses as a `SessionState` is loaded, given a
     /// derived `SessionMeta` (timestamps from the file's own mtime, since
     /// the legacy format never recorded them; `first_user_text` and
     /// `turns` from its history), saved into the store, and then removed.
+    /// One with an empty history is a conversation that was `/clear`ed
+    /// (the single-file layout persisted the empty session), so it is
+    /// deleted rather than migrated, and the result is `Ok(false)`.
     /// A `legacy` file that *doesn't* parse is not discarded -- its raw
     /// bytes are renamed into the store directory unchanged, under a
     /// mtime-derived id, so a corrupt-but-maybe-recoverable file is never
@@ -535,10 +532,15 @@ impl SessionStore {
             .unwrap_or(0);
         let mtime_secs = mtime_ms / 1000;
         let id = Self::new_id(mtime_ms);
+        let loaded = load(legacy);
+        if loaded.as_ref().is_some_and(|state| state.history.is_empty()) {
+            std::fs::remove_file(legacy)?;
+            return Ok(false);
+        }
 
-        ensure_private_dir(&self.dir)?;
+        self.ensure_dirs()?;
 
-        match load(legacy) {
+        match loaded {
             Some(mut state) => {
                 state.meta = SessionMeta {
                     id: id.clone(),
@@ -906,6 +908,41 @@ mod tests {
         assert!(!legacy.exists());
         let kept: Vec<_> = std::fs::read_dir(store.dir()).unwrap().collect();
         assert_eq!(kept.len(), 1, "the bytes are kept, even if unlistable");
+    }
+
+    #[test]
+    fn migrate_deletes_an_empty_legacy_session_instead_of_migrating_it() {
+        // The single-file layout persisted the now-empty session on /clear,
+        // so a legacy file with no history is just a cleared conversation.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("p.json");
+        save(&legacy, &SessionState::new(vec![], vec![], false, vec![])).unwrap();
+        let store = SessionStore::new(dir.path().join("p"));
+        assert!(!store.migrate_legacy(&legacy).unwrap());
+        assert!(!legacy.exists());
+        assert!(store.list().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_store_creates_the_sessions_root_owner_only_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let store = SessionStore::new(root.join("proj"));
+        store.save(&meta_state("1-aaaaaaaa", 1, "x")).unwrap();
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let root2 = dir2.path().join("sessions");
+        let legacy_dir = dir2.path().join("elsewhere");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join("proj.json");
+        save(&legacy, &SessionState::new(vec![Message::text(Role::User, "hi")], vec![], false, vec![])).unwrap();
+        assert!(SessionStore::new(root2.join("proj")).migrate_legacy(&legacy).unwrap());
+        let root2_mode = std::fs::metadata(&root2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root2_mode, 0o700);
     }
 
     #[test]
