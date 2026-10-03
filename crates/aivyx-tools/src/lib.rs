@@ -27,6 +27,23 @@ pub mod web;
 pub mod wiki;
 
 pub use aivyx_checkpoint::{GitCheckpointer, exclude_pathspecs, run_git};
+
+/// `git add -A` pathspecs for everything under `dir` except the deny list:
+/// absolute deny paths inside `dir` (as the checkpointer excludes them) and
+/// bare basename patterns (`.env`, `*.pem`) in every directory — which the
+/// checkpointer's own `exclude_pathspecs` doesn't express. Shared by `/diff`
+/// and `/commit` so neither shows or stages a deny-listed file.
+pub fn deny_aware_pathspecs(dir: &Path, deny: &[PathBuf]) -> Vec<String> {
+    let mut specs = vec![".".to_string()];
+    specs.extend(exclude_pathspecs(dir, deny));
+    specs.extend(
+        deny.iter()
+            .filter(|d| d.parent() == Some(Path::new("")))
+            .filter_map(|d| d.to_str())
+            .map(|pattern| format!(":(exclude,glob)**/{pattern}")),
+    );
+    specs
+}
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use path_resolve::resolve;
@@ -377,11 +394,8 @@ impl ToolExecutor {
         let _ = std::fs::remove_file(&index);
         let index_str = index.to_str()?.to_string();
         let env = [("GIT_INDEX_FILE", index_str.as_str())];
-        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-        add_args.extend(aivyx_checkpoint::exclude_pathspecs(
-            cwd,
-            &self.checkpoint_deny_paths,
-        ));
+        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into()];
+        add_args.extend(deny_aware_pathspecs(cwd, &self.checkpoint_deny_paths));
         let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
         let seeded = match base {
             Some(base) => run_git(cwd, &["read-tree", base], &env).await.is_ok(),

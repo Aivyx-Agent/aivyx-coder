@@ -21,18 +21,21 @@ pub struct FileChange {
 }
 
 pub fn parse_numstat(numstat: &str, name_status: &str) -> Vec<FileChange> {
-    let status_of = |path: &str| {
-        name_status
-            .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .find(|(_, p)| *p == path)
-            .map(|(s, _)| match s.chars().next() {
+    // One pass over name-status, so a turn touching thousands of files
+    // doesn't rescan it per numstat line.
+    let statuses: std::collections::HashMap<&str, ChangeStatus> = name_status
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(s, p)| {
+            let status = match s.chars().next() {
                 Some('A') => ChangeStatus::Added,
                 Some('D') => ChangeStatus::Removed,
                 _ => ChangeStatus::Modified,
-            })
-            .unwrap_or(ChangeStatus::Modified)
-    };
+            };
+            (p, status)
+        })
+        .collect();
+    let status_of = |path: &str| statuses.get(path).cloned().unwrap_or(ChangeStatus::Modified);
     numstat
         .lines()
         .filter_map(|line| {

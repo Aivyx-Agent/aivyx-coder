@@ -130,21 +130,6 @@ async fn restore_all(root: &Path) -> Result<(), String> {
     }
 }
 
-/// `git add -A` pathspecs for the whole repository minus `deny`: absolute
-/// deny paths inside `root` as the checkpointer excludes them, and bare
-/// basename patterns (`.env`, `*.pem`) in every directory.
-fn add_pathspecs(root: &Path, deny: &[PathBuf]) -> Vec<String> {
-    let mut specs = vec![".".to_string()];
-    specs.extend(aivyx_tools::exclude_pathspecs(root, deny));
-    specs.extend(
-        deny.iter()
-            .filter(|d| d.parent() == Some(Path::new("")))
-            .filter_map(|d| d.to_str())
-            .map(|pattern| format!(":(exclude,glob)**/{pattern}")),
-    );
-    specs
-}
-
 /// Whether an executable hook that can stop a commit exists (honouring
 /// `core.hooksPath`).
 async fn has_commit_hook(root: &Path) -> bool {
@@ -325,7 +310,7 @@ impl Agent {
         let staged_by_us = if git(&root, &["diff", "--cached", "--quiet"]).await.is_err() {
             Vec::new()
         } else {
-            let specs = add_pathspecs(&root, &deny);
+            let specs = aivyx_tools::deny_aware_pathspecs(&root, &deny);
             let mut args = vec!["add", "-A", "--"];
             args.extend(specs.iter().map(String::as_str));
             let staged = match git(&root, &args).await {

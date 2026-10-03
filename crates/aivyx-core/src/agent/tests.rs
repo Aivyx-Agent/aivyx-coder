@@ -7546,6 +7546,28 @@ fn all_request_text(mock: &MockBackend) -> String {
 }
 
 #[tokio::test]
+async fn diff_never_shows_deny_listed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join(".env"), "SECRET=hunter2\n").unwrap();
+    std::fs::write(cwd.join("key.pem"), "PRIVATE\n").unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let (mut agent, mut rx) = commit_agent_with_deny(
+        &cwd,
+        Arc::new(PanickingBackend),
+        vec![PathBuf::from(".env"), PathBuf::from("*.pem")],
+    )
+    .await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    let text = &diffs[0].1;
+    assert!(text.contains("+v2"), "{text}");
+    assert!(!text.contains("hunter2") && !text.contains(".env"), "{text}");
+    assert!(!text.contains("PRIVATE") && !text.contains("key.pem"), "{text}");
+}
+
+#[tokio::test]
 async fn commit_never_stages_or_sends_deny_listed_files() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
