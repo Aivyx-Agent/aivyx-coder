@@ -1,10 +1,24 @@
 //! Session persistence: the conversation history plus the task list,
 //! serialized so a crash, quit, or slow-model interruption can be resumed.
 //! Best-effort — a failure to save must never take down a turn.
+//!
+//! **Layout.** Each project gets its own directory,
+//! `<state>/sessions/<project-key>/` (mode 0700, `<project-key>` exactly
+//! the stem `session_file_path` used to name the single legacy file), and
+//! each conversation within that project is its own file,
+//! `<created_unix_ms>-<8 hex>.json` (mode 0600). `SessionStore` is the
+//! handle onto one project's directory: `list`/`load`/`save`/`prune` and
+//! `migrate_legacy` (which moves the old single-file layout in the first
+//! time the new layout is used). The free `load`/`save` functions below
+//! still operate on a single path each — `SessionStore` is built on top of
+//! them, not a replacement for them, since existing call sites still use
+//! the legacy single-file path directly (that path is now reached via
+//! `sessions_root()` + `project_key()`, re-expressed so the key logic
+//! exists exactly once).
 
 use std::path::{Path, PathBuf};
 
-use aivyx_types::Message;
+use aivyx_types::{Message, Role};
 pub use aivyx_types::{Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +93,15 @@ pub struct SessionState {
     /// message. `#[serde(default)]` so older session files load with none.
     #[serde(default)]
     pub pending_notes: Vec<String>,
+    /// This conversation's header: id, timestamps, and a short preview --
+    /// everything `/sessions` needs without loading (and deserializing)
+    /// the full history of every other conversation in the project.
+    /// `#[serde(default)]` so a session file written before `SessionMeta`
+    /// existed still loads, as `SessionMeta::default()` (an empty id) --
+    /// the legacy single-file layout never had one, since there was only
+    /// ever one file per project and nothing to tell apart.
+    #[serde(default)]
+    pub meta: SessionMeta,
 }
 
 impl SessionState {
@@ -96,9 +119,27 @@ impl SessionState {
             specialist_sessions,
             undo: crate::undo::UndoLedger::default(),
             pending_notes: Vec::new(),
+            meta: SessionMeta::default(),
         }
     }
 }
+
+/// One conversation's header -- enough for `/sessions` to list it without
+/// loading the full history. `#[serde(default)]` on `SessionState::meta`
+/// means an empty `id` (the `Default` value) marks a file that predates
+/// this field, or a legacy single-file session not yet migrated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub created_unix: i64,
+    pub updated_unix: i64,
+    pub first_user_text: String,
+    pub turns: usize,
+}
+
+/// How many conversations `SessionStore::prune` keeps per project, newest
+/// by `updated_unix` first.
+pub const SESSIONS_KEPT: usize = 20;
 
 /// Where this project's session is persisted: one file per project
 /// directory, keyed by a stable hash of the canonicalized `cwd` (plus its
@@ -110,12 +151,20 @@ impl SessionState {
 ///
 /// `None` when no home/state directory can be determined at all.
 pub fn session_file_path(cwd: &Path) -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
-    let state_dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    let root = sessions_root()?;
+    let key = project_key(cwd);
+    Some(root.join(format!("{key}.json")))
+}
 
+/// The stable per-project key used both by the legacy single file
+/// (`<key>.json`) and the new per-project directory (`<key>/`): the
+/// canonicalized `cwd`'s last path component (human-readable, sanitized,
+/// truncated), plus a hash of the full canonicalized path so distinct
+/// directories that happen to share a last component never collide.
+/// Unchanged from `session_file_path`'s own key logic before this
+/// function existed -- re-expressing it here keeps that logic in exactly
+/// one place.
+pub fn project_key(cwd: &Path) -> String {
     // Canonicalize so `/home/u/proj` and `/home/u/./proj` (or a symlinked
     // path) key to the same session; fall back to the raw path if the
     // directory can't be canonicalized rather than failing resume outright.
@@ -129,11 +178,55 @@ pub fn session_file_path(cwd: &Path) -> Option<PathBuf> {
         .take(40)
         .collect();
 
-    let key = format!(
+    format!(
         "{name}-{:016x}",
         fnv1a(canonical.to_string_lossy().as_bytes())
-    );
-    Some(state_dir.join("sessions").join(format!("{key}.json")))
+    )
+}
+
+/// `<state>/sessions`, the directory both the legacy single file
+/// (`<key>.json`) and the new per-project directories (`<key>/`) live
+/// under. `None` when no home/state directory can be determined at all.
+pub fn sessions_root() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
+    let state_dir = dirs
+        .state_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    Some(state_dir.join("sessions"))
+}
+
+/// A short, single-line preview of a message's text for `/sessions`
+/// listings: strips a leading note block (text produced by `/undo`/
+/// `/redo` prefixing, which starts with `(` and contains `)\n\n`),
+/// collapses whitespace runs (newlines included) to single spaces, and
+/// caps at 60 chars, appending `…` when cut.
+pub fn preview_text(text: &str) -> String {
+    let stripped = if text.starts_with('(') {
+        match text.find(")\n\n") {
+            Some(idx) => &text[idx + ")\n\n".len()..],
+            None => text,
+        }
+    } else {
+        text
+    };
+
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    const MAX: usize = 60;
+    if collapsed.chars().count() > MAX {
+        let truncated: String = collapsed.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
+/// How many turns a conversation has had so far -- the number of
+/// `Role::User` messages in its history (each user message starts one
+/// turn; the assistant's reply and any tool round-trips complete it).
+pub fn count_turns(history: &[Message]) -> usize {
+    history.iter().filter(|m| m.role == Role::User).count()
 }
 
 /// Where cross-session memory (`memory_write`/`memory_read`/
@@ -178,13 +271,24 @@ pub fn load(path: &Path) -> Option<SessionState> {
 /// output read during the session, so it's treated as sensitive like
 /// `config.toml`). Best-effort at the call site.
 ///
-/// The file is opened with mode `0600` set at `open()` time (via
+/// Atomic: the JSON is written in full to a sibling temp file
+/// (`<path>.tmp-<pid>`, so two processes racing on the same path -- e.g.
+/// `aivyx-coder` and a specialist, or two instances started in the same
+/// project -- never collide on the temp name), `fsync`'d, then `rename`d
+/// over `path`. A reader (`load`) therefore never observes a partially
+/// written file, and a crash mid-write leaves the previous contents (or
+/// nothing) rather than a truncated one -- unlike the previous
+/// truncate-in-place implementation, which had a real window where a
+/// concurrent `load` (or a crash) could observe a half-written file.
+///
+/// The temp file is opened with mode `0600` set at `open()` time (via
 /// `OpenOptions::mode`, Unix-only) rather than written with the process's
 /// default umask and then `chmod`'d afterward -- the latter has a real
 /// window where the file is observable at a wider mode, plus (as it was
 /// previously written here) a silent failure mode if the `chmod` itself
-/// errors. Any I/O error -- including a failure to apply the mode -- now
-/// propagates as a real `Err` instead of being discarded.
+/// errors. `rename` preserves the temp file's mode, so the final file is
+/// `0600` too. Any I/O error -- including a failure to apply the mode --
+/// now propagates as a real `Err` instead of being discarded.
 pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -197,6 +301,14 @@ pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+
     #[cfg(unix)]
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -205,25 +317,211 @@ pub fn save(path: &Path, state: &SessionState) -> std::io::Result<()> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?
+            .open(&tmp_path)?
     };
     #[cfg(not(unix))]
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)?;
+        .open(&tmp_path)?;
 
     use std::io::Write;
-    file.write_all(json.as_bytes())?;
-    file.sync_all()?;
+    let write_result = file.write_all(json.as_bytes()).and_then(|()| file.sync_all());
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    drop(file);
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
     Ok(())
+}
+
+/// A handle onto one project's conversation directory
+/// (`<state>/sessions/<project-key>/`). Each conversation is its own
+/// `<id>.json` file (`id` = `<created_unix_ms>-<8 hex>`); `save`/`load`
+/// address a conversation by its `meta.id`/`id`, `list` enumerates every
+/// conversation's header without loading full histories unnecessarily
+/// (it still loads each whole file today -- headers aren't split into
+/// separate files -- but callers only see the `SessionMeta`), and `prune`
+/// deletes everything past the newest `SESSIONS_KEPT`.
+#[derive(Debug, Clone)]
+pub struct SessionStore {
+    dir: PathBuf,
+}
+
+impl SessionStore {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// The store for `cwd`'s project, rooted at `sessions_root()/<project_key>`.
+    /// `None` under the same conditions `sessions_root()` returns `None`.
+    pub fn for_project(cwd: &Path) -> Option<Self> {
+        let root = sessions_root()?;
+        Some(Self::new(root.join(project_key(cwd))))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A new conversation id: `<now_ms>-<8 hex>`, where the hex suffix is
+    /// derived from the pid and a monotonic clock reading so two ids
+    /// minted in the same millisecond (even in the same process) still
+    /// differ -- there's no other source of entropy available here, and
+    /// collisions would silently merge two unrelated conversations into
+    /// one file.
+    pub fn new_id(now_ms: i64) -> String {
+        let salt = format!(
+            "{now_ms}-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        );
+        let suffix = (fnv1a(salt.as_bytes()) & 0xffff_ffff) as u32;
+        format!("{now_ms}-{suffix:08x}")
+    }
+
+    /// The path a conversation with this id would be saved at: not
+    /// guaranteed to exist.
+    pub fn path_for(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}.json"))
+    }
+
+    /// Every conversation's header, newest `updated_unix` first (ties
+    /// broken by `id` descending, so two conversations saved in the same
+    /// second still sort deterministically). A file that doesn't parse as
+    /// a `SessionState` -- including any lingering `*.tmp-<pid>` file, by
+    /// extension alone, not by attempting to load it -- is skipped rather
+    /// than failing the whole listing. A loaded file whose `meta.id` is
+    /// empty (predates `SessionMeta`, or a hand-copied file) takes its id
+    /// from the file's own stem instead, so it's still addressable by
+    /// `load`/`path_for`.
+    pub fn list(&self) -> Vec<SessionMeta> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+
+        let mut metas: Vec<SessionMeta> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| {
+                let mut meta = load(&path)?.meta;
+                if meta.id.is_empty() {
+                    meta.id = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                }
+                Some(meta)
+            })
+            .collect();
+
+        metas.sort_by(|a, b| b.updated_unix.cmp(&a.updated_unix).then_with(|| b.id.cmp(&a.id)));
+        metas
+    }
+
+    pub fn load(&self, id: &str) -> Option<SessionState> {
+        load(&self.path_for(id))
+    }
+
+    /// Saves `state` to the path its own `meta.id` names -- callers set
+    /// `state.meta.id` (and the rest of `meta`) before calling this, the
+    /// same way the free `save(path, state)` takes its path from the
+    /// caller rather than inferring one.
+    pub fn save(&self, state: &SessionState) -> std::io::Result<()> {
+        save(&self.path_for(&state.meta.id), state)
+    }
+
+    /// Deletes every conversation past the newest `keep` (by `list`'s
+    /// order). A failure to delete one file is swallowed and pruning
+    /// continues with the rest -- this runs after every persist and must
+    /// never turn into a reason a turn fails.
+    pub fn prune(&self, keep: usize) {
+        for meta in self.list().into_iter().skip(keep) {
+            let _ = std::fs::remove_file(self.path_for(&meta.id));
+        }
+    }
+
+    /// One-time migration from the legacy single-file layout
+    /// (`<project-key>.json`) to this store's directory. Does nothing
+    /// (`Ok(false)`) unless `legacy` is a regular file and `self.dir`
+    /// doesn't exist yet -- once the directory exists, migration has
+    /// already happened (or this project never had a legacy file), and
+    /// running it again must be a safe no-op, not a second conversation
+    /// appearing from nowhere.
+    ///
+    /// A `legacy` file that parses as a `SessionState` is loaded, given a
+    /// derived `SessionMeta` (timestamps from the file's own mtime, since
+    /// the legacy format never recorded them; `first_user_text` and
+    /// `turns` from its history), saved into the store, and then removed.
+    /// A `legacy` file that *doesn't* parse is not discarded -- its raw
+    /// bytes are renamed into the store directory unchanged, under a
+    /// mtime-derived id, so a corrupt-but-maybe-recoverable file is never
+    /// silently lost.
+    pub fn migrate_legacy(&self, legacy: &Path) -> std::io::Result<bool> {
+        if !legacy.is_file() || self.dir.exists() {
+            return Ok(false);
+        }
+
+        let metadata = std::fs::metadata(legacy)?;
+        let mtime = metadata
+            .modified()
+            .unwrap_or_else(|_| std::time::SystemTime::now());
+        let mtime_ms = mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mtime_secs = mtime_ms / 1000;
+        let id = Self::new_id(mtime_ms);
+
+        std::fs::create_dir_all(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        match load(legacy) {
+            Some(mut state) => {
+                state.meta = SessionMeta {
+                    id: id.clone(),
+                    created_unix: mtime_secs,
+                    updated_unix: mtime_secs,
+                    first_user_text: state
+                        .history
+                        .iter()
+                        .find(|m| m.role == Role::User)
+                        .map(|m| preview_text(&m.text_content()))
+                        .unwrap_or_default(),
+                    turns: count_turns(&state.history),
+                };
+                self.save(&state)?;
+                std::fs::remove_file(legacy)?;
+            }
+            None => {
+                let dest = self.path_for(&id);
+                std::fs::rename(legacy, &dest)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
+
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aivyx_types::Role;
 
     #[test]
     fn round_trips_through_disk() {
@@ -426,4 +724,123 @@ mod tests {
     // above remains the correct, sufficient regression test: it proves the
     // resulting mode is exactly `0o600`, which is all `open()`-time mode
     // assignment can ever produce.
+
+    fn meta_state(id: &str, updated: i64, first: &str) -> SessionState {
+        let mut s = SessionState::new(vec![Message::text(Role::User, first)], vec![], false, vec![]);
+        s.meta = SessionMeta {
+            id: id.into(),
+            created_unix: updated,
+            updated_unix: updated,
+            first_user_text: first.into(),
+            turns: 1,
+        };
+        s
+    }
+
+    #[test]
+    fn store_lists_newest_first_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("proj"));
+        store.save(&meta_state("1000-aaaaaaaa", 10, "old")).unwrap();
+        store.save(&meta_state("2000-bbbbbbbb", 30, "newest")).unwrap();
+        store.save(&meta_state("1500-cccccccc", 20, "middle")).unwrap();
+        let ids: Vec<String> = store.list().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["2000-bbbbbbbb", "1500-cccccccc", "1000-aaaaaaaa"]);
+        let loaded = store.load("1500-cccccccc").unwrap();
+        assert_eq!(loaded.history[0].text_content(), "middle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_files_are_0600_in_a_0700_dir_and_leave_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("proj"));
+        store.save(&meta_state("1-aaaaaaaa", 1, "x")).unwrap();
+        store.save(&meta_state("1-aaaaaaaa", 2, "x")).unwrap();
+        let dir_mode = std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(store.path_for("1-aaaaaaaa")).unwrap().permissions().mode() & 0o777;
+        assert_eq!((dir_mode, file_mode), (0o700, 0o600));
+        let names: Vec<String> = std::fs::read_dir(store.dir()).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["1-aaaaaaaa.json".to_string()]);
+    }
+
+    #[test]
+    fn prune_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("proj"));
+        for i in 0..25 {
+            store.save(&meta_state(&format!("{i}-00000000"), i, "t")).unwrap();
+        }
+        store.prune(SESSIONS_KEPT);
+        let list = store.list();
+        assert_eq!(list.len(), 20);
+        assert_eq!(list[0].updated_unix, 24);
+        assert_eq!(list[19].updated_unix, 5);
+    }
+
+    #[test]
+    fn migrate_moves_the_legacy_file_in_and_derives_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("proj-0000000000000001.json");
+        let old = SessionState::new(
+            vec![
+                Message::text(Role::User, "(You undid the last turn.)\n\nthe tests in\n  test_stats.py fail"),
+                Message::text(Role::Assistant, "ok"),
+                Message::text(Role::User, "again"),
+            ],
+            vec![],
+            false,
+            vec![],
+        );
+        save(&legacy, &old).unwrap();
+        let store = SessionStore::new(dir.path().join("proj-0000000000000001"));
+        assert!(store.migrate_legacy(&legacy).unwrap());
+        assert!(!legacy.exists());
+        let list = store.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].first_user_text, "the tests in test_stats.py fail");
+        assert_eq!(list[0].turns, 2);
+        assert!(list[0].updated_unix > 0);
+        assert_eq!(store.load(&list[0].id).unwrap().history.len(), 3);
+        // Second run: the directory exists, nothing happens.
+        assert!(!store.migrate_legacy(&legacy).unwrap());
+    }
+
+    #[test]
+    fn migrate_keeps_an_unparseable_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("p.json");
+        std::fs::write(&legacy, "{not json").unwrap();
+        let store = SessionStore::new(dir.path().join("p"));
+        assert!(store.migrate_legacy(&legacy).unwrap());
+        assert!(!legacy.exists());
+        let kept: Vec<_> = std::fs::read_dir(store.dir()).unwrap().collect();
+        assert_eq!(kept.len(), 1, "the bytes are kept, even if unlistable");
+    }
+
+    #[test]
+    fn old_files_load_with_a_default_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.json");
+        std::fs::write(&path, r#"{"version":1,"history":[],"tasks":[]}"#).unwrap();
+        assert_eq!(load(&path).unwrap().meta, SessionMeta::default());
+    }
+
+    #[test]
+    fn preview_text_strips_notes_collapses_space_and_caps_at_60() {
+        assert_eq!(preview_text("(note one) (note two)\n\nfix  the\nbug"), "fix the bug");
+        let long = "x".repeat(70);
+        assert_eq!(preview_text(&long), format!("{}…", "x".repeat(60)));
+        assert_eq!(preview_text("(not a note) just text"), "(not a note) just text");
+    }
+
+    #[test]
+    fn new_ids_sort_by_time_and_differ() {
+        let a = SessionStore::new_id(1000);
+        let b = SessionStore::new_id(1000);
+        assert!(a.starts_with("1000-") && a.len() == "1000-".len() + 8);
+        assert_ne!(a, b);
+    }
 }
