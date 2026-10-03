@@ -26,6 +26,7 @@ use crate::specialist_sessions::SpecialistSessionPool;
 use crate::undo::TurnMark;
 
 mod change_commands;
+mod test_command;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -382,6 +383,11 @@ pub struct Agent {
     /// that require alternating roles still work. Persisted with the
     /// session; reset by `clear_conversation`.
     pending_notes: Vec<String>,
+    /// The command `/test` runs (config, else detected); `None` = none.
+    tests: Option<crate::test_detect::EffectiveTests>,
+    /// How long `/test` may run. Always [`test_command::TEST_TIMEOUT`]
+    /// outside tests.
+    pub(super) test_timeout: std::time::Duration,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -464,6 +470,8 @@ impl Agent {
             command_prompter: None,
             write_sandbox: None,
             pending_notes: Vec::new(),
+            tests: None,
+            test_timeout: test_command::TEST_TIMEOUT,
             events_tx,
         }
     }
@@ -585,6 +593,16 @@ impl Agent {
     /// — see `main.rs`'s startup validation warning). `max_retries` is
     /// clamped to a minimum of 1, matching the same "a misconfigured 0 would
     /// otherwise be silently wrong" reasoning as `max_tool_iterations`.
+    /// The command `/test` runs — resolved once at startup (see
+    /// `aivyx_core::test_detect::EffectiveTests::resolve`).
+    pub fn set_tests(&mut self, tests: Option<crate::test_detect::EffectiveTests>) {
+        self.tests = tests;
+    }
+
+    pub fn tests(&self) -> Option<&crate::test_detect::EffectiveTests> {
+        self.tests.as_ref()
+    }
+
     pub fn set_verification(&mut self, command_name: String, max_retries: u32) {
         self.verification = Some(VerificationConfig {
             command_name,
@@ -1583,6 +1601,12 @@ impl Agent {
         // `/diff` and `/commit` likewise act on the worktree directly.
         if let Some(command) = change_commands::parse(&user_input) {
             self.run_change_command(command, cancellation.clone()).await;
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
+        // `/test` runs the project's tests directly — never a model turn.
+        if test_command::parse(&user_input) {
+            self.run_tests(cwd, cancellation.clone()).await;
             self.emit(AgentEvent::TurnComplete);
             return Ok(());
         }

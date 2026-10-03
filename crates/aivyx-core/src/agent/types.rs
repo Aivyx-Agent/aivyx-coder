@@ -105,6 +105,18 @@ pub enum AgentEvent {
         title: String,
         text: String,
     },
+    /// One line of `/test` output (stdout or stderr, as it arrives), no
+    /// trailing newline. Frontends show it in a dim block that keeps only
+    /// the most recent lines.
+    TestOutput(String),
+    /// `/test` ended: `summary` is the result line (`Tests passed (1.2 s)`,
+    /// `Tests failed (exit 1, 1.2 s)`, `Tests cancelled`, …), `tail` the
+    /// last 80 output lines — for a frontend that didn't show the stream
+    /// (ACP).
+    TestFinished {
+        summary: String,
+        tail: String,
+    },
 }
 
 /// How edit content travels to and from the model. See ROADMAP.md Phase 2

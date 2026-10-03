@@ -180,6 +180,7 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
                 "{title}\n\n{fence}diff\n{text}\n{fence}"
             )))
         }
+        AgentEvent::TestOutput(_) | AgentEvent::TestFinished { .. } => return None,
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
             AcpToolCall::new(call.id.0.clone(), call.name.clone())
                 .kind(tool_kind(&call.name))

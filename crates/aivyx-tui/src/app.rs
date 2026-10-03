@@ -927,6 +927,8 @@ impl App {
                     });
                 }
             }
+            AgentEvent::TestOutput(line) => self.transcript.push(ChatLine::Info(line)),
+            AgentEvent::TestFinished { summary, .. } => self.transcript.push(ChatLine::Info(summary)),
         }
     }
 
@@ -1261,6 +1263,8 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
             text.clone()
         }
         AgentEvent::ShowDiff { title, .. } => title.clone(),
+        AgentEvent::TestOutput(line) => line.clone(),
+        AgentEvent::TestFinished { summary, .. } => summary.clone(),
         AgentEvent::TurnComplete
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::TasksUpdated(_)

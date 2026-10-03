@@ -86,6 +86,11 @@ pub const COMMANDS: &[CommandInfo] = &[
         tier: CommandTier::AgentState,
     },
     CommandInfo {
+        name: "/test",
+        description: "Run the project's tests (the command shown at startup)",
+        tier: CommandTier::AgentState,
+    },
+    CommandInfo {
         name: "/help",
         description: "List available commands",
         tier: CommandTier::FrontendOnly,
