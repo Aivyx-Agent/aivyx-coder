@@ -12,6 +12,7 @@ pub mod routing_commands;
 pub mod session;
 pub mod specialist_enforcement;
 pub mod specialist_sessions;
+pub mod test_detect;
 pub mod undo;
 pub mod wiki;
 
