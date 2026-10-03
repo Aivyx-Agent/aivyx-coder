@@ -1545,11 +1545,14 @@ answers "/resume isn't available here." (the editor manages its own
 conversation view, which an in-place swap would leave not reflecting the
 switched-to history).
 
+The editor's stop button (`session/cancel`) stops the running reply,
+including a `/test` run, and the prompt ends as cancelled. A pending
+approval the editor cancels along with it counts as denied.
+
 **Not yet supported over ACP**: `--auto` (autonomous mode), `--resume`
 (TUI-only — the editor manages its own conversation view, so resumed
 history would be invisible to it; `--acp --resume` is rejected at
-startup), mid-turn cancellation (`session/cancel`), and non-text prompt
-content (images, embedded resources) — see `docs/superpowers/specs/
+startup), and non-text prompt content (images, embedded resources) — see `docs/superpowers/specs/
 2026-07-20-acp-editor-integration-design.md` for the full scope.
 
 ### First-run setup
@@ -1704,12 +1707,12 @@ below for exact forms):
 
 While composing a command (input starts with `/`, no space yet), the TUI
 shows a small hint listing matching commands and their descriptions —
-purely visual, keep typing and press Enter as normal. `/help`/`/clear`/
-`/quit` and the hint are TUI-only; the ACP editor-integration frontend
-doesn't wire them up (an editor hosting ACP has its own UI for
-equivalent actions), though `/council`/`/wiki`/`/architect`/`/models`/
-`/model` work there too since they flow through the same
-`Agent::run_turn` path either way.
+purely visual, keep typing and press Enter as normal. The hint and
+`/quit` are TUI-only. Over ACP, every command except `/resume` and `/quit`
+is listed in the editor's own command picker: `/help` and `/clear` are
+answered by the ACP frontend itself (`/clear` also empties the editor's
+Plan panel), and the rest flow through the same `Agent::run_turn` path
+as in the TUI.
 
 ## Council mode
 

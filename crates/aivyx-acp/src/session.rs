@@ -3,7 +3,8 @@
 //! achieved by the editor spawning multiple `aivyx --acp` processes, not
 //! by this crate hosting multiple sessions), `session/prompt` drives one
 //! turn to completion while streaming `AgentEvent`s out as ACP session
-//! updates, `session/set_mode` toggles `PlanMode`.
+//! updates, `session/set_mode` toggles `PlanMode`, and `session/cancel`
+//! cancels the running prompt (see `TurnCancellation`).
 //!
 //! # Deadlock avoidance (read before changing `PromptRequest`'s handler)
 //!
@@ -82,12 +83,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason,
 };
-use agent_client_protocol::{Agent as AcpAgentBuilder, Client, ConnectionTo, Responder, Result, Stdio};
+use agent_client_protocol::{
+    Agent as AcpAgentBuilder, Client, ConnectionTo, Responder, Result, Stdio,
+};
 use aivyx_core::{Agent, AgentEvent, SpecialistSessionSummary};
 use aivyx_sandbox::{InjectionFinding, PlanMode};
 use aivyx_types::{MissionPlan, Task};
@@ -148,6 +151,82 @@ impl Session {
             event,
         )
     }
+}
+
+/// The running prompt's `CancellationToken`, reachable by the
+/// `session/cancel` handler without the session mutex: that mutex is held
+/// by the spawned prompt task for the whole turn, and the cancel handler
+/// runs inline in the dispatch loop (see the module doc comment), so
+/// waiting on it there would only return once the turn it was meant to
+/// stop had finished. A plain `std::sync::Mutex` is fine here: it's held
+/// only for a swap or a `cancel()`, never across an `.await`.
+///
+/// Each `begin` gets a generation number so a turn that finishes late can
+/// never clear a newer turn's token.
+#[derive(Clone, Default)]
+struct TurnCancellation(Arc<std::sync::Mutex<TurnSlot>>);
+
+#[derive(Default)]
+struct TurnSlot {
+    generation: u64,
+    current: Option<(u64, CancellationToken)>,
+}
+
+impl TurnCancellation {
+    fn slot(&self) -> std::sync::MutexGuard<'_, TurnSlot> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A fresh token for the prompt about to run, now the one `cancel`
+    /// reaches.
+    fn begin(&self) -> (u64, CancellationToken) {
+        let mut slot = self.slot();
+        slot.generation += 1;
+        let generation = slot.generation;
+        let token = CancellationToken::new();
+        slot.current = Some((generation, token.clone()));
+        (generation, token)
+    }
+
+    /// Forgets the token `begin` returned `generation` for, unless a newer
+    /// prompt has replaced it since.
+    fn finish(&self, generation: u64) {
+        let mut slot = self.slot();
+        if slot.current.as_ref().is_some_and(|(g, _)| *g == generation) {
+            slot.current = None;
+        }
+    }
+
+    /// Cancels the running prompt, if there is one. A cancel with nothing
+    /// running is a no-op and never carries over to the next prompt.
+    fn cancel(&self) -> bool {
+        match &self.slot().current {
+            Some((_, token)) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The `StopReason` a finished prompt reports. ACP requires `Cancelled`
+/// once the client has cancelled the prompt, whatever the turn emitted on
+/// the way out (`run_turn` breaks out of its loop on cancellation and may
+/// still emit `TurnComplete`). Otherwise the stop reason observed from the
+/// turn's own terminal event wins, falling back to whether the turn
+/// paused at its iteration cap.
+fn final_stop_reason(cancelled: bool, observed: Option<StopReason>, paused: bool) -> StopReason {
+    if cancelled {
+        return StopReason::Cancelled;
+    }
+    observed.unwrap_or(if paused {
+        StopReason::MaxTurnRequests
+    } else {
+        StopReason::EndTurn
+    })
 }
 
 /// Turns `req.prompt`'s content blocks into the plain text `Agent::run_turn`
@@ -283,6 +362,140 @@ pub async fn run_unconfigured() -> Result<()> {
         .await
 }
 
+/// One `session/prompt`, run inside the task `connection.spawn` starts
+/// (see the module doc comment for why it can't run in the handler):
+/// handles `/help` and `/clear` locally, otherwise drives
+/// `Agent::run_turn` with `cancellation` (the token `session/cancel`
+/// reaches) while streaming its events out as session updates, then
+/// answers the prompt.
+async fn run_prompt(
+    prompt_state: Arc<Mutex<Option<Session>>>,
+    spawn_connection: ConnectionTo<Client>,
+    req: PromptRequest,
+    responder: Responder<PromptResponse>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let mut guard = prompt_state.lock().await;
+    let Some(session) = guard.as_mut() else {
+        return responder
+            .respond_with_error(agent_client_protocol::util::internal_error("no session"));
+    };
+    let text = extract_prompt_text(&req.prompt);
+    // `/help` and `/clear` are handled entirely here -- neither ever
+    // reaches `Agent::run_turn` or the model. See `commands.rs`'s own doc
+    // comments for why these two are the ones this frontend intercepts
+    // rather than just advertises.
+    if let Some(local) = acp_local_command(&text) {
+        let mut updates = Vec::new();
+        match local {
+            LocalCommand::Help => updates.push(help_update()),
+            LocalCommand::Clear => {
+                session.agent.clear_conversation();
+                // `clear_conversation` emits `ConversationCleared`, which
+                // `translate_and_merge` turns into resetting the tracked
+                // tasks/mission/specialist sessions and an empty Plan, so
+                // the editor's Plan panel clears too. Drained here, not
+                // left for the next turn.
+                while let Ok(event) = session.events_rx.try_recv() {
+                    updates.extend(session.translate_and_merge(&event));
+                }
+                updates.push(clear_update());
+            }
+        }
+        for update in updates {
+            let _ = spawn_connection
+                .send_notification(SessionNotification::new(session.session_id.clone(), update));
+        }
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
+    // Scoped so the `run` future (which mutably borrows
+    // `session.agent` for `Agent::run_turn`'s duration) is
+    // fully dropped before `session.agent.last_turn_paused()`
+    // needs an immutable borrow of the same field below.
+    let (result, mut stop_reason) = {
+        let run = session
+            .agent
+            .run_turn(text, &session.cwd, cancellation.clone());
+        tokio::pin!(run);
+        let mut stop_reason = None;
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                Some(event) = session.events_rx.recv() => {
+                    if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
+                        stop_reason = Some(reason);
+                    }
+                    // Calls the free function with disjoint
+                    // field-path borrows directly, rather
+                    // than `session.translate_and_merge(...)`
+                    // -- `run` (above) holds `session.agent`
+                    // mutably borrowed for this whole loop,
+                    // and a `&mut self` method call borrows
+                    // the entire `session` value, which the
+                    // borrow checker rejects as overlapping.
+                    // Field-path arguments to a free
+                    // function get disjoint-borrow treatment
+                    // instead. The second call site below
+                    // (after `run` is dropped) has no such
+                    // conflict and uses the method as usual.
+                    if let Some(update) = crate::translate::translate_event_with_state(
+                        &session.session_id,
+                        &mut session.tasks,
+                        &mut session.mission_plan,
+                        &mut session.open_specialist_sessions,
+                        &event,
+                    ) {
+                        let _ = spawn_connection.send_notification(SessionNotification::new(
+                            session.session_id.clone(),
+                            update,
+                        ));
+                    }
+                }
+            }
+        };
+        (result, stop_reason)
+    };
+    // Drain anything buffered right at completion (e.g. the
+    // final TextDelta/TurnComplete pair) before responding.
+    while let Ok(event) = session.events_rx.try_recv() {
+        if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
+            stop_reason = Some(reason);
+        }
+        if let Some(update) = session.translate_and_merge(&event) {
+            let _ = spawn_connection
+                .send_notification(SessionNotification::new(session.session_id.clone(), update));
+        }
+    }
+    // Peek — never take() — the shared taint flag after
+    // every turn, regardless of `result`/`stop_reason`. An
+    // ACP session is always the interactive-equivalent
+    // case (see `interactive_injection_notice`'s own doc
+    // comment), and has no pause-and-resume flow to clear
+    // this the way autonomous mode's `.take()` in
+    // `aivyx-tui`'s driver loop does — the editor's user
+    // already saw every action this turn took, so naming
+    // the flagged source is a notice, not a gate.
+    if let Some(finding) = session.agent.injection_taint().current() {
+        let notice = AgentEvent::Error(interactive_injection_notice(&finding));
+        if let Some(update) = crate::translate::translate_event(&session.session_id, &notice) {
+            let _ = spawn_connection
+                .send_notification(SessionNotification::new(session.session_id.clone(), update));
+        }
+    }
+    // A cancelled prompt reports `Cancelled` even when cancelling made
+    // the turn fail (ACP requires it, so the editor doesn't show an error
+    // for a stop the user asked for).
+    let cancelled = cancellation.is_cancelled();
+    if let Err(err) = result
+        && !cancelled
+    {
+        return responder
+            .respond_with_error(agent_client_protocol::util::internal_error(err.to_string()));
+    }
+    let stop_reason = final_stop_reason(cancelled, stop_reason, session.agent.last_turn_paused());
+    responder.respond(PromptResponse::new(stop_reason))
+}
+
 pub async fn run(config: AcpSessionConfig) -> Result<()> {
     // `plan_mode` is a cheap `Arc<AtomicBool>` clone, kept outside the
     // session lock entirely — see the module doc comment on why
@@ -298,6 +511,10 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
     let new_session_exists = Arc::clone(&session_exists);
     let prompt_state = Arc::clone(&state);
     let mode_exists = Arc::clone(&session_exists);
+    // Outside the session lock for the same reason as `plan_mode` — see
+    // `TurnCancellation`'s doc comment.
+    let turn_cancellation = TurnCancellation::default();
+    let cancel_turn = turn_cancellation.clone();
 
     AcpAgentBuilder
         .builder()
@@ -384,6 +601,19 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_notification(
+            async move |_notification: CancelNotification, _connection| {
+                // This process hosts exactly one session (see the module
+                // doc comment), so there's only ever one prompt this can
+                // be about. Pending `session/request_permission` calls
+                // are the client's to answer with `Cancelled` (which
+                // `AcpPrompter` maps to Deny); the turn then stops at its
+                // next cancellation check, and a running `/test` is killed.
+                cancel_turn.cancel();
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_request(
             async move |req: PromptRequest, responder, connection| {
                 // Deliberately *not* awaited here beyond the non-blocking
@@ -396,137 +626,23 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 // this turn runs.
                 let prompt_state = Arc::clone(&prompt_state);
                 let spawn_connection = connection.clone();
+                // Started here, in the dispatch loop, rather than inside the
+                // spawned task: a `session/cancel` sent right after this
+                // prompt must find its token even if the task hasn't run
+                // yet.
+                let turn_cancellation = turn_cancellation.clone();
+                let (turn_generation, cancellation) = turn_cancellation.begin();
                 let spawn_result = connection.spawn(async move {
-                    let mut guard = prompt_state.lock().await;
-                    let Some(session) = guard.as_mut() else {
-                        return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            "no session",
-                        ));
-                    };
-                    let text = extract_prompt_text(&req.prompt);
-                    // `/help` and `/clear` are handled entirely here --
-                    // neither ever reaches `Agent::run_turn` or the model.
-                    // See `commands.rs`'s own doc comments for why these
-                    // two (of all `AgentState`/`FrontendOnly` commands) are
-                    // the ones this frontend intercepts rather than just
-                    // advertises.
-                    if let Some(local) = acp_local_command(&text) {
-                        let mut updates = Vec::new();
-                        match local {
-                            LocalCommand::Help => updates.push(help_update()),
-                            LocalCommand::Clear => {
-                                session.agent.clear_conversation();
-                                // `clear_conversation` emits
-                                // `ConversationCleared`, which
-                                // `translate_and_merge` turns into resetting
-                                // the tracked tasks/mission/specialist
-                                // sessions and an empty Plan, so the
-                                // editor's Plan panel clears too. Drained
-                                // here, not left for the next turn.
-                                while let Ok(event) = session.events_rx.try_recv() {
-                                    updates.extend(session.translate_and_merge(&event));
-                                }
-                                updates.push(clear_update());
-                            }
-                        }
-                        for update in updates {
-                            let _ = spawn_connection.send_notification(SessionNotification::new(
-                                session.session_id.clone(),
-                                update,
-                            ));
-                        }
-                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                    }
-                    let cancellation = CancellationToken::new();
-                    // Scoped so the `run` future (which mutably borrows
-                    // `session.agent` for `Agent::run_turn`'s duration) is
-                    // fully dropped before `session.agent.last_turn_paused()`
-                    // needs an immutable borrow of the same field below.
-                    let (result, mut stop_reason) = {
-                        let run = session.agent.run_turn(text, &session.cwd, cancellation);
-                        tokio::pin!(run);
-                        let mut stop_reason = None;
-                        let result = loop {
-                            tokio::select! {
-                                result = &mut run => break result,
-                                Some(event) = session.events_rx.recv() => {
-                                    if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
-                                        stop_reason = Some(reason);
-                                    }
-                                    // Calls the free function with disjoint
-                                    // field-path borrows directly, rather
-                                    // than `session.translate_and_merge(...)`
-                                    // -- `run` (above) holds `session.agent`
-                                    // mutably borrowed for this whole loop,
-                                    // and a `&mut self` method call borrows
-                                    // the entire `session` value, which the
-                                    // borrow checker rejects as overlapping.
-                                    // Field-path arguments to a free
-                                    // function get disjoint-borrow treatment
-                                    // instead. The second call site below
-                                    // (after `run` is dropped) has no such
-                                    // conflict and uses the method as usual.
-                                    if let Some(update) = crate::translate::translate_event_with_state(
-                                        &session.session_id,
-                                        &mut session.tasks,
-                                        &mut session.mission_plan,
-                                        &mut session.open_specialist_sessions,
-                                        &event,
-                                    ) {
-                                        let _ = spawn_connection.send_notification(SessionNotification::new(
-                                            session.session_id.clone(),
-                                            update,
-                                        ));
-                                    }
-                                }
-                            }
-                        };
-                        (result, stop_reason)
-                    };
-                    // Drain anything buffered right at completion (e.g. the
-                    // final TextDelta/TurnComplete pair) before responding.
-                    while let Ok(event) = session.events_rx.try_recv() {
-                        if let Some(reason) = crate::translate::terminal_stop_reason(&event) {
-                            stop_reason = Some(reason);
-                        }
-                        if let Some(update) = session.translate_and_merge(&event) {
-                            let _ = spawn_connection.send_notification(SessionNotification::new(
-                                session.session_id.clone(),
-                                update,
-                            ));
-                        }
-                    }
-                    // Peek — never take() — the shared taint flag after
-                    // every turn, regardless of `result`/`stop_reason`. An
-                    // ACP session is always the interactive-equivalent
-                    // case (see `interactive_injection_notice`'s own doc
-                    // comment), and has no pause-and-resume flow to clear
-                    // this the way autonomous mode's `.take()` in
-                    // `aivyx-tui`'s driver loop does — the editor's user
-                    // already saw every action this turn took, so naming
-                    // the flagged source is a notice, not a gate.
-                    if let Some(finding) = session.agent.injection_taint().current() {
-                        let notice = AgentEvent::Error(interactive_injection_notice(&finding));
-                        if let Some(update) =
-                            crate::translate::translate_event(&session.session_id, &notice)
-                        {
-                            let _ = spawn_connection.send_notification(SessionNotification::new(
-                                session.session_id.clone(),
-                                update,
-                            ));
-                        }
-                    }
-                    if let Err(err) = result {
-                        return responder.respond_with_error(agent_client_protocol::util::internal_error(err.to_string()));
-                    }
-                    let stop_reason = stop_reason.unwrap_or_else(|| {
-                        if session.agent.last_turn_paused() {
-                            StopReason::MaxTurnRequests
-                        } else {
-                            StopReason::EndTurn
-                        }
-                    });
-                    responder.respond(PromptResponse::new(stop_reason))
+                    let responded = run_prompt(
+                        prompt_state,
+                        spawn_connection,
+                        req,
+                        responder,
+                        cancellation,
+                    )
+                    .await;
+                    turn_cancellation.finish(turn_generation);
+                    responded
                 });
                 // A `spawn` failure means the connection's task channel is
                 // already gone (shutting down) — the `Responder` moved into
@@ -594,13 +710,114 @@ mod tests {
         let second = next().await;
         agent_task.abort();
 
-        assert_eq!(first["id"], 1, "the response must come first: {first} then {second}");
+        assert_eq!(
+            first["id"], 1,
+            "the response must come first: {first} then {second}"
+        );
         assert_eq!(first["result"]["sessionId"], "s-1", "{first}");
         assert_eq!(second["method"], "session/update", "{second}");
         assert_eq!(
             second["params"]["update"]["sessionUpdate"], "available_commands_update",
             "{second}"
         );
+    }
+
+    #[test]
+    fn cancel_cancels_the_running_turns_token() {
+        let slot = TurnCancellation::default();
+        let (generation, token) = slot.begin();
+        assert!(slot.cancel(), "a turn is running");
+        assert!(token.is_cancelled());
+        slot.finish(generation);
+        assert!(!slot.cancel(), "nothing is running once the turn finished");
+    }
+
+    #[test]
+    fn cancel_with_no_turn_running_is_a_no_op() {
+        let slot = TurnCancellation::default();
+        assert!(!slot.cancel());
+        // ...and doesn't pre-cancel the next turn.
+        let (_, token) = slot.begin();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn a_finished_turn_never_clears_a_newer_turns_token() {
+        let slot = TurnCancellation::default();
+        let (old, old_token) = slot.begin();
+        let (_, new_token) = slot.begin();
+        slot.finish(old);
+        assert!(slot.cancel(), "the newer turn is still running");
+        assert!(new_token.is_cancelled());
+        assert!(!old_token.is_cancelled());
+    }
+
+    #[test]
+    fn a_cancelled_turn_stops_with_cancelled_whatever_else_was_seen() {
+        assert_eq!(final_stop_reason(true, None, false), StopReason::Cancelled);
+        assert_eq!(
+            final_stop_reason(true, Some(StopReason::EndTurn), false),
+            StopReason::Cancelled
+        );
+        assert_eq!(final_stop_reason(true, None, true), StopReason::Cancelled);
+    }
+
+    #[test]
+    fn an_uncancelled_turn_keeps_its_observed_or_fallback_stop_reason() {
+        assert_eq!(
+            final_stop_reason(false, Some(StopReason::MaxTurnRequests), false),
+            StopReason::MaxTurnRequests
+        );
+        assert_eq!(final_stop_reason(false, None, false), StopReason::EndTurn);
+        assert_eq!(
+            final_stop_reason(false, None, true),
+            StopReason::MaxTurnRequests
+        );
+    }
+
+    /// `session/cancel` arrives as a notification carrying the session id;
+    /// checks that the protocol type this frontend registers for decodes
+    /// the editor's message and reaches the turn's token.
+    #[tokio::test]
+    async fn a_session_cancel_notification_reaches_the_turn_token() {
+        use agent_client_protocol::schema::v1::CancelNotification;
+        use tokio::io::AsyncWriteExt;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (agent_writer, _client_reader) = tokio::io::duplex(65536);
+        let (mut client_writer, agent_reader) = tokio::io::duplex(65536);
+        let transport = agent_client_protocol::ByteStreams::new(
+            agent_writer.compat_write(),
+            agent_reader.compat(),
+        );
+        let slot = TurnCancellation::default();
+        let (_, token) = slot.begin();
+        let handler_slot = slot.clone();
+        let agent_task = tokio::spawn(async move {
+            AcpAgentBuilder
+                .builder()
+                .on_receive_notification(
+                    async move |_n: CancelNotification, _connection| {
+                        handler_slot.cancel();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(transport)
+                .await
+        });
+
+        client_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\
+                  \"params\":{\"sessionId\":\"s-1\"}}\n",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+            .await
+            .expect("session/cancel should cancel the running turn within 5s");
+        agent_task.abort();
     }
 
     #[test]
