@@ -37,7 +37,7 @@ aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "f
 aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "07116905ae92f9e378d624080886bb6dbcc4fc3b" }
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "02d96f05aa3a5655a7e59b92d17c1ca19b27c4cb" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "4af0b9364c527df3e04b5b9f306526e263e4b3ad" }
-aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "bcd98e98f3b6aaa4c09dee50c56b2d00230d0e4a" }
+aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a0b0e7a55d0a7a5d07108a285a76101c12a45f21" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "4ee706e7b378f8da1792d320908f557fea270747" }
 aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "2cd3587b4da442d293d5c75f956194e1e38c5236" }
 # Not on crates.io -- pinned by commit SHA, same as aivyx-checkpoint/
