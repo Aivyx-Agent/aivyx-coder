@@ -153,23 +153,26 @@ impl Session {
     }
 }
 
-/// The running prompt's `CancellationToken`, reachable by the
+/// The running prompts' `CancellationToken`s, reachable by the
 /// `session/cancel` handler without the session mutex: that mutex is held
 /// by the spawned prompt task for the whole turn, and the cancel handler
 /// runs inline in the dispatch loop (see the module doc comment), so
 /// waiting on it there would only return once the turn it was meant to
 /// stop had finished. A plain `std::sync::Mutex` is fine here: it's held
-/// only for a swap or a `cancel()`, never across an `.await`.
+/// only for an insert, a removal or a `cancel()`, never across an
+/// `.await`.
 ///
-/// Each `begin` gets a generation number so a turn that finishes late can
-/// never clear a newer turn's token.
+/// Each `begin` gets a generation number, and every unfinished turn's
+/// token is kept under it: prompts can overlap (a second `session/prompt`
+/// arriving while the first still runs), and `session/cancel` must stop
+/// all of them, while a turn that finishes only ever drops its own token.
 #[derive(Clone, Default)]
 struct TurnCancellation(Arc<std::sync::Mutex<TurnSlot>>);
 
 #[derive(Default)]
 struct TurnSlot {
     generation: u64,
-    current: Option<(u64, CancellationToken)>,
+    running: std::collections::HashMap<u64, CancellationToken>,
 }
 
 impl TurnCancellation {
@@ -179,36 +182,31 @@ impl TurnCancellation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A fresh token for the prompt about to run, now the one `cancel`
-    /// reaches.
+    /// A fresh token for the prompt about to run, which `cancel` reaches
+    /// until `finish` is called with the returned generation.
     fn begin(&self) -> (u64, CancellationToken) {
         let mut slot = self.slot();
         slot.generation += 1;
         let generation = slot.generation;
         let token = CancellationToken::new();
-        slot.current = Some((generation, token.clone()));
+        slot.running.insert(generation, token.clone());
         (generation, token)
     }
 
-    /// Forgets the token `begin` returned `generation` for, unless a newer
-    /// prompt has replaced it since.
+    /// Forgets the token `begin` returned `generation` for.
     fn finish(&self, generation: u64) {
-        let mut slot = self.slot();
-        if slot.current.as_ref().is_some_and(|(g, _)| *g == generation) {
-            slot.current = None;
-        }
+        self.slot().running.remove(&generation);
     }
 
-    /// Cancels the running prompt, if there is one. A cancel with nothing
-    /// running is a no-op and never carries over to the next prompt.
+    /// Cancels every running prompt; whether there was one. A cancel with
+    /// nothing running is a no-op and never carries over to the next
+    /// prompt.
     fn cancel(&self) -> bool {
-        match &self.slot().current {
-            Some((_, token)) => {
-                token.cancel();
-                true
-            }
-            None => false,
+        let slot = self.slot();
+        for token in slot.running.values() {
+            token.cancel();
         }
+        !slot.running.is_empty()
     }
 }
 
@@ -750,6 +748,24 @@ mod tests {
         assert!(slot.cancel(), "the newer turn is still running");
         assert!(new_token.is_cancelled());
         assert!(!old_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_reaches_every_overlapping_turn() {
+        let slot = TurnCancellation::default();
+        let (first, first_token) = slot.begin();
+        let (second, second_token) = slot.begin();
+        assert!(slot.cancel());
+        assert!(first_token.is_cancelled() && second_token.is_cancelled());
+
+        // `finish` drops only its own turn's token.
+        let (third, third_token) = slot.begin();
+        slot.finish(first);
+        slot.finish(second);
+        assert!(slot.cancel(), "the third turn is still running");
+        assert!(third_token.is_cancelled());
+        slot.finish(third);
+        assert!(!slot.cancel(), "nothing is running");
     }
 
     #[test]
