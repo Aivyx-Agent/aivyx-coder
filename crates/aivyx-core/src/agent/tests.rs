@@ -2982,7 +2982,7 @@ async fn a_hand_edit_is_flagged_and_deny_changes_nothing() {
 
     agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
     let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
-    assert!(preview.contains("tracked.txt   ⚠ changed after the turn"), "{preview}");
+    assert!(preview.contains("tracked.txt   ⚠ changed since then"), "{preview}");
     assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "hand edit\n");
     assert_eq!(agent.undo_ledger().marks.len(), 1, "deny keeps the mark");
 }
@@ -3568,7 +3568,7 @@ async fn redo_flags_paths_changed_since_the_undo() {
 
     agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
     let preview = prompter.seen.lock().unwrap()[1].preview.clone().unwrap();
-    assert!(preview.contains("~ tracked.txt   ⚠ changed after the turn"), "{preview}");
+    assert!(preview.contains("~ tracked.txt   ⚠ changed since then"), "{preview}");
     assert!(preview.contains("+ a.txt   (will come back)\n"), "unchanged path not flagged: {preview}");
     assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "hand edit\n");
 }
@@ -9307,7 +9307,7 @@ async fn undo_warns_about_generated_files_changed_after_the_turn() {
     assert_eq!(
         preview,
         "Undo the last turn (\"write\")?\n\n− a.txt   (will be removed)\n\n\
-         ⚠ Also removes or rewinds 1 generated file(s) changed after that turn: node_modules/\n\n\
+         ⚠ Also removes or rewinds 1 generated file(s) changed since then: node_modules/\n\n\
          (git-ignored files are not touched)"
     );
     assert_eq!(infos(&mut rx), vec!["Undone: a.txt (+1 generated)".to_string()]);
@@ -9340,7 +9340,7 @@ async fn redo_warns_about_generated_files_changed_after_the_undo() {
     assert_eq!(
         preview,
         "Redo the last undo?\n\n+ a.txt   (will come back)\n\n\
-         ⚠ Also removes or rewinds 2 generated file(s) changed after that turn: .venv/, x.pyc\n\n\
+         ⚠ Also removes or rewinds 2 generated file(s) changed since then: .venv/, x.pyc\n\n\
          (git-ignored files are not touched)"
     );
     assert_eq!(infos(&mut rx), vec!["Redone: a.txt (+2 generated)".to_string()]);

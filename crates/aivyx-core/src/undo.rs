@@ -138,12 +138,12 @@ pub fn preview_text(title: &str, entries: &[PreviewEntry], late_generated: &[Str
         };
         text.push_str(&format!("\n{sym} {}{note}", e.path));
         if e.changed_after {
-            text.push_str("   ⚠ changed after the turn");
+            text.push_str("   ⚠ changed since then");
         }
     }
     if !late_generated.is_empty() {
         text.push_str(&format!(
-            "\n\n⚠ Also removes or rewinds {} generated file(s) changed after that turn: {}",
+            "\n\n⚠ Also removes or rewinds {} generated file(s) changed since then: {}",
             late_generated.len(),
             top_level_names(late_generated)
         ));
@@ -296,11 +296,11 @@ mod tests {
         assert_eq!(
             text,
             "Undo the last turn (\"fix it\")?\n\n\
-             ~ stats.py   ⚠ changed after the turn\n\
+             ~ stats.py   ⚠ changed since then\n\
              − notes.md   (will be removed)\n\
              + old.txt   (will come back)\n\
-             − draft.md   (will be removed)   ⚠ changed after the turn\n\
-             + gone.rs   (will come back)   ⚠ changed after the turn\n\n\
+             − draft.md   (will be removed)   ⚠ changed since then\n\
+             + gone.rs   (will come back)   ⚠ changed since then\n\n\
              (git-ignored files are not touched)"
         );
         // The ignored-files caveat is always shown: checkpoints never
@@ -333,13 +333,13 @@ mod tests {
         assert_eq!(
             preview_text("t", &[], &paths),
             "t\n\n(only generated files changed)\n\n\
-             ⚠ Also removes or rewinds 6 generated file(s) changed after that turn: \
+             ⚠ Also removes or rewinds 6 generated file(s) changed since then: \
              .venv/, a/, node_modules/, …\n\n(git-ignored files are not touched)"
         );
         assert_eq!(
             preview_text("t", &[], &paths[3..5]),
             "t\n\n(only generated files changed)\n\n\
-             ⚠ Also removes or rewinds 2 generated file(s) changed after that turn: \
+             ⚠ Also removes or rewinds 2 generated file(s) changed since then: \
              node_modules/, x.pyc\n\n(git-ignored files are not touched)"
         );
     }
