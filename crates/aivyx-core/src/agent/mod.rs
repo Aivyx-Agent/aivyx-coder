@@ -2791,18 +2791,22 @@ impl Agent {
             // "out loud", surface the trimmed reasoning as the answer
             // instead of silently losing it; if it reasoned not even that,
             // say so explicitly rather than ending the turn without a
-            // trace.
+            // trace. The notice itself is deferred (not emitted here): the
+            // enforced-verification check further down can `continue` the
+            // loop instead of ending the turn on this very response (a
+            // failed attempt), in which case neither notice may ever reach
+            // the transcript for it — only the two points below where the
+            // turn actually ends emit a pending notice. The history push
+            // just below stays unconditional either way.
+            let mut empty_response_notice: Option<&'static str> = None;
             if assistant_content.is_empty() {
                 let reasoning_trimmed = reasoning_text.trim();
                 if reasoning_trimmed.is_empty() {
-                    self.emit(AgentEvent::Info(
-                        "The model ended its turn without replying.".to_string(),
-                    ));
+                    empty_response_notice = Some("The model ended its turn without replying.");
                 } else {
                     assistant_content.push(ContentBlock::Text(reasoning_trimmed.to_string()));
-                    self.emit(AgentEvent::Info(
-                        "(The model answered only in its thinking, shown above.)".to_string(),
-                    ));
+                    empty_response_notice =
+                        Some("(The model answered only in its thinking, shown above.)");
                 }
             }
             if !assistant_content.is_empty() {
@@ -2846,6 +2850,9 @@ impl Agent {
                             self.verify_retries = 0;
                             self.pre_experiment_ref = None;
                             self.verification_touched_paths.clear();
+                            if let Some(notice) = empty_response_notice {
+                                self.emit(AgentEvent::Info(notice.to_string()));
+                            }
                             self.emit(AgentEvent::TurnComplete);
                             return Ok(());
                         }
@@ -2907,6 +2914,9 @@ impl Agent {
                     }
                 }
 
+                if let Some(notice) = empty_response_notice {
+                    self.emit(AgentEvent::Info(notice.to_string()));
+                }
                 self.emit(AgentEvent::TurnComplete);
                 return Ok(());
             }

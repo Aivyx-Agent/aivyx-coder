@@ -4457,6 +4457,27 @@ fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
     }
 }
 
+/// A real verification command that fails its first invocation and
+/// passes every one after — touches `marker` on the failing attempt, then
+/// checks for it on the next. Used to drive the enforced-verification
+/// retry loop through exactly one failure before it passes, without
+/// needing to fake `run_verification_attempt` itself.
+fn fail_once_then_pass_verify_command_spec(marker: &std::path::Path) -> CommandSpec {
+    CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            format!(
+                "test -f '{}' && exit 0 || (touch '{}' && exit 1)",
+                marker.display(),
+                marker.display()
+            ),
+        ],
+        timeout: Duration::from_secs(5),
+    }
+}
+
 fn auto_verify_calls(history: &[Message]) -> usize {
     history
         .iter()
@@ -4517,6 +4538,85 @@ async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip()
     // no-more-tool-calls response) — it's dispatched directly, not
     // through another `stream_chat` call.
     assert_eq!(mock.received.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn empty_response_notice_only_fires_once_the_turn_actually_ends() {
+    // A reasoning-only response whose own enforced-verification attempt
+    // then *fails* must not emit its own "answered only in its thinking"
+    // notice -- the turn doesn't end there, it `continue`s for another
+    // round trip (see agent/mod.rs's `empty_response_notice`, deferred
+    // past that check). Only the later reasoning-only response whose
+    // attempt actually passes may emit it, and exactly once for the
+    // whole turn.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("verify-ran-once");
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![
+        fail_once_then_pass_verify_command_spec(&marker),
+    ])));
+
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "out.txt", "content": "hi\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let reasoning_only = |text: &str| {
+        vec![
+            StreamEvent::ReasoningDelta(text.to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]
+    };
+    let (mut agent, mut rx, _mock) = build_agent(
+        vec![
+            write_call,
+            reasoning_only("checking the fix"),
+            reasoning_only("looks correct now"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let notice_count = infos(&mut rx)
+        .into_iter()
+        .filter(|t| t == "(The model answered only in its thinking, shown above.)")
+        .count();
+    assert_eq!(
+        notice_count, 1,
+        "expected the notice exactly once -- the failing attempt's own reasoning-only response \
+         must not have emitted it, since the turn didn't end there"
+    );
+    // Both reasoning-only responses must still have been pushed to
+    // history regardless -- the history push stays unconditional, only
+    // the notice's emission is gated on the turn actually ending.
+    let history_text: String = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(history_text.contains("checking the fix"));
+    assert!(history_text.contains("looks correct now"));
+    assert!(!agent.unverified_edits);
+    assert_eq!(agent.verify_retries, 0);
 }
 
 #[tokio::test]
