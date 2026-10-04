@@ -220,6 +220,9 @@ and the like, left behind by test runs and shell commands in a project with no
 `/diff`, the `/undo`/`/redo` previews, and what `/commit` stages when nothing
 is staged. The list is `[git] ignore` (`.gitignore` syntax; `ignore = []`
 turns it off); like `.gitignore`, it never hides a file git already tracks.
+`/undo` and `/redo` still restore the whole snapshot, so when that would also
+remove or rewind generated files changed *after* the turn (a dependency
+install, a new `.venv`), their preview says so in one line with a count.
 
 **`/test`** runs the project's test command: `[verification] command` when
 configured, else whatever's detected in the project folder (first match

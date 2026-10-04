@@ -73,12 +73,14 @@ async fn committed_note(cwd: &Path, after_oid: Option<&str>, paths: &[String]) -
 }
 
 /// The `Undone:`/`Redone:` list (and the model's note): the visible
-/// paths, or a plain phrase when only generated files changed.
-fn path_list(paths: &[String]) -> String {
-    if paths.is_empty() {
-        "only generated files".to_string()
-    } else {
-        paths.join(", ")
+/// paths, plus a count of the generated files changed after the turn
+/// that the restore also took back.
+fn path_list(paths: &[String], late_generated: usize) -> String {
+    match (paths.is_empty(), late_generated) {
+        (true, 0) => "only generated files".to_string(),
+        (true, n) => format!("{n} generated file(s)"),
+        (false, 0) => paths.join(", "),
+        (false, n) => format!("{} (+{n} generated)", paths.join(", ")),
     }
 }
 
@@ -131,18 +133,32 @@ impl Agent {
             .map(|out| parse_name_status(&out))
     }
 
-    /// `changes` without untracked generated files (`[git] ignore`): the
-    /// restore still covers the whole snapshot, only the listing leaves
-    /// them out.
+    /// Splits `changes` for the listing: untracked generated files
+    /// (`[git] ignore`) are left out — silently when they didn't change
+    /// after the turn, since the restore only takes back what the turn
+    /// itself did to them; those in `changed_after` are returned as the
+    /// second list, because the restore removes or rewinds them too and
+    /// the user must be told. The restore always covers the whole
+    /// snapshot.
     async fn without_generated(
         &self,
         cwd: &Path,
-        mut changes: Vec<(String, ChangeKind)>,
-    ) -> Vec<(String, ChangeKind)> {
-        if let Some(filter) = self.generated_filter(cwd).await {
-            changes.retain(|(path, _)| !filter.hides(path));
+        changes: Vec<(String, ChangeKind)>,
+        changed_after: &HashSet<String>,
+    ) -> (Vec<(String, ChangeKind)>, Vec<String>) {
+        let Some(filter) = self.generated_filter(cwd).await else {
+            return (changes, Vec::new());
+        };
+        let mut late = Vec::new();
+        let mut visible = Vec::new();
+        for (path, kind) in changes {
+            if !filter.hides(&path) {
+                visible.push((path, kind));
+            } else if changed_after.contains(&path) {
+                late.push(path);
+            }
         }
-        changes
+        (visible, late)
     }
 
     async fn confirm(&self, tool_name: &str, preview: String) -> bool {
@@ -201,7 +217,8 @@ impl Agent {
                 .unwrap_or_default(),
             None => HashSet::new(),
         };
-        let changes = self.without_generated(&cwd, changes).await;
+        let (changes, late_generated) =
+            self.without_generated(&cwd, changes, &changed_after).await;
         let paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
         let entries: Vec<PreviewEntry> = changes
             .into_iter()
@@ -211,7 +228,11 @@ impl Agent {
                 kind,
             })
             .collect();
-        let mut preview = preview_text(&preview_title_undo(&mark.user_text_preview), &entries);
+        let mut preview = preview_text(
+            &preview_title_undo(&mark.user_text_preview),
+            &entries,
+            &late_generated,
+        );
         if let Some(note) = committed_note(&cwd, mark.after_oid.as_deref(), &paths).await {
             preview.push_str("\n\n");
             preview.push_str(&note);
@@ -230,7 +251,7 @@ impl Agent {
         }
         self.undo.pop_mark();
         self.undo.push_redo(RedoMark { mark, redo_oid });
-        let list = path_list(&paths);
+        let list = path_list(&paths, late_generated.len());
         self.pending_notes.push(format!(
             "The user undid your changes from the last turn: {list}."
         ));
@@ -278,7 +299,8 @@ impl Agent {
                 .await
                 .map(|out| out.lines().map(str::to_string).collect())
                 .unwrap_or_default();
-        let changes = self.without_generated(&cwd, changes).await;
+        let (changes, late_generated) =
+            self.without_generated(&cwd, changes, &changed_after).await;
         let paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
         let entries: Vec<PreviewEntry> = changes
             .into_iter()
@@ -288,7 +310,7 @@ impl Agent {
                 kind,
             })
             .collect();
-        let preview = preview_text("Redo the last undo?", &entries);
+        let preview = preview_text("Redo the last undo?", &entries, &late_generated);
         if !self.confirm("redo", preview).await {
             self.info("Redo cancelled.");
             return;
@@ -303,7 +325,7 @@ impl Agent {
         }
         let redo = self.undo.pop_redo().expect("checked above");
         self.undo.push_mark_back(redo.mark);
-        let list = path_list(&paths);
+        let list = path_list(&paths, late_generated.len());
         self.pending_notes
             .push(format!("The user restored your changes: {list}."));
         self.info(format!("Redone: {list}"));

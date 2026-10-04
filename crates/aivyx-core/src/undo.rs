@@ -121,8 +121,11 @@ pub fn parse_name_status(from_to_name_status: &str) -> Vec<(String, ChangeKind)>
 /// The `/undo` / `/redo` confirmation text. The git-ignored caveat is
 /// always shown: checkpoint trees never contain ignored files, so whether
 /// one is affected can't be told from them. No entries means every changed
-/// path was a generated file the listing leaves out.
-pub fn preview_text(title: &str, entries: &[PreviewEntry]) -> String {
+/// path was a generated file the listing leaves out. `late_generated` are
+/// generated files the restore removes or rewinds although they changed
+/// after the turn (a dependency install, say): too many to list one by
+/// one, they get a single warning line naming their top-level entries.
+pub fn preview_text(title: &str, entries: &[PreviewEntry], late_generated: &[String]) -> String {
     let mut text = format!("{title}\n");
     if entries.is_empty() {
         text.push_str("\n(only generated files changed)");
@@ -138,8 +141,37 @@ pub fn preview_text(title: &str, entries: &[PreviewEntry]) -> String {
             text.push_str("   ⚠ changed after the turn");
         }
     }
+    if !late_generated.is_empty() {
+        text.push_str(&format!(
+            "\n\n⚠ Also removes or rewinds {} generated file(s) changed after that turn: {}",
+            late_generated.len(),
+            top_level_names(late_generated)
+        ));
+    }
     text.push_str("\n\n(git-ignored files are not touched)");
     text
+}
+
+/// Up to three distinct top-level entries of `paths` (`dir/` for a
+/// directory, the name for a file at the top), then `…` if there are more.
+fn top_level_names(paths: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let mut names: Vec<String> = Vec::new();
+    for path in paths {
+        let name = match path.split_once('/') {
+            Some((dir, _)) => format!("{dir}/"),
+            None => path.clone(),
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let more = names.len() > SHOWN;
+    names.truncate(SHOWN);
+    if more {
+        names.push("…".to_string());
+    }
+    names.join(", ")
 }
 
 pub fn preview_title_undo(user_text_preview: &str) -> String {
@@ -260,7 +292,7 @@ mod tests {
             PreviewEntry { path: "draft.md".into(), kind: ChangeKind::Removed, changed_after: true },
             PreviewEntry { path: "gone.rs".into(), kind: ChangeKind::Restored, changed_after: true },
         ];
-        let text = preview_text("Undo the last turn (\"fix it\")?", &entries);
+        let text = preview_text("Undo the last turn (\"fix it\")?", &entries, &[]);
         assert_eq!(
             text,
             "Undo the last turn (\"fix it\")?\n\n\
@@ -273,15 +305,42 @@ mod tests {
         );
         // The ignored-files caveat is always shown: checkpoints never
         // contain ignored files, so there is no way to tell from them.
-        let plain = preview_text("t", &entries[1..2]);
+        let plain = preview_text("t", &entries[1..2], &[]);
         assert_eq!(plain, "t\n\n− notes.md   (will be removed)\n\n(git-ignored files are not touched)");
     }
 
     #[test]
     fn preview_with_only_generated_files_says_so() {
         assert_eq!(
-            preview_text("t", &[]),
+            preview_text("t", &[], &[]),
             "t\n\n(only generated files changed)\n\n(git-ignored files are not touched)"
+        );
+    }
+
+    #[test]
+    fn late_generated_files_are_one_summary_line_by_top_level_name() {
+        let paths: Vec<String> = [
+            ".venv/bin/python",
+            ".venv/lib/x.py",
+            "a/__pycache__/m.pyc",
+            "node_modules/x/index.js",
+            "x.pyc",
+            "z/node_modules/y.js",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        assert_eq!(
+            preview_text("t", &[], &paths),
+            "t\n\n(only generated files changed)\n\n\
+             ⚠ Also removes or rewinds 6 generated file(s) changed after that turn: \
+             .venv/, a/, node_modules/, …\n\n(git-ignored files are not touched)"
+        );
+        assert_eq!(
+            preview_text("t", &[], &paths[3..5]),
+            "t\n\n(only generated files changed)\n\n\
+             ⚠ Also removes or rewinds 2 generated file(s) changed after that turn: \
+             node_modules/, x.pyc\n\n(git-ignored files are not touched)"
         );
     }
 

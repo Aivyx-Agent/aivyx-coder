@@ -9283,3 +9283,65 @@ async fn undo_of_a_turn_that_only_changed_generated_files_says_so() {
     assert!(!cwd.join("__pycache__/m.pyc").exists());
     assert_eq!(infos(&mut rx), vec!["Undone: only generated files".to_string()]);
 }
+
+#[tokio::test]
+async fn undo_warns_about_generated_files_changed_after_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, vec![
+        write_call("c1", "a.txt", "one\n"),
+        text_response("done"),
+    ]).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    // The user installs dependencies after the turn: the restore will
+    // remove them, so the preview must say so.
+    std::fs::create_dir_all(cwd.join("node_modules/x")).unwrap();
+    std::fs::write(cwd.join("node_modules/x/index.js"), "module\n").unwrap();
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert_eq!(
+        preview,
+        "Undo the last turn (\"write\")?\n\n− a.txt   (will be removed)\n\n\
+         ⚠ Also removes or rewinds 1 generated file(s) changed after that turn: node_modules/\n\n\
+         (git-ignored files are not touched)"
+    );
+    assert_eq!(infos(&mut rx), vec!["Undone: a.txt (+1 generated)".to_string()]);
+    assert_eq!(
+        agent.pending_notes,
+        vec!["The user undid your changes from the last turn: a.txt (+1 generated).".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn redo_warns_about_generated_files_changed_after_the_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, vec![
+        write_call("c1", "a.txt", "one\n"),
+        text_response("done"),
+    ]).await;
+    let prompter = scripted(vec![UserResponse::Allow, UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    std::fs::create_dir_all(cwd.join(".venv/bin")).unwrap();
+    std::fs::write(cwd.join(".venv/bin/python"), "py\n").unwrap();
+    std::fs::write(cwd.join("x.pyc"), "bytecode\n").unwrap();
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[1].preview.clone().unwrap();
+    assert_eq!(
+        preview,
+        "Redo the last undo?\n\n+ a.txt   (will come back)\n\n\
+         ⚠ Also removes or rewinds 2 generated file(s) changed after that turn: .venv/, x.pyc\n\n\
+         (git-ignored files are not touched)"
+    );
+    assert_eq!(infos(&mut rx), vec!["Redone: a.txt (+2 generated)".to_string()]);
+}
