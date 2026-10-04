@@ -460,6 +460,12 @@ pub struct Agent {
     /// by `clear_conversation`/`switch_to` since it no longer describes the
     /// conversation now in progress.
     last_test_passed: Option<bool>,
+    /// `[git] ignore`: `.gitignore`-syntax patterns for generated files.
+    /// An untracked path matching one is left out of the change summary,
+    /// `/diff`, the `/undo`/`/redo` previews and their result lists, and
+    /// is never staged by `/commit`'s nothing-staged path. Empty turns it
+    /// off. Defaults to [`aivyx_tools::DEFAULT_GENERATED_PATTERNS`].
+    generated_ignore: Vec<String>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -547,6 +553,7 @@ impl Agent {
             tests: None,
             test_timeout: test_command::TEST_TIMEOUT,
             last_test_passed: None,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
             events_tx,
         }
     }
@@ -1235,6 +1242,12 @@ impl Agent {
     /// `command_prompter` field.
     pub fn set_command_prompter(&mut self, prompter: Arc<dyn aivyx_sandbox::PermissionPrompter>) {
         self.command_prompter = Some(prompter);
+    }
+
+    /// Sets the generated-file patterns (see the `generated_ignore`
+    /// field); an empty list hides nothing.
+    pub fn set_generated_ignore(&mut self, patterns: Vec<String>) {
+        self.generated_ignore = patterns;
     }
 
     /// Sets the directory confined child processes may write under (see
@@ -1930,7 +1943,6 @@ impl Agent {
         let mut command = tokio::process::Command::new(&scoped.spec.program);
         command
             .args(&args)
-            .envs(scoped.spec.env.iter().cloned())
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2113,9 +2125,31 @@ impl Agent {
         result
     }
 
+    /// The [`GeneratedFilter`] for the repository `cwd` is in, built once
+    /// per view (one `git ls-files`). `None` — hide nothing — when
+    /// `[git] ignore` is empty or git can't list the tracked files.
+    pub(super) async fn generated_filter(&self, cwd: &Path) -> Option<GeneratedFilter> {
+        if self.generated_ignore.is_empty() {
+            return None;
+        }
+        let root = repo_root(cwd).await?;
+        let tracked = aivyx_tools::tracked_paths(&root).await.ok()?;
+        Some(GeneratedFilter {
+            files: aivyx_tools::GeneratedFiles::new(&root, &self.generated_ignore),
+            tracked,
+        })
+    }
+
+    /// The `[git] ignore` matcher alone, rooted at `root` — for paths
+    /// already known to be untracked. `None` when the list is empty.
+    pub(super) fn generated_files(&self, root: &Path) -> Option<aivyx_tools::GeneratedFiles> {
+        (!self.generated_ignore.is_empty())
+            .then(|| aivyx_tools::GeneratedFiles::new(root, &self.generated_ignore))
+    }
+
     /// Emits `Changed: …` (an `Info` line) for the files that differ
-    /// between two snapshot commits; nothing when git fails or nothing
-    /// changed.
+    /// between two snapshot commits, leaving out untracked generated
+    /// files; nothing when git fails or nothing visible changed.
     async fn emit_change_summary(&self, cwd: &Path, before_oid: &str, after_oid: &str) {
         let diff = |format: &'static str| {
             let args = [
@@ -2133,9 +2167,14 @@ impl Agent {
         };
         let numstat = diff("--numstat").await;
         let names = diff("--name-status").await;
-        if let (Ok(n), Ok(s)) = (numstat, names)
-            && let Some(line) = crate::changes::summary_line(&crate::changes::parse_numstat(&n, &s))
-        {
+        let (Ok(n), Ok(s)) = (numstat, names) else {
+            return;
+        };
+        let mut changes = crate::changes::parse_numstat(&n, &s);
+        if let Some(filter) = self.generated_filter(cwd).await {
+            changes.retain(|c| !filter.hides(&c.path));
+        }
+        if let Some(line) = crate::changes::summary_line(&changes) {
             self.info(line);
         }
     }
@@ -3192,6 +3231,31 @@ fn elide(text: &str, cap: usize) -> String {
         "{head}\n[... {} characters elided to fit the context window ...]\n{tail}",
         chars.len() - 2 * half
     )
+}
+
+/// Which changed paths aivyx-coder's own change views leave out: a path
+/// matching a `[git] ignore` pattern that git doesn't track. A tracked
+/// path is always shown, as `.gitignore` never hides one either.
+pub(super) struct GeneratedFilter {
+    files: aivyx_tools::GeneratedFiles,
+    tracked: std::collections::HashSet<String>,
+}
+
+impl GeneratedFilter {
+    /// `path` is relative to the repository's top level, as `git diff`
+    /// prints it between two trees.
+    pub(super) fn hides(&self, path: &str) -> bool {
+        self.files.is_generated(path) && !self.tracked.contains(path)
+    }
+}
+
+/// The repository top level `cwd` is in.
+pub(super) async fn repo_root(cwd: &Path) -> Option<PathBuf> {
+    let out = aivyx_tools::run_git(cwd, &["rev-parse", "--show-toplevel"], &[])
+        .await
+        .ok()?;
+    let root = out.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
 /// The tree a commit points at — compared, not commit ids, because a

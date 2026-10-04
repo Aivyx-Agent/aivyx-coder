@@ -214,6 +214,13 @@ a linked worktree), `/commit` can't write it and says so — start it at the
 repository root, or commit with git. `/undo` after `/commit` rewinds only
 your files, never the commit; its preview says so.
 
+Untracked generated files — `__pycache__/`, `node_modules/`, `.pytest_cache/`
+and the like, left behind by test runs and shell commands in a project with no
+`.gitignore` of its own — are kept out of all of this: the change line,
+`/diff`, the `/undo`/`/redo` previews, and what `/commit` stages when nothing
+is staged. The list is `[git] ignore` (`.gitignore` syntax; `ignore = []`
+turns it off); like `.gitignore`, it never hides a file git already tracks.
+
 **`/test`** runs the project's test command: `[verification] command` when
 configured, else whatever's detected in the project folder (first match
 wins):
@@ -2017,6 +2024,11 @@ extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
 
 [git]
 checkpoints = true   # snapshot the worktree before every mutating tool call
+# Generated files (.gitignore syntax), hidden from the change summary, /diff
+# and the /undo and /redo previews, and never auto-staged by /commit — only while
+# untracked, like .gitignore: a file git tracks is always shown. [] = off.
+# ignore = ["__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", ".mypy_cache/",
+#           ".ruff_cache/", "node_modules/", ".venv/", ".DS_Store"]
 
 [repo_map]
 enabled = true       # append a ranked symbol map to the system prompt

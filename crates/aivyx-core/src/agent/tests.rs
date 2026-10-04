@@ -2568,7 +2568,6 @@ async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), "exit 1".to_string()], // always fails
         timeout: Duration::from_secs(5),
-        env: Vec::new(),
     }])));
 
     let write_call = vec![
@@ -4455,7 +4454,6 @@ fn verify_command_spec(name: &str, exit_ok: bool) -> CommandSpec {
             if exit_ok { "exit 0" } else { "exit 1" }.to_string(),
         ],
         timeout: Duration::from_secs(5),
-        env: Vec::new(),
     }
 }
 
@@ -4787,7 +4785,6 @@ async fn run_scoped_verification_reports_pass_and_records_history() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 0".to_string()],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4815,7 +4812,6 @@ async fn run_scoped_verification_reports_failure_for_a_nonzero_exit() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 1".to_string()],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4847,7 +4843,6 @@ async fn run_scoped_verification_substitutes_touched_paths_into_argv() {
                 "{touched_paths}".to_string(),
             ],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     };
@@ -4874,7 +4869,6 @@ fn set_scoped_verification_attaches_to_an_already_configured_verification() {
             program: "pytest".to_string(),
             args: vec!["{touched_paths}".to_string()],
             timeout: Duration::from_secs(30),
-            env: Vec::new(),
         },
         Arc::new(NoopConfiner),
     );
@@ -4895,7 +4889,6 @@ fn set_scoped_verification_before_set_verification_is_a_harmless_no_op() {
             program: "pytest".to_string(),
             args: vec![],
             timeout: Duration::from_secs(30),
-            env: Vec::new(),
         },
         Arc::new(NoopConfiner),
     );
@@ -4965,7 +4958,6 @@ fn stateful_verify_command_spec(name: &str, script: &str) -> CommandSpec {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), script.to_string()],
         timeout: Duration::from_secs(5),
-        env: Vec::new(),
     }
 }
 
@@ -5242,7 +5234,6 @@ async fn a_failing_scoped_run_skips_the_full_command_this_iteration() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 1".to_string()],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5290,7 +5281,6 @@ async fn a_passing_scoped_run_is_confirmed_by_a_full_run_that_can_still_fail() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "exit 0".to_string()],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5329,7 +5319,6 @@ async fn run_verification_attempt_falls_back_to_full_only_when_no_paths_are_touc
             // Would leave a marker file if it ever ran — proves it doesn't.
             args: vec!["-c".to_string(), "touch scoped_ran".to_string()],
             timeout: Duration::from_secs(5),
-            env: Vec::new(),
         },
         confiner: Arc::new(NoopConfiner),
     });
@@ -5564,7 +5553,6 @@ async fn a_dropped_compacted_tool_call_requires_a_fresh_confirmation_on_reissue(
         program: "true".to_string(),
         args: vec![],
         timeout: Duration::from_secs(5),
-        env: Vec::new(),
     }])));
 
     let prompter = Arc::new(CountingAlwaysAllowPrompter(
@@ -7482,7 +7470,7 @@ async fn commit_without_binary_labels_still_commits_when_the_binary_check_fails(
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
-    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    std::fs::write(cwd.join("x.bin"), [0u8, 0, 1, 2, 0, 3]).unwrap();
     let (mut agent, mut rx) =
         undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
     let prompter = scripted(vec![UserResponse::Allow]);
@@ -7496,7 +7484,7 @@ async fn commit_without_binary_labels_still_commits_when_the_binary_check_fails(
     assert_eq!(commit_count(&cwd).await, 2, "committed without the labels");
     let seen = prompter.seen.lock().unwrap();
     let preview = seen[0].preview.as_deref().unwrap();
-    assert!(preview.contains("  x.pyc"), "{preview}");
+    assert!(preview.contains("  x.bin"), "{preview}");
     assert!(!preview.contains("(binary"), "{preview}");
 }
 
@@ -7534,8 +7522,8 @@ async fn commit_preview_marks_an_untracked_binary_file_as_new() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
-    // A real compiled-Python artefact shape: untracked, NUL bytes.
-    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    // Untracked, with NUL bytes: git diffs it as binary.
+    std::fs::write(cwd.join("x.bin"), [0u8, 0, 1, 2, 0, 3]).unwrap();
     let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
     let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
     let prompter = scripted(vec![UserResponse::Allow]);
@@ -7546,7 +7534,7 @@ async fn commit_preview_marks_an_untracked_binary_file_as_new() {
     let seen = prompter.seen.lock().unwrap();
     let preview = seen[0].preview.as_deref().unwrap();
     assert!(
-        preview.contains("  x.pyc   (binary, new)"),
+        preview.contains("  x.bin   (binary, new)"),
         "an untracked binary file must be marked \"(binary, new)\": {preview}"
     );
 }
@@ -7565,8 +7553,8 @@ async fn commit_preview_never_runs_a_repo_textconv_and_still_sees_binary() {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     git_in(&cwd, &["config", "diff.conv.textconv", script.to_str().unwrap()]).await;
-    std::fs::write(cwd.join(".gitattributes"), "*.pyc diff=conv\n").unwrap();
-    std::fs::write(cwd.join("x.pyc"), [0u8, 0, 1, 2, 0, 3]).unwrap();
+    std::fs::write(cwd.join(".gitattributes"), "*.bin diff=conv\n").unwrap();
+    std::fs::write(cwd.join("x.bin"), [0u8, 0, 1, 2, 0, 3]).unwrap();
     let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
     let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
     let prompter = scripted(vec![UserResponse::Deny]);
@@ -7577,7 +7565,7 @@ async fn commit_preview_never_runs_a_repo_textconv_and_still_sees_binary() {
     assert!(!marker.exists(), "the /commit preview ran the repo's textconv program");
     let seen = prompter.seen.lock().unwrap();
     let preview = seen[0].preview.as_deref().unwrap();
-    assert!(preview.contains("  x.pyc   (binary, new)"), "{preview}");
+    assert!(preview.contains("  x.bin   (binary, new)"), "{preview}");
 }
 
 #[tokio::test]
@@ -8129,18 +8117,6 @@ async fn test_cancelled_or_unable_to_start_leaves_last_test_passed_unchanged() {
     });
     agent.run_turn("/test".into(), &cwd, token).await.unwrap();
     assert_eq!(agent.last_test_passed(), Some(false), "cancelled leaves it unchanged");
-}
-
-#[tokio::test]
-async fn test_run_does_not_write_python_bytecode() {
-    let dir = tempfile::tempdir().unwrap();
-    init_git_repo(dir.path()).await;
-    let cwd = dir.path().canonicalize().unwrap();
-    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
-    agent.set_tests(Some(sh_tests(r#"echo "$PYTHONDONTWRITEBYTECODE""#)));
-    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
-    let (lines, _finished) = test_events(&mut rx);
-    assert_eq!(lines, vec!["1".to_string()]);
 }
 
 #[tokio::test]
@@ -9059,4 +9035,251 @@ async fn last_assistant_text_never_returns_an_earlier_turns_answer() {
     assert_eq!(agent.last_assistant_text().as_deref(), Some("the first answer"));
     agent.run_turn("second".into(), dir.path(), CancellationToken::new()).await.unwrap();
     assert_eq!(agent.last_assistant_text(), None, "the second turn produced no reply");
+}
+
+// ----- generated files ([git] ignore) -----
+
+/// A turn that writes `a.txt` and `__pycache__/m.pyc`.
+fn writes_source_and_bytecode() -> Vec<Vec<StreamEvent>> {
+    vec![
+        multi_call_response(vec![
+            write_call_in("a.txt", "one\n", "c1"),
+            write_call_in("__pycache__/m.pyc", "bytecode\n", "c2"),
+        ]),
+        text_response("done"),
+    ]
+}
+
+#[tokio::test]
+async fn the_change_summary_hides_untracked_generated_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["Changed: a.txt (+1, new)".to_string()]);
+}
+
+#[tokio::test]
+async fn the_change_summary_shows_a_tracked_generated_file() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(cwd.join("__pycache__")).unwrap();
+    std::fs::write(cwd.join("__pycache__/m.pyc"), "old\n").unwrap();
+    git_in(&cwd, &["add", "__pycache__/m.pyc"]).await;
+    git_in(&cwd, &["commit", "-q", "-m", "track bytecode"]).await;
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        infos(&mut rx),
+        vec!["Changed: __pycache__/m.pyc (+1 −1) · a.txt (+1, new)".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn an_empty_ignore_list_shows_generated_files_again() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
+    agent.set_generated_ignore(Vec::new());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        infos(&mut rx),
+        vec!["Changed: __pycache__/m.pyc (+1, new) · a.txt (+1, new)".to_string()]
+    );
+    std::fs::create_dir_all(cwd.join("node_modules")).unwrap();
+    std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let text = &shown_diffs(&mut rx)[0].1;
+    assert!(text.contains("node_modules/x.js"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_hides_untracked_generated_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::create_dir(cwd.join("node_modules")).unwrap();
+    std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let diffs = shown_diffs(&mut rx);
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let text = &diffs[0].1;
+    assert!(text.contains("+v2"), "{text}");
+    assert!(!text.contains("node_modules") && !text.contains("module"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_with_only_generated_files_says_nothing_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(cwd.join("node_modules")).unwrap();
+    std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["No uncommitted changes.".to_string()]);
+}
+
+#[tokio::test]
+async fn diff_turn_hides_untracked_generated_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+    agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let text = &shown_diffs(&mut rx)[0].1;
+    assert!(text.contains("a.txt"), "{text}");
+    assert!(!text.contains("__pycache__") && !text.contains("bytecode"), "{text}");
+}
+
+#[tokio::test]
+async fn diff_from_a_subfolder_hides_generated_files_by_repository_path() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("sub/__pycache__")).unwrap();
+    std::fs::write(root.join("sub/__pycache__/m.pyc"), "bytecode\n").unwrap();
+    std::fs::write(root.join("sub/new.txt"), "fresh\n").unwrap();
+    let sub = root.join("sub");
+    let (mut agent, mut rx) = undo_agent_with_events(&sub, true).await;
+    agent.run_turn("/diff".into(), &sub, CancellationToken::new()).await.unwrap();
+    let text = &shown_diffs(&mut rx)[0].1;
+    // Shown by its repository path, so the pathspec is taken from the top
+    // level, not from `sub`.
+    assert!(text.contains("sub/new.txt") && text.contains("+fresh"), "{text}");
+    assert!(!text.contains("__pycache__"), "{text}");
+}
+
+#[tokio::test]
+async fn commit_with_nothing_staged_leaves_generated_files_untracked() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    std::fs::create_dir(cwd.join("src")).unwrap();
+    std::fs::write(cwd.join("src/new.rs"), "fn main() {}\n").unwrap();
+    std::fs::create_dir(cwd.join("__pycache__")).unwrap();
+    std::fs::write(cwd.join("__pycache__/m.pyc"), [0u8, 159, 146, 150]).unwrap();
+    std::fs::write(cwd.join(".env"), "SECRET=hunter2\n").unwrap();
+    let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
+    let (mut agent, _rx) = commit_agent_with_deny(&cwd, mock.clone(), vec![PathBuf::from(".env")]).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        git_text(&cwd, &["show", "--name-only", "--format=", "HEAD"]).await,
+        "src/new.rs\ntracked.txt\n"
+    );
+    assert_eq!(
+        git_text(&cwd, &["status", "--porcelain", "-uall"]).await,
+        "?? .env\n?? __pycache__/m.pyc\n"
+    );
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert!(preview.ends_with("Files:\n  src/new.rs\n  tracked.txt"), "{preview}");
+    let sent = all_request_text(&mock);
+    assert!(!sent.contains("hunter2") && !sent.contains("__pycache__"), "{sent}");
+}
+
+#[tokio::test]
+async fn commit_with_nothing_staged_stages_a_tracked_deletion_and_a_tracked_generated_file() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("old.pyc"), "old\n").unwrap();
+    git_in(&cwd, &["add", "old.pyc"]).await;
+    git_in(&cwd, &["commit", "-q", "-m", "track bytecode"]).await;
+    std::fs::write(cwd.join("old.pyc"), "new\n").unwrap();
+    std::fs::remove_file(cwd.join("tracked.txt")).unwrap();
+    let mock = Arc::new(MockBackend::new(vec![]));
+    let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
+    agent.set_command_prompter(scripted(vec![]));
+
+    agent.run_turn("/commit -m \"update\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        git_text(&cwd, &["show", "--name-status", "--format=", "HEAD"]).await,
+        "M\told.pyc\nD\ttracked.txt\n"
+    );
+    assert_eq!(git_text(&cwd, &["status", "--porcelain"]).await, "");
+}
+
+#[tokio::test]
+async fn commit_with_only_generated_files_has_nothing_to_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(cwd.join("node_modules")).unwrap();
+    std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
+    agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), vec!["Nothing to commit.".to_string()]);
+    assert_eq!(commit_count(&cwd).await, 1);
+    assert_eq!(git_text(&cwd, &["diff", "--cached", "--name-only"]).await, "");
+}
+
+#[tokio::test]
+async fn undo_preview_and_result_list_only_visible_files() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut script = writes_source_and_bytecode();
+    script.push(text_response("ok"));
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, script).await;
+    let prompter = scripted(vec![UserResponse::Allow, UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    drain(&mut rx);
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(!cwd.join("a.txt").exists());
+    assert!(!cwd.join("__pycache__/m.pyc").exists(), "the restore is still the whole snapshot");
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert_eq!(
+        preview,
+        "Undo the last turn (\"write\")?\n\n− a.txt   (will be removed)\n\n(git-ignored files are not touched)"
+    );
+    assert_eq!(infos(&mut rx), vec!["Undone: a.txt".to_string()]);
+    assert_eq!(agent.pending_notes, vec!["The user undid your changes from the last turn: a.txt.".to_string()]);
+
+    agent.run_turn("/redo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[1].preview.clone().unwrap();
+    assert_eq!(
+        preview,
+        "Redo the last undo?\n\n+ a.txt   (will come back)\n\n(git-ignored files are not touched)"
+    );
+    assert_eq!(infos(&mut rx), vec!["Redone: a.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn undo_of_a_turn_that_only_changed_generated_files_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, vec![
+        write_call("c1", "__pycache__/m.pyc", "bytecode\n"),
+        text_response("done"),
+    ]).await;
+    let prompter = scripted(vec![UserResponse::Allow]);
+    agent.set_command_prompter(prompter.clone());
+    agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(infos(&mut rx), Vec::<String>::new(), "no visible change, no summary");
+
+    agent.run_turn("/undo".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let preview = prompter.seen.lock().unwrap()[0].preview.clone().unwrap();
+    assert_eq!(
+        preview,
+        "Undo the last turn (\"write\")?\n\n(only generated files changed)\n\n(git-ignored files are not touched)"
+    );
+    assert!(!cwd.join("__pycache__/m.pyc").exists());
+    assert_eq!(infos(&mut rx), vec!["Undone: only generated files".to_string()]);
 }

@@ -54,16 +54,6 @@ pub(crate) const DETECTED_TESTS_ENTRY: &str = "detected-tests";
 pub(crate) struct AutoVerification {
     pub command_name: String,
     pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
-    /// Extra env for `command_name`'s `CommandSpec` (`env` isn't a field on
-    /// `aivyx_config::AllowedCommand` — see `command_specs`'s own doc
-    /// comment for why config format stays unchanged). Empty unless
-    /// `synthetic_entry` is `Some`: a user-configured command is run with
-    /// whatever environment the user already controls via their own shell/
-    /// config, with no need for this hack; the synthetic `detected-tests`
-    /// entry runs unattended under `--auto`, so it gets
-    /// `PYTHONDONTWRITEBYTECODE=1` to keep a Python test run from leaving
-    /// `__pycache__`/`.pyc` files in the project.
-    pub env: Vec<(String, String)>,
 }
 
 /// `--auto`'s test-command resolution: a configured name must resolve to
@@ -108,7 +98,6 @@ pub(crate) fn auto_verification(
         return Ok(AutoVerification {
             command_name: name.to_string(),
             synthetic_entry: None,
-            env: Vec::new(),
         });
     }
     match tests {
@@ -128,7 +117,6 @@ pub(crate) fn auto_verification(
                     args: tests.args.clone(),
                     timeout_secs: Some(aivyx_core::test_detect::TEST_TIMEOUT_SECS),
                 }),
-                env: vec![("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())],
             })
         }
         _ => anyhow::bail!(
@@ -529,29 +517,13 @@ pub(crate) async fn build_agent(
         auto.as_ref().and_then(|a| a.synthetic_entry.as_ref()),
     );
 
-    // `AllowedCommand` (the config type) deliberately has no `env` field —
-    // env is not something config.toml exposes for a user-written command.
-    // The one exception is `--auto`'s own synthetic `detected-tests` entry
-    // (see `auto_verification`), whose env lives on `AutoVerification`
-    // instead and is spliced in here, by name, when building that entry's
-    // `CommandSpec` — every other entry gets an empty `env`.
     let command_specs: Vec<CommandSpec> = allowed_commands
         .iter()
-        .map(|c| {
-            let env = auto
-                .as_ref()
-                .filter(|a| a.command_name == c.name)
-                .map(|a| a.env.clone())
-                .unwrap_or_default();
-            CommandSpec {
-                name: c.name.clone(),
-                program: c.program.clone(),
-                args: c.args.clone(),
-                timeout: Duration::from_secs(
-                    c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS),
-                ),
-                env,
-            }
+        .map(|c| CommandSpec {
+            name: c.name.clone(),
+            program: c.program.clone(),
+            args: c.args.clone(),
+            timeout: Duration::from_secs(c.timeout_secs.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)),
         })
         .collect();
 
@@ -1381,6 +1353,7 @@ pub(crate) async fn build_agent(
     if cfg!(feature = "sandbox-backend") {
         agent.set_write_sandbox(Some(cwd.clone()));
     }
+    agent.set_generated_ignore(settings.git.ignore.clone());
     if let Some(mission_plan_handle) = &mission_plan {
         agent.set_mission_plan_handle(Arc::clone(mission_plan_handle));
     }
@@ -2150,25 +2123,13 @@ tool_allowlist = []
     }
 
     #[test]
-    fn auto_falling_back_to_detection_sets_pythondontwritebytecode() {
-        // The synthetic `detected-tests` entry runs unattended under
-        // `--auto` with no human watching the working tree — it must not
-        // leave `.pyc`/`__pycache__` litter behind, regardless of whether
-        // the detected command is actually a Python one (harmless either
-        // way; the real intent is "never silently dirty the project").
-        let auto = auto_verification(None, &names(&[]), Some(&detected("cargo"))).unwrap();
+    fn the_git_ignore_default_matches_the_agents_own_default() {
+        // An `Agent` built without config (sub-agents, MCP sessions, tests)
+        // hides the same generated files as one built from config.toml.
         assert_eq!(
-            auto.env,
-            vec![("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())]
+            aivyx_config::GitSettings::default().ignore,
+            aivyx_tools::default_generated_patterns()
         );
-    }
-
-    #[test]
-    fn auto_with_a_configured_name_has_no_extra_env() {
-        let auto =
-            auto_verification(Some("tests"), &names(&["tests"]), Some(&detected("cargo")))
-                .unwrap();
-        assert!(auto.env.is_empty());
     }
 
     #[test]

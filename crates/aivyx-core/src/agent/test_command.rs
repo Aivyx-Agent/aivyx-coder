@@ -200,11 +200,6 @@ impl Agent {
         command
             .args(&tests.args)
             .current_dir(cwd)
-            // Each `/test` run spawns a fresh process -- cached `.pyc`
-            // files would just be dead weight in the worktree, never
-            // reused across runs the way they would be in a long-lived
-            // interpreter.
-            .env("PYTHONDONTWRITEBYTECODE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -72,6 +72,16 @@ async fn committed_note(cwd: &Path, after_oid: Option<&str>, paths: &[String]) -
     ))
 }
 
+/// The `Undone:`/`Redone:` list (and the model's note): the visible
+/// paths, or a plain phrase when only generated files changed.
+fn path_list(paths: &[String]) -> String {
+    if paths.is_empty() {
+        "only generated files".to_string()
+    } else {
+        paths.join(", ")
+    }
+}
+
 /// The local UTC offset, in seconds, for `/checkpoints` times.
 fn local_offset_secs() -> i32 {
     chrono::Local::now().offset().local_minus_utc()
@@ -119,6 +129,20 @@ impl Agent {
         git(cwd, &["diff", "--name-status", current, target])
             .await
             .map(|out| parse_name_status(&out))
+    }
+
+    /// `changes` without untracked generated files (`[git] ignore`): the
+    /// restore still covers the whole snapshot, only the listing leaves
+    /// them out.
+    async fn without_generated(
+        &self,
+        cwd: &Path,
+        mut changes: Vec<(String, ChangeKind)>,
+    ) -> Vec<(String, ChangeKind)> {
+        if let Some(filter) = self.generated_filter(cwd).await {
+            changes.retain(|(path, _)| !filter.hides(path));
+        }
+        changes
     }
 
     async fn confirm(&self, tool_name: &str, preview: String) -> bool {
@@ -177,6 +201,7 @@ impl Agent {
                 .unwrap_or_default(),
             None => HashSet::new(),
         };
+        let changes = self.without_generated(&cwd, changes).await;
         let paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
         let entries: Vec<PreviewEntry> = changes
             .into_iter()
@@ -205,7 +230,7 @@ impl Agent {
         }
         self.undo.pop_mark();
         self.undo.push_redo(RedoMark { mark, redo_oid });
-        let list = paths.join(", ");
+        let list = path_list(&paths);
         self.pending_notes.push(format!(
             "The user undid your changes from the last turn: {list}."
         ));
@@ -253,6 +278,7 @@ impl Agent {
                 .await
                 .map(|out| out.lines().map(str::to_string).collect())
                 .unwrap_or_default();
+        let changes = self.without_generated(&cwd, changes).await;
         let paths: Vec<String> = changes.iter().map(|(p, _)| p.clone()).collect();
         let entries: Vec<PreviewEntry> = changes
             .into_iter()
@@ -277,7 +303,7 @@ impl Agent {
         }
         let redo = self.undo.pop_redo().expect("checked above");
         self.undo.push_mark_back(redo.mark);
-        let list = paths.join(", ");
+        let list = path_list(&paths);
         self.pending_notes
             .push(format!("The user restored your changes: {list}."));
         self.info(format!("Redone: {list}"));

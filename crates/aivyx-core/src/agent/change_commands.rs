@@ -6,11 +6,13 @@
 //! `/diff` diffs a verified snapshot of the whole worktree (untracked,
 //! non-ignored files included) against `HEAD` — or the empty tree in a
 //! repository with no commits — and `/diff turn` against the last turn's
-//! starting snapshot.
+//! starting snapshot. Untracked generated files (`[git] ignore`) are left
+//! out of both.
 //!
 //! `/commit` works on the whole repository from its top level, wherever
-//! in it the session started: with nothing staged it stages everything
-//! (`git add -A`), drafts a message with the model (unless `-m` gave one),
+//! in it the session started: with nothing staged it stages every tracked
+//! change and every untracked file but generated ones (`[git] ignore`),
+//! drafts a message with the model (unless `-m` gave one),
 //! asks through the command prompter, and commits under the executor's
 //! confiner — so hooks run confined like any tool. Whatever it staged
 //! itself is unstaged again if the commit doesn't happen; a set the user
@@ -56,9 +58,10 @@ const BINARY_NEW: &str = "   (binary, new)";
 const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// The hooks whose failure stops a `git commit`.
 const COMMIT_HOOKS: [&str; 3] = ["pre-commit", "prepare-commit-msg", "commit-msg"];
-/// Paths per `git reset`/`git rm --cached` call when unstaging, so a huge
-/// change set never overflows the argument list.
-const UNSTAGE_CHUNK: usize = 500;
+/// Paths per git call that takes a path list (unstaging, staging untracked
+/// files, `/diff` without generated files), so a huge change set never
+/// overflows the argument list.
+const PATH_CHUNK: usize = 500;
 
 /// Which change command a message is, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,8 +197,8 @@ async fn has_head(root: &Path) -> bool {
         .is_ok()
 }
 
-/// Unstages everything — the exact undo of a `git add -A` over an index
-/// that had nothing staged, for when what it staged can't be listed.
+/// Unstages everything — the exact undo of `/commit`'s own staging over
+/// an index that had nothing staged, for when what it staged can't be listed.
 async fn restore_all(root: &Path) -> Result<(), String> {
     if has_head(root).await {
         git(root, &["reset", "-q"]).await.map(drop)
@@ -243,7 +246,7 @@ async fn has_commit_hook(root: &Path) -> bool {
 /// A no-op for an empty list, so a hand-staged set is never touched.
 async fn restore_staging(root: &Path, paths: &[String]) -> Result<(), String> {
     let head = has_head(root).await;
-    for chunk in paths.chunks(UNSTAGE_CHUNK) {
+    for chunk in paths.chunks(PATH_CHUNK) {
         let mut args = vec!["--literal-pathspecs"];
         if head {
             args.extend(["reset", "-q", "--"]);
@@ -329,21 +332,7 @@ impl Agent {
             self.notify("Couldn't read the changes: could not snapshot the current state");
             return;
         };
-        let diff = match git(
-            &cwd,
-            &[
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                &base,
-                &now,
-            ],
-        )
-        .await
-        {
+        let diff = match self.visible_diff(&cwd, &base, &now).await {
             Ok(diff) => diff,
             Err(e) => {
                 self.notify(format!("Couldn't read the changes: {e}"));
@@ -358,6 +347,93 @@ impl Agent {
             title,
             text: truncate_lines(&diff, DIFF_LINE_CAP),
         });
+    }
+
+    /// What `git add -A` would stage, minus deny-listed files and
+    /// untracked generated files: tracked changes (`git add -u`), then
+    /// the untracked files `git ls-files --others --exclude-standard`
+    /// lists, generated ones dropped — both under the same deny-aware
+    /// pathspecs.
+    async fn stage_all_but_generated(&self, root: &Path, deny: &[PathBuf]) -> Result<(), String> {
+        let specs = aivyx_tools::deny_aware_pathspecs(root, deny);
+        let mut args = vec!["add", "-u", "--"];
+        args.extend(specs.iter().map(String::as_str));
+        if let Err(e) = git(root, &args).await {
+            // With nothing tracked at all (a repository with no commits)
+            // `.` matches no tracked file and `add -u` refuses it; there
+            // is nothing for it to stage then anyway.
+            let tracked = git(root, &["ls-files", "-z"]).await?;
+            if !tracked.is_empty() {
+                return Err(e);
+            }
+        }
+
+        let mut args = vec![
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ];
+        args.extend(specs.iter().map(String::as_str));
+        let untracked = git(root, &args).await?;
+        let generated = self.generated_files(root);
+        let to_add: Vec<&str> = untracked
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter(|name| !generated.as_ref().is_some_and(|g| g.is_generated(name)))
+            .collect();
+        for chunk in to_add.chunks(PATH_CHUNK) {
+            let mut args = vec!["--literal-pathspecs", "add", "--"];
+            args.extend(chunk.iter().copied());
+            git(root, &args).await?;
+        }
+        Ok(())
+    }
+
+    /// `git diff base now`, without the sections of untracked generated
+    /// files. When one is hidden, the visible paths are diffed by name,
+    /// in chunks so a large change set never overflows the argument list.
+    async fn visible_diff(&self, cwd: &Path, base: &str, now: &str) -> Result<String, String> {
+        const DIFF: [&str; 6] = [
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+        ];
+        let whole = || async {
+            let mut args = DIFF.to_vec();
+            args.extend([base, now]);
+            git(cwd, &args).await
+        };
+        let Some(filter) = self.generated_filter(cwd).await else {
+            return whole().await;
+        };
+        let mut args = DIFF.to_vec();
+        args.extend(["--name-only", "-z", base, now]);
+        let names = git(cwd, &args).await?;
+        let (hidden, visible): (Vec<&str>, Vec<&str>) = names
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .partition(|name| filter.hides(name));
+        if hidden.is_empty() {
+            return whole().await;
+        }
+        let mut diff = String::new();
+        for chunk in visible.chunks(PATH_CHUNK) {
+            // `top`: the names are relative to the repository root, the
+            // diff runs wherever in it the session started.
+            let specs: Vec<String> = chunk.iter().map(|p| format!(":(top,literal){p}")).collect();
+            let mut args = DIFF.to_vec();
+            args.extend([base, now, "--"]);
+            args.extend(specs.iter().map(String::as_str));
+            diff.push_str(&git(cwd, &args).await?);
+        }
+        Ok(diff)
     }
 
     async fn commit(&mut self, message: Option<String>, cancellation: &CancellationToken) {
@@ -393,11 +469,8 @@ impl Agent {
         let staged_by_us = if git(&root, &["diff", "--cached", "--quiet"]).await.is_err() {
             Vec::new()
         } else {
-            let specs = aivyx_tools::deny_aware_pathspecs(&root, &deny);
-            let mut args = vec!["add", "-A", "--"];
-            args.extend(specs.iter().map(String::as_str));
-            let staged = match git(&root, &args).await {
-                Ok(_) => staged_names(&root).await,
+            let staged = match self.stage_all_but_generated(&root, &deny).await {
+                Ok(()) => staged_names(&root).await,
                 Err(e) => Err(e),
             };
             let staged = match staged {

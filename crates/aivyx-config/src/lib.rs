@@ -582,11 +582,35 @@ pub struct GitSettings {
     /// touches HEAD, the index, or the worktree; silently disabled when the
     /// working directory isn't a git repository.
     pub checkpoints: bool,
+    /// Generated files, in `.gitignore` syntax: hidden from aivyx-coder's
+    /// own change views (the per-turn change summary, `/diff`, the
+    /// `/undo`/`/redo` previews) and never auto-staged by `/commit`, but
+    /// only while untracked — exactly like `.gitignore`, a file git
+    /// already tracks is always shown. Covers build output and caches
+    /// that test runs and shell commands leave behind in a project with
+    /// no `.gitignore` of its own. `ignore = []` turns it off.
+    pub ignore: Vec<String>,
 }
 
 impl Default for GitSettings {
     fn default() -> Self {
-        Self { checkpoints: true }
+        Self {
+            checkpoints: true,
+            ignore: [
+                "__pycache__/",
+                "*.pyc",
+                "*.pyo",
+                ".pytest_cache/",
+                ".mypy_cache/",
+                ".ruff_cache/",
+                "node_modules/",
+                ".venv/",
+                ".DS_Store",
+            ]
+            .iter()
+            .map(|p| p.to_string())
+            .collect(),
+        }
     }
 }
 
@@ -1318,6 +1342,29 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_ignore_defaults_to_common_generated_files_and_can_be_emptied() {
+        assert_eq!(
+            GitSettings::default().ignore,
+            [
+                "__pycache__/",
+                "*.pyc",
+                "*.pyo",
+                ".pytest_cache/",
+                ".mypy_cache/",
+                ".ruff_cache/",
+                "node_modules/",
+                ".venv/",
+                ".DS_Store",
+            ]
+        );
+        let parsed: Settings = toml::from_str("[git]\ncheckpoints = true\n").unwrap();
+        assert_eq!(parsed.git.ignore, GitSettings::default().ignore);
+        let parsed: Settings = toml::from_str("[git]\nignore = []\n").unwrap();
+        assert!(parsed.git.ignore.is_empty());
+        assert!(parsed.git.checkpoints);
+    }
 
     #[test]
     fn default_settings_round_trip_through_toml() {

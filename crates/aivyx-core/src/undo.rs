@@ -120,9 +120,13 @@ pub fn parse_name_status(from_to_name_status: &str) -> Vec<(String, ChangeKind)>
 
 /// The `/undo` / `/redo` confirmation text. The git-ignored caveat is
 /// always shown: checkpoint trees never contain ignored files, so whether
-/// one is affected can't be told from them.
+/// one is affected can't be told from them. No entries means every changed
+/// path was a generated file the listing leaves out.
 pub fn preview_text(title: &str, entries: &[PreviewEntry]) -> String {
     let mut text = format!("{title}\n");
+    if entries.is_empty() {
+        text.push_str("\n(only generated files changed)");
+    }
     for e in entries {
         let (sym, note) = match e.kind {
             ChangeKind::Modified => ("~", ""),
@@ -271,6 +275,14 @@ mod tests {
         // contain ignored files, so there is no way to tell from them.
         let plain = preview_text("t", &entries[1..2]);
         assert_eq!(plain, "t\n\n− notes.md   (will be removed)\n\n(git-ignored files are not touched)");
+    }
+
+    #[test]
+    fn preview_with_only_generated_files_says_so() {
+        assert_eq!(
+            preview_text("t", &[]),
+            "t\n\n(only generated files changed)\n\n(git-ignored files are not touched)"
+        );
     }
 
     #[test]

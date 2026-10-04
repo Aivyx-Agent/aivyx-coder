@@ -16,6 +16,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 mod diff;
+mod generated;
 mod lsp;
 mod mcp;
 mod memory_topic;
@@ -27,6 +28,9 @@ pub mod web;
 pub mod wiki;
 
 pub use aivyx_checkpoint::{GitCheckpointer, exclude_pathspecs, run_git};
+pub use generated::{
+    DEFAULT_GENERATED_PATTERNS, GeneratedFiles, default_generated_patterns, tracked_paths,
+};
 
 /// `git add -A` pathspecs for everything under `dir` except the deny list:
 /// absolute deny paths inside `dir` (as the checkpointer excludes them) and
@@ -767,7 +771,6 @@ mod tests {
             program: "true".to_string(),
             args: vec![],
             timeout: std::time::Duration::from_secs(5),
-            env: Vec::new(),
         }])));
         let prompter = Arc::new(CountingAlwaysAllowPrompter(AtomicUsize::new(0)));
         let gate: Arc<dyn PermissionGate> = Arc::new(ConfirmationGate::new(
