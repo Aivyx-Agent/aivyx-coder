@@ -24,6 +24,13 @@ pub struct CommandInfo {
     pub name: &'static str,
     pub description: &'static str,
     pub tier: CommandTier,
+    /// A short hint for the argument(s) this command takes, shown by a
+    /// frontend that offers argument hints (today: `aivyx-acp`'s
+    /// `AvailableCommand::input`) — `None` for a command that takes no
+    /// arguments at all. Purely descriptive: nothing here parses or
+    /// enforces this shape, it just tells a human (or an editor's command
+    /// picker) what to type after the command name.
+    pub args_hint: Option<&'static str>,
 }
 
 /// Every known slash command, in the order `/help` lists them. Adding a
@@ -34,81 +41,97 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "/council",
         description: "Convene the configured council on a subject (or the last assistant message if bare)",
         tier: CommandTier::AgentTurn,
+        args_hint: Some("subject (optional)"),
     },
     CommandInfo {
         name: "/wiki",
         description: "Regenerate stale wiki pages, or one named page",
         tier: CommandTier::AgentTurn,
+        args_hint: Some("page (optional)"),
     },
     CommandInfo {
         name: "/architect",
         description: "Have the configured architect model produce a plan for a task, then execute it",
         tier: CommandTier::AgentTurn,
+        args_hint: Some("task"),
     },
     CommandInfo {
         name: "/models",
         description: "List routing candidates; `/models refresh` re-runs discovery, `/models why` explains the last choice",
         tier: CommandTier::AgentState,
+        args_hint: Some("refresh | why (optional)"),
     },
     CommandInfo {
         name: "/model",
         description: "Pin this conversation to a model (`/model <id>`), or `/model auto` to let routing choose",
         tier: CommandTier::AgentState,
+        args_hint: Some("model id, or auto"),
     },
     CommandInfo {
         name: "/clear",
         description: "Start a new conversation (the old one stays in /sessions)",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/sessions",
         description: "List this project's saved conversations",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/resume",
         description: "Switch to saved conversation N (/resume N)",
         tier: CommandTier::AgentState,
+        args_hint: Some("N"),
     },
     CommandInfo {
         name: "/undo",
         description: "Take back the assistant's last turn (asks first; /redo puts it back)",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/redo",
         description: "Put back what the last /undo removed",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/checkpoints",
         description: "List the turns /undo can take back",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/diff",
         description: "Show uncommitted changes (`/diff turn`: just the last turn's)",
         tier: CommandTier::AgentState,
+        args_hint: Some("turn (optional)"),
     },
     CommandInfo {
         name: "/commit",
         description: "Commit with a drafted message you approve (`/commit -m \"…\"` to write your own)",
         tier: CommandTier::AgentState,
+        args_hint: Some("-m \"message\" (optional)"),
     },
     CommandInfo {
         name: "/test",
         description: "Run the project's tests (the command shown at startup)",
         tier: CommandTier::AgentState,
+        args_hint: None,
     },
     CommandInfo {
         name: "/help",
         description: "List available commands",
         tier: CommandTier::FrontendOnly,
+        args_hint: None,
     },
     CommandInfo {
         name: "/quit",
         description: "Exit aivyx-coder",
         tier: CommandTier::FrontendOnly,
+        args_hint: None,
     },
 ];
 

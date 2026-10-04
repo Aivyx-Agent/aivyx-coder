@@ -1528,7 +1528,10 @@ fn new_input_box() -> TextArea<'static> {
 fn help_text(tests_line: &str) -> String {
     let mut lines = vec!["Available commands:".to_string()];
     for cmd in aivyx_core::commands::COMMANDS {
-        lines.push(format!("  {} — {}", cmd.name, cmd.description));
+        match cmd.args_hint {
+            Some(hint) => lines.push(format!("  {} <{hint}> — {}", cmd.name, cmd.description)),
+            None => lines.push(format!("  {} — {}", cmd.name, cmd.description)),
+        }
     }
     lines.push(String::new());
     lines.push("Keys:".to_string());
@@ -3215,6 +3218,24 @@ mod tests {
         // Undo is an in-app command now, not a pointer to the README.
         assert!(text.contains("/undo") && text.contains("/redo") && text.contains("/checkpoints"));
         assert!(!text.contains("Worktree checkpoints"));
+    }
+
+    #[test]
+    fn help_text_shows_the_args_hint_for_commands_that_have_one() {
+        let text = help_text("");
+        assert!(
+            text.lines().any(|l| l == "  /model <model id, or auto> — Pin this conversation to a \
+                model (`/model <id>`), or `/model auto` to let routing choose"),
+            "{text}"
+        );
+        // /undo has no args_hint -- its own line must stay exactly as
+        // before, with no `<...>` hint inserted.
+        assert!(
+            text.lines().any(|l| l
+                == "  /undo — Take back the assistant's last turn (asks first; /redo puts it \
+                    back)"),
+            "{text}"
+        );
     }
 
     #[test]

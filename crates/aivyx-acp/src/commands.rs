@@ -7,8 +7,8 @@
 //! actually get called against a real connection/session.
 
 use agent_client_protocol::schema::v1::{
-    AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk, SessionUpdate,
-    TextContent,
+    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock, ContentChunk,
+    SessionUpdate, TextContent, UnstructuredCommandInput,
 };
 use aivyx_core::commands::{COMMANDS, CommandInfo, CommandTier, parse_slash_command};
 
@@ -42,12 +42,25 @@ fn is_advertised(cmd: &CommandInfo) -> bool {
 /// testable without constructing a `SessionUpdate`. `name` is the command
 /// without its leading `/` (ACP's own convention — see the schema crate's
 /// `AvailableCommand::name` doc, "e.g. `create_plan`"); `description` is
-/// `CommandInfo.description` verbatim.
+/// `CommandInfo.description` verbatim. `input` is set to the schema's
+/// unstructured-input variant, carrying `CommandInfo.args_hint`, for any
+/// command that has one — `None` (no `input` at all) for a command that
+/// takes no arguments, so the editor's command picker shows no hint
+/// placeholder for e.g. `/undo`.
 pub(crate) fn advertised_commands() -> Vec<AvailableCommand> {
     COMMANDS
         .iter()
         .filter(|cmd| is_advertised(cmd))
-        .map(|cmd| AvailableCommand::new(cmd.name.trim_start_matches('/'), cmd.description))
+        .map(|cmd| {
+            let command =
+                AvailableCommand::new(cmd.name.trim_start_matches('/'), cmd.description);
+            match cmd.args_hint {
+                Some(hint) => command.input(AvailableCommandInput::Unstructured(
+                    UnstructuredCommandInput::new(hint),
+                )),
+                None => command,
+            }
+        })
         .collect()
 }
 
@@ -70,7 +83,12 @@ pub(crate) fn available_commands_update() -> SessionUpdate {
 pub(crate) fn acp_help_text() -> String {
     let mut text = "\n\nAvailable commands:\n".to_string();
     for cmd in COMMANDS.iter().filter(|cmd| is_advertised(cmd)) {
-        text.push_str(&format!("\n- `{}` — {}", cmd.name, cmd.description));
+        match cmd.args_hint {
+            Some(hint) => {
+                text.push_str(&format!("\n- `{} <{hint}>` — {}", cmd.name, cmd.description))
+            }
+            None => text.push_str(&format!("\n- `{}` — {}", cmd.name, cmd.description)),
+        }
     }
     text
 }
@@ -220,6 +238,7 @@ mod tests {
             name,
             description: "d",
             tier,
+            args_hint: None,
         };
         assert!(is_advertised(&info("/future-turn", CommandTier::AgentTurn)));
         assert!(is_advertised(&info(
@@ -260,6 +279,38 @@ mod tests {
             panic!("expected a text content block");
         };
         assert_eq!(text.text, acp_help_text());
+    }
+
+    #[test]
+    fn advertised_model_command_carries_its_configured_args_hint() {
+        let model = advertised_commands()
+            .into_iter()
+            .find(|c| c.name == "model")
+            .expect("/model must be advertised");
+        let Some(AvailableCommandInput::Unstructured(input)) = model.input else {
+            panic!("expected /model to carry an Unstructured input hint, got {:?}", model.input);
+        };
+        assert_eq!(input.hint, "model id, or auto");
+    }
+
+    #[test]
+    fn advertised_undo_command_carries_no_args_hint() {
+        let undo = advertised_commands()
+            .into_iter()
+            .find(|c| c.name == "undo")
+            .expect("/undo must be advertised");
+        assert_eq!(undo.input, None);
+    }
+
+    #[test]
+    fn acp_help_text_shows_the_args_hint_for_commands_that_have_one() {
+        let text = acp_help_text();
+        assert!(
+            text.contains("`/model <model id, or auto>` — "),
+            "{text}"
+        );
+        // /undo has no args_hint -- its line must stay exactly as before.
+        assert!(text.contains("- `/undo` — "), "{text}");
     }
 
     #[test]
