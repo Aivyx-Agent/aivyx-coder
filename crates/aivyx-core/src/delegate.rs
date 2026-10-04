@@ -123,6 +123,14 @@ pub struct DelegateTaskConfig {
     /// and passed to both this field and the top-level `set_broker_mode`
     /// call.
     pub broker_mode: bool,
+    /// Mirrors the top-level `Agent`'s own `set_generated_ignore` call
+    /// (`agent_builder.rs`'s `settings.git.ignore.clone()`) -- without
+    /// this, the sub-agent built here would keep `Agent::new`'s built-in
+    /// default (`aivyx_tools::default_generated_patterns()`) regardless
+    /// of what the user configured, so its own change summaries would
+    /// disagree with the parent's about which untracked files count as
+    /// "generated."
+    pub generated_ignore: Vec<String>,
 }
 
 pub struct DelegateTaskTool {
@@ -133,6 +141,72 @@ impl DelegateTaskTool {
     pub fn new(config: DelegateTaskConfig) -> Self {
         Self { config }
     }
+}
+
+/// Builds the sub-agent `delegate_task` drives one task against —
+/// extracted to its own function (rather than inlined in `execute()`
+/// alone) so a test can construct one directly and inspect it (e.g. via
+/// `Agent::generated_ignore()`) without going through a full tool call,
+/// which never reaches this far into `Agent` state (its change-summary
+/// machinery needs a checkpointed executor, which the sub-agent's own
+/// `sub_executor` deliberately never gets — see `execute()`'s
+/// `set_checkpointer` call, not `set_checkpointer_at`).
+fn build_sub_agent(
+    config: &DelegateTaskConfig,
+    sub_executor: ToolExecutor,
+    sub_tx: UnboundedSender<AgentEvent>,
+) -> Agent {
+    let mut sub_agent = Agent::new(
+        Arc::clone(&config.llm),
+        sub_executor,
+        SUB_AGENT_SYSTEM_PROMPT,
+        AgentConfig {
+            // Deliberately 1, *not* `config.max_iterations`: the outer
+            // loop in `execute()` re-invokes `run_turn` (via the
+            // `TurnPaused`-continuation mechanism) up to `max_iterations`
+            // times to bound the sub-agent's *total* LLM round-trip
+            // budget. If the inner `Agent` were instead given the same
+            // cap, a single `run_turn` call could by itself burn through
+            // up to `max_iterations` round-trips before ever returning
+            // control to that loop — letting it then grant up to
+            // `max_iterations` more such calls, for a worst case of
+            // `max_iterations²` round trips instead of `max_iterations`.
+            // Capping the inner agent at exactly 1 round-trip per call
+            // makes each outer-loop iteration correspond to exactly one
+            // LLM round-trip, so `max_iterations` bounds the total
+            // precisely — see `DelegateTaskConfig::max_iterations`'s doc
+            // comment.
+            max_tool_iterations: 1,
+            context_tokens: config.context_tokens,
+            edit_format: config.edit_format,
+        },
+        Arc::default(),
+        config.plan_mode.clone(),
+        config.autonomous_mode.clone(),
+        sub_tx,
+    );
+    if let Some((map, budget)) = &config.repo_map {
+        sub_agent.set_repo_map(Arc::clone(map), *budget);
+    }
+    if let Some((command, max_retries)) = &config.verification {
+        sub_agent.set_verification(command.clone(), *max_retries);
+    }
+    // Must be the *same* shared instance the parent's `Agent` and
+    // `ConfirmationGate` hold — see `DelegateTaskConfig::injection_taint`'s
+    // doc comment for why a fresh, disconnected instance here would let a
+    // sub-agent's own ingested content poison autonomous mode with the
+    // guard never seeing it.
+    sub_agent.set_injection_taint(config.injection_taint.clone());
+    // See `DelegateTaskConfig::broker_mode`'s doc comment — without this,
+    // the sub-agent's own requests to a shared aivyx-broker would omit
+    // `aivyx_slot_hint` entirely, which the broker interprets as "clear
+    // this slot's tracked prefix."
+    sub_agent.set_broker_mode(config.broker_mode);
+    // See `DelegateTaskConfig::generated_ignore`'s doc comment — without
+    // this, the sub-agent would keep `Agent::new`'s built-in default
+    // instead of the user's own configured `[git] ignore` list.
+    sub_agent.set_generated_ignore(config.generated_ignore.clone());
+    sub_agent
 }
 
 #[async_trait]
@@ -229,53 +303,7 @@ impl Tool for DelegateTaskTool {
             }
         });
 
-        let mut sub_agent = Agent::new(
-            Arc::clone(&self.config.llm),
-            sub_executor,
-            SUB_AGENT_SYSTEM_PROMPT,
-            AgentConfig {
-                // Deliberately 1, *not* `self.config.max_iterations`: the
-                // outer loop below re-invokes `run_turn` (via the
-                // `TurnPaused`-continuation mechanism) up to
-                // `max_iterations` times to bound the sub-agent's *total*
-                // LLM round-trip budget. If the inner `Agent` were instead
-                // given the same cap, a single `run_turn` call could by
-                // itself burn through up to `max_iterations` round-trips
-                // before ever returning control here — letting the outer
-                // loop then grant it up to `max_iterations` more such
-                // calls, for a worst case of `max_iterations²` round
-                // trips instead of `max_iterations`. Capping the inner
-                // agent at exactly 1 round-trip per call makes each
-                // outer-loop iteration correspond to exactly one LLM
-                // round-trip, so `max_iterations` bounds the total
-                // precisely — see `DelegateTaskConfig::max_iterations`'s
-                // doc comment.
-                max_tool_iterations: 1,
-                context_tokens: self.config.context_tokens,
-                edit_format: self.config.edit_format,
-            },
-            Arc::default(),
-            self.config.plan_mode.clone(),
-            self.config.autonomous_mode.clone(),
-            sub_tx,
-        );
-        if let Some((map, budget)) = &self.config.repo_map {
-            sub_agent.set_repo_map(Arc::clone(map), *budget);
-        }
-        if let Some((command, max_retries)) = &self.config.verification {
-            sub_agent.set_verification(command.clone(), *max_retries);
-        }
-        // Must be the *same* shared instance the parent's `Agent` and
-        // `ConfirmationGate` hold — see `DelegateTaskConfig::injection_taint`'s
-        // doc comment for why a fresh, disconnected instance here would
-        // let a sub-agent's own ingested content poison autonomous mode
-        // with the guard never seeing it.
-        sub_agent.set_injection_taint(self.config.injection_taint.clone());
-        // See `DelegateTaskConfig::broker_mode`'s doc comment — without
-        // this, the sub-agent's own requests to a shared aivyx-broker
-        // would omit `aivyx_slot_hint` entirely, which the broker
-        // interprets as "clear this slot's tracked prefix."
-        sub_agent.set_broker_mode(self.config.broker_mode);
+        let mut sub_agent = build_sub_agent(&self.config, sub_executor, sub_tx);
 
         let max_iterations = self.config.max_iterations.max(1);
         let mut result = sub_agent
@@ -426,6 +454,7 @@ mod tests {
             verification: None,
             max_iterations,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
         }
     }
 
@@ -884,5 +913,34 @@ mod tests {
             .unwrap();
         assert_eq!(request.action, ActionKind::Internal);
         assert!(matches!(request.target, PermissionTarget::Other(name) if name == "delegate_task"));
+    }
+
+    #[test]
+    fn build_sub_agent_threads_the_configured_generated_ignore_list() {
+        // A sub-agent's own change summaries never actually fire (its
+        // `sub_executor` is wired with `set_checkpointer`, not
+        // `set_checkpointer_at`, so `checkpoint_cwd()` stays `None` and
+        // `Agent::run_turn`'s undo-snapshot/change-summary machinery is
+        // skipped entirely) -- so this asserts directly on the built
+        // `Agent` via `generated_ignore()` instead of driving a real turn
+        // and inspecting a change-summary event.
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = base_config(mock, tx, ToolRegistry::new(), 10);
+        // Deliberately different from `base_config`'s own default
+        // (`aivyx_tools::default_generated_patterns()`) and from an empty
+        // list, so this can't pass by accident if `build_sub_agent` just
+        // happened to leave `Agent::new`'s own built-in default in place.
+        config.generated_ignore = vec!["custom.log".to_string()];
+        let sub_executor = ToolExecutor::new(
+            config.sub_agent_registry.clone(),
+            Arc::clone(&config.gate),
+            Arc::clone(&config.confiner),
+        );
+        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
+
+        let agent = build_sub_agent(&config, sub_executor, sub_tx);
+
+        assert_eq!(agent.generated_ignore(), ["custom.log".to_string()]);
     }
 }

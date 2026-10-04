@@ -166,6 +166,7 @@ mod session_map_tests {
             context_tokens: 8192,
             edit_format: aivyx_core::EditFormat::Native,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
         };
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let agent = build_session_agent(&config, AccessLevel::Plan, tx).await;
@@ -493,6 +494,7 @@ mod tests {
             context_tokens: 8192,
             edit_format: aivyx_core::EditFormat::Native,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
         };
         AivyxCoderMcpServer::new(McpServerRunConfig {
             session_config,

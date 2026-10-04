@@ -1250,6 +1250,15 @@ impl Agent {
         self.generated_ignore = patterns;
     }
 
+    /// The generated-file patterns currently in effect (see the
+    /// `generated_ignore` field) — a plain getter, mainly useful so a
+    /// sub-agent/specialist/MCP-session builder's own tests can assert
+    /// the configured `[git] ignore` list actually reached the `Agent`
+    /// they built, without needing a real repo + change summary.
+    pub fn generated_ignore(&self) -> &[String] {
+        &self.generated_ignore
+    }
+
     /// Sets the directory confined child processes may write under (see
     /// the `write_sandbox` field); `None` when writes aren't confined.
     pub fn set_write_sandbox(&mut self, root: Option<PathBuf>) {

@@ -367,6 +367,13 @@ pub struct SpecialistSessionsConfig {
     pub verification: Option<(String, u32)>,
     pub max_iterations: u32,
     pub broker_mode: bool,
+    /// Mirrors `DelegateTaskConfig::generated_ignore`'s doc comment in
+    /// `delegate.rs` -- without this, a specialist session's own `Agent`
+    /// would keep `Agent::new`'s built-in default instead of the user's
+    /// own configured `[git] ignore` list. `build_specialist_agent`
+    /// below threads it through; `..config.clone()` on `child_config`
+    /// (same function) carries it unchanged into any nested session.
+    pub generated_ignore: Vec<String>,
     pub pool: SpecialistSessionPool,
     /// How many `build_specialist_agent` calls produced this config --
     /// `0` only for the lead's own top-level config (never built via
@@ -630,6 +637,11 @@ fn build_specialist_agent(
     }
     agent.set_injection_taint(config.injection_taint.clone());
     agent.set_broker_mode(config.broker_mode);
+    // See `SpecialistSessionsConfig::generated_ignore`'s doc comment --
+    // without this, this session's own `Agent` would keep `Agent::new`'s
+    // built-in default instead of the user's own configured `[git]
+    // ignore` list.
+    agent.set_generated_ignore(config.generated_ignore.clone());
 
     (agent, forward_task, accumulated, barrier_tx)
 }
@@ -1180,6 +1192,7 @@ mod specialist_session_tests {
             verification: None,
             max_iterations: 3,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
             pool,
             spawn_depth: 0,
             caller: SessionOwner::Lead,
@@ -2503,5 +2516,25 @@ mod specialist_session_tests {
             0,
             "the dehydrated record must actually be discarded by the lead's close"
         );
+    }
+
+    #[tokio::test]
+    async fn build_specialist_agent_threads_the_configured_generated_ignore_list() {
+        // Mirrors `delegate.rs`/`delegate_to_specialist.rs`'s identical
+        // tests -- a specialist session's own change summaries never
+        // actually fire (its `sub_executor` is wired with
+        // `set_checkpointer`, not `set_checkpointer_at`), so this asserts
+        // directly on the built `Agent` via `generated_ignore()`.
+        let llm = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let mut cfg = config(llm, tx, simple_team(), pool);
+        cfg.generated_ignore = vec!["custom.log".to_string()];
+        let member = cfg.team.members[1].clone();
+
+        let (agent, _forward_task, _accumulated, _barrier_tx) =
+            build_specialist_agent(&member, &cfg, std::path::Path::new("."), "session-1");
+
+        assert_eq!(agent.generated_ignore(), ["custom.log".to_string()]);
     }
 }

@@ -145,6 +145,11 @@ pub struct DelegateToSpecialistConfig {
     pub verification: Option<(String, u32)>,
     pub max_iterations: u32,
     pub broker_mode: bool,
+    /// Mirrors `DelegateTaskConfig::generated_ignore`'s doc comment in
+    /// `delegate.rs` -- without this, a specialist built here would keep
+    /// `Agent::new`'s built-in default instead of the user's own
+    /// configured `[git] ignore` list.
+    pub generated_ignore: Vec<String>,
 }
 
 pub struct DelegateToSpecialistTool {
@@ -155,6 +160,61 @@ impl DelegateToSpecialistTool {
     pub fn new(config: DelegateToSpecialistConfig) -> Self {
         Self { config }
     }
+}
+
+/// Builds the specialist `delegate_to_specialist` drives one task
+/// against -- extracted to its own function (mirrors `delegate.rs`'s
+/// `build_sub_agent`) so a test can construct one directly and inspect it
+/// (e.g. via `Agent::generated_ignore()`) without a full tool call, which
+/// never reaches this far into `Agent` state (its change-summary
+/// machinery needs a checkpointed executor, which `sub_executor`
+/// deliberately never gets -- see `execute()`'s `set_checkpointer` call,
+/// not `set_checkpointer_at`).
+fn build_specialist_agent(
+    config: &DelegateToSpecialistConfig,
+    member: &aivyx_team::TeamMember,
+    sub_executor: ToolExecutor,
+    sub_tx: UnboundedSender<AgentEvent>,
+) -> Agent {
+    let mut specialist = Agent::new(
+        Arc::clone(&config.llm),
+        sub_executor,
+        member.persona.clone(),
+        AgentConfig {
+            // Deliberately 1, not `config.max_iterations` -- see
+            // `delegate.rs`'s identical `max_tool_iterations: 1` comment
+            // for why: the outer loop in `execute()` bounds the
+            // specialist's total LLM round-trip budget instead.
+            max_tool_iterations: 1,
+            context_tokens: config.context_tokens,
+            edit_format: config.edit_format,
+        },
+        Arc::default(),
+        config.plan_mode.clone(),
+        config.autonomous_mode.clone(),
+        sub_tx,
+    );
+    if let Some(task) = &member.task {
+        specialist.set_route_task(task.parse().unwrap_or_else(|never| match never {}));
+    }
+    if let Some((map, budget)) = &config.repo_map {
+        specialist.set_repo_map(Arc::clone(map), *budget);
+    }
+    if let Some((command, max_retries)) = &config.verification {
+        specialist.set_verification(command.clone(), *max_retries);
+    }
+    // Must be the parent's own *shared* instance -- see
+    // `DelegateTaskConfig::injection_taint`'s doc comment in `delegate.rs`
+    // for why a fresh, disconnected instance here would let a
+    // specialist's own ingested content poison autonomous mode with the
+    // guard never seeing it.
+    specialist.set_injection_taint(config.injection_taint.clone());
+    specialist.set_broker_mode(config.broker_mode);
+    // See `DelegateToSpecialistConfig::generated_ignore`'s doc comment --
+    // without this, the specialist would keep `Agent::new`'s built-in
+    // default instead of the user's own configured `[git] ignore` list.
+    specialist.set_generated_ignore(config.generated_ignore.clone());
+    specialist
 }
 
 #[async_trait]
@@ -274,40 +334,7 @@ impl Tool for DelegateToSpecialistTool {
             }
         });
 
-        let mut specialist = Agent::new(
-            Arc::clone(&self.config.llm),
-            sub_executor,
-            member.persona.clone(),
-            AgentConfig {
-                // Deliberately 1, not `self.config.max_iterations` -- see
-                // `delegate.rs`'s identical `max_tool_iterations: 1`
-                // comment for why: the outer loop below bounds the
-                // specialist's total LLM round-trip budget instead.
-                max_tool_iterations: 1,
-                context_tokens: self.config.context_tokens,
-                edit_format: self.config.edit_format,
-            },
-            Arc::default(),
-            self.config.plan_mode.clone(),
-            self.config.autonomous_mode.clone(),
-            sub_tx,
-        );
-        if let Some(task) = &member.task {
-            specialist.set_route_task(task.parse().unwrap_or_else(|never| match never {}));
-        }
-        if let Some((map, budget)) = &self.config.repo_map {
-            specialist.set_repo_map(Arc::clone(map), *budget);
-        }
-        if let Some((command, max_retries)) = &self.config.verification {
-            specialist.set_verification(command.clone(), *max_retries);
-        }
-        // Must be the parent's own *shared* instance -- see
-        // `DelegateTaskConfig::injection_taint`'s doc comment in
-        // `delegate.rs` for why a fresh, disconnected instance here would
-        // let a specialist's own ingested content poison autonomous mode
-        // with the guard never seeing it.
-        specialist.set_injection_taint(self.config.injection_taint.clone());
-        specialist.set_broker_mode(self.config.broker_mode);
+        let mut specialist = build_specialist_agent(&self.config, member, sub_executor, sub_tx);
 
         let max_iterations = self.config.max_iterations.max(1);
         let mut result = specialist
@@ -552,6 +579,7 @@ mod delegation_tests {
             verification: None,
             max_iterations: 3,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
         }
     }
 
@@ -894,6 +922,31 @@ mod delegation_tests {
              outgoing request's `tools` field -- not the full parent registry and not empty; \
              got: {tool_names:?}"
         );
+    }
+
+    #[test]
+    fn build_specialist_agent_threads_the_configured_generated_ignore_list() {
+        // Mirrors `delegate.rs`'s identical test -- a specialist's own
+        // change summaries never actually fire (see
+        // `build_specialist_agent`'s own doc comment), so this asserts
+        // directly on the built `Agent` via `generated_ignore()`.
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = base_config(mock, tx, simple_team());
+        config.generated_ignore = vec!["custom.log".to_string()];
+        let member = config.team.members[1].clone();
+        let specialist_registry = compute_specialist_registry(&member, &config.parent_registry);
+        let (gate, confiner) = crate::specialist_enforcement::scoped_gate_and_confiner(
+            &config.enforcement,
+            &member,
+            std::path::Path::new("."),
+        );
+        let sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
+        let (sub_tx, _sub_rx) = mpsc::unbounded_channel();
+
+        let agent = build_specialist_agent(&config, &member, sub_executor, sub_tx);
+
+        assert_eq!(agent.generated_ignore(), ["custom.log".to_string()]);
     }
 }
 

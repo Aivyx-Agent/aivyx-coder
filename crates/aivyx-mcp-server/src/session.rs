@@ -83,6 +83,14 @@ pub struct SessionConfig {
     /// prefix this slot was tracking" -- silently corrupting the
     /// cache-locality bookkeeping every other hinted request built up.
     pub broker_mode: bool,
+    /// Mirrors the top-level `Agent`'s own `set_generated_ignore` call
+    /// (`agent_builder.rs`'s `settings.git.ignore.clone()`) -- without
+    /// this, every MCP session's own `Agent` would keep `Agent::new`'s
+    /// built-in default instead of the user's own configured `[git]
+    /// ignore` list, so its own change summaries would disagree with the
+    /// top-level agent's about which untracked files count as
+    /// "generated."
+    pub generated_ignore: Vec<String>,
 }
 
 const SESSION_SYSTEM_PROMPT: &str = "You are aivyx-coder, delegated a bounded coding task by \
@@ -209,6 +217,10 @@ pub async fn build_session_agent(
     // `aivyx_slot_hint` entirely, which the broker interprets as "clear
     // this slot's tracked prefix."
     agent.set_broker_mode(config.broker_mode);
+    // See `SessionConfig::generated_ignore`'s doc comment -- without
+    // this, this session's own `Agent` would keep `Agent::new`'s built-in
+    // default instead of the user's own configured `[git] ignore` list.
+    agent.set_generated_ignore(config.generated_ignore.clone());
     agent
 }
 
@@ -407,6 +419,7 @@ mod tests {
             context_tokens: 8192,
             edit_format: EditFormat::Native,
             broker_mode: false,
+            generated_ignore: aivyx_tools::default_generated_patterns(),
         }
     }
 

@@ -6460,6 +6460,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
         verification: None,
         max_iterations: 3,
         broker_mode: false,
+        generated_ignore: aivyx_tools::default_generated_patterns(),
         pool: pool.clone(),
         spawn_depth: 0,
         caller: crate::session::SessionOwner::Lead,

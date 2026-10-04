@@ -362,6 +362,11 @@ async fn main() -> anyhow::Result<()> {
                 // (the same broker URL) as the top-level agent, so it must
                 // also attach a `slot_hint` to its own outgoing requests.
                 broker_mode: settings.backend.kind == aivyx_config::BackendKind::LlamaServerBroker,
+                // See `agent_builder.rs`'s own `agent.set_generated_ignore`
+                // call -- every MCP session's own `Agent` must honor the
+                // same configured `[git] ignore` list the top-level agent
+                // does, not `Agent::new`'s built-in default.
+                generated_ignore: settings.git.ignore.clone(),
             },
             max_access_level,
             session_ttl: Duration::from_secs(settings.mcp_server.session_ttl_secs),

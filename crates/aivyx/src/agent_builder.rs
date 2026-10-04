@@ -984,6 +984,7 @@ pub(crate) async fn build_agent(
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
+            generated_ignore: settings.git.ignore.clone(),
         },
     )));
 
@@ -1083,6 +1084,7 @@ pub(crate) async fn build_agent(
                 verification: verification.clone(),
                 max_iterations: settings.sub_agent.max_iterations,
                 broker_mode,
+                generated_ignore: settings.git.ignore.clone(),
             },
         )));
 
@@ -1147,6 +1149,7 @@ pub(crate) async fn build_agent(
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
+            generated_ignore: settings.git.ignore.clone(),
             pool: specialist_session_pool_handle,
             spawn_depth: 0,
             caller: aivyx_core::SessionOwner::Lead,
