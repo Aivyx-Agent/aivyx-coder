@@ -334,6 +334,15 @@ mod tests {
     /// `unix.txt` whether it could create an `AF_UNIX` socket, and starts
     /// a helper that would write `late.txt` a second later.
     #[cfg(feature = "sandbox-backend")]
+    fn have_python3() -> bool {
+        let found = std::process::Command::new("python3").arg("-c").arg("").status().is_ok();
+        if !found {
+            eprintln!("python3 not found; skipping");
+        }
+        found
+    }
+
+    #[cfg(feature = "sandbox-backend")]
     fn python_mcp_server(name: &str) -> McpClient {
         let script = r#"
 import json, socket, subprocess, sys
@@ -366,6 +375,9 @@ for line in sys.stdin:
     #[cfg(feature = "sandbox-backend")]
     #[tokio::test]
     async fn a_confined_stdio_mcp_server_works_without_unix_sockets() {
+        if !have_python3() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         let confiner: Arc<dyn ExecutionConfiner> =
@@ -386,6 +398,9 @@ for line in sys.stdin:
     #[cfg(feature = "sandbox-backend")]
     #[tokio::test]
     async fn allow_unix_sockets_reaches_confined_mcp_servers() {
+        if !have_python3() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
         let confiner: Arc<dyn ExecutionConfiner> =

@@ -404,9 +404,10 @@ impl Tool for ReplStartTool {
         // as `.process_group(0)` provided before.
         //
         // Under `LandlockConfiner`, though, the child already leads its
-        // own process group (`confine()` sets `process_group(0)`) and
-        // seccomp refuses `setsid()` unless `[sandbox]
-        // allow_leaving_process_group` is set — so `setsid()` failing is
+        // own process group (`confine()` sets `process_group(0)`, applied
+        // before this hook runs), and POSIX refuses `setsid()` to a group
+        // leader — so it fails with `EPERM` whatever the seccomp policy,
+        // `[sandbox] allow_leaving_process_group` included. That failure is
         // tolerated: the REPL then runs on the pty without it being its
         // controlling terminal (no `SIGWINCH` on resize, and an
         // interactive shell prints "no job control"), still in its own,

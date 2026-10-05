@@ -32,7 +32,10 @@ pub use aivyx_injection_guard::{InjectionFinding, InjectionTaint, scan_for_injec
 pub use confirmation::ConfirmationGate;
 
 /// The session IPC variables `LandlockConfiner` removes from every
-/// confined command (mirrors `aivyx-confine`'s own, crate-private list).
+/// confined command — a copy of `aivyx-confine`'s own `SCRUBBED_ENV_VARS`,
+/// which that crate doesn't export. Keep the two in step when bumping
+/// aivyx-confine. Drift fails safe: a variable confine scrubs that is
+/// missing here just stays scrubbed even with `allow_unix_sockets`.
 const SESSION_IPC_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",

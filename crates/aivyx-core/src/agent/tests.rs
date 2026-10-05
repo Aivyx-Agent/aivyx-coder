@@ -8282,14 +8282,15 @@ async fn test_kills_a_background_job_when_the_run_finishes() {
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
     // The job holds the output pipes, so this also checks /test returns
     // when the test command exits rather than when its pipes close.
-    agent.set_tests(Some(sh_tests("(sleep 1; echo late > late.txt) & echo done")));
+    // Generous margins: the job sleeps 3 s, /test must return well before.
+    agent.set_tests(Some(sh_tests("(sleep 3; echo late > late.txt) & echo done")));
     let started = std::time::Instant::now();
     agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_millis(900), "waited for the job");
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500), "waited for the job");
     let (_, finished) = test_events(&mut rx);
     assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
 
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
     assert!(!cwd.join("late.txt").exists(), "the background job outlived /test");
 }
 
