@@ -354,11 +354,19 @@ impl ToolExecutor {
     /// into a throwaway private index under the git dir (never the user's
     /// index).
     async fn current_worktree_tree(&self, cwd: &Path) -> Option<String> {
+        // Per-call atomic-counter suffix, mirroring `worktree_tree_over`'s
+        // identical index-naming scheme -- without it, concurrent calls on
+        // the same executor (e.g. multiple MCP sessions in one process
+        // sharing a checkpointer) raced on this fixed per-process path,
+        // each one's `git add`/`write-tree`/`remove_file` stepping on
+        // another's in-flight throwaway index.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let git_dir = run_git(cwd, &["rev-parse", "--absolute-git-dir"], &[])
             .await
             .ok()?;
         let git_dir = PathBuf::from(git_dir.trim());
-        let index = git_dir.join(format!("aivyx-verify-index-{}", std::process::id()));
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let index = git_dir.join(format!("aivyx-verify-index-{}-{n}", std::process::id()));
         // Start from a copy of the checkpointer's own index, not an empty
         // one: git keeps an already-indexed file even after it becomes
         // ignored, so only the same starting index yields the same tree the
@@ -1356,6 +1364,40 @@ mod tests {
             .await
             .expect("a working checkpoint is returned");
         assert_eq!(tree_of_ref(&cwd, &r).await, independent_worktree_tree(&cwd).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_current_worktree_tree_calls_do_not_corrupt_each_other() {
+        // Regression test: `current_worktree_tree`'s throwaway verify
+        // index used to live at a fixed per-process path
+        // (`aivyx-verify-index-{pid}`), with no per-call uniqueness --
+        // unlike `worktree_tree_over`, which already adds a per-call
+        // atomic-counter suffix for exactly this reason. Concurrent calls
+        // on the same executor (e.g. multiple MCP sessions in one process
+        // sharing a checkpointer, per `checkpoint_now`'s own doc comment)
+        // raced writing to, reading, and removing that same file. Many
+        // concurrent calls here, each checked against an independently
+        // computed ground-truth tree, to make that interference visible.
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let executor = undo_executor(&cwd, vec![]).await;
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+
+        let expected = independent_worktree_tree(&cwd).await;
+
+        let results =
+            futures::future::join_all((0..30).map(|_| executor.current_worktree_tree(&cwd)))
+                .await;
+
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.as_deref(),
+                Some(expected.as_str()),
+                "call {i} returned {result:?}, expected the real worktree tree {expected:?} -- \
+                 concurrent calls must not corrupt each other's throwaway index"
+            );
+        }
     }
 
     #[tokio::test]
