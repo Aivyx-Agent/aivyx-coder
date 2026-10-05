@@ -56,6 +56,37 @@ pub(crate) struct AutoVerification {
     pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
 }
 
+/// A startup notice for a Rust project whose root directly holds a
+/// `deny_paths` entry (often `.env`) and has no `target/` yet. The
+/// confiner gives such a root list-and-create rights only, and cargo
+/// creates `target/` by renaming a temp directory, so every confined
+/// `cargo build` there fails (leaving an undeletable `targetXXXXXX`
+/// behind) until `target/` exists. `None` without the sandbox backend.
+pub(crate) fn carved_root_cargo_notice(
+    cwd: &std::path::Path,
+    deny_paths: &[PathBuf],
+) -> Option<String> {
+    if !cfg!(feature = "sandbox-backend")
+        || !cwd.join("Cargo.toml").is_file()
+        || cwd.join("target").exists()
+    {
+        return None;
+    }
+    let denied_child = std::fs::read_dir(cwd).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        // The entry is denied itself, or a denied path lies under it.
+        let hit = aivyx_sandbox::path_is_denied(&path, deny_paths)
+            || deny_paths.iter().any(|denied| denied.is_absolute() && denied.starts_with(&path));
+        hit.then(|| entry.file_name().to_string_lossy().into_owned())
+    })?;
+    Some(format!(
+        "This project's root holds `{denied_child}`, which deny_paths hides from commands, so \
+         sandboxed commands can't rename or delete files directly in the root, and `cargo \
+         build` can't create `target/`. Run `mkdir target` once (or build once outside \
+         aivyx-coder); after that builds work."
+    ))
+}
+
 /// The `[sandbox]` section as `aivyx-confine`'s policy: every confiner
 /// this binary builds (the lead's, and each specialist's) uses it.
 /// `require_enforcement` keeps its existing meaning; the three opt-outs
@@ -1241,6 +1272,9 @@ pub(crate) async fn build_agent(
     if let Some(notice) = crate::routing::cloud_backend_notice(settings) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
+    if let Some(notice) = carved_root_cargo_notice(&cwd, &deny_paths) {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
+    }
 
     // KV-cache persistence/sharing (aivyx-kvcache): only ever attempted
     // against a real llama-server backend, whose `/props` response both
@@ -1637,6 +1671,30 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sandbox-backend")]
+    #[test]
+    fn carved_root_cargo_notice_fires_only_for_a_rust_root_holding_a_denied_entry_without_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let env_deny = vec![PathBuf::from(".env")];
+        std::fs::write(cwd.join(".env"), "S=1\n").unwrap();
+        assert_eq!(carved_root_cargo_notice(&cwd, &env_deny), None, "not a Cargo project");
+
+        std::fs::write(cwd.join("Cargo.toml"), "[package]\n").unwrap();
+        let notice = carved_root_cargo_notice(&cwd, &env_deny).expect("notice");
+        assert!(notice.contains("mkdir target"), "{notice}");
+        assert!(notice.contains(".env"), "{notice}");
+        assert_eq!(carved_root_cargo_notice(&cwd, &[]), None, "nothing denied");
+
+        let absolute = vec![cwd.join(".env")];
+        assert!(carved_root_cargo_notice(&cwd, &absolute).is_some(), "absolute deny entry");
+        let outside = vec![PathBuf::from("/definitely/elsewhere")];
+        assert_eq!(carved_root_cargo_notice(&cwd, &outside), None);
+
+        std::fs::create_dir(cwd.join("target")).unwrap();
+        assert_eq!(carved_root_cargo_notice(&cwd, &env_deny), None, "target/ exists");
+    }
 
     #[test]
     fn confine_options_map_every_sandbox_key() {
