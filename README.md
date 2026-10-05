@@ -523,7 +523,8 @@ smaller, incidental facts via `memory_write` — scoped to this project
 (`project:`) or global (`global:`), recalled only when it explicitly
 calls `memory_read` (never injected automatically). Unlike
 `remember_preference`'s single always-active file, this is many small,
-independently-forgettable notes — see `memory_forget`. Both writing and
+independently-forgettable notes — see `memory_forget`. Each topic keeps
+at most 1000 notes: writing a 1001st silently drops the oldest. Both writing and
 forgetting go through the same review-then-cache flow as any other
 mutating tool, and are unconditionally denied in autonomous mode for the
 same reason `remember_preference` is (see above).
@@ -683,7 +684,11 @@ configure it when called unconfigured, rather than being silently absent),
 `allow_private_targets` (default `false`).
 
 **`generate_svg(prompt)`**: the agent's third network-reaching tool, via
-the standalone `aivyx-vision-svg` crate. It reuses the exact same
+the standalone `aivyx-vision-svg` crate. The sanitizer drops all CSS
+(`<style>` and `style=` attributes — the model is asked for presentation
+attributes like `fill`/`stroke` instead) and every reference that isn't a
+`#fragment` or `data:` URL, and rejects input over 256 KiB or nested more
+than 64 elements deep. It reuses the exact same
 `Arc<dyn LlmBackend>` instance already built for this conversation
 (wrapped in a small adapter, `CoderTextCompleter`) to turn a text prompt
 into sanitized SVG markup, returned as plain text via `ToolOutput::Ok` —
@@ -1951,8 +1956,11 @@ and MCP servers at startup. Each such child process is confined via Linux
 applied in the forked child before `exec`:
 
 - **Write** access: the working directory + a **private temp directory**
-  (created per session, exported to commands as `TMPDIR`, deleted when
-  aivyx-coder exits normally), minus any `deny_paths` nested inside them (carved out
+  (exported to commands as `TMPDIR`, one per confiner: the lead agent's
+  lives until aivyx-coder exits normally, each specialist session and each
+  `delegate_to_specialist` call gets its own, deleted when that session or
+  delegation ends — even if a REPL the specialist started is still using
+  it — so a specialist's commands see a different `$TMPDIR` than yours), minus any `deny_paths` nested inside them (carved out
   precisely, since Landlock has no "deny" rule — the working directory is
   granted child-by-child around a denied subpath rather than wholesale). The
   shared `/tmp` is **not** writable, so a command can't read or tamper with
@@ -2232,10 +2240,13 @@ Deliberately not (yet) addressed — documented rather than hidden:
     socket-based database clients and keyring-backed credential helpers
     fail inside confined commands unless `[sandbox] allow_unix_sockets =
     true`.
-  - *Private `TMPDIR`*: commands get their own temp directory; a tool that
-    writes to a hard-coded `/tmp` path fails (`share_system_tmp = true`
-    to opt out). Its files are deleted when aivyx-coder exits normally
-    (after a crash it's left in the system temp dir as `aivyx-confine-*`).
+  - *Private `TMPDIR`*: commands get their own temp directory, one per
+    confiner (the lead, each specialist session, each delegation), so a
+    file a specialist leaves in `$TMPDIR` isn't in yours, and it is gone
+    once that specialist's session or delegation ends. A tool that writes
+    to a hard-coded `/tmp` path fails (`share_system_tmp = true` to opt
+    out). The lead's is deleted when aivyx-coder exits normally (after a
+    crash it's left in the system temp dir as `aivyx-confine-*`).
   - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put
     children in their own process groups (cargo-nextest's per-test process
     groups, Python's `start_new_session=True`, the `setsid` tool,
@@ -2245,9 +2256,12 @@ Deliberately not (yet) addressed — documented rather than hidden:
     auto-maintenance (your own git still does it). A `git commit` the model
     runs through `run_shell` does, and prints `fatal: setsid failed` while
     the commit itself succeeds.
-    A REPL started under the confiner can't take the pty as its
-    controlling terminal, so it gets no `SIGWINCH` on resize and a Ctrl-C
-    byte in `repl_send` doesn't interrupt it (use `repl_stop`).
+  - *REPLs have no controlling terminal*: a confined command already
+    leads its own process group, and POSIX refuses `setsid()` to a group
+    leader, so a REPL started under the confiner can't take the pty as its
+    controlling terminal — whatever `allow_leaving_process_group` says. It
+    gets no `SIGWINCH` on resize, and a Ctrl-C byte in `repl_send` doesn't
+    interrupt it (use `repl_stop`).
   - *Directories holding a denied entry*: a directory that directly
     contains a `deny_paths` match (often the project root, for `.env`)
     gets list-and-create rights only. `rm`/`mv` of entries **directly** in
@@ -2261,7 +2275,22 @@ Deliberately not (yet) addressed — documented rather than hidden:
     until `target/` exists. Create it once (`mkdir target`, confined or
     not) and builds work from then on. Deeper subdirectories are
     unaffected, and aivyx-coder's own file tools (`write_file`,
-    `delete_file`, `move_file`) aren't confined.
+    `delete_file`, `move_file`) aren't confined. aivyx-coder prints a
+    notice at startup when it sees a Rust project in this state.
+  - *Rarer edges* (details in aivyx-confine's README, "Known limits"):
+    when aivyx-coder runs in `$HOME` or an ancestor of it, a symlinked
+    `~/.cargo`/`~/.rustup` is not granted (a command could have planted
+    the link), so toolchains reached through one fail; a working directory
+    inside a denied directory gets no access at all; an
+    `extra_read_paths` entry inside the working directory that is a
+    symlink grants nothing; a denied file nested about a thousand
+    directories deep can exhaust a 1024-descriptor limit and every
+    confined spawn is then refused (`EMFILE`); with basename-pattern
+    `deny_paths` (`.env`, `*.pem`) every spawn rescans the working
+    directory (cached by mtime, but noticeable on huge trees); a
+    `SOCK_DGRAM` `socketpair()` is refused along with Unix sockets; on a
+    kernel whose Landlock ABI is older than 7 the newer restrictions (signal
+    and abstract-socket scoping below ABI 6) simply aren't enforced.
 - **Network is not restricted** by the sandbox. A command you approve can make
   network connections (needed for `cargo build`, `npm install`, `git clone`,
   etc.). Combined with the read scope, an approved command could in principle
