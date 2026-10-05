@@ -250,9 +250,18 @@ fn resolve_team_config(
 /// per-tool-result scan (exactly `agents_files_text`'s own situation), so
 /// it needs this explicit call, tagging `injection_taint` on a match *and*
 /// leaving the flagged entry out of the listing entirely (logged via
-/// `tracing::warn!`) -- unlike a tool result, this text is unconditionally
-/// trusted context the model acts on, so flagging alone (without also
-/// hiding it) would still hand the model the injected content.
+/// `tracing::warn!`).
+///
+/// This "exclude, don't just flag" rule is deliberate *for the skill
+/// listing specifically*, not a general policy this codebase applies to
+/// every piece of prompt-injected context: `agents_files_text` (both
+/// `user-level AGENTS.md` and `project AGENTS.md`) and the `repo map`/
+/// `editor context` scans just above it in `agent/mod.rs` all still only
+/// flag `injection_taint` and leave the content in the prompt either way
+/// -- AGENTS.md in particular is meant to be user/project-authored
+/// instruction text the model should follow, so silently dropping a
+/// flagged section would defeat its own purpose, unlike a skill, which
+/// exists purely as optional, named guidance the model can take or leave.
 /// `LoadSkillTool::definition` (`aivyx-tools/src/tools/load_skill.rs`)
 /// applies the identical exclusion rule to its own "Available skills: …"
 /// text, so an overlay skill can never reach the model's context via
