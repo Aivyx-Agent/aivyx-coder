@@ -76,7 +76,13 @@ pub(crate) fn cloud_backend_notice(settings: &Settings) -> Option<String> {
 /// A URL's host for messages, never its userinfo (which may hold a
 /// credential) or path.
 fn host_of(url: &str) -> String {
-    url::Url::parse(url)
+    // aivyx-route reads a scheme-less base_url as http://; do the same.
+    let parsed = if url.contains("://") {
+        url::Url::parse(url)
+    } else {
+        url::Url::parse(&format!("http://{url}"))
+    };
+    parsed
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| "an unparseable base_url".to_string())
@@ -558,6 +564,19 @@ mod tests {
             !err.contains("s3cret") && !err.contains("user") && !err.contains("key=abc"),
             "{err}"
         );
+    }
+
+    /// aivyx-route reads a scheme-less base_url as http://, so the
+    /// rejection names its host rather than calling it unparseable.
+    #[test]
+    fn the_rejection_names_the_host_of_a_scheme_less_base_url() {
+        let s = settings_with(
+            "[routing.endpoints.gpu]\nkind = \"openai_compat\"\n\
+             base_url = \"gpu.example.com:11434\"\n",
+        );
+        let err = check_routing_config(&s.routing).unwrap_err().to_string();
+        assert!(err.contains("gpu.example.com"), "{err}");
+        assert!(!err.contains("unparseable"), "{err}");
     }
 
     #[test]
