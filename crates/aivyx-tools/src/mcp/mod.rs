@@ -330,9 +330,6 @@ mod tests {
         client
     }
 
-    /// A real stdio MCP server (python3): answers `initialize`, records in
-    /// `unix.txt` whether it could create an `AF_UNIX` socket, and starts
-    /// a helper that would write `late.txt` a second later.
     #[cfg(feature = "sandbox-backend")]
     fn have_python3() -> bool {
         let found = std::process::Command::new("python3").arg("-c").arg("").status().is_ok();
@@ -342,6 +339,9 @@ mod tests {
         found
     }
 
+    /// A real stdio MCP server (python3): answers `initialize`, records in
+    /// `unix.txt` whether it could create an `AF_UNIX` socket, and starts
+    /// a helper that would write `late.txt` a second later.
     #[cfg(feature = "sandbox-backend")]
     fn python_mcp_server(name: &str) -> McpClient {
         let script = r#"

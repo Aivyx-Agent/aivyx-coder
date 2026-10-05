@@ -1959,8 +1959,7 @@ applied in the forked child before `exec`:
   (exported to commands as `TMPDIR`, one per confiner: the lead agent's
   lives until aivyx-coder exits normally, each specialist session and each
   `delegate_to_specialist` call gets its own, deleted when that session or
-  delegation ends — even if a REPL the specialist started is still using
-  it — so a specialist's commands see a different `$TMPDIR` than yours), minus any `deny_paths` nested inside them (carved out
+  delegation ends — so a specialist's commands see a different `$TMPDIR` than yours), minus any `deny_paths` nested inside them (carved out
   precisely, since Landlock has no "deny" rule — the working directory is
   granted child-by-child around a denied subpath rather than wholesale). The
   shared `/tmp` is **not** writable, so a command can't read or tamper with
@@ -2280,7 +2279,9 @@ Deliberately not (yet) addressed — documented rather than hidden:
   - *Rarer edges* (details in aivyx-confine's README, "Known limits"):
     when aivyx-coder runs in `$HOME` or an ancestor of it, a symlinked
     `~/.cargo`/`~/.rustup` is not granted (a command could have planted
-    the link), so toolchains reached through one fail; a working directory
+    the link), so toolchains reached through one fail, and an existing
+    `~/.git-credentials` makes `$HOME` itself list-and-create only (no
+    `rm`/`mv` of its direct entries); a working directory
     inside a denied directory gets no access at all; an
     `extra_read_paths` entry inside the working directory that is a
     symlink grants nothing; a denied file nested about a thousand

@@ -200,6 +200,14 @@ async fn check_upstream_configured(ctx: &ToolExecutionContext) -> Result<(), Str
     .map(|output| output.status);
     match status {
         Ok(status) if status.success() => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Err("cancelled while checking the branch's upstream".to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "`git rev-parse @{{u}}` didn't answer within {}s — check git works, then try \
+             git_pr again",
+            crate::process::PREFLIGHT_TIMEOUT.as_secs()
+        )),
         _ => Err(
             "the current branch has no upstream — call git_push first, then try git_pr again"
                 .to_string(),
@@ -504,6 +512,19 @@ mod tests {
         let result = check_gh_authenticated(gh.to_str().unwrap(), &ctx).await;
         assert!(result.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "waited for gh");
+    }
+
+    /// A cancelled upstream check says so, not "no upstream".
+    #[tokio::test]
+    async fn a_cancelled_upstream_check_is_reported_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let ctx = ctx_with_confiner(dir.path(), std::sync::Arc::new(aivyx_sandbox::NoopConfiner));
+        ctx.cancellation.cancel();
+
+        let err = check_upstream_configured(&ctx).await.unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!err.contains("no upstream"), "{err}");
     }
 
     #[tokio::test]
