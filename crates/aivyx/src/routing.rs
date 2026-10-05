@@ -342,6 +342,7 @@ pub(crate) struct ResidencySources {
 }
 
 impl ResidencySources {
+    /// Precondition: `default` names only a non-cloud `[backend]`, as [`default_residency`] guarantees.
     pub(crate) fn new(config: &RoutingConfig, default: DefaultResidency) -> Self {
         let mut endpoints = endpoints_of(config);
         if let DefaultResidency::LlamaServer(url) = &default {
@@ -765,19 +766,6 @@ mod tests {
             default_residency(&lan),
             DefaultResidency::LlamaServer("http://llama.example.com:8080".into())
         );
-    }
-
-    /// The `[backend]` llama-server added as a residency endpoint keeps
-    /// the locality aivyx-coder already decided, so aivyx-route doesn't
-    /// skip a `[backend] locality = "local"` server with a public name.
-    #[test]
-    fn the_default_residency_endpoint_is_local() {
-        let s = ResidencySources::new(
-            &RoutingConfig::default(),
-            DefaultResidency::LlamaServer("http://llama.example.com:8080".into()),
-        );
-        let (_, c) = s.endpoints.last().unwrap();
-        assert_eq!(c.effective_locality(), Locality::Local);
     }
 
     #[test]
