@@ -427,7 +427,12 @@ impl ServerHandler for AivyxCoderMcpServer {
         // replace that, keeping the exact same fields set as before.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
-            .with_server_info(Implementation::from_build_env())
+            // Not `Implementation::from_build_env()`: that is compiled
+            // inside rmcp, so it reports rmcp's own name and version.
+            .with_server_info(Implementation::new(
+                "aivyx-coder",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions("Delegate bounded coding tasks to aivyx-coder via code/code_reply.")
     }
 }
@@ -512,6 +517,15 @@ mod tests {
         })
     }
 
+    /// `Implementation::from_build_env` is compiled inside rmcp, so it
+    /// would report rmcp's own name and version.
+    #[test]
+    fn server_info_names_aivyx_coder() {
+        let info = server_with_ceiling(AccessLevel::Plan).get_info();
+        assert_eq!(info.server_info.name, "aivyx-coder");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    }
+
     #[tokio::test]
     async fn code_then_code_reply_round_trips_real_conversation_state() {
         let server = server_with_ceiling(AccessLevel::Execute);
@@ -531,9 +545,7 @@ mod tests {
             .unwrap()
             .text
             .parse()
-            .unwrap_or_else(|_| {
-                serde_json::from_str(&content[0].as_text().unwrap().text).unwrap()
-            });
+            .unwrap_or_else(|_| serde_json::from_str(&content[0].as_text().unwrap().text).unwrap());
         let session_id = first_json["session_id"].as_str().unwrap().to_string();
         assert_eq!(first_json["result"], "first answer");
 
