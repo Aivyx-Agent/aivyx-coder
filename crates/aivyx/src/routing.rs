@@ -152,6 +152,14 @@ pub(crate) fn routing_config_warnings(
                  broker_base_url), so routing counts its model as cloud and never picks it"
                     .to_string()
             }
+            ConfigIssue::LocalOverrideIgnored {
+                endpoint,
+                model: Some(model),
+            } if endpoint == DEFAULT_ENDPOINT => format!(
+                "model `{model}` is on [backend], which routing counts as cloud, so its \
+                 [[routing.models]] `locality = \"local\"` is ignored — if the [backend] server \
+                 is on your own network, set `locality = \"local\"` in [backend] instead"
+            ),
             _ => issue.to_string(),
         })
         .collect()
@@ -684,6 +692,28 @@ mod tests {
         let backend_model = find(&profiles, &key(DEFAULT_ENDPOINT, "qwen3.5:9b")).unwrap();
         assert_eq!(backend_model.locality, Locality::Local);
         assert!(routing_config_warnings(&config, &s.backend).is_empty());
+    }
+
+    /// `locality = "local"` on a roster entry for a model on a cloud
+    /// `[backend]` is ignored upstream; the fix is `[backend] locality`.
+    #[test]
+    fn a_local_roster_override_on_a_cloud_backend_names_backend_locality() {
+        let mut s = settings_with(
+            "[routing]\nenabled = true\n[[routing.models]]\nid = \"qwen3.5:9b\"\n\
+             endpoint = \"backend\"\nlocality = \"local\"\n",
+        );
+        s.backend.base_url = "http://gpu.example.com/v1".into();
+        let config = effective_routing_config(&s);
+        let warnings = routing_config_warnings(&config, &s.backend);
+        let ignored: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("qwen3.5:9b"))
+            .collect();
+        assert_eq!(ignored.len(), 1, "{warnings:?}");
+        assert!(
+            ignored[0].contains("`locality = \"local\"` in [backend]"),
+            "{warnings:?}"
+        );
     }
 
     /// The embedded backend has no address and needs none; a broker with
