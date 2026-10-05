@@ -7,13 +7,13 @@ publish.workspace = true
 
 [dependencies]
 aivyx-kvcache = { workspace = true }
-aivyx-llm = { version = "0.4.4", path = "../aivyx-llm" }
-aivyx-repomap = { version = "0.4.4", path = "../aivyx-repomap" }
+aivyx-llm = { version = "0.4.5", path = "../aivyx-llm" }
+aivyx-repomap = { version = "0.4.5", path = "../aivyx-repomap" }
 aivyx-route = { workspace = true }
-aivyx-sandbox = { version = "0.4.4", path = "../aivyx-sandbox", default-features = false }
-aivyx-team = { version = "0.4.4", path = "../aivyx-team" }
-aivyx-tools = { version = "0.4.4", path = "../aivyx-tools", default-features = false }
-aivyx-types = { version = "0.4.4", path = "../aivyx-types" }
+aivyx-sandbox = { version = "0.4.5", path = "../aivyx-sandbox", default-features = false }
+aivyx-team = { version = "0.4.5", path = "../aivyx-team" }
+aivyx-tools = { version = "0.4.5", path = "../aivyx-tools", default-features = false }
+aivyx-types = { version = "0.4.5", path = "../aivyx-types" }
 async-trait = "0.1.89"
 directories = "6.0.0"
 futures = "0.3.32"
