@@ -1828,7 +1828,8 @@ way to *remove* a built-in default through config. This covers:
   (recursively walking `/usr` for a project-local pattern would be
   substantial, pointless work) — only files nested under the working
   directory or `extra_read_paths` are ever discovered.
-  `~/.cargo/credentials(.toml)` and `~/.config/git/credentials` are always
+  `~/.cargo/credentials(.toml)`, `~/.config/git/credentials` and
+  `~/.git-credentials` are always
   unreadable to commands, even with no `deny_paths` configured.
 
 ### 2. `ConfirmationGate` — human-in-the-loop, tiered trust
