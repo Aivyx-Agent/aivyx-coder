@@ -40,7 +40,12 @@ pub struct RoutedBackend {
     refresher: Option<Arc<dyn ProfileRefresher>>,
     router: Router,
     pool: Mutex<HashMap<ModelKey, Arc<dyn LlmBackend>>>,
+    /// Appended to the error when no candidate can serve a routed call.
+    no_route_hint: String,
 }
+
+/// The default [`RoutedBackend::with_no_route_hint`].
+const DEFAULT_NO_ROUTE_HINT: &str = "add a capable model to [[routing.models]] (see /models)";
 
 impl RoutedBackend {
     pub fn new(
@@ -57,7 +62,15 @@ impl RoutedBackend {
             refresher: None,
             router: Router::new(profiles, tasks),
             pool: Mutex::new(HashMap::new()),
+            no_route_hint: DEFAULT_NO_ROUTE_HINT.to_string(),
         }
+    }
+
+    /// Replaces [`DEFAULT_NO_ROUTE_HINT`], the remedy a "no candidate"
+    /// routing error names, when the product knows a better one.
+    pub fn with_no_route_hint(mut self, hint: impl Into<String>) -> Self {
+        self.no_route_hint = hint.into();
+        self
     }
 
     pub fn default_key(&self) -> &ModelKey {
@@ -180,11 +193,10 @@ impl LlmBackend for RoutedBackend {
             return self.default_backend.stream_chat(request).await;
         };
         let query = query(&request, &hint);
-        let plan = self.router.plan(&query, Instant::now()).map_err(|e| {
-            LlmError::Routing(format!(
-                "{e} — add a capable model to [[routing.models]] (see /models)"
-            ))
-        })?;
+        let plan = self
+            .router
+            .plan(&query, Instant::now())
+            .map_err(|e| LlmError::Routing(format!("{e} — {}", self.no_route_hint)))?;
         if plan.reason.contains("; warning: it may lack") {
             tracing::warn!(model = %plan.chain[0], reason = %plan.reason, "pinned model may lack a hard requirement");
         }
