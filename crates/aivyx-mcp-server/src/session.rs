@@ -176,7 +176,19 @@ pub async fn build_session_agent(
 
     let mut executor = ToolExecutor::new(registry, Arc::clone(&gate), Arc::clone(&config.confiner));
     if let Some(checkpointer) = &config.checkpointer {
-        executor.set_checkpointer(Arc::clone(checkpointer));
+        // `set_checkpointer_at`, not plain `set_checkpointer` -- this
+        // session's own `cwd`/`deny_paths` are exactly the main agent's
+        // (see `SessionConfig`'s own doc comments; both are threaded
+        // straight from `BuiltAgent::cwd`/`BuiltAgent::deny_paths` in
+        // `main.rs`), the same ones `checkpointer` was itself detected
+        // with. Without `_at`, `checkpoint_cwd()` stayed `None` and this
+        // session's `Agent::run_turn` silently skipped its per-turn
+        // change summary / `[git] ignore` filtering.
+        executor.set_checkpointer_at(
+            config.cwd.clone(),
+            config.deny_paths.clone(),
+            Arc::clone(checkpointer),
+        );
     }
 
     let mut agent = Agent::new(
@@ -469,6 +481,70 @@ mod tests {
             events.push(event);
         }
         (result, events)
+    }
+
+    /// Mirrors `aivyx-core/src/delegate.rs`'s identical private helper
+    /// exactly -- not shared across crates for a few lines of git setup.
+    async fn init_git_repo(dir: &Path) {
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@test.invalid"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&argv)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_mcp_sessions_file_write_emits_a_change_summary() {
+        // Regression test for the `set_checkpointer` (not `_at`) bug --
+        // mirrors `aivyx-core`'s identical delegation tests. Without
+        // `checkpoint_cwd()` set, this session's own `Agent::run_turn`
+        // silently skipped `emit_change_summary` for every write.
+        let cwd = unique_temp_dir("change-summary-cwd");
+        init_git_repo(&cwd).await;
+        let mut cfg = config(full_registry());
+        cfg.cwd = cwd.clone();
+        cfg.checkpointer =
+            Some(Arc::new(GitCheckpointer::detect(&cwd, Vec::new()).await.unwrap()));
+        cfg.llm = MockBackend::calls_tool(
+            "write_file",
+            serde_json::json!({ "path": "new.txt", "content": "hello\n" }),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Execute, tx).await;
+
+        let (result, events) =
+            run_turn_collecting_events(&mut agent, &mut rx, "write a file".to_string(), &cwd)
+                .await;
+
+        assert!(result.is_ok(), "unexpected turn error: {result:?}");
+        let saw_change_summary = events.iter().any(|event| {
+            matches!(event, AgentEvent::Info(text) if text.starts_with("Changed:") && text.contains("new.txt"))
+        });
+        assert!(
+            saw_change_summary,
+            "an MCP session's file write must produce a change summary (AgentEvent::Info), \
+             got: {events:?}"
+        );
     }
 
     #[test]

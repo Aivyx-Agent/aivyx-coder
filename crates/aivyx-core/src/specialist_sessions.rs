@@ -561,7 +561,17 @@ fn build_specialist_agent(
         crate::specialist_enforcement::scoped_gate_and_confiner(&config.enforcement, member, cwd);
     let mut sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
     if let Some(checkpointer) = &config.checkpointer {
-        sub_executor.set_checkpointer(Arc::clone(checkpointer));
+        // `set_checkpointer_at`, not plain `set_checkpointer` -- mirrors
+        // `delegate_to_specialist.rs`'s identical fix and its own doc
+        // comment on why this is `enforcement.base_deny_paths` (the
+        // lead's own deny_paths, which `checkpointer` was actually
+        // detected with), not `member`'s own attenuated/extended deny
+        // list from `scoped_gate_and_confiner` above.
+        sub_executor.set_checkpointer_at(
+            cwd.to_path_buf(),
+            config.enforcement.base_deny_paths.clone(),
+            Arc::clone(checkpointer),
+        );
     }
 
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
@@ -2518,13 +2528,122 @@ mod specialist_session_tests {
         );
     }
 
+    /// Mirrors `delegate.rs`'s identical private helper exactly -- not
+    /// shared across modules since it's a handful of lines and neither
+    /// module depends on the other.
+    async fn init_git_repo(dir: &std::path::Path) {
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@test.invalid"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&argv)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_spawned_specialists_file_write_emits_a_change_summary_to_the_parent() {
+        // Regression test for the `set_checkpointer` (not `_at`) bug --
+        // mirrors `delegate.rs`/`delegate_to_specialist.rs`'s identical
+        // tests. Without `checkpoint_cwd()` set, a specialist session's
+        // own `Agent::run_turn` silently skips `emit_change_summary` for
+        // every delegated write.
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut team = simple_team();
+        team.members[1].tool_allowlist = vec!["write_file".to_string()];
+
+        let llm = Arc::new(MockBackend::new(vec![
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: ToolCallId("c0".to_string()),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path": "new.txt", "content": "hello\n"}),
+                    source: ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_response("wrote the file"),
+        ]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let mut cfg = config(llm, tx, team, pool);
+        cfg.parent_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(aivyx_tools::WriteFileTool));
+            registry
+        };
+        cfg.checkpointer =
+            Some(Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+        let tool = SpawnSpecialistTool::new(cfg);
+        let ctx = exec_ctx(&cwd);
+
+        let output = tool
+            .execute(
+                serde_json::json!({ "member": "implementer", "task": "write a file" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Ok(text) = output else {
+            panic!("expected Ok, got {output:?}");
+        };
+        assert!(
+            text.ends_with("wrote the file"),
+            "unexpected specialist reply: {text}"
+        );
+
+        let mut saw_change_summary = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SubAgentActivity(inner) = event
+                && let AgentEvent::Info(text) = *inner
+                && text.starts_with("Changed:")
+                && text.contains("new.txt")
+            {
+                saw_change_summary = true;
+            }
+        }
+        assert!(
+            saw_change_summary,
+            "a spawned specialist's file write must produce a change summary \
+             (AgentEvent::Info wrapped in SubAgentActivity) forwarded to the parent"
+        );
+    }
+
     #[tokio::test]
     async fn build_specialist_agent_threads_the_configured_generated_ignore_list() {
         // Mirrors `delegate.rs`/`delegate_to_specialist.rs`'s identical
-        // tests -- a specialist session's own change summaries never
-        // actually fire (its `sub_executor` is wired with
-        // `set_checkpointer`, not `set_checkpointer_at`), so this asserts
-        // directly on the built `Agent` via `generated_ignore()`.
+        // tests -- this config has no checkpointer configured at all, so
+        // `build_specialist_agent`'s `set_checkpointer_at` branch is never
+        // reached; this asserts directly on the built `Agent` via
+        // `generated_ignore()` rather than driving a real turn (see
+        // `a_specialists_file_write_emits_a_change_summary_to_the_parent`
+        // for that, with a real checkpointer configured).
         let llm = Arc::new(MockBackend::new(vec![]));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));

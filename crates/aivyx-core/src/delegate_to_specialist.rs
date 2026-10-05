@@ -165,11 +165,11 @@ impl DelegateToSpecialistTool {
 /// Builds the specialist `delegate_to_specialist` drives one task
 /// against -- extracted to its own function (mirrors `delegate.rs`'s
 /// `build_sub_agent`) so a test can construct one directly and inspect it
-/// (e.g. via `Agent::generated_ignore()`) without a full tool call, which
-/// never reaches this far into `Agent` state (its change-summary
-/// machinery needs a checkpointed executor, which `sub_executor`
-/// deliberately never gets -- see `execute()`'s `set_checkpointer` call,
-/// not `set_checkpointer_at`).
+/// (e.g. via `Agent::generated_ignore()`) without a full tool call -- note
+/// that doing so skips the checkpointer wiring `execute()` itself does
+/// (`set_checkpointer_at`, so the specialist's own change-summary
+/// machinery actually runs), since `sub_executor` is built and passed in
+/// by the caller here.
 fn build_specialist_agent(
     config: &DelegateToSpecialistConfig,
     member: &aivyx_team::TeamMember,
@@ -312,7 +312,20 @@ impl Tool for DelegateToSpecialistTool {
         );
         let mut sub_executor = ToolExecutor::new(specialist_registry, gate, confiner);
         if let Some(checkpointer) = &self.config.checkpointer {
-            sub_executor.set_checkpointer(Arc::clone(checkpointer));
+            // `set_checkpointer_at`, not plain `set_checkpointer` -- same
+            // cwd/deny_paths the main agent's own executor uses. Note this
+            // is `enforcement.base_deny_paths` (the lead's own deny_paths),
+            // not `member`'s own attenuated/extended deny list from
+            // `scoped_gate_and_confiner` above -- `checkpointer` itself was
+            // detected (`agent_builder.rs`) with the lead's `deny_paths`
+            // only, and `checkpoint_now`'s tree verification requires the
+            // exact same excludes it was built with, so this must match
+            // that, not the (possibly wider) per-specialist gate scoping.
+            sub_executor.set_checkpointer_at(
+                ctx.cwd.clone(),
+                self.config.enforcement.base_deny_paths.clone(),
+                Arc::clone(checkpointer),
+            );
         }
 
         // See `delegate.rs`'s own `execute()` for the full rationale --
@@ -924,12 +937,129 @@ mod delegation_tests {
         );
     }
 
+    /// Mirrors `delegate.rs`'s identical private helper exactly -- not
+    /// shared across modules since it's a handful of lines and neither
+    /// module depends on the other.
+    async fn init_git_repo(dir: &std::path::Path) {
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@test.invalid"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&argv)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_specialists_file_write_emits_a_change_summary_to_the_parent() {
+        // Regression test for the `set_checkpointer` (not `_at`) bug --
+        // mirrors `delegate.rs`'s identical test. Without `checkpoint_cwd()`
+        // set, a specialist's own `Agent::run_turn` silently skips
+        // `emit_change_summary` for every delegated write.
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let team = TeamConfig {
+            lead: "coordinator".to_string(),
+            members: vec![
+                TeamMember {
+                    task: None,
+                    name: "coordinator".to_string(),
+                    role: "Lead".to_string(),
+                    persona: "You delegate.".to_string(),
+                    tool_allowlist: vec![],
+                    extra_deny_paths: vec![],
+                },
+                TeamMember {
+                    task: None,
+                    name: "implementer".to_string(),
+                    role: "Implementer".to_string(),
+                    persona: "You are the implementer specialist. You write code.".to_string(),
+                    tool_allowlist: vec!["write_file".to_string()],
+                    extra_deny_paths: vec![],
+                },
+            ],
+        };
+
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: ToolCallId("c0".to_string()),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path": "new.txt", "content": "hello\n"}),
+                    source: ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_response("wrote the file"),
+        ]));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut config = base_config(mock, tx, team);
+        config.parent_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(WriteFileTool));
+            registry
+        };
+        config.checkpointer =
+            Some(Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+        let tool = DelegateToSpecialistTool::new(config);
+        let ctx = exec_ctx(&cwd);
+        let args = serde_json::json!({ "member": "implementer", "task": "write a file" });
+
+        let output = tool.execute(args, &ctx).await.unwrap();
+        assert!(
+            matches!(&output, ToolOutput::Ok(text) if text == "wrote the file"),
+            "unexpected output: {output:?}"
+        );
+
+        let mut saw_change_summary = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SubAgentActivity(inner) = event
+                && let AgentEvent::Info(text) = *inner
+                && text.starts_with("Changed:")
+                && text.contains("new.txt")
+            {
+                saw_change_summary = true;
+            }
+        }
+        assert!(
+            saw_change_summary,
+            "a specialist's file write must produce a change summary (AgentEvent::Info \
+             wrapped in SubAgentActivity) forwarded to the parent"
+        );
+    }
+
     #[test]
     fn build_specialist_agent_threads_the_configured_generated_ignore_list() {
-        // Mirrors `delegate.rs`'s identical test -- a specialist's own
-        // change summaries never actually fire (see
-        // `build_specialist_agent`'s own doc comment), so this asserts
-        // directly on the built `Agent` via `generated_ignore()`.
+        // Mirrors `delegate.rs`'s identical test -- this builds
+        // `sub_executor` by hand (bypassing `execute()`'s own
+        // `set_checkpointer_at` call, see `build_specialist_agent`'s doc
+        // comment), so it asserts directly on the built `Agent` via
+        // `generated_ignore()` rather than driving a real turn.
         let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![]));
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut config = base_config(mock, tx, simple_team());

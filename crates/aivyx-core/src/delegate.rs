@@ -14,7 +14,7 @@
 //! doc's "Crate placement" decision
 //! (`docs/superpowers/specs/2026-07-13-subagent-delegation-design.md`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aivyx_llm::LlmBackend;
@@ -80,6 +80,15 @@ pub struct DelegateTaskConfig {
     pub gate: Arc<dyn PermissionGate>,
     pub confiner: Arc<dyn ExecutionConfiner>,
     pub checkpointer: Option<Arc<GitCheckpointer>>,
+    /// The main agent's own `deny_paths` (`agent_builder.rs`'s `deny_paths`
+    /// local) — threaded through so the sub-agent's `set_checkpointer_at`
+    /// call below excludes the same paths `checkpointer` was itself
+    /// detected with (`GitCheckpointer::detect(&cwd, deny_paths.clone())`
+    /// in `agent_builder.rs`). Must match exactly: `checkpoint_now`'s tree
+    /// verification compares against a tree built with these same
+    /// excludes, so a mismatched list would make every sub-agent snapshot
+    /// fail to verify.
+    pub deny_paths: Vec<PathBuf>,
     pub repo_map: Option<(Arc<RepoMap>, u32)>,
     pub events_tx: UnboundedSender<AgentEvent>,
     /// The parent's own tool registry, cloned *before* `delegate_task`
@@ -146,11 +155,11 @@ impl DelegateTaskTool {
 /// Builds the sub-agent `delegate_task` drives one task against —
 /// extracted to its own function (rather than inlined in `execute()`
 /// alone) so a test can construct one directly and inspect it (e.g. via
-/// `Agent::generated_ignore()`) without going through a full tool call,
-/// which never reaches this far into `Agent` state (its change-summary
-/// machinery needs a checkpointed executor, which the sub-agent's own
-/// `sub_executor` deliberately never gets — see `execute()`'s
-/// `set_checkpointer` call, not `set_checkpointer_at`).
+/// `Agent::generated_ignore()`) without going through a full tool call —
+/// note that doing so skips the checkpointer wiring `execute()` itself
+/// does (`set_checkpointer_at`, so the sub-agent's own change-summary
+/// machinery actually runs), since `sub_executor` is built and passed in
+/// by the caller here.
 fn build_sub_agent(
     config: &DelegateTaskConfig,
     sub_executor: ToolExecutor,
@@ -269,7 +278,18 @@ impl Tool for DelegateTaskTool {
             Arc::clone(&self.config.confiner),
         );
         if let Some(checkpointer) = &self.config.checkpointer {
-            sub_executor.set_checkpointer(Arc::clone(checkpointer));
+            // `set_checkpointer_at`, not plain `set_checkpointer` — the
+            // same cwd/deny_paths the main agent's own executor uses (see
+            // `DelegateTaskConfig::deny_paths`'s doc comment), so the
+            // sub-agent's own `Agent::run_turn` can resolve
+            // `checkpoint_cwd()` and actually run its per-turn change
+            // summary / `[git] ignore` filtering instead of silently
+            // skipping both.
+            sub_executor.set_checkpointer_at(
+                ctx.cwd.clone(),
+                self.config.deny_paths.clone(),
+                Arc::clone(checkpointer),
+            );
         }
 
         // The sub-agent gets its own event channel — sharing the parent's
@@ -443,6 +463,7 @@ mod tests {
             gate: Arc::new(AllowAllGate),
             confiner: Arc::new(NoopConfiner),
             checkpointer: None,
+            deny_paths: Vec::new(),
             repo_map: None,
             events_tx,
             sub_agent_registry,
@@ -460,6 +481,37 @@ mod tests {
 
     fn delegate_call(task: &str) -> serde_json::Value {
         serde_json::json!({ "task": task })
+    }
+
+    /// Mirrors `agent/tests.rs`'s own private `init_git_repo` helper
+    /// exactly -- not shared across modules since it's a handful of lines
+    /// and neither module depends on the other.
+    async fn init_git_repo(dir: &Path) {
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@test.invalid"],
+        ] {
+            tokio::process::Command::new("git")
+                .args(&argv)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap();
+        }
+        std::fs::write(dir.join("tracked.txt"), "v1\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
     }
 
     fn exec_ctx(cwd: &Path) -> ToolExecutionContext {
@@ -591,6 +643,68 @@ mod tests {
                 .iter()
                 .any(|d| d.name == "delegate_task"),
             "delegate_task must never appear in a sub-agent's own tool list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_sub_agents_file_write_emits_a_change_summary_to_the_parent() {
+        // Regression test for the `set_checkpointer` (not `_at`) bug:
+        // without `checkpoint_cwd()` set, `Agent::run_turn`'s undo-snapshot
+        // bracket silently skips `emit_change_summary` entirely for a
+        // sub-agent, so a delegated write produced no per-turn summary at
+        // all -- the parent had no idea what the sub-agent actually
+        // touched.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let mut sub_registry = ToolRegistry::new();
+        sub_registry.register(Arc::new(aivyx_tools::WriteFileTool));
+
+        let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: ToolCallId("c0".to_string()),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path": "new.txt", "content": "hello\n"}),
+                    source: ToolCallSource::Native,
+                }),
+                StreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_response("wrote the file"),
+        ]));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut config = base_config(mock, tx, sub_registry, 10);
+        config.checkpointer =
+            Some(Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()));
+        let tool = DelegateTaskTool::new(config);
+
+        let output = tool
+            .execute(delegate_call("write a file"), &exec_ctx(&cwd))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&output, ToolOutput::Ok(text) if text == "wrote the file"),
+            "unexpected output: {output:?}"
+        );
+
+        let mut saw_change_summary = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::SubAgentActivity(inner) = event
+                && let AgentEvent::Info(text) = *inner
+                && text.starts_with("Changed:")
+                && text.contains("new.txt")
+            {
+                saw_change_summary = true;
+            }
+        }
+        assert!(
+            saw_change_summary,
+            "a delegated sub-agent's file write must produce a change summary \
+             (AgentEvent::Info wrapped in SubAgentActivity) forwarded to the parent"
         );
     }
 
@@ -917,13 +1031,15 @@ mod tests {
 
     #[test]
     fn build_sub_agent_threads_the_configured_generated_ignore_list() {
-        // A sub-agent's own change summaries never actually fire (its
-        // `sub_executor` is wired with `set_checkpointer`, not
-        // `set_checkpointer_at`, so `checkpoint_cwd()` stays `None` and
-        // `Agent::run_turn`'s undo-snapshot/change-summary machinery is
-        // skipped entirely) -- so this asserts directly on the built
-        // `Agent` via `generated_ignore()` instead of driving a real turn
-        // and inspecting a change-summary event.
+        // `build_sub_agent` is tested directly here (bypassing `execute()`,
+        // which is what actually calls `set_checkpointer_at` on the real
+        // `sub_executor` it builds) -- see `build_sub_agent`'s own doc
+        // comment. So this test's own hand-built `sub_executor` below has
+        // no checkpointer at all, and asserts directly on the built
+        // `Agent` via `generated_ignore()` rather than driving a real turn
+        // and inspecting a change-summary event (see
+        // `a_delegated_sub_agents_file_write_emits_a_change_summary_to_the_parent`
+        // for that).
         let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![]));
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut config = base_config(mock, tx, ToolRegistry::new(), 10);

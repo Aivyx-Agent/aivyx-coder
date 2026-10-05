@@ -973,6 +973,7 @@ pub(crate) async fn build_agent(
             gate: Arc::clone(&gate),
             confiner: Arc::clone(&confiner),
             checkpointer: checkpointer.clone(),
+            deny_paths: deny_paths.clone(),
             repo_map: repo_map.clone(),
             events_tx: events_tx.clone(),
             sub_agent_registry,

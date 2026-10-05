@@ -223,11 +223,16 @@ pub struct ToolExecutor {
     /// git repository).
     checkpointer: Option<Arc<GitCheckpointer>>,
     /// The directory `checkpointer` snapshots, when known. Set only by
-    /// `set_checkpointer_at` — plain `set_checkpointer` (used by delegated
-    /// sub-executors that clone the parent's checkpointer but don't need
-    /// `/undo` tracking of their own) leaves this `None`. `Agent` uses this
-    /// to resolve a checkpoint ref to a commit oid for the undo ledger; see
-    /// `checkpoint_cwd`.
+    /// `set_checkpointer_at` — plain `set_checkpointer` leaves this `None`,
+    /// which makes `Agent::run_turn`'s undo-snapshot/change-summary
+    /// machinery a no-op for that executor (see `checkpoint_cwd`'s doc
+    /// comment). Every production call site (the top-level agent and every
+    /// delegated sub-agent/specialist/MCP session — `agent_builder.rs`,
+    /// `delegate.rs`, `delegate_to_specialist.rs`, `specialist_sessions.rs`,
+    /// `aivyx-mcp-server/src/session.rs`) uses `set_checkpointer_at`; plain
+    /// `set_checkpointer` remains as a lower-level primitive for a caller
+    /// that genuinely wants checkpoint/restore without undo-ledger
+    /// tracking, but nothing in this codebase currently is one.
     checkpoint_cwd: Option<PathBuf>,
     /// The deny paths `checkpointer` excludes from its snapshots, so
     /// `checkpoint_now` can verify a snapshot against the same tree. Set
@@ -264,12 +269,14 @@ impl ToolExecutor {
 
     /// Like `set_checkpointer`, but also remembers `cwd` so `checkpoint_cwd`
     /// and therefore the `/undo` mark-recording path (`agent/mod.rs`) can
-    /// resolve checkpoint refs to commit oids. Use this for the top-level
-    /// agent's own executor; delegated sub-executors that only need
-    /// checkpoint/restore (not undo tracking) can keep using
-    /// `set_checkpointer`. `deny_paths` must be the ones `checkpointer` was
-    /// detected with: `checkpoint_now` verifies snapshots against a tree
-    /// built with the same excludes.
+    /// resolve checkpoint refs to commit oids. Use this everywhere a real
+    /// `Agent::run_turn` will drive this executor — the top-level agent's
+    /// own executor and every delegated sub-agent/specialist/MCP session's
+    /// own executor alike — since without it, `checkpoint_cwd()` stays
+    /// `None` and that `Agent`'s own per-turn change summary / `[git]
+    /// ignore` filtering silently never runs. `deny_paths` must be the ones
+    /// `checkpointer` was detected with: `checkpoint_now` verifies
+    /// snapshots against a tree built with the same excludes.
     pub fn set_checkpointer_at(
         &mut self,
         cwd: PathBuf,
@@ -1421,11 +1428,12 @@ mod tests {
 
     #[tokio::test]
     async fn plain_set_checkpointer_leaves_checkpoint_cwd_unset() {
-        // `set_checkpointer` (no `_at`) is what delegated sub-executors use
-        // to share the parent's checkpointer without needing `/undo`
-        // tracking of their own — `checkpoint_cwd` must stay `None` so
+        // Direct unit proof of `set_checkpointer`'s own doc comment: unlike
+        // `set_checkpointer_at` (what every real call site in this
+        // codebase actually uses — see that method's own doc comment),
+        // plain `set_checkpointer` must leave `checkpoint_cwd` unset, so
         // `Agent`'s mark-recording path (which requires it) stays a no-op
-        // for them.
+        // for an executor configured this way.
         use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
 
         let dir = tempfile::tempdir().unwrap();
