@@ -674,6 +674,16 @@ struct App {
     /// cancelled" from the event stream alone; this flag is read there
     /// instead to suppress `plan_mode_turn_notice` for a cancelled turn.
     cancel_requested: bool,
+    /// Whether the message that started the current turn was `/test` --
+    /// set by `push_user_message`, read when a cancelled turn's generic
+    /// `CANCELLED_TURN_MARKER` arrives (see that `AgentEvent::Error` arm in
+    /// `handle_agent_event`). A cancelled `/test` already gets its own
+    /// specific "Tests cancelled" line (`AgentEvent::TestFinished`'s
+    /// `Outcome::Cancelled` summary, `aivyx-core`'s `test_command.rs`) --
+    /// without this flag, the generic marker rendered too, so a cancelled
+    /// `/test` showed both lines for what the user experienced as one
+    /// cancellation.
+    turn_is_test_command: bool,
     /// The model the router last moved this conversation to, shown in the
     /// status line. `None` until routing reports a choice (always `None`
     /// with routing off).
@@ -724,6 +734,7 @@ impl App {
             plan_mode,
             turn_had_model_activity: false,
             cancel_requested: false,
+            turn_is_test_command: false,
             diff_view: None,
             tests_line: String::new(),
             autonomous: false,
@@ -835,6 +846,8 @@ impl App {
     }
 
     fn push_user_message(&mut self, text: String) {
+        self.turn_is_test_command =
+            aivyx_core::commands::parse_slash_command(&text, "/test").is_some();
         self.transcript.push(ChatLine::User(text));
         self.streaming_active = true;
         self.turn_had_model_activity = false;
@@ -972,7 +985,14 @@ impl App {
                 self.turn_had_model_activity = false;
             }
             AgentEvent::Error(message) if message == CANCELLED_TURN_MARKER => {
-                self.transcript.push(ChatLine::Cancelled(message));
+                // A cancelled `/test` already got its own specific "Tests
+                // cancelled" line via `AgentEvent::TestFinished` just
+                // above -- showing this generic marker too would say the
+                // same thing twice for what the user experienced as one
+                // cancellation. See `turn_is_test_command`'s doc comment.
+                if !self.turn_is_test_command {
+                    self.transcript.push(ChatLine::Cancelled(message));
+                }
                 self.streaming_active = false;
             }
             AgentEvent::Error(message) => {
@@ -2767,6 +2787,52 @@ mod tests {
             unreachable!()
         };
         assert_eq!(text, CANCELLED_TURN_MARKER);
+    }
+
+    #[test]
+    fn a_cancelled_test_run_shows_only_tests_cancelled_not_the_generic_marker() {
+        // Regression test: Ctrl+C during `/test` used to show both "Tests
+        // cancelled" (from `AgentEvent::TestFinished`) and the generic
+        // "— stopped (Ctrl+C)" marker (from the background task's
+        // unconditional `agent.notify(CANCELLED_TURN_MARKER)` after every
+        // cancelled `run_turn`, `/test` included) -- two lines for one
+        // cancellation.
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("/test".to_string());
+
+        app.handle_agent_event(AgentEvent::TestFinished {
+            summary: "Tests cancelled".to_string(),
+            tail: String::new(),
+        });
+        app.handle_agent_event(AgentEvent::Error(CANCELLED_TURN_MARKER.to_string()));
+
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| matches!(line, ChatLine::Info(text) if text == "Tests cancelled")),
+            "the test-specific cancellation summary must still appear"
+        );
+        assert!(
+            !app.transcript.iter().any(|line| matches!(line, ChatLine::Cancelled(_))),
+            "a cancelled /test must not also show the generic \"— stopped (Ctrl+C)\" marker"
+        );
+        assert!(!app.streaming_active);
+    }
+
+    #[test]
+    fn an_ordinary_cancelled_turn_still_shows_the_generic_marker() {
+        // Companion to the test above: the suppression is specific to
+        // `/test`, not a blanket change -- an ordinary turn's cancellation
+        // must still show `CANCELLED_TURN_MARKER` exactly as before.
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("do the thing".to_string());
+
+        app.handle_agent_event(AgentEvent::Error(CANCELLED_TURN_MARKER.to_string()));
+
+        assert!(
+            app.transcript.iter().any(|line| matches!(line, ChatLine::Cancelled(_))),
+            "an ordinary cancelled turn must still show the generic marker"
+        );
     }
 
     #[test]
