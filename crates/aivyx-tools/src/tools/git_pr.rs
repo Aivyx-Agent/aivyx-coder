@@ -189,10 +189,25 @@ async fn check_upstream_configured(ctx: &ToolExecutionContext) -> Result<(), Str
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = ctx.confiner.confine(command).status().await;
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = crate::process::output_in_group_bounded(
+        ctx.confiner.confine(command),
+        crate::process::PREFLIGHT_TIMEOUT,
+        &ctx.cancellation,
+    )
+    .await
+    .map(|output| output.status);
     match status {
         Ok(status) if status.success() => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Err("cancelled while checking the branch's upstream".to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "`git rev-parse @{{u}}` didn't answer within {}s — check git works, then try \
+             git_pr again",
+            crate::process::PREFLIGHT_TIMEOUT.as_secs()
+        )),
         _ => Err(
             "the current branch has no upstream — call git_push first, then try git_pr again"
                 .to_string(),
@@ -214,14 +229,28 @@ async fn check_gh_authenticated(gh_program: &str, ctx: &ToolExecutionContext) ->
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = ctx.confiner.confine(command).status().await;
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = crate::process::output_in_group_bounded(
+        ctx.confiner.confine(command),
+        crate::process::PREFLIGHT_TIMEOUT,
+        &ctx.cancellation,
+    )
+    .await
+    .map(|output| output.status);
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(_) => Err(
             "gh is installed but not authenticated — run `gh auth login`, then try git_pr again"
                 .to_string(),
         ),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Err("cancelled while checking gh's authentication".to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "`gh auth status` didn't answer within {}s — check gh works, then try git_pr again",
+            crate::process::PREFLIGHT_TIMEOUT.as_secs()
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "gh CLI not found (tried \"{gh_program}\") — install it from \
              https://cli.github.com, then try git_pr again"
@@ -460,6 +489,42 @@ mod tests {
         .unwrap_err();
         assert!(!err.contains("not found"), "{err}");
         assert!(err.contains("could not start"), "{err}");
+    }
+
+    /// A hung `gh auth status` must not outlive a cancelled turn.
+    #[tokio::test]
+    async fn a_hung_gh_preflight_stops_when_the_turn_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let script_dir = tempfile::tempdir().unwrap();
+        let gh = script_dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = ctx_with_confiner(dir.path(), std::sync::Arc::new(aivyx_sandbox::NoopConfiner));
+        let cancel = ctx.cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let result = check_gh_authenticated(gh.to_str().unwrap(), &ctx).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "waited for gh");
+    }
+
+    /// A cancelled upstream check says so, not "no upstream".
+    #[tokio::test]
+    async fn a_cancelled_upstream_check_is_reported_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let ctx = ctx_with_confiner(dir.path(), std::sync::Arc::new(aivyx_sandbox::NoopConfiner));
+        ctx.cancellation.cancel();
+
+        let err = check_upstream_configured(&ctx).await.unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!err.contains("no upstream"), "{err}");
     }
 
     #[tokio::test]

@@ -6545,7 +6545,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
             editor_approval_enabled: false,
             injection_taint: InjectionTaint::new(),
             extra_read_paths: vec![],
-            require_enforcement: false,
+            confine_options: aivyx_sandbox::ConfineOptions::new().require_enforcement(false),
         },
         checkpointer: None,
         repo_map: None,
@@ -7742,6 +7742,29 @@ async fn commit_with_a_message_skips_the_model_and_the_prompt() {
 }
 
 #[tokio::test]
+async fn commit_kills_what_a_hook_left_running() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let hook = cwd.join(".git/hooks/post-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh
+(sleep 1; echo late > late.txt) >/dev/null 2>&1 &
+").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+    let (mut agent, _rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.set_command_prompter(scripted(vec![]));
+
+    agent.run_turn("/commit -m \"Hooked\"".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(commit_count(&cwd).await, 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!cwd.join("late.txt").exists(), "the hook's background job outlived /commit");
+}
+
+#[tokio::test]
 async fn commit_rejected_by_a_hook_reports_it_and_restores_staging() {
     let dir = tempfile::tempdir().unwrap();
     init_git_repo(dir.path()).await;
@@ -8249,6 +8272,26 @@ async fn test_cancelled_or_unable_to_start_leaves_last_test_passed_unchanged() {
     });
     agent.run_turn("/test".into(), &cwd, token).await.unwrap();
     assert_eq!(agent.last_test_passed(), Some(false), "cancelled leaves it unchanged");
+}
+
+#[tokio::test]
+async fn test_kills_a_background_job_when_the_run_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    // The job holds the output pipes, so this also checks /test returns
+    // when the test command exits rather than when its pipes close.
+    // Generous margins: the job sleeps 3 s, /test must return well before.
+    agent.set_tests(Some(sh_tests("(sleep 3; echo late > late.txt) & echo done")));
+    let started = std::time::Instant::now();
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500), "waited for the job");
+    let (_, finished) = test_events(&mut rx);
+    assert!(finished[0].0.starts_with("Tests passed ("), "{:?}", finished[0]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+    assert!(!cwd.join("late.txt").exists(), "the background job outlived /test");
 }
 
 #[tokio::test]

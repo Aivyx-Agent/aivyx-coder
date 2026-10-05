@@ -138,29 +138,78 @@ impl SessionPoolState {
 /// for the identical reason.
 #[derive(Clone)]
 pub struct SpecialistSessionPool {
-    inner: Arc<Mutex<SessionPoolState>>,
+    inner: PoolRef,
+}
+
+/// The lead's handles own the pool; the session tools a specialist gets
+/// (`build_specialist_agent`'s child config) only borrow it, since the
+/// pool owns that specialist's `Agent` and so, through its tool registry,
+/// those tools — a strong reference there would be a cycle that keeps
+/// every still-open session (and its confiner's private temp dir) alive
+/// forever once the lead is gone.
+#[derive(Clone)]
+enum PoolRef {
+    Owned(Arc<Mutex<SessionPoolState>>),
+    Borrowed(std::sync::Weak<Mutex<SessionPoolState>>),
 }
 
 impl SpecialistSessionPool {
     pub fn new(max_concurrent: usize, idle_timeout: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(SessionPoolState {
+            inner: PoolRef::Owned(Arc::new(Mutex::new(SessionPoolState {
                 sessions: HashMap::new(),
                 dehydrated: HashMap::new(),
                 max_concurrent,
                 idle_timeout,
-            })),
+            }))),
+        }
+    }
+
+    /// A handle that doesn't keep the pool alive — for the session tools
+    /// handed to a specialist the pool itself holds (see `PoolRef`).
+    fn downgrade(&self) -> Self {
+        let weak = match &self.inner {
+            PoolRef::Owned(state) => Arc::downgrade(state),
+            PoolRef::Borrowed(weak) => weak.clone(),
+        };
+        Self { inner: PoolRef::Borrowed(weak) }
+    }
+
+    /// The shared state, or — once every owning handle is gone, i.e.
+    /// while the lead is being torn down — an empty pool with no room,
+    /// so a late call through a borrowed handle finds nothing and opens
+    /// nothing.
+    fn state(&self) -> Arc<Mutex<SessionPoolState>> {
+        match &self.inner {
+            PoolRef::Owned(state) => Arc::clone(state),
+            PoolRef::Borrowed(weak) => weak.upgrade().unwrap_or_else(|| {
+                Arc::new(Mutex::new(SessionPoolState {
+                    sessions: HashMap::new(),
+                    dehydrated: HashMap::new(),
+                    max_concurrent: 0,
+                    idle_timeout: Duration::ZERO,
+                }))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn downgrade_state_for_test(&self) -> std::sync::Weak<Mutex<SessionPoolState>> {
+        match &self.inner {
+            PoolRef::Owned(state) => Arc::downgrade(state),
+            PoolRef::Borrowed(weak) => weak.clone(),
         }
     }
 
     fn has_room(&self) -> bool {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         state.sessions.len() + state.dehydrated.len() < state.max_concurrent
     }
 
     pub fn max_concurrent(&self) -> usize {
-        self.inner.lock().unwrap().max_concurrent
+        self.state().lock().unwrap().max_concurrent
     }
 
     /// Drops every currently-parked LIVE session at once, closing each
@@ -181,7 +230,8 @@ impl SpecialistSessionPool {
     /// dehydrated -- never stays queryable against a lead conversation
     /// that's just been wiped.
     pub fn close_all(&self) {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.sessions.clear();
         state.dehydrated.clear();
     }
@@ -196,7 +246,8 @@ impl SpecialistSessionPool {
     /// would otherwise reorder arbitrarily between calls (`HashMap`
     /// iteration order is not stable).
     pub fn open_sessions(&self) -> Vec<SpecialistSessionSummary> {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         let mut sessions: Vec<SpecialistSessionSummary> = state
             .sessions
@@ -221,7 +272,8 @@ impl SpecialistSessionPool {
     /// convention of giving a model that hit a limit a recovery path in
     /// the same tool result.
     fn open_sessions_description(&self) -> String {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         let mut live: Vec<String> = state
             .sessions
@@ -256,7 +308,8 @@ impl SpecialistSessionPool {
     /// instead of a borrow-returning accessor. `None` if the id doesn't
     /// exist or has gone stale.
     fn take(&self, id: &str) -> Option<ParkedSpecialistSession> {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         state.sessions.remove(id)
     }
@@ -265,7 +318,7 @@ impl SpecialistSessionPool {
     /// `last_active` to now.
     fn put_back(&self, id: String, mut session: ParkedSpecialistSession) {
         session.last_active = Instant::now();
-        self.inner.lock().unwrap().sessions.insert(id, session);
+        self.state().lock().unwrap().sessions.insert(id, session);
     }
 
     /// Re-inserts a session exactly as it was, WITHOUT refreshing
@@ -280,7 +333,7 @@ impl SpecialistSessionPool {
     /// indefinitely preventing it from being evicted as idle even though
     /// that caller was never authorized to touch it.
     fn restore_untouched(&self, id: String, session: ParkedSpecialistSession) {
-        self.inner.lock().unwrap().sessions.insert(id, session);
+        self.state().lock().unwrap().sessions.insert(id, session);
     }
 
     /// Inserts a brand-new session, enforcing the concurrent-session cap.
@@ -289,7 +342,8 @@ impl SpecialistSessionPool {
     /// avoid running a wasted specialist turn, but this is still checked
     /// here too as the authoritative guard.
     fn insert_new(&self, id: String, session: ParkedSpecialistSession) -> Result<(), usize> {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         if state.sessions.len() + state.dehydrated.len() >= state.max_concurrent {
             return Err(state.max_concurrent);
@@ -305,7 +359,8 @@ impl SpecialistSessionPool {
     /// `query_specialist` rehydrates it on first use, or
     /// `close_specialist` discards it unused.
     pub fn seed_dehydrated(&self, sessions: Vec<PersistedSpecialistSession>) {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         for session in sessions {
             state.dehydrated.insert(session.session_id.clone(), session);
         }
@@ -315,7 +370,7 @@ impl SpecialistSessionPool {
     /// rebuilt into a live one, mirroring `take`'s remove-and-return
     /// shape.
     fn take_dehydrated(&self, id: &str) -> Option<PersistedSpecialistSession> {
-        self.inner.lock().unwrap().dehydrated.remove(id)
+        self.state().lock().unwrap().dehydrated.remove(id)
     }
 
     /// A snapshot of every session that should survive a restart --
@@ -329,7 +384,8 @@ impl SpecialistSessionPool {
     /// resumed (moves into the live map from then on) or explicitly
     /// closed. Called from `Agent::persist()`.
     pub fn snapshot_for_persistence(&self) -> Vec<PersistedSpecialistSession> {
-        let mut state = self.inner.lock().unwrap();
+        let shared = self.state();
+        let mut state = shared.lock().unwrap();
         state.evict_stale();
         let mut out: Vec<PersistedSpecialistSession> = state.dehydrated.values().cloned().collect();
         out.extend(
@@ -533,6 +589,9 @@ fn build_specialist_agent(
         let child_config = SpecialistSessionsConfig {
             spawn_depth: config.spawn_depth + 1,
             caller: SessionOwner::Specialist(own_session_id.to_string()),
+            // Borrowed, not owned: the pool owns this specialist (see
+            // `PoolRef`).
+            pool: config.pool.downgrade(),
             ..config.clone()
         };
         if member
@@ -1187,7 +1246,7 @@ mod specialist_session_tests {
                 editor_approval_enabled: false,
                 injection_taint: InjectionTaint::new(),
                 extra_read_paths: vec![],
-                require_enforcement: false,
+                confine_options: aivyx_sandbox::ConfineOptions::new().require_enforcement(false),
             },
             checkpointer: None,
             repo_map: None,
@@ -2010,6 +2069,41 @@ mod specialist_session_tests {
             !denied.join("secret.txt").exists(),
             "the write must have been blocked by the specialist's own scoped gate -- if this \
              file exists, extra_deny_paths was not actually enforced via spawn_specialist"
+        );
+    }
+
+    /// A session whose member may spawn peers holds session tools bound
+    /// to the pool; if those held the pool strongly, pool -> session ->
+    /// tool -> pool would be a cycle, and a session still open when the
+    /// lead goes away would never be dropped (nor its confiner's private
+    /// temp dir removed).
+    #[tokio::test]
+    async fn an_open_session_with_session_tools_does_not_keep_the_pool_alive() {
+        let llm = Arc::new(MockBackend::new(vec![text_response("ready")]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pool = SpecialistSessionPool::new(3, Duration::from_secs(600));
+        let state = pool.downgrade_state_for_test();
+        let tool = SpawnSpecialistTool::new(config(
+            llm,
+            tx,
+            team_with_spawn_specialist_allowlisted(),
+            pool.clone(),
+        ));
+        let result = tool
+            .execute(
+                serde_json::json!({ "member": "orchestrator", "task": "stand by" }),
+                &exec_ctx(std::path::Path::new(".")),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ToolOutput::Ok(_)), "{result:?}");
+        assert_eq!(pool.open_sessions().len(), 1);
+
+        drop(tool);
+        drop(pool);
+        assert!(
+            state.upgrade().is_none(),
+            "the open session's own session tools keep the pool alive"
         );
     }
 

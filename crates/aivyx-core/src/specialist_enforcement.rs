@@ -33,7 +33,9 @@ pub struct SpecialistEnforcementIngredients {
     pub editor_approval_enabled: bool,
     pub injection_taint: InjectionTaint,
     pub extra_read_paths: Vec<PathBuf>,
-    pub require_enforcement: bool,
+    /// The lead's `[sandbox]` policy, applied to every specialist's
+    /// confiner unchanged.
+    pub confine_options: aivyx_sandbox::ConfineOptions,
 }
 
 /// Builds a fresh `ConfirmationGate` + `ExecutionConfiner` pair scoped to
@@ -69,11 +71,11 @@ pub fn scoped_gate_and_confiner(
         )
         .with_injection_taint(ingredients.injection_taint.clone()),
     );
-    let confiner = aivyx_sandbox::default_confiner(
+    let confiner = aivyx_sandbox::build_confiner(
         cwd,
         &ingredients.extra_read_paths,
         &deny_paths,
-        ingredients.require_enforcement,
+        ingredients.confine_options.clone(),
     );
     (gate, confiner)
 }
@@ -170,8 +172,42 @@ mod tests {
             editor_approval_enabled: false,
             injection_taint: InjectionTaint::new(),
             extra_read_paths: vec![],
-            require_enforcement: false,
+            confine_options: aivyx_sandbox::ConfineOptions::new().require_enforcement(false),
         }
+    }
+
+    /// Whether a command confined by `member`'s scoped confiner can
+    /// create an `AF_UNIX` socket. `None` when python3 isn't installed.
+    #[cfg(feature = "sandbox-backend")]
+    async fn specialist_can_open_a_unix_socket(options: aivyx_sandbox::ConfineOptions) -> Option<bool> {
+        if std::process::Command::new("python3").arg("-c").arg("").status().is_err() {
+            eprintln!("python3 not found; skipping");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut ing = ingredients(vec![]);
+        ing.confine_options = options;
+        let (_gate, confiner) = scoped_gate_and_confiner(&ing, &member("implementer", &[]), &cwd);
+        let mut command = tokio::process::Command::new("python3");
+        command
+            .args(["-c", "import socket; socket.socket(socket.AF_UNIX)"])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        Some(confiner.confine(command).status().await.unwrap().success())
+    }
+
+    /// Specialists get the lead's `[sandbox]` policy: no per-member
+    /// loosening, and the lead's opt-outs do reach them.
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn a_specialist_confiner_inherits_the_leads_confine_options() {
+        let strict = aivyx_sandbox::ConfineOptions::new().require_enforcement(true);
+        let Some(strict_ok) = specialist_can_open_a_unix_socket(strict.clone()).await else { return };
+        assert!(!strict_ok, "AF_UNIX must stay blocked for a specialist under the strict policy");
+        let opted_out = strict.allow_unix_sockets(true);
+        assert_eq!(specialist_can_open_a_unix_socket(opted_out).await, Some(true));
     }
 
     #[tokio::test]

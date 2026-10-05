@@ -22,11 +22,103 @@ use aivyx_confine::{is_bare_pattern, is_basename_glob_match};
 
 mod confirmation;
 mod editor_approval;
-pub use aivyx_confine::{ExecutionConfiner, NoopConfiner, default_confiner};
+pub use aivyx_confine::{
+    ConfineOptions, ExecutionConfiner, NoopConfiner, default_confiner, default_confiner_with_options,
+    kill_process_group,
+};
 #[cfg(feature = "sandbox-backend")]
 pub use aivyx_confine::LandlockConfiner;
 pub use aivyx_injection_guard::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 pub use confirmation::ConfirmationGate;
+
+/// The session IPC variables `LandlockConfiner` removes from every
+/// confined command — a copy of `aivyx-confine`'s own `SCRUBBED_ENV_VARS`,
+/// which that crate doesn't export. Keep the two in step when bumping
+/// aivyx-confine. Drift fails safe: a variable confine scrubs that is
+/// missing here just stays scrubbed even with `allow_unix_sockets`.
+const SESSION_IPC_VARS: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+];
+
+/// The confiner every aivyx-coder command spawn goes through:
+/// `default_confiner_with_options`, plus one thing of our own. With
+/// `allow_unix_sockets`, the session IPC variables `LandlockConfiner`
+/// scrubs are handed back (the caller's explicit value on the command,
+/// else this process's own), since the reason to opt into Unix sockets is
+/// reaching ssh-agent, gpg-agent, D-Bus or a display — none of which a
+/// command can find without them. Without the opt-out they stay scrubbed.
+pub fn build_confiner(
+    cwd: &Path,
+    extra_read_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
+    options: ConfineOptions,
+) -> Arc<dyn ExecutionConfiner> {
+    let parent_env = SESSION_IPC_VARS
+        .iter()
+        .filter_map(|var| std::env::var_os(var).map(|value| (*var, value)))
+        .collect();
+    build_confiner_with_parent_env(cwd, extra_read_paths, deny_paths, options, parent_env)
+}
+
+/// `build_confiner` with this process's environment passed in, so tests
+/// don't have to mutate the real one.
+fn build_confiner_with_parent_env(
+    cwd: &Path,
+    extra_read_paths: &[PathBuf],
+    deny_paths: &[PathBuf],
+    options: ConfineOptions,
+    parent_env: Vec<(&'static str, std::ffi::OsString)>,
+) -> Arc<dyn ExecutionConfiner> {
+    let restore = options.allow_unix_sockets;
+    let inner = default_confiner_with_options(cwd, extra_read_paths, deny_paths, options);
+    if restore {
+        Arc::new(RestoreSessionIpcEnv { inner, parent_env })
+    } else {
+        inner
+    }
+}
+
+struct RestoreSessionIpcEnv {
+    inner: Arc<dyn ExecutionConfiner>,
+    parent_env: Vec<(&'static str, std::ffi::OsString)>,
+}
+
+impl ExecutionConfiner for RestoreSessionIpcEnv {
+    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+        // What the caller set (or removed) on the command itself, before
+        // the inner confiner scrubs it.
+        let explicit: Vec<(&'static str, Option<std::ffi::OsString>)> = SESSION_IPC_VARS
+            .iter()
+            .filter_map(|var| {
+                command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(var))
+                    .map(|(_, value)| (*var, value.map(|v| v.to_os_string())))
+            })
+            .collect();
+        let mut command = self.inner.confine(command);
+        for var in SESSION_IPC_VARS {
+            let value = match explicit.iter().find(|(key, _)| key == var) {
+                Some((_, value)) => value.clone(),
+                None => self
+                    .parent_env
+                    .iter()
+                    .find(|(key, _)| key == var)
+                    .map(|(_, value)| value.clone()),
+            };
+            if let Some(value) = value {
+                command.env(var, value);
+            }
+        }
+        command
+    }
+}
 
 /// What a tool is asking to do, described *before* any side effect happens.
 #[derive(Debug, Clone)]
@@ -812,5 +904,87 @@ mod tests {
             diff: None,
         };
         assert!(runs_code_later_for_request(&request).is_some());
+    }
+}
+
+#[cfg(test)]
+mod build_confiner_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    async fn echo_ipc_env(confiner: &dyn ExecutionConfiner, cwd: &Path, set: Option<&str>) -> String {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "printf '%s|%s' \"$SSH_AUTH_SOCK\" \"$DISPLAY\""])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null());
+        if let Some(value) = set {
+            command.env("SSH_AUTH_SOCK", value);
+        }
+        let output = confiner.confine(command).output().await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn parent(vars: &[(&'static str, &str)]) -> Vec<(&'static str, OsString)> {
+        vars.iter().map(|(k, v)| (*k, OsString::from(v))).collect()
+    }
+
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn without_the_socket_opt_out_session_ipc_variables_stay_scrubbed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner = build_confiner_with_parent_env(
+            &cwd,
+            &[],
+            &[],
+            ConfineOptions::new(),
+            parent(&[("SSH_AUTH_SOCK", "/run/agent.sock"), ("DISPLAY", ":0")]),
+        );
+        assert_eq!(echo_ipc_env(confiner.as_ref(), &cwd, None).await, "|");
+        assert_eq!(echo_ipc_env(confiner.as_ref(), &cwd, Some("/explicit")).await, "|");
+    }
+
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn the_socket_opt_out_hands_session_ipc_variables_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner = build_confiner_with_parent_env(
+            &cwd,
+            &[],
+            &[],
+            ConfineOptions::new().allow_unix_sockets(true),
+            parent(&[("SSH_AUTH_SOCK", "/run/agent.sock"), ("DISPLAY", ":0")]),
+        );
+        assert_eq!(echo_ipc_env(confiner.as_ref(), &cwd, None).await, "/run/agent.sock|:0");
+        // A value the caller set on the command itself wins over the
+        // parent's.
+        assert_eq!(
+            echo_ipc_env(confiner.as_ref(), &cwd, Some("/explicit")).await,
+            "/explicit|:0"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unset_parent_variable_is_not_invented() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner = build_confiner_with_parent_env(
+            &cwd,
+            &[],
+            &[],
+            ConfineOptions::new().allow_unix_sockets(true).require_enforcement(false),
+            parent(&[]),
+        );
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "[ -z \"${SSH_AUTH_SOCK+x}\" ] && echo unset"])
+            .current_dir(&cwd)
+            .env_remove("SSH_AUTH_SOCK")
+            .stdin(std::process::Stdio::null());
+        let output = confiner.confine(command).output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unset");
     }
 }

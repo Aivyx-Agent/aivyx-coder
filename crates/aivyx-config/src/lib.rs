@@ -634,6 +634,34 @@ pub struct SandboxSettings {
     /// into that) and `false` elsewhere, since non-Linux builds have no
     /// `sandbox-backend` to enforce with in the first place.
     pub require_enforcement: bool,
+    /// Let confined commands (`run_command`, `run_shell`, `/test`, git,
+    /// REPLs, MCP and LSP servers) create `AF_UNIX` sockets, and pass them
+    /// the session IPC variables (`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`,
+    /// `XDG_RUNTIME_DIR`, ...) that are otherwise removed from their
+    /// environment. Off by default: Landlock
+    /// doesn't gate `connect()` to an existing Unix socket, so with this
+    /// on a confined command can reach any local daemon you can — the
+    /// D-Bus session bus (`systemd-run --user` runs anything, unconfined),
+    /// ssh-agent, gpg-agent, `docker.sock`. Turn it on only if you need
+    /// ssh-agent pushes, `git commit -S`, docker, or a socket-backed
+    /// database client inside the sandbox, and accept that the sandbox
+    /// then no longer contains code execution.
+    pub allow_unix_sockets: bool,
+    /// Let confined commands call `setsid`/`setpgid`. Off by default:
+    /// every confined command leads its own process group and everything
+    /// in it is killed when the tool call ends, which only holds if
+    /// nothing can leave the group. Turn it on for test runners or tools
+    /// that put children in their own process groups (cargo-nextest,
+    /// Python's `start_new_session=True`, the `setsid` tool); a process
+    /// that leaves the group can then outlive the tool call.
+    pub allow_leaving_process_group: bool,
+    /// Give confined commands read+write on the shared system temp dir
+    /// (`/tmp`, and `$TMPDIR` if set) instead of a private per-session
+    /// temp dir exported as `TMPDIR`. Off by default, so a confined
+    /// command can't read or tamper with other programs' files in `/tmp`.
+    /// Turn it on only for tools that hard-code `/tmp` and ignore
+    /// `TMPDIR`.
+    pub share_system_tmp: bool,
 }
 
 impl Default for SandboxSettings {
@@ -652,6 +680,9 @@ impl Default for SandboxSettings {
             // explicit `--no-default-features` build on Linux already
             // behaves when a user opts into that themselves.
             require_enforcement: cfg!(target_os = "linux"),
+            allow_unix_sockets: false,
+            allow_leaving_process_group: false,
+            share_system_tmp: false,
         }
     }
 }
@@ -1663,6 +1694,30 @@ mod tests {
         } else {
             assert!(!SandboxSettings::default().require_enforcement);
         }
+    }
+
+    #[test]
+    fn sandbox_opt_outs_default_off() {
+        let settings: Settings = toml::from_str("").unwrap();
+        assert!(!settings.sandbox.allow_unix_sockets);
+        assert!(!settings.sandbox.allow_leaving_process_group);
+        assert!(!settings.sandbox.share_system_tmp);
+        let explicit: Settings = toml::from_str("[sandbox]\nextra_read_paths = []\n").unwrap();
+        assert!(!explicit.sandbox.allow_unix_sockets);
+        assert!(!explicit.sandbox.allow_leaving_process_group);
+        assert!(!explicit.sandbox.share_system_tmp);
+    }
+
+    #[test]
+    fn sandbox_opt_outs_parse_from_toml() {
+        let settings: Settings = toml::from_str(
+            "[sandbox]\nallow_unix_sockets = true\nallow_leaving_process_group = true\n\
+             share_system_tmp = true\n",
+        )
+        .unwrap();
+        assert!(settings.sandbox.allow_unix_sockets);
+        assert!(settings.sandbox.allow_leaving_process_group);
+        assert!(settings.sandbox.share_system_tmp);
     }
 
     #[test]

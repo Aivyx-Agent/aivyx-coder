@@ -178,6 +178,12 @@ fn git_command(args: &[String], ctx: &ToolExecutionContext) -> tokio::process::C
 /// `.git/config` in the first place -- hooks themselves still run
 /// deliberately (the user's own), this only stops a *planted* fsmonitor
 /// hook from firing via these `add`/`commit` calls.
+///
+/// Global `-c maintenance.auto=false` too: after a commit git starts its
+/// auto-maintenance detached, which needs `setsid()` — refused inside the
+/// sandbox — so every successful commit would otherwise end with
+/// `fatal: setsid failed` in the tool output. The user's own (unconfined)
+/// git keeps doing the housekeeping.
 pub fn confined_git(
     args: &[String],
     cwd: &Path,
@@ -185,7 +191,7 @@ pub fn confined_git(
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
-        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.fsmonitor=false", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -243,8 +249,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let command = confined_git(&["status".into()], dir.path(), &aivyx_sandbox::NoopConfiner);
         let args: Vec<_> = command.as_std().get_args().collect();
-        assert_eq!(args, ["-c", "core.fsmonitor=false", "status"]);
+        assert_eq!(args, ["-c", "core.fsmonitor=false", "-c", "maintenance.auto=false", "status"]);
         assert_eq!(command.as_std().get_current_dir(), Some(dir.path()));
+    }
+
+    /// Under the real confiner `setsid` is refused, so git's detached
+    /// auto-maintenance after a commit would print `fatal: setsid failed`
+    /// into every successful commit's output.
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn a_confined_commit_does_not_report_a_failed_setsid() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "edited\n").unwrap();
+        let ctx = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: aivyx_sandbox::build_confiner(&cwd, &[], &[], aivyx_sandbox::ConfineOptions::new()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let output = GitCommitTool::new(vec![])
+            .execute(json!({ "message": "confined commit" }), &ctx)
+            .await
+            .unwrap();
+
+        let ToolOutput::Ok(text) = output else { panic!("expected Ok output") };
+        assert!(text.contains("exit status: 0 (success)"), "{text}");
+        assert!(!text.contains("setsid failed"), "{text}");
     }
 
     #[tokio::test]
@@ -421,6 +453,6 @@ mod tests {
             &["-c".to_string(), "core.fsmonitor=false".to_string()],
             "argv: {args:?}"
         );
-        assert_eq!(args[2], "status");
+        assert_eq!(args[4], "status");
     }
 }

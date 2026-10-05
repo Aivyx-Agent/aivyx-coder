@@ -21,7 +21,7 @@ use aivyx_core::{
 };
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{
-    AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
+    AutonomousMode, ConfineOptions, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
 };
 use aivyx_tools::{
     CoderTextCompleter, CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool,
@@ -54,6 +54,49 @@ pub(crate) const DETECTED_TESTS_ENTRY: &str = "detected-tests";
 pub(crate) struct AutoVerification {
     pub command_name: String,
     pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
+}
+
+/// A startup notice for a Rust project whose root directly holds a
+/// `deny_paths` entry (often `.env`) and has no `target/` yet. The
+/// confiner gives such a root list-and-create rights only, and cargo
+/// creates `target/` by renaming a temp directory, so every confined
+/// `cargo build` there fails (leaving an undeletable `targetXXXXXX`
+/// behind) until `target/` exists. `None` without the sandbox backend.
+pub(crate) fn carved_root_cargo_notice(
+    cwd: &std::path::Path,
+    deny_paths: &[PathBuf],
+) -> Option<String> {
+    if !cfg!(feature = "sandbox-backend")
+        || !cwd.join("Cargo.toml").is_file()
+        || cwd.join("target").exists()
+    {
+        return None;
+    }
+    let denied_child = std::fs::read_dir(cwd).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        // The entry is denied itself, or a denied path lies under it.
+        let hit = aivyx_sandbox::path_is_denied(&path, deny_paths)
+            || deny_paths.iter().any(|denied| denied.is_absolute() && denied.starts_with(&path));
+        hit.then(|| entry.file_name().to_string_lossy().into_owned())
+    })?;
+    Some(format!(
+        "This project's root holds `{denied_child}`, which deny_paths hides from commands, so \
+         sandboxed commands can't rename or delete files directly in the root, and `cargo \
+         build` can't create `target/`. Run `mkdir target` once (or build once outside \
+         aivyx-coder); after that builds work."
+    ))
+}
+
+/// The `[sandbox]` section as `aivyx-confine`'s policy: every confiner
+/// this binary builds (the lead's, and each specialist's) uses it.
+/// `require_enforcement` keeps its existing meaning; the three opt-outs
+/// are off unless the user's config turns them on.
+pub(crate) fn confine_options(sandbox: &aivyx_config::SandboxSettings) -> ConfineOptions {
+    ConfineOptions::new()
+        .require_enforcement(sandbox.require_enforcement)
+        .allow_unix_sockets(sandbox.allow_unix_sockets)
+        .allow_leaving_process_group(sandbox.allow_leaving_process_group)
+        .share_system_tmp(sandbox.share_system_tmp)
 }
 
 /// `--auto`'s test-command resolution: a configured name must resolve to
@@ -600,11 +643,12 @@ pub(crate) async fn build_agent(
         )
         .with_injection_taint(injection_taint.clone()),
     );
-    let confiner = aivyx_sandbox::default_confiner(
+    let confine_options = confine_options(&settings.sandbox);
+    let confiner = aivyx_sandbox::build_confiner(
         &cwd,
         &settings.sandbox.resolved_extra_read_paths(),
         &deny_paths,
-        settings.sandbox.require_enforcement,
+        confine_options.clone(),
     );
 
     // On a build compiled without `sandbox-backend` (see the warning just
@@ -622,7 +666,7 @@ pub(crate) async fn build_agent(
             editor_approval_enabled: settings.editor_approval.enabled,
             injection_taint: injection_taint.clone(),
             extra_read_paths: settings.sandbox.resolved_extra_read_paths(),
-            require_enforcement: settings.sandbox.require_enforcement,
+            confine_options,
         };
     // This build has no `sandbox-backend` compiled in (e.g. a macOS
     // binary, where landlock/seccompiler don't exist), so `default_confiner`
@@ -1228,6 +1272,9 @@ pub(crate) async fn build_agent(
     if let Some(notice) = crate::routing::cloud_backend_notice(settings) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
+    if let Some(notice) = carved_root_cargo_notice(&cwd, &deny_paths) {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
+    }
 
     // KV-cache persistence/sharing (aivyx-kvcache): only ever attempted
     // against a real llama-server backend, whose `/props` response both
@@ -1624,6 +1671,65 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sandbox-backend")]
+    #[test]
+    fn carved_root_cargo_notice_fires_only_for_a_rust_root_holding_a_denied_entry_without_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let env_deny = vec![PathBuf::from(".env")];
+        std::fs::write(cwd.join(".env"), "S=1\n").unwrap();
+        assert_eq!(carved_root_cargo_notice(&cwd, &env_deny), None, "not a Cargo project");
+
+        std::fs::write(cwd.join("Cargo.toml"), "[package]\n").unwrap();
+        let notice = carved_root_cargo_notice(&cwd, &env_deny).expect("notice");
+        assert!(notice.contains("mkdir target"), "{notice}");
+        assert!(notice.contains(".env"), "{notice}");
+        assert_eq!(carved_root_cargo_notice(&cwd, &[]), None, "nothing denied");
+
+        let absolute = vec![cwd.join(".env")];
+        assert!(carved_root_cargo_notice(&cwd, &absolute).is_some(), "absolute deny entry");
+        let outside = vec![PathBuf::from("/definitely/elsewhere")];
+        assert_eq!(carved_root_cargo_notice(&cwd, &outside), None);
+
+        std::fs::create_dir(cwd.join("target")).unwrap();
+        assert_eq!(carved_root_cargo_notice(&cwd, &env_deny), None, "target/ exists");
+    }
+
+    #[test]
+    fn confine_options_map_every_sandbox_key() {
+        let mut sandbox = aivyx_config::SandboxSettings {
+            require_enforcement: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            confine_options(&sandbox),
+            aivyx_sandbox::ConfineOptions::new().require_enforcement(false)
+        );
+
+        sandbox.require_enforcement = true;
+        sandbox.allow_unix_sockets = true;
+        sandbox.allow_leaving_process_group = true;
+        sandbox.share_system_tmp = true;
+        assert_eq!(
+            confine_options(&sandbox),
+            aivyx_sandbox::ConfineOptions::new()
+                .require_enforcement(true)
+                .allow_unix_sockets(true)
+                .allow_leaving_process_group(true)
+                .share_system_tmp(true)
+        );
+    }
+
+    #[test]
+    fn default_sandbox_settings_are_the_strict_confine_policy_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                confine_options(&aivyx_config::SandboxSettings::default()),
+                aivyx_sandbox::ConfineOptions::new()
+            );
+        }
+    }
 
     fn metas(n: usize) -> Vec<aivyx_core::session::SessionMeta> {
         (0..n)

@@ -523,7 +523,8 @@ smaller, incidental facts via `memory_write` — scoped to this project
 (`project:`) or global (`global:`), recalled only when it explicitly
 calls `memory_read` (never injected automatically). Unlike
 `remember_preference`'s single always-active file, this is many small,
-independently-forgettable notes — see `memory_forget`. Both writing and
+independently-forgettable notes — see `memory_forget`. Each topic keeps
+at most 1000 notes: writing a 1001st silently drops the oldest. Both writing and
 forgetting go through the same review-then-cache flow as any other
 mutating tool, and are unconditionally denied in autonomous mode for the
 same reason `remember_preference` is (see above).
@@ -683,7 +684,11 @@ configure it when called unconfigured, rather than being silently absent),
 `allow_private_targets` (default `false`).
 
 **`generate_svg(prompt)`**: the agent's third network-reaching tool, via
-the standalone `aivyx-vision-svg` crate. It reuses the exact same
+the standalone `aivyx-vision-svg` crate. The sanitizer drops all CSS
+(`<style>` and `style=` attributes — the model is asked for presentation
+attributes like `fill`/`stroke` instead) and every reference that isn't a
+`#fragment` or `data:` URL, and rejects input over 256 KiB or nested more
+than 64 elements deep. It reuses the exact same
 `Arc<dyn LlmBackend>` instance already built for this conversation
 (wrapped in a small adapter, `CoderTextCompleter`) to turn a text prompt
 into sanitized SVG markup, returned as plain text via `ToolOutput::Ok` —
@@ -1817,18 +1822,20 @@ way to *remove* a built-in default through config. This covers:
   is no Landlock, so this reduces to the same gate-only enforcement as reads
   below — see "Platform support". Basename-glob entries (no separator, e.g.
   `.env`, `*.pem`) are enforced too: `LandlockConfiner` resolves them to
-  concrete file paths once at startup by scanning the working directory and
-  any configured `extra_read_paths` (the roots a project's own secrets could
-  plausibly live under), then excludes those resolved paths from *every*
-  grant — including the fixed system paths (`/usr`, `/lib`, etc.) and the OS
-  temp directory, in case the working directory happens to be nested inside
-  one of them. What's *not* scanned is the system paths' own contents for
-  unrelated matches (recursively walking `/usr` for a project-local pattern
-  would be substantial, pointless work) — only files nested under the
-  working directory or `extra_read_paths` are ever discovered. A file
-  created *after* startup, or matching a bare pattern inside a directory
-  that was granted wholesale because nothing matched yet, also isn't
-  retroactively excluded, since Landlock rulesets are static once built.
+  concrete file paths on **every** spawn by scanning the working directory
+  and any configured `extra_read_paths` (the roots a project's own secrets
+  could plausibly live under), then excludes those resolved paths — and any
+  hard-link alias of them under those roots — from *every* grant, including
+  the fixed system paths (`/usr`, `/lib`, etc.), in case the working
+  directory happens to be nested inside one of them. A denied file created
+  after startup is therefore denied to the next command too. What's *not*
+  scanned is the system paths' own contents for unrelated matches
+  (recursively walking `/usr` for a project-local pattern would be
+  substantial, pointless work) — only files nested under the working
+  directory or `extra_read_paths` are ever discovered.
+  `~/.cargo/credentials(.toml)`, `~/.config/git/credentials` and
+  `~/.git-credentials` are always
+  unreadable to commands, even with no `deny_paths` configured.
 
 ### 2. `ConfirmationGate` — human-in-the-loop, tiered trust
 
@@ -1942,15 +1949,23 @@ OS-level confinement applies.
 
 Confinement isn't limited to `run_command`/`run_shell` — it applies to every
 tool that spawns a child process: `git_commit`/`git_push`/`git_branch`/
-`git_pr`/`git_read`'s `git` invocations, `find_references`/`go_to_definition`'s
-`rust-analyzer` spawn, and MCP servers at startup. Each such child process is
-confined via Linux **Landlock** (filesystem scoping) and a **seccomp-bpf**
-syscall denylist, applied in the forked child before `exec`:
+`git_pr`/`git_read`'s `git` invocations (and `gh`), `/test`, `/commit`,
+`repl_start`, `find_references`/`go_to_definition`'s `rust-analyzer` spawn,
+and MCP servers at startup. Each such child process is confined via Linux
+**Landlock** (filesystem scoping) and a **seccomp-bpf** syscall denylist,
+applied in the forked child before `exec`:
 
-- **Write** access: the working directory + the system temp dir(s), minus any
-  `deny_paths` nested inside them (carved out precisely, since Landlock has no
-  "deny" rule — the working directory is granted child-by-child around a denied
-  subpath rather than wholesale).
+- **Write** access: the working directory + a **private temp directory**
+  (exported to commands as `TMPDIR`, one per confiner: the lead agent's
+  lives until aivyx-coder exits normally, each specialist session and each
+  `delegate_to_specialist` call gets its own, deleted when that session or
+  delegation ends — so a specialist's commands see a different `$TMPDIR` than yours), minus any `deny_paths` nested inside them (carved out
+  precisely, since Landlock has no "deny" rule — the working directory is
+  granted child-by-child around a denied subpath rather than wholesale). The
+  shared `/tmp` is **not** writable, so a command can't read or tamper with
+  other programs' temp files; tools that honour `TMPDIR` (`mktemp`, rustc,
+  Python's `tempfile`, ...) just work. `[sandbox] share_system_tmp = true`
+  restores the old shared-`/tmp` grant for tools that hard-code `/tmp`.
 - **Read** access: the working directory + a bounded list of common
   system/toolchain paths (`/usr`, `/lib`, `/bin`, `/etc`, `~/.cargo`,
   `~/.rustup`) + any `sandbox.extra_read_paths` you configure — again minus
@@ -1959,9 +1974,35 @@ syscall denylist, applied in the forked child before `exec`:
 - **Blocked syscalls**: `ptrace`, `process_vm_readv/writev`, `io_uring_*`,
   `mount`/`umount2`, `reboot`, `kexec_*`, module loading, `pivot_root`,
   `swapon/off`, `bpf`, `perf_event_open`, the keyring calls (`keyctl`/`add_key`/
-  `request_key`), `userfaultfd`, `unshare`/`setns`, `personality`, and a few
-  more — confinement-escape and privilege-escalation primitives a coding
-  agent's commands never legitimately need.
+  `request_key`), `userfaultfd`, `unshare`/`setns`, `clone` with any
+  `CLONE_NEW*` flag (so no rootless containers, `bwrap` or Chromium's
+  sandbox), `personality`, and a few more — confinement-escape and
+  privilege-escalation primitives a coding agent's commands never
+  legitimately need.
+- **No local daemons**: `socket(AF_UNIX)` fails with `EPERM`, and
+  `SSH_AUTH_SOCK`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`,
+  `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY` and `DISPLAY` are removed from the
+  command's environment. Landlock doesn't gate `connect()` to an existing
+  Unix socket, so without this a command could ask the D-Bus session bus
+  (`systemd-run --user ...`) to run anything **outside** the sandbox. The
+  cost: ssh-agent (`git push` over ssh with an agent), gpg/ssh commit
+  signing, `docker`, `psql`/`mysql` over their default sockets, git
+  credential-cache/libsecret helpers and `systemctl --user` don't work in
+  confined commands. MCP servers are confined the same way: their stdio
+  transport is a pair of pipes and needs no Unix socket, so a stdio MCP
+  server works unchanged, but one that itself talks to a local daemon
+  (docker, a database socket) needs the opt-out. `[sandbox]
+  allow_unix_sockets = true` lifts the block for every confined command
+  and hands those variables back — at the price of the sandbox no longer
+  containing code execution.
+- **Process groups**: every confined command leads its own process group,
+  `setsid`/`setpgid` fail with `EPERM` (unless `[sandbox]
+  allow_leaving_process_group = true`), and the whole group is killed with
+  `SIGKILL` when the call **finishes**, times out or is cancelled — so a
+  `cargo run &` or a daemonising grandchild never outlives the tool call,
+  and a background job holding the output pipe doesn't stall it either.
+  Commands also can't signal processes outside their own sandbox (Landlock
+  ABI 6+), including aivyx-coder and servers an earlier command started.
 
 `sandbox.require_enforcement` (default **true** on Linux, **false** on every
 other platform — non-Linux builds have no Landlock/seccomp backend compiled
@@ -1978,8 +2019,9 @@ when even partial enforcement isn't available (you'll get a warning logged
 either way).
 
 Process execution also: races each command against a timeout (default 300s)
-and Ctrl+C cancellation, killing the whole **process group** (so backgrounded
-grandchildren don't survive); bounds captured output to the last 50 KiB per
+and Ctrl+C cancellation, killing the whole **process group** on either and
+when the command exits (so backgrounded grandchildren don't survive); bounds
+captured output to the last 50 KiB per
 stream during collection (so a runaway `yes`-style command can't exhaust
 memory); and reports a non-zero exit as normal output, not a tool failure.
 
@@ -2052,6 +2094,18 @@ max_tool_iterations_per_turn = 25
 [sandbox]
 require_enforcement = true
 extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
+# Opt-outs from the default confinement policy, all off by default; see
+# "Landlock + seccomp" under "Security model" before turning one on.
+# allow_unix_sockets = false           # true: commands may reach local daemons
+#                                      # (ssh-agent, gpg-agent, docker, D-Bus)
+#                                      # and get SSH_AUTH_SOCK etc. back. The
+#                                      # sandbox then no longer contains code
+#                                      # execution (systemd-run --user).
+# allow_leaving_process_group = false  # true: setsid/setpgid allowed (nextest,
+#                                      # start_new_session=True); a process
+#                                      # that leaves can outlive the call
+# share_system_tmp = false             # true: shared /tmp writable instead of
+#                                      # a private per-session TMPDIR
 
 [git]
 checkpoints = true   # snapshot the worktree before every mutating tool call
@@ -2179,6 +2233,65 @@ Deliberately not (yet) addressed — documented rather than hidden:
   human reviewing each prompt: it pauses the run outright on a
   high-confidence hit, and denies any further mutating or network tool call
   for the rest of that session until a human clears it.
+- **Sandbox side effects you may hit** (Linux confinement, see "Landlock +
+  seccomp" above):
+  - *No local daemons by default*: ssh-agent, gpg signing, `docker`,
+    socket-based database clients and keyring-backed credential helpers
+    fail inside confined commands unless `[sandbox] allow_unix_sockets =
+    true`.
+  - *Private `TMPDIR`*: commands get their own temp directory, one per
+    confiner (the lead, each specialist session, each delegation), so a
+    file a specialist leaves in `$TMPDIR` isn't in yours, and it is gone
+    once that specialist's session or delegation ends. A tool that writes
+    to a hard-coded `/tmp` path fails (`share_system_tmp = true` to opt
+    out). The lead's is deleted when aivyx-coder exits normally (after a
+    crash it's left in the system temp dir as `aivyx-confine-*`).
+  - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put
+    children in their own process groups (cargo-nextest's per-test process
+    groups, Python's `start_new_session=True`, the `setsid` tool,
+    interactive job control) may fail; `allow_leaving_process_group = true`
+    opts out. `git_commit` and `/commit` run git with
+    `-c maintenance.auto=false`, so git doesn't try to start its detached
+    auto-maintenance (your own git still does it). A `git commit` the model
+    runs through `run_shell` does, and prints `fatal: setsid failed` while
+    the commit itself succeeds.
+  - *REPLs have no controlling terminal*: a confined command already
+    leads its own process group, and POSIX refuses `setsid()` to a group
+    leader, so a REPL started under the confiner can't take the pty as its
+    controlling terminal — whatever `allow_leaving_process_group` says. It
+    gets no `SIGWINCH` on resize, and a Ctrl-C byte in `repl_send` doesn't
+    interrupt it (use `repl_stop`).
+  - *Directories holding a denied entry*: a directory that directly
+    contains a `deny_paths` match (often the project root, for `.env`)
+    gets list-and-create rights only. `rm`/`mv` of entries **directly** in
+    it fail, and a file or directory created directly in it by a command
+    can't be written by that same command (`echo a > new.txt` leaves an
+    empty file) — the next command can, so a retry usually works. Not for
+    `cargo build`, though: cargo creates `target/` by renaming a temp
+    directory, which is never allowed there, so in a Rust project whose root
+    holds a denied file (`.env` is denied by default) confined builds keep
+    failing — and leave an undeletable `targetXXXXXX` directory behind —
+    until `target/` exists. Create it once (`mkdir target`, confined or
+    not) and builds work from then on. Deeper subdirectories are
+    unaffected, and aivyx-coder's own file tools (`write_file`,
+    `delete_file`, `move_file`) aren't confined. aivyx-coder prints a
+    notice at startup when it sees a Rust project in this state.
+  - *Rarer edges* (details in aivyx-confine's README, "Known limits"):
+    when aivyx-coder runs in `$HOME` or an ancestor of it, a symlinked
+    `~/.cargo`/`~/.rustup` is not granted (a command could have planted
+    the link), so toolchains reached through one fail, and an existing
+    `~/.git-credentials` makes `$HOME` itself list-and-create only (no
+    `rm`/`mv` of its direct entries); a working directory
+    inside a denied directory gets no access at all; an
+    `extra_read_paths` entry inside the working directory that is a
+    symlink grants nothing; a denied file nested about a thousand
+    directories deep can exhaust a 1024-descriptor limit and every
+    confined spawn is then refused (`EMFILE`); with basename-pattern
+    `deny_paths` (`.env`, `*.pem`) every spawn rescans the working
+    directory (cached by mtime, but noticeable on huge trees); a
+    `SOCK_DGRAM` `socketpair()` is refused along with Unix sockets; on a
+    kernel whose Landlock ABI is older than 7 the newer restrictions (signal
+    and abstract-socket scoping below ABI 6) simply aren't enforced.
 - **Network is not restricted** by the sandbox. A command you approve can make
   network connections (needed for `cargo build`, `npm install`, `git clone`,
   etc.). Combined with the read scope, an approved command could in principle
@@ -2204,7 +2317,9 @@ Deliberately not (yet) addressed — documented rather than hidden:
   terminal would see); and standard control characters in `repl_send`'s
   `input` (e.g. a literal Ctrl-C byte) are interpreted by the tty driver
   as signals to the process, not passed through as literal data — again,
-  same as at a real terminal.
+  same as at a real terminal (except under the Linux sandbox, where the
+  pty can't be the REPL's controlling terminal; see "Sandbox side
+  effects" above).
 - **`Tool::execute` bypass**: the "all tool calls go through the permission
   gate" property is enforced by convention (the executor is the only caller),
   not by the type system.
