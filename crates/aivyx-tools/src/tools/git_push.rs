@@ -155,9 +155,13 @@ async fn current_branch_confined(ctx: &ToolExecutionContext) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = crate::process::output_in_group(ctx.confiner.confine(command))
-        .await
-        .ok()?;
+    let output = crate::process::output_in_group_bounded(
+        ctx.confiner.confine(command),
+        crate::process::PREFLIGHT_TIMEOUT,
+        &ctx.cancellation,
+    )
+    .await
+    .ok()?;
     output
         .status
         .success()

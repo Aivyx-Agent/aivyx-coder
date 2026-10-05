@@ -167,6 +167,28 @@ pub async fn output_in_group(
     })
 }
 
+/// `output_in_group`, bounded: gives up (killing the group) after
+/// `timeout` with `ErrorKind::TimedOut`, or when `cancellation` fires
+/// with `ErrorKind::Interrupted`. For short confined probes (a tool's
+/// preflight checks) that would otherwise wait on a hung program until
+/// the whole turn is dropped.
+pub async fn output_in_group_bounded(
+    command: tokio::process::Command,
+    timeout: Duration,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> std::io::Result<std::process::Output> {
+    tokio::select! {
+        output = tokio::time::timeout(timeout, output_in_group(command)) => {
+            output.unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+        }
+        _ = cancellation.cancelled() => Err(std::io::ErrorKind::Interrupted.into()),
+    }
+}
+
+/// How long a tool's confined preflight probe (`gh auth status`, `git
+/// rev-parse`, `git branch --show-current`) may take.
+pub(crate) const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The process group a spawned command leads, recorded right after
 /// `spawn()` (`Child::id()` is gone once the child has been reaped).
 /// `kill` sends `SIGKILL` to the whole group, once; dropping a
