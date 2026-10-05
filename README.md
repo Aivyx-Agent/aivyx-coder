@@ -1408,10 +1408,15 @@ summarize = { tier = "small" }
   `locality = "cloud"` forces cloud.
 - The `[backend]` model is judged by the same rule, from the address chat
   connects to (`broker_base_url` for `kind = "llama_server_broker"`, else
-  `base_url`; the embedded `mistral_rs` backend is always local). A
-  `[backend]` that counts as cloud still serves every untagged call as
-  before, but routing never picks its model, and startup logs a warning;
-  set `locality = "local"` in `[backend]` if it is on your own network.
+  `base_url`; the embedded `mistral_rs` backend is always local). With
+  routing on, a `[backend]` that counts as cloud is not used for routed
+  calls — the main loop, `/architect` without an `[architect]` model and
+  `/commit` drafts are all routed — so unless another local model is a
+  candidate, every turn fails with a routing error. Only calls that carry
+  no routing hint still go to it. Startup says so in the transcript. If
+  the server is on your own network, set `locality = "local"` in
+  `[backend]`; otherwise add a capable local model to
+  `[[routing.models]]`.
 - Endpoints are configured as discovery sees them
   (`http://localhost:11434`); chat requests go to their
   OpenAI-compatible `/v1` path.

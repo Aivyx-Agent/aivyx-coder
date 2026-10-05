@@ -32,6 +32,56 @@ pub(crate) fn default_endpoint(backend: &BackendSettings) -> DefaultEndpoint {
     }
 }
 
+/// Why routing counts `[backend]` as cloud, and the fix, or `None` when it
+/// is local.
+fn cloud_backend_remedy(backend: &BackendSettings) -> Option<String> {
+    let default = default_endpoint(backend);
+    if default.effective_locality() == Locality::Local {
+        return None;
+    }
+    Some(match (default.locality, default.base_url.as_deref()) {
+        (Some(Locality::Cloud), _) => "[backend] is marked `locality = \"cloud\"`, so routing \
+             never picks its model — remove that, or add a capable local model to \
+             [[routing.models]] (see /models)"
+            .to_string(),
+        (_, None) => "[backend] has no address routing can check (llama_server_broker needs \
+             broker_base_url), so routing counts its model as cloud and never picks it — set \
+             broker_base_url, or add a capable local model to [[routing.models]] (see /models)"
+            .to_string(),
+        (_, Some(url)) => format!(
+            "the [backend] server `{}` is not a local address, so routing counts its model as \
+             cloud and never picks it — if it is on your own network, set `locality = \
+             \"local\"` in [backend]; otherwise add a capable local model to \
+             [[routing.models]] (see /models)",
+            host_of(url)
+        ),
+    })
+}
+
+/// A startup notice for the transcript when routing is on and counts
+/// `[backend]` as cloud: routed calls, the main loop's included, then
+/// never use it.
+pub(crate) fn cloud_backend_notice(settings: &Settings) -> Option<String> {
+    if !settings.routing.enabled {
+        return None;
+    }
+    cloud_backend_remedy(&settings.backend).map(|remedy| {
+        format!(
+            "Model routing will not use your [backend] model: routed calls, the main loop \
+             included, fail unless another local model is a candidate. {remedy}."
+        )
+    })
+}
+
+/// A URL's host for messages, never its userinfo (which may hold a
+/// credential) or path.
+fn host_of(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "an unparseable base_url".to_string())
+}
+
 /// aivyx-coder never routes to a cloud endpoint — by kind, by address, or
 /// marked `locality = "cloud"` (`EndpointConfig::effective_locality`) —
 /// and `backend` names `[backend]`.
@@ -385,16 +435,18 @@ pub(crate) async fn wrap_with_routing(
     if let Some(warning) = backend_caps_undeclared_warning(&profiles, &default_key) {
         tracing::warn!("{warning}");
     }
-    let router = Arc::new(
-        RoutedBackend::new(
-            default_key,
-            llm,
-            profiles,
-            config.tasks.clone(),
-            backend_factory(settings, &config),
-        )
-        .with_refresher(refresher),
-    );
+    let mut router = RoutedBackend::new(
+        default_key,
+        llm,
+        profiles,
+        config.tasks.clone(),
+        backend_factory(settings, &config),
+    )
+    .with_refresher(refresher);
+    if let Some(remedy) = cloud_backend_remedy(&settings.backend) {
+        router = router.with_no_route_hint(remedy);
+    }
+    let router = Arc::new(router);
     tracing::info!(
         candidates = router.profiles().len(),
         "model routing enabled"
@@ -976,6 +1028,63 @@ mod tests {
             None,
         ));
         assert!(wrap_with_routing(&s, llm).await.is_err());
+    }
+
+    /// A `[backend]` routing counts as cloud, with no other local
+    /// candidate, leaves every routed call (the main loop's included) with
+    /// nothing to pick; the error must name the real fix, not just
+    /// `[[routing.models]]`.
+    #[tokio::test]
+    async fn a_cloud_backend_with_no_other_candidate_names_backend_locality_in_the_error() {
+        let mut s = settings_with("[routing]\nenabled = true\ndiscover = false\n");
+        s.backend.base_url = "http://gpu.example.com/v1".into();
+        let llm: Arc<dyn LlmBackend> = Arc::new(aivyx_llm::OpenAiCompatBackend::new(
+            s.backend.base_url.clone(),
+            s.backend.model.clone(),
+            None,
+        ));
+        let (wrapped, _) = wrap_with_routing(&s, llm).await.unwrap();
+        let mut request = aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
+            aivyx_types::Role::User,
+            "hi",
+        )]);
+        request.route = Some(aivyx_llm::RouteHint {
+            task: aivyx_route::TaskKind::CodeEdit,
+            session: Some("s".into()),
+            estimated_prompt_tokens: 0,
+        });
+        let err = match wrapped.stream_chat(request).await {
+            Ok(_) => panic!("nothing local to route to"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("locality = \"local\"` in [backend]"),
+            "{err}"
+        );
+    }
+
+    /// The transcript notice fires only with routing on and a cloud
+    /// `[backend]`, and names both the consequence and the fix.
+    #[test]
+    fn the_startup_notice_names_backend_locality_for_a_cloud_backend() {
+        let mut s = settings_with("[routing]\nenabled = true\n");
+        assert_eq!(cloud_backend_notice(&s), None, "local backend");
+
+        s.backend.base_url = "http://box.tail1234.ts.net:11434/v1".into();
+        let notice = cloud_backend_notice(&s).expect("cloud backend");
+        assert!(notice.contains("main loop"), "{notice}");
+        assert!(notice.contains("box.tail1234.ts.net"), "{notice}");
+        assert!(
+            notice.contains("`locality = \"local\"` in [backend]"),
+            "{notice}"
+        );
+
+        s.backend.locality = Some(Locality::Local);
+        assert_eq!(cloud_backend_notice(&s), None, "marked local");
+
+        s.backend.locality = None;
+        s.routing.enabled = false;
+        assert_eq!(cloud_backend_notice(&s), None, "routing off");
     }
 
     #[test]

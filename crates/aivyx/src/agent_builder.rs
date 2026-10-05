@@ -1222,6 +1222,13 @@ pub(crate) async fn build_agent(
         }
     }
 
+    // A `[backend]` routing counts as cloud leaves routed calls (the main
+    // loop's included) with nothing to pick unless another local model is
+    // a candidate; aivyx.log alone is not where a user looks for that.
+    if let Some(notice) = crate::routing::cloud_backend_notice(settings) {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
+    }
+
     // KV-cache persistence/sharing (aivyx-kvcache): only ever attempted
     // against a real llama-server backend, whose `/props` response both
     // `probe_served_context` above and `parse_llama_slots_info` here parse
