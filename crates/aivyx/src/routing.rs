@@ -109,7 +109,7 @@ pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()>
                      only talks to local models — remove it"
                 );
             }
-            let address = endpoint.base_url().unwrap_or("no base_url");
+            let address = endpoint.base_url().map_or("no base_url".to_string(), host_of);
             anyhow::bail!(
                 "[routing.endpoints.{name}] ({address}) is not a local address, so it counts as \
                  cloud, and aivyx-coder only talks to local models — if it is on your own \
@@ -533,6 +533,22 @@ mod tests {
         );
         let err = check_routing_config(&s.routing).unwrap_err().to_string();
         assert!(err.contains("marked `locality = \"cloud\"`"), "{err}");
+    }
+
+    /// The rejection names the host only: a base_url's userinfo may hold
+    /// a credential.
+    #[test]
+    fn the_rejection_never_echoes_base_url_credentials() {
+        let s = settings_with(
+            "[routing.endpoints.hosted]\nkind = \"openai_compat\"\n\
+             base_url = \"https://user:s3cret@api.example.com/v1?key=abc\"\n",
+        );
+        let err = check_routing_config(&s.routing).unwrap_err().to_string();
+        assert!(err.contains("api.example.com"), "{err}");
+        assert!(
+            !err.contains("s3cret") && !err.contains("user") && !err.contains("key=abc"),
+            "{err}"
+        );
     }
 
     #[test]
