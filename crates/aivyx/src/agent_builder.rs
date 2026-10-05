@@ -730,7 +730,10 @@ pub(crate) async fn build_agent(
         Arc::new(loader)
     });
     if let Some(loader) = &skill_loader {
-        registry.register(Arc::new(LoadSkillTool::new(Arc::clone(loader))));
+        registry.register(Arc::new(LoadSkillTool::new(
+            Arc::clone(loader),
+            injection_taint.clone(),
+        )));
     }
 
     registry.register(Arc::new(GitReadTool::new(deny_paths.clone())));
