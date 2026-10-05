@@ -2239,8 +2239,11 @@ Deliberately not (yet) addressed — documented rather than hidden:
     children in their own process groups (cargo-nextest's per-test process
     groups, Python's `start_new_session=True`, the `setsid` tool,
     interactive job control) may fail; `allow_leaving_process_group = true`
-    opts out. Git's background auto-maintenance after a commit prints
-    `fatal: setsid failed` and skips that run; the commit itself succeeds.
+    opts out. `git_commit` and `/commit` run git with
+    `-c maintenance.auto=false`, so git doesn't try to start its detached
+    auto-maintenance (your own git still does it). A `git commit` the model
+    runs through `run_shell` does, and prints `fatal: setsid failed` while
+    the commit itself succeeds.
     A REPL started under the confiner can't take the pty as its
     controlling terminal, so it gets no `SIGWINCH` on resize and a Ctrl-C
     byte in `repl_send` doesn't interrupt it (use `repl_stop`).
