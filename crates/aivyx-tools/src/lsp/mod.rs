@@ -15,6 +15,10 @@ use transport::Connection;
 struct Started {
     connection: Arc<Connection>,
     child: Option<tokio::process::Child>,
+    /// The server's process group, killed when this session is replaced
+    /// (respawn) or dropped, so helpers the server started go with it.
+    /// `None` for a test-wired session with no process behind it.
+    _group: Option<crate::process::ProcessGroup>,
     opened_uris: HashSet<String>,
     next_doc_version: i32,
 }
@@ -67,6 +71,7 @@ impl LspClient {
         *self.state.lock().await = Some(Started {
             connection: Arc::new(Connection::new(reader, writer)),
             child: None,
+            _group: None,
             opened_uris: HashSet::new(),
             next_doc_version: 1,
         });
@@ -101,7 +106,8 @@ impl LspClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
 
         let mut child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(if err.kind() == std::io::ErrorKind::NotFound {
@@ -119,6 +125,7 @@ impl LspClient {
                 )
             })
         })?;
+        let group = crate::process::ProcessGroup::of(&child);
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let connection = Connection::new(stdout, stdin);
@@ -149,6 +156,7 @@ impl LspClient {
         *guard = Some(Started {
             connection: Arc::new(connection),
             child: Some(child),
+            _group: Some(group),
             opened_uris: HashSet::new(),
             next_doc_version: 1,
         });

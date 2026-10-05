@@ -189,8 +189,11 @@ async fn check_upstream_configured(ctx: &ToolExecutionContext) -> Result<(), Str
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = ctx.confiner.confine(command).status().await;
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = crate::process::output_in_group(ctx.confiner.confine(command))
+        .await
+        .map(|output| output.status);
     match status {
         Ok(status) if status.success() => Ok(()),
         _ => Err(
@@ -214,8 +217,11 @@ async fn check_gh_authenticated(gh_program: &str, ctx: &ToolExecutionContext) ->
         .current_dir(&ctx.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let status = ctx.confiner.confine(command).status().await;
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = crate::process::output_in_group(ctx.confiner.confine(command))
+        .await
+        .map(|output| output.status);
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(_) => Err(

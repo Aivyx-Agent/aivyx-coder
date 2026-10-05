@@ -151,8 +151,13 @@ async fn current_branch_confined(ctx: &ToolExecutionContext) -> Option<String> {
     command
         .args(["branch", "--show-current"])
         .current_dir(&ctx.cwd)
-        .stdin(Stdio::null());
-    let output = ctx.confiner.confine(command).output().await.ok()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = crate::process::output_in_group(ctx.confiner.confine(command))
+        .await
+        .ok()?;
     output
         .status
         .success()

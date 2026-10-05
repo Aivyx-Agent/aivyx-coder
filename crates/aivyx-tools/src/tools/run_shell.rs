@@ -129,6 +129,43 @@ mod tests {
         assert!(text.contains("ABC"));
     }
 
+    /// Confined commands get a private, writable `TMPDIR`; the shared
+    /// `/tmp` is not writable (`[sandbox] share_system_tmp` is off).
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn confined_commands_write_temp_files_under_a_private_tmpdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let ctx = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: aivyx_sandbox::build_confiner(
+                &cwd,
+                &[],
+                &[],
+                aivyx_sandbox::ConfineOptions::new(),
+            ),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let script = "f=$(mktemp) && echo ok > \"$f\" && cat \"$f\" && echo \"tmpdir=$TMPDIR\"; \
+                      if echo x > /tmp/aivyx-coder-shared-tmp-probe 2>/dev/null; \
+                      then echo shared-writable; else echo shared-denied; fi";
+        let ToolOutput::Ok(text) = RunShellTool
+            .execute(json!({ "command": script }), &ctx)
+            .await
+            .unwrap()
+        else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("exit status: 0 (success)"), "{text}");
+        assert!(text.contains("\nok\n"), "{text}");
+        assert!(text.contains("shared-denied"), "{text}");
+        let tmpdir = text
+            .lines()
+            .find_map(|l| l.strip_prefix("tmpdir="))
+            .expect("TMPDIR printed");
+        assert!(tmpdir.contains("aivyx-confine-"), "{tmpdir}");
+    }
+
     #[tokio::test]
     async fn permission_request_targets_sh_dash_c() {
         let request = RunShellTool

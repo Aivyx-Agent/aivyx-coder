@@ -205,8 +205,8 @@ impl Agent {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut command = self.executor.confiner().confine(command);
-        // Own process group, so a timeout or Ctrl+C kills everything the
-        // test run started (see `aivyx_tools::kill_process_group`).
+        // Own process group, so everything the test run started can be
+        // killed with it (see `aivyx_tools::ProcessGroup`).
         command.process_group(0);
 
         let started = Instant::now();
@@ -220,6 +220,9 @@ impl Agent {
                 return;
             }
         };
+        // Killed when the test command exits, times out or is cancelled —
+        // or, through `Drop`, if this future is dropped mid-run.
+        let mut group = aivyx_tools::ProcessGroup::of(&child);
         let mut stdout = CappedLines::new(BufReader::new(child.stdout.take().expect("piped")), MAX_LINE_BYTES);
         let mut stderr = CappedLines::new(BufReader::new(child.stderr.take().expect("piped")), MAX_LINE_BYTES);
         let (mut out_open, mut err_open) = (true, true);
@@ -228,9 +231,11 @@ impl Agent {
         tokio::pin!(deadline);
 
         // Phase 1: stream lines until both pipes close (or time/cancel
-        // runs out). No branch future borrows `child`, so the handlers can
-        // kill it.
+        // runs out). When the test command itself exits, the rest of its
+        // group is killed at once: a background job it left behind would
+        // otherwise hold the pipes open until the deadline.
         let mut stopped: Option<Outcome> = None;
+        let mut exited: Option<std::io::Result<std::process::ExitStatus>> = None;
         while out_open || err_open {
             let line = tokio::select! {
                 line = stdout.next_line(), if out_open => match line {
@@ -241,13 +246,18 @@ impl Agent {
                     Some(line) => Some(line),
                     None => { err_open = false; None }
                 },
+                status = child.wait(), if exited.is_none() => {
+                    exited = Some(status);
+                    group.kill();
+                    None
+                }
                 _ = &mut deadline => {
-                    aivyx_tools::kill_process_group(&child);
+                    group.kill();
                     stopped = Some(Outcome::TimedOut);
                     break;
                 }
                 _ = cancellation.cancelled() => {
-                    aivyx_tools::kill_process_group(&child);
+                    group.kill();
                     stopped = Some(Outcome::Cancelled);
                     break;
                 }
@@ -263,22 +273,24 @@ impl Agent {
         }
         // Phase 2: reap. A child that closed its pipes but keeps running
         // is still bounded by the same deadline and Ctrl+C.
-        let outcome = match stopped {
-            Some(outcome) => {
+        let outcome = match (stopped, exited) {
+            (Some(outcome), _) => {
                 let _ = child.wait().await;
                 outcome
             }
-            None => {
+            (None, Some(Ok(status))) => Outcome::Exited(status),
+            (None, Some(Err(err))) => Outcome::WaitFailed(err.to_string()),
+            (None, None) => {
                 let waited = tokio::select! {
                     status = child.wait() => Some(status),
                     _ = &mut deadline => None,
                     _ = cancellation.cancelled() => None,
                 };
+                group.kill();
                 match waited {
                     Some(Ok(status)) => Outcome::Exited(status),
                     Some(Err(err)) => Outcome::WaitFailed(err.to_string()),
                     None => {
-                        aivyx_tools::kill_process_group(&child);
                         let _ = child.wait().await;
                         if cancellation.is_cancelled() { Outcome::Cancelled } else { Outcome::TimedOut }
                     }

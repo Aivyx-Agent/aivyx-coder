@@ -67,6 +67,16 @@ impl aivyx_sandbox::ResizeTarget for ReplResizeTarget {
 /// scoped, and does not survive `--resume`.
 pub struct ReplSession {
     child: tokio::process::Child,
+    /// The child's process group, recorded at spawn. Dropping the session
+    /// (however that happens, including `aivyx-coder`'s own shutdown, when
+    /// the `Arc`-shared state holding it is torn down along with the rest
+    /// of `Agent`) kills the whole group, not just the direct child the
+    /// way `Command::kill_on_drop(true)` would, so a backgrounded
+    /// grandchild (`npm run dev` spawning its own watcher) can't survive
+    /// as an orphan. `Drop` can only kill, not reap (`.wait()` is async);
+    /// every path that removes a session on purpose (`idle_watcher`,
+    /// `repl_stop`, `repl_send`'s exit detection) reaps explicitly.
+    group: crate::process::ProcessGroup,
     /// The pty master — used for both writing input (`repl_send`) and
     /// resizing (`resize`, Task 3). A `tokio::fs::File` wrapping a raw fd
     /// gives async read/write via tokio's blocking-pool dispatch (fine
@@ -94,26 +104,6 @@ pub struct ReplSession {
     /// checkpoint (see that tool's doc comment) — `false` from the moment
     /// `repl_start` creates the session until its first `repl_send`.
     checkpointed: bool,
-}
-
-/// Process-exit safety net: kills the process group whenever a
-/// `ReplSession` value is dropped, however that happens — including
-/// `aivyx-coder`'s own shutdown (Ctrl+C-to-quit or a normal quit), when
-/// the `Arc`-shared state holding it is torn down along with the rest of
-/// `Agent`. Deliberately NOT `Command::kill_on_drop(true)` (used by
-/// `mcp/mod.rs` for its own child processes) — that only kills the direct
-/// child PID, not the whole process group, so a backgrounded grandchild
-/// (`npm run dev` spawning its own child watcher) would survive as an
-/// orphan. `Drop::drop` is synchronous, so this can only kill, not reap
-/// (`.wait()` is async) — that's fine: every code path that removes a
-/// session from the shared slot on purpose (`idle_watcher`, `repl_stop`,
-/// `repl_send`'s exit detection) already reaps explicitly; this impl
-/// firing again afterward on the same, already-dead process group is a
-/// harmless no-op (`kill` on an already-gone pid just returns `ESRCH`).
-impl Drop for ReplSession {
-    fn drop(&mut self) {
-        crate::process::kill_process_group(&self.child);
-    }
 }
 
 impl ReplSession {
@@ -259,7 +249,7 @@ async fn idle_watcher(state: SharedReplSession, idle_timeout: Duration) {
         }
         let mut session = guard.take().expect("checked Some above");
         drop(guard);
-        crate::process::kill_process_group(&session.child);
+        session.group.kill();
         let _ = session.child.wait().await;
         return;
     }
@@ -409,13 +399,22 @@ impl Tool for ReplStartTool {
         // was removed rather than kept alongside: calling both would make
         // `setsid()` fail (POSIX: it errors if the caller is already a
         // process-group leader, which `.process_group(0)` would have just
-        // made it). `kill_process_group`'s `-(pid)` target still works
-        // unchanged, since `setsid()`'s new group's pgid equals the
-        // child's own pid, same as `.process_group(0)` provided before.
+        // made it). `ProcessGroup`'s pgid still works unchanged, since
+        // `setsid()`'s new group's pgid equals the child's own pid, same
+        // as `.process_group(0)` provided before.
+        //
+        // Under `LandlockConfiner`, though, the child already leads its
+        // own process group (`confine()` sets `process_group(0)`) and
+        // seccomp refuses `setsid()` unless `[sandbox]
+        // allow_leaving_process_group` is set — so `setsid()` failing is
+        // tolerated: the REPL then runs on the pty without it being its
+        // controlling terminal (no `SIGWINCH` on resize, and an
+        // interactive shell prints "no job control"), still in its own,
+        // killable process group.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() < 0 {
-                    return Err(io::Error::last_os_error());
+                    return Ok(());
                 }
                 if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
@@ -451,6 +450,7 @@ impl Tool for ReplStartTool {
         // watcher's very first wake-up see `None` and exit immediately,
         // permanently orphaning idle-timeout protection for this session.
         *guard = Some(ReplSession {
+            group: crate::process::ProcessGroup::of(&child),
             child,
             pty_master,
             output: Arc::clone(&output),
@@ -701,7 +701,7 @@ impl Tool for ReplStopTool {
             )));
         }
 
-        crate::process::kill_process_group(&session.child);
+        session.group.kill();
         let _ = session.child.wait().await;
         let final_output = drain_output(&session.output);
         Ok(ToolOutput::Ok(format!("process stopped\n{final_output}")))
@@ -761,6 +761,43 @@ mod tests {
             panic!("expected Ok output");
         };
         assert!(text.contains("sh"));
+    }
+
+    /// `LandlockConfiner` makes every confined command lead its own
+    /// process group and blocks `setsid()`, so the REPL's own
+    /// `setsid()`+`TIOCSCTTY` pre-exec hook can't be a hard requirement.
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn repl_starts_and_talks_under_the_real_confiner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let ctx = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: Arc::new(aivyx_sandbox::LandlockConfiner::new(&cwd, &[], &[], true)),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let (quiet_window, max_wait, idle_timeout) = short_timing();
+        let session = new_shared_repl_session();
+        let start = ReplStartTool::new(Arc::clone(&session), quiet_window, max_wait, idle_timeout);
+        let (program, args) = fake_repl_args();
+
+        let started = start
+            .execute(serde_json::json!({ "program": program, "args": args }), &ctx)
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Ok(_) = started else {
+            panic!("repl_start failed under the real confiner: {started:?}");
+        };
+
+        let send = ReplSendTool::new(Arc::clone(&session), quiet_window, max_wait, None);
+        let reply = send
+            .execute(serde_json::json!({ "input": "hello" }), &ctx)
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = reply else {
+            panic!("expected Ok output, got {reply:?}");
+        };
+        assert!(text.contains("echo: hello"), "{text}");
     }
 
     #[tokio::test]
@@ -919,6 +956,7 @@ mod tests {
         let pty_master = tokio::fs::File::from_std(std::fs::File::from(master));
 
         let session = ReplSession {
+            group: crate::process::ProcessGroup::of(&child),
             child,
             pty_master,
             output: Arc::new(std::sync::Mutex::new(VecDeque::new())),

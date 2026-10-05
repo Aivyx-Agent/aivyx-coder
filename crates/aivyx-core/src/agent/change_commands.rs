@@ -619,9 +619,11 @@ impl Agent {
         let mut command = aivyx_tools::confined_git(&args, &root, confiner.as_ref());
         command.kill_on_drop(true);
         // Bounded and cancellable like the git_commit tool: a hook that hangs
-        // must not wedge the session (dropping the future kills git).
+        // must not wedge the session. Dropping the future kills git's whole
+        // process group, and so does git exiting, so nothing a hook left
+        // running outlives the commit.
         let output = tokio::select! {
-            output = tokio::time::timeout(COMMIT_TIMEOUT, command.output()) => match output {
+            output = tokio::time::timeout(COMMIT_TIMEOUT, aivyx_tools::output_in_group(command)) => match output {
                 Ok(output) => output,
                 Err(_) => {
                     self.abandon_commit(

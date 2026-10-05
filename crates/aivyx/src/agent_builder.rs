@@ -21,7 +21,7 @@ use aivyx_core::{
 };
 use aivyx_llm::{LlmBackend, OpenAiCompatBackend};
 use aivyx_sandbox::{
-    AutonomousMode, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
+    AutonomousMode, ConfineOptions, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
 };
 use aivyx_tools::{
     CoderTextCompleter, CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool,
@@ -54,6 +54,18 @@ pub(crate) const DETECTED_TESTS_ENTRY: &str = "detected-tests";
 pub(crate) struct AutoVerification {
     pub command_name: String,
     pub synthetic_entry: Option<aivyx_config::AllowedCommand>,
+}
+
+/// The `[sandbox]` section as `aivyx-confine`'s policy: every confiner
+/// this binary builds (the lead's, and each specialist's) uses it.
+/// `require_enforcement` keeps its existing meaning; the three opt-outs
+/// are off unless the user's config turns them on.
+pub(crate) fn confine_options(sandbox: &aivyx_config::SandboxSettings) -> ConfineOptions {
+    ConfineOptions::new()
+        .require_enforcement(sandbox.require_enforcement)
+        .allow_unix_sockets(sandbox.allow_unix_sockets)
+        .allow_leaving_process_group(sandbox.allow_leaving_process_group)
+        .share_system_tmp(sandbox.share_system_tmp)
 }
 
 /// `--auto`'s test-command resolution: a configured name must resolve to
@@ -600,11 +612,12 @@ pub(crate) async fn build_agent(
         )
         .with_injection_taint(injection_taint.clone()),
     );
-    let confiner = aivyx_sandbox::default_confiner(
+    let confine_options = confine_options(&settings.sandbox);
+    let confiner = aivyx_sandbox::build_confiner(
         &cwd,
         &settings.sandbox.resolved_extra_read_paths(),
         &deny_paths,
-        settings.sandbox.require_enforcement,
+        confine_options.clone(),
     );
 
     // On a build compiled without `sandbox-backend` (see the warning just
@@ -622,7 +635,7 @@ pub(crate) async fn build_agent(
             editor_approval_enabled: settings.editor_approval.enabled,
             injection_taint: injection_taint.clone(),
             extra_read_paths: settings.sandbox.resolved_extra_read_paths(),
-            require_enforcement: settings.sandbox.require_enforcement,
+            confine_options,
         };
     // This build has no `sandbox-backend` compiled in (e.g. a macOS
     // binary, where landlock/seccompiler don't exist), so `default_confiner`
@@ -1624,6 +1637,41 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confine_options_map_every_sandbox_key() {
+        let mut sandbox = aivyx_config::SandboxSettings {
+            require_enforcement: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            confine_options(&sandbox),
+            aivyx_sandbox::ConfineOptions::new().require_enforcement(false)
+        );
+
+        sandbox.require_enforcement = true;
+        sandbox.allow_unix_sockets = true;
+        sandbox.allow_leaving_process_group = true;
+        sandbox.share_system_tmp = true;
+        assert_eq!(
+            confine_options(&sandbox),
+            aivyx_sandbox::ConfineOptions::new()
+                .require_enforcement(true)
+                .allow_unix_sockets(true)
+                .allow_leaving_process_group(true)
+                .share_system_tmp(true)
+        );
+    }
+
+    #[test]
+    fn default_sandbox_settings_are_the_strict_confine_policy_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                confine_options(&aivyx_config::SandboxSettings::default()),
+                aivyx_sandbox::ConfineOptions::new()
+            );
+        }
+    }
 
     fn metas(n: usize) -> Vec<aivyx_core::session::SessionMeta> {
         (0..n)

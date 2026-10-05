@@ -15,6 +15,10 @@ pub use protocol::ToolInfo;
 struct Started {
     connection: Arc<McpConnection>,
     child: Option<tokio::process::Child>,
+    /// The server's process group, killed when this session is replaced
+    /// (respawn) or dropped, so helpers the server started go with it.
+    /// `None` for a test-wired session with no process behind it.
+    _group: Option<crate::process::ProcessGroup>,
 }
 
 /// Owns one configured MCP server's spawned child process (or, in tests, an
@@ -53,6 +57,7 @@ impl McpClient {
         *self.state.lock().await = Some(Started {
             connection: Arc::new(McpConnection::new(reader, writer)),
             child: None,
+            _group: None,
         });
     }
 
@@ -92,7 +97,8 @@ impl McpClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
 
         let mut child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(format!(
@@ -100,6 +106,7 @@ impl McpClient {
                 self.server_name, self.program
             ))
         })?;
+        let group = crate::process::ProcessGroup::of(&child);
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let connection = McpConnection::new(stdout, stdin);
@@ -109,6 +116,7 @@ impl McpClient {
         *guard = Some(Started {
             connection: Arc::new(connection),
             child: Some(child),
+            _group: Some(group),
         });
         Ok(())
     }
@@ -320,6 +328,77 @@ mod tests {
         );
         client.wire_for_test(client_reader, client_writer).await;
         client
+    }
+
+    /// A real stdio MCP server (python3): answers `initialize`, records in
+    /// `unix.txt` whether it could create an `AF_UNIX` socket, and starts
+    /// a helper that would write `late.txt` a second later.
+    #[cfg(feature = "sandbox-backend")]
+    fn python_mcp_server(name: &str) -> McpClient {
+        let script = r#"
+import json, socket, subprocess, sys
+try:
+    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    result = "allowed"
+except OSError:
+    result = "blocked"
+open("unix.txt", "w").write(result)
+subprocess.Popen(["sh", "-c", "sleep 1; echo late > late.txt"])
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" in msg:
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "serverInfo": {"name": "t", "version": "0"}}}), flush=True)
+"#;
+        McpClient::new(
+            name.to_string(),
+            "python3".to_string(),
+            vec!["-c".to_string(), script.to_string()],
+            vec![],
+        )
+    }
+
+    /// Confined MCP servers get the same policy as every other confined
+    /// command — no `AF_UNIX` sockets unless `[sandbox] allow_unix_sockets`
+    /// is set — since their stdio transport is a pair of pipes and needs
+    /// none; dropping the client kills the server's whole process group.
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn a_confined_stdio_mcp_server_works_without_unix_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner: Arc<dyn ExecutionConfiner> =
+            Arc::new(aivyx_sandbox::LandlockConfiner::new(&cwd, &[], &[], true));
+        let client = python_mcp_server("py");
+
+        client.ensure_started(&cwd, &confiner).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join("unix.txt")).unwrap(), "blocked");
+
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !cwd.join("late.txt").exists(),
+            "the MCP server's helper outlived the client"
+        );
+    }
+
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn allow_unix_sockets_reaches_confined_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner: Arc<dyn ExecutionConfiner> =
+            Arc::new(aivyx_sandbox::LandlockConfiner::with_options(
+                &cwd,
+                &[],
+                &[],
+                aivyx_sandbox::ConfineOptions::new().allow_unix_sockets(true),
+            ));
+        let client = python_mcp_server("py");
+
+        client.ensure_started(&cwd, &confiner).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join("unix.txt")).unwrap(), "allowed");
     }
 
     #[tokio::test]

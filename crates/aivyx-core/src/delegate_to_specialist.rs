@@ -577,7 +577,7 @@ mod delegation_tests {
                 editor_approval_enabled: false,
                 injection_taint: InjectionTaint::new(),
                 extra_read_paths: vec![],
-                require_enforcement: false,
+                confine_options: aivyx_sandbox::ConfineOptions::new().require_enforcement(false),
             },
             checkpointer: None,
             repo_map: None,

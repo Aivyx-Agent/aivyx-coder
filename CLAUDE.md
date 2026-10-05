@@ -151,7 +151,9 @@ hypothetical, since the shipped `aarch64-apple-darwin` release binary
 `NoopConfiner` (no OS-level confinement, gate-only) — see README.md's
 "Platform support" section.
 
-- **Landlock** (ABI V7): write grants are `cwd` + the system temp dir(s);
+- **Landlock** (ABI V7): write grants are `cwd` + a private per-confiner
+  temp dir exported as `TMPDIR` (the shared `/tmp` only with `[sandbox]
+  share_system_tmp`);
   read grants are `cwd` + a fixed system/toolchain list (`/usr`, `/lib`,
   `/lib64`, `/bin`, `/sbin`, `/etc`, plus `$HOME`-relative `.cargo`,
   `.rustup`, `.gitconfig`, `.config/git` — git needs a readable global
@@ -165,8 +167,19 @@ hypothetical, since the shipped `aarch64-apple-darwin` release binary
   `umount2`, `reboot`, `kexec_load`/`file_load`, `init_module`,
   `finit_module`, `delete_module`, `pivot_root`, `swapon`/`off`, `acct`,
   `bpf`, `perf_event_open`, `keyctl`/`add_key`/`request_key`,
-  `userfaultfd`, `unshare`, `setns`, `personality` — deliberate
-  defense-in-depth compensating for not using Linux namespaces.
+  `userfaultfd`, `unshare`, `setns`, `clone(CLONE_NEW*)`, `personality` —
+  deliberate defense-in-depth compensating for not using Linux namespaces.
+  Also `socket(AF_UNIX)` (plus the session IPC env vars scrubbed) unless
+  `[sandbox] allow_unix_sockets`, and `setsid`/`setpgid` unless
+  `[sandbox] allow_leaving_process_group`. `aivyx_sandbox::build_confiner`
+  is the one constructor (it maps `ConfineOptions` and, with the socket
+  opt-out, hands the IPC vars back); `agent_builder::confine_options` maps
+  `[sandbox]` onto it.
+- **Process groups**: every confined spawn leads its own group and must
+  own an `aivyx_tools::ProcessGroup` (recorded right after `spawn()`,
+  kills the group on finish/timeout/cancel/drop). Use
+  `aivyx_tools::run` or `aivyx_tools::output_in_group` rather than a bare
+  `.output()`/`.status()` on a confined command.
 - **`sandbox.require_enforcement`** is checked at *two* points, both
   fail-closed when `true` / fail-open (log + run unconfined) when `false`:
   the parent failing to build the Landlock ruleset at all, and the forked

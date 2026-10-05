@@ -33,7 +33,9 @@ pub struct SpecialistEnforcementIngredients {
     pub editor_approval_enabled: bool,
     pub injection_taint: InjectionTaint,
     pub extra_read_paths: Vec<PathBuf>,
-    pub require_enforcement: bool,
+    /// The lead's `[sandbox]` policy, applied to every specialist's
+    /// confiner unchanged.
+    pub confine_options: aivyx_sandbox::ConfineOptions,
 }
 
 /// Builds a fresh `ConfirmationGate` + `ExecutionConfiner` pair scoped to
@@ -69,11 +71,11 @@ pub fn scoped_gate_and_confiner(
         )
         .with_injection_taint(ingredients.injection_taint.clone()),
     );
-    let confiner = aivyx_sandbox::default_confiner(
+    let confiner = aivyx_sandbox::build_confiner(
         cwd,
         &ingredients.extra_read_paths,
         &deny_paths,
-        ingredients.require_enforcement,
+        ingredients.confine_options.clone(),
     );
     (gate, confiner)
 }
@@ -170,7 +172,7 @@ mod tests {
             editor_approval_enabled: false,
             injection_taint: InjectionTaint::new(),
             extra_read_paths: vec![],
-            require_enforcement: false,
+            confine_options: aivyx_sandbox::ConfineOptions::new().require_enforcement(false),
         }
     }
 
