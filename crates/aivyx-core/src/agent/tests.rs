@@ -7244,6 +7244,7 @@ async fn diff_shows_tracked_edits_and_untracked_files() {
     std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
     std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let diffs = shown_diffs(&mut rx);
     assert_eq!(diffs.len(), 1, "{diffs:?}");
@@ -7271,6 +7272,7 @@ async fn diff_never_runs_a_repo_configured_external_diff() {
     git_in(&cwd, &["config", "diff.external", script.to_str().unwrap()]).await;
     std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert!(!marker.exists(), "/diff ran the repo's external diff program");
     let diffs = shown_diffs(&mut rx);
@@ -7283,6 +7285,7 @@ async fn diff_in_a_clean_repo_says_so() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let events = drain(&mut rx);
     let infos: Vec<_> = events
@@ -7304,6 +7307,7 @@ async fn diff_turn_shows_only_the_last_turn() {
     let cwd = dir.path().canonicalize().unwrap();
     std::fs::write(cwd.join("tracked.txt"), "hand edit\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("write a file".into(), &cwd, CancellationToken::new()).await.unwrap();
     drain(&mut rx);
     agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
@@ -7322,6 +7326,7 @@ async fn diff_turn_without_marks_says_so() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(infos(&mut rx), vec!["No changes from the last turn to show.".to_string()]);
 }
@@ -7340,6 +7345,7 @@ async fn diff_without_commits_is_against_the_empty_tree() {
     std::fs::write(cwd.join("one.txt"), "1\n").unwrap();
     std::fs::write(cwd.join("two.txt"), "2\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let diffs = shown_diffs(&mut rx);
     assert_eq!(diffs.len(), 1, "{diffs:?}");
@@ -7392,6 +7398,7 @@ async fn diff_keeps_tracked_ignored_files() {
     git_in(&cwd, &["add", "-f", "x.log"]).await;
     git_in(&cwd, &["commit", "-q", "-m", "force-add a log"]).await;
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
 
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let events = drain(&mut rx);
@@ -7416,6 +7423,7 @@ async fn diff_turn_with_a_pruned_snapshot_is_too_old() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
     drain(&mut rx);
     agent.undo.marks[0].before_oid = "f".repeat(40);
@@ -7881,6 +7889,28 @@ async fn commit_outside_a_repository_or_without_a_prompter() {
 }
 
 #[tokio::test]
+async fn diff_outside_a_repository_or_without_a_prompter() {
+    // Mirrors `commit_outside_a_repository_or_without_a_prompter` exactly
+    // -- `/diff` emits `AgentEvent::ShowDiff`, meant for a human looking
+    // at a pager (the TUI/ACP frontends), so it must be refused the same
+    // way `/commit` is for a delegated sub-agent or an MCP session,
+    // whatever its executor is given (no `command_prompter` set).
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, mut rx) = undo_agent_with_events(&cwd, false).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["Not a git repository.".to_string()]);
+
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path()).await;
+    let cwd = repo.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
+    let (mut agent, mut rx) = undo_agent_over(&cwd, Arc::new(PanickingBackend)).await;
+    agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert_eq!(notices(&mut rx), vec!["/diff isn't available here.".to_string()]);
+}
+
+#[tokio::test]
 async fn commit_with_a_message_still_needs_a_human() {
     let repo = tempfile::tempdir().unwrap();
     init_git_repo(repo.path()).await;
@@ -7983,6 +8013,7 @@ async fn diff_never_shows_deny_listed_files() {
         vec![PathBuf::from(".env"), PathBuf::from("*.pem")],
     )
     .await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let diffs = shown_diffs(&mut rx);
     let text = &diffs[0].1;
@@ -9185,6 +9216,7 @@ async fn an_empty_ignore_list_shows_generated_files_again() {
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
     agent.set_generated_ignore(Vec::new());
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(
         infos(&mut rx),
@@ -9206,6 +9238,7 @@ async fn diff_hides_untracked_generated_files() {
     std::fs::create_dir(cwd.join("node_modules")).unwrap();
     std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     let diffs = shown_diffs(&mut rx);
     assert_eq!(diffs.len(), 1, "{diffs:?}");
@@ -9222,6 +9255,7 @@ async fn diff_with_only_generated_files_says_nothing_changed() {
     std::fs::create_dir(cwd.join("node_modules")).unwrap();
     std::fs::write(cwd.join("node_modules/x.js"), "module\n").unwrap();
     let (mut agent, mut rx) = undo_agent_with_events(&cwd, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &cwd, CancellationToken::new()).await.unwrap();
     assert_eq!(infos(&mut rx), vec!["No uncommitted changes.".to_string()]);
 }
@@ -9232,6 +9266,7 @@ async fn diff_turn_hides_untracked_generated_files() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let (mut agent, mut rx) = undo_agent_with_script(&cwd, true, writes_source_and_bytecode()).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
     drain(&mut rx);
     agent.run_turn("/diff turn".into(), &cwd, CancellationToken::new()).await.unwrap();
@@ -9250,6 +9285,7 @@ async fn diff_from_a_subfolder_hides_generated_files_by_repository_path() {
     std::fs::write(root.join("sub/new.txt"), "fresh\n").unwrap();
     let sub = root.join("sub");
     let (mut agent, mut rx) = undo_agent_with_events(&sub, true).await;
+    agent.set_command_prompter(allow_prompter(0));
     agent.run_turn("/diff".into(), &sub, CancellationToken::new()).await.unwrap();
     let text = &shown_diffs(&mut rx)[0].1;
     // Shown by its repository path, so the pathspec is taken from the top

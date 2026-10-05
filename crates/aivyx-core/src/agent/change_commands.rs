@@ -277,6 +277,17 @@ impl Agent {
             self.notify(NOT_A_REPO);
             return;
         };
+        // Mirrors `commit`'s identical check -- `/diff` emits
+        // `AgentEvent::ShowDiff`, meant for a human looking at a pager
+        // (the TUI/ACP frontends), never for a delegated sub-agent or an
+        // MCP session, whatever its executor is given. Unlike `/commit`,
+        // nothing here actually needs a prompt/response -- this is a
+        // visibility gate, not a confirmation -- but the same "only where
+        // there's a user at the keyboard" rule applies.
+        if self.command_prompter.is_none() {
+            self.notify("/diff isn't available here.");
+            return;
+        }
         // The base, the "now" snapshot, the title and the nothing-to-show
         // line. `/diff turn` compares two checkpoints (the mark's was taken
         // by the checkpointer, so "now" must be one too); `/diff` compares
