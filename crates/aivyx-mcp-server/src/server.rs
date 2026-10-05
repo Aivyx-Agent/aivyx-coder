@@ -9,7 +9,7 @@ use aivyx_core::Agent;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -345,7 +345,7 @@ impl AivyxCoderMcpServer {
             sessions.insert(session_id.clone(), agent, events_rx);
         }
 
-        let content = Content::json(CodeOutcome {
+        let content = ContentBlock::json(CodeOutcome {
             session_id,
             result: text,
         })
@@ -402,7 +402,7 @@ impl AivyxCoderMcpServer {
         }
 
         result.map_err(|e| mcp_error(e.to_string()))?;
-        let content = Content::json(CodeOutcome {
+        let content = ContentBlock::json(CodeOutcome {
             session_id: params.session_id,
             result: text,
         })
@@ -411,17 +411,29 @@ impl AivyxCoderMcpServer {
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` keeps rmcp 2.x's generated `call_tool`/
+// `list_tools` dispatching through the instance's own stored router
+// (built once in `new()`) rather than its new default of rebuilding a
+// fresh `ToolRouter` via `Self::tool_router()` on every single call --
+// same tool set either way (both routes are static), but this avoids a
+// needless per-call router rebuild and keeps the `tool_router` field
+// genuinely used instead of dead weight.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for AivyxCoderMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "Delegate bounded coding tasks to aivyx-coder via code/code_reply.".to_string(),
-            ),
-        }
+        // `ServerInfo` (== `InitializeResult`) is `#[non_exhaustive]` as of
+        // rmcp 2.x, so it can no longer be built with a plain struct
+        // literal -- `ServerInfo::new` + the `with_*` builder methods
+        // replace that, keeping the exact same fields set as before.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            // Not `Implementation::from_build_env()`: that is compiled
+            // inside rmcp, so it reports rmcp's own name and version.
+            .with_server_info(Implementation::new(
+                "aivyx-coder",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions("Delegate bounded coding tasks to aivyx-coder via code/code_reply.")
     }
 }
 
@@ -505,6 +517,15 @@ mod tests {
         })
     }
 
+    /// `Implementation::from_build_env` is compiled inside rmcp, so it
+    /// would report rmcp's own name and version.
+    #[test]
+    fn server_info_names_aivyx_coder() {
+        let info = server_with_ceiling(AccessLevel::Plan).get_info();
+        assert_eq!(info.server_info.name, "aivyx-coder");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    }
+
     #[tokio::test]
     async fn code_then_code_reply_round_trips_real_conversation_state() {
         let server = server_with_ceiling(AccessLevel::Execute);
@@ -520,14 +541,11 @@ mod tests {
             .expect("code call should succeed");
         let CallToolResult { content, .. } = first;
         let first_json: serde_json::Value = content[0]
-            .raw
             .as_text()
             .unwrap()
             .text
             .parse()
-            .unwrap_or_else(|_| {
-                serde_json::from_str(&content[0].raw.as_text().unwrap().text).unwrap()
-            });
+            .unwrap_or_else(|_| serde_json::from_str(&content[0].as_text().unwrap().text).unwrap());
         let session_id = first_json["session_id"].as_str().unwrap().to_string();
         assert_eq!(first_json["result"], "first answer");
 
@@ -542,7 +560,7 @@ mod tests {
             .await
             .expect("code_reply should succeed");
         let second_json: serde_json::Value =
-            serde_json::from_str(&second.content[0].raw.as_text().unwrap().text).unwrap();
+            serde_json::from_str(&second.content[0].as_text().unwrap().text).unwrap();
         assert_eq!(
             second_json["result"], "second answer",
             "code_reply must return its OWN turn's real text, not an empty string from a \
