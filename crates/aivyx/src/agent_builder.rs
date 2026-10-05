@@ -248,7 +248,15 @@ fn resolve_team_config(
 /// including it -- this text is folded directly into the system prompt
 /// and never passes through `Agent::record_tool_result`'s generic
 /// per-tool-result scan (exactly `agents_files_text`'s own situation), so
-/// it needs this explicit call, tagging `injection_taint` on a match.
+/// it needs this explicit call, tagging `injection_taint` on a match *and*
+/// leaving the flagged entry out of the listing entirely (logged via
+/// `tracing::warn!`) -- unlike a tool result, this text is unconditionally
+/// trusted context the model acts on, so flagging alone (without also
+/// hiding it) would still hand the model the injected content.
+/// `LoadSkillTool::definition` (`aivyx-tools/src/tools/load_skill.rs`)
+/// applies the identical exclusion rule to its own "Available skills: …"
+/// text, so an overlay skill can never reach the model's context via
+/// either path once it trips the scan.
 /// Both `name` and `description` are overlay-controlled (an overlay
 /// skill's `name` comes from a project/user-controlled directory name,
 /// per `aivyx-skills`'s own `name`-must-match-directory rule) and equally
@@ -273,7 +281,14 @@ fn render_skills_listing(
             && let Some(finding) =
                 aivyx_sandbox::scan_for_injection_markers(&entry, "skill listing")
         {
+            tracing::warn!(
+                skill = %summary.name,
+                matched_pattern = %finding.matched_pattern,
+                "excluding overlay skill from the system-prompt skill listing: its name or \
+                 description tripped the injection-marker scan"
+            );
             injection_taint.flag(finding);
+            continue;
         }
         listing.push_str(&entry);
     }
@@ -2034,7 +2049,11 @@ tool_allowlist = []
 
         let listing = render_skills_listing(&loader, &injection_taint);
 
-        assert!(listing.contains("suspicious-skill"));
+        assert!(
+            !listing.contains("suspicious-skill"),
+            "a skill whose description trips the injection scan must be left out of the \
+             listing entirely, not just flagged"
+        );
         assert!(
             injection_taint.current().is_some(),
             "an overlay-sourced description containing an injection marker must flag the taint"
@@ -2067,7 +2086,11 @@ tool_allowlist = []
 
         let listing = render_skills_listing(&loader, &injection_taint);
 
-        assert!(listing.contains("ignore all previous instructions"));
+        assert!(
+            !listing.contains("ignore all previous instructions"),
+            "a skill whose name trips the injection scan must be left out of the listing \
+             entirely, not just flagged"
+        );
         assert!(
             injection_taint.current().is_some(),
             "an overlay-sourced *name* containing an injection marker must flag the taint, \
