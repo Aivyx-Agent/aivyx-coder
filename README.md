@@ -1393,9 +1393,25 @@ summarize = { tier = "small" }
 - Every model discovery finds becomes a candidate, even without a
   `[[routing.models]]` entry. Such a model is `medium` tier with no
   strengths.
-- Only local endpoint kinds are accepted. `kind = "anthropic"` or
-  `kind = "openai"` stops startup with an error; `aivyx-coder` never calls
-  a cloud API.
+- Only local endpoints are accepted; `aivyx-coder` never routes to a cloud
+  API. An endpoint is local or cloud by `aivyx-route`'s rule: `kind =
+  "anthropic"` or `"openai"` is always cloud, and any other kind is local
+  only when its `base_url` host is a loopback, private (`10/8`,
+  `172.16/12`, `192.168/16`, `fc00::/7`), link-local or CGNAT/Tailscale
+  (`100.64.0.0/10`) address, or a name that is `localhost`, has no dots,
+  or ends in `.local`, `.lan`, `.internal` or `.home.arpa`. So
+  `kind = "openai_compat"` at `https://api.groq.com/openai/v1` is cloud,
+  and so is an `openai_compat` endpoint with no `base_url`. A cloud
+  endpoint stops startup with an error. If a server on your own network
+  has a public-looking name (`gpu.example.com`, a `*.ts.net` MagicDNS
+  name), set `locality = "local"` on its `[routing.endpoints.*]` table;
+  `locality = "cloud"` forces cloud.
+- The `[backend]` model is judged by the same rule, from the address chat
+  connects to (`broker_base_url` for `kind = "llama_server_broker"`, else
+  `base_url`; the embedded `mistral_rs` backend is always local). A
+  `[backend]` that counts as cloud still serves every untagged call as
+  before, but routing never picks its model, and startup logs a warning;
+  set `locality = "local"` in `[backend]` if it is on your own network.
 - Endpoints are configured as discovery sees them
   (`http://localhost:11434`); chat requests go to their
   OpenAI-compatible `/v1` path.
@@ -1408,11 +1424,13 @@ summarize = { tier = "small" }
   residency source (see "Model residency" below).
 - **Discovery** (`discover`, default `true`) probes every
   `[routing.endpoints.*]` at startup (Ollama `/api/tags` + `/api/show`,
-  llama-server router mode `/models`, or `/v1/models`) with a 5 s timeout
-  per request. An unreachable endpoint therefore slows startup by up to
-  that timeout per probe, and its models stay unavailable until
-  `/models refresh`. `discover = false` skips probing and uses only the
-  roster. `/models refresh` re-runs discovery later.
+  llama-server router mode `/models`, or `/v1/models`). Endpoints are
+  probed concurrently, and the whole run stops after 15 s: an endpoint
+  that hasn't answered by then is unreachable and its models stay
+  unavailable until `/models refresh`, and an Ollama model whose details
+  hadn't arrived keeps its capabilities unknown. `discover = false` skips
+  probing and uses only the roster. `/models refresh` re-runs discovery
+  later.
 - **Ollama's discovered context window is the model's trained maximum**,
   not the window Ollama serves by default (often 4096, see "Serving").
   Declare `context_window` for every Ollama model you route to.
@@ -1470,7 +1488,8 @@ configured — Ollama (`/api/ps` + `/api/tags`), llama-server router mode
 is `kind = "llama_server"` (resident and router-mode-probed),
 `kind = "llama_server_broker"` (`aivyx-broker`'s residency report, which
 also supplies VRAM), or the embedded `kind = "mistral_rs"` backend (always
-resident, nothing to poll) — and feeds the result to the router, which
+resident, nothing to poll); a `[backend]` that counts as cloud (see
+"Configuration" above) is never polled — and feeds the result to the router, which
 prefers already-loaded models over ones that would need a load. There is no
 `[backend] kind = "lemonade"`: point `[backend] kind = "generic"` at
 `base_url = "http://127.0.0.1:13305/api/v1"` to use Lemonade as the default
@@ -1498,7 +1517,7 @@ the current snapshot.
 | `/models` | Lists the candidates: `id@endpoint`, tier, capabilities (unknown ones marked `?`), context window, availability, and (when a residency source is configured) a `Residency:` block of loaded / needs-load / may-not-fit models and the host's VRAM. `*` marks this conversation's current model; a pin is marked `(pinned)`. |
 | `/models refresh` | Re-runs discovery, rebuilds the candidate list, and clears every cooldown. |
 | `/models why` | The last routing decision in this conversation and its reason. |
-| `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. |
+| `/model <id>` / `/model <id@endpoint>` | Pins this conversation's main loop to that model. A bare id must be served by exactly one endpoint. A pin that lacks a hard need is used anyway, with a warning in the reason. If `/models refresh` drops the pinned model, the pin is ignored (routing chooses as if unpinned, and the reason starts "ignored pin to") but kept, so it applies again once the model is back. |
 | `/model auto` | Clears the pin; routing chooses this conversation's model again on the next call. `/model` alone shows the current pin. |
 
 With routing off, these commands reply that they need
@@ -2000,6 +2019,10 @@ context_tokens = 8192
 # aivyx-broker instance. Replaces base_url as the address this process
 # actually connects to on that path.
 # broker_base_url = "http://127.0.0.1:8899"
+# Model routing only: whether this server is on your own network. Unset,
+# its address decides (see "Model routing"); set "local" for a LAN box
+# with a public-looking name, or "cloud" to keep routing off it.
+# locality = "local"
 
 [permissions]
 # A path-separator entry (or a bare "~") is an exact absolute location,

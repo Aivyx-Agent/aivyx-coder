@@ -814,6 +814,18 @@ pub struct BackendSettings {
     /// broker owns that lifecycle now. See `aivyx-broker`'s own README
     /// for the full rationale and wire contract.
     pub broker_base_url: Option<String>,
+    /// Whether this backend is on your own network, for model routing
+    /// only (`[routing] enabled = true`). Unset, `aivyx-route` decides
+    /// from the address chat connects to (`broker_base_url` for
+    /// `llama_server_broker`, else `base_url`; the embedded `mistral_rs`
+    /// backend is always local): loopback, private, link-local and
+    /// CGNAT/Tailscale addresses and dotless, `.local`, `.lan`,
+    /// `.internal` and `.home.arpa` names are local, anything else is
+    /// cloud, and routing never picks a cloud model. `"local"` marks a
+    /// box on your network with a public-looking name local; `"cloud"`
+    /// marks it cloud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<aivyx_route::Locality>,
     /// Absolute path to a local GGUF file or a directory containing GGUF
     /// files. Required when `kind = "mistral_rs"` -- checked at
     /// backend-construction time (agent_builder.rs), not at config-load
@@ -896,6 +908,7 @@ impl Default for BackendSettings {
             kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
             kvcache_store_path: None,
             broker_base_url: None,
+            locality: None,
             mistralrs_model_path: None,
             mistralrs_model_file: None,
             mistralrs_chat_template_path: None,
@@ -1373,6 +1386,18 @@ mod tests {
         let parsed: Settings = toml::from_str(&toml_string).unwrap();
         assert_eq!(parsed.backend.base_url, settings.backend.base_url);
         assert_eq!(parsed.backend.model, settings.backend.model);
+    }
+
+    #[test]
+    fn backend_locality_is_optional_and_parses_local_or_cloud() {
+        assert_eq!(BackendSettings::default().locality, None);
+        let parsed: Settings = toml::from_str("[backend]\nlocality = \"local\"\n").unwrap();
+        assert_eq!(parsed.backend.locality, Some(aivyx_route::Locality::Local));
+        let parsed: Settings = toml::from_str("[backend]\nlocality = \"cloud\"\n").unwrap();
+        assert_eq!(parsed.backend.locality, Some(aivyx_route::Locality::Cloud));
+        // Unset, it isn't written out.
+        let toml_string = toml::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!toml_string.contains("locality"), "{toml_string}");
     }
 
     #[test]
