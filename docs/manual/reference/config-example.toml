@@ -1,0 +1,177 @@
+# aivyx-coder — annotated example config (~/.config/aivyx-coder/config.toml).
+# Every key is documented in docs/manual/reference/03-configuration.md.
+
+[backend]
+base_url = "http://localhost:11434/v1"
+model = "qwen3.5:9b"
+# api_key = "..."   # only for auth-protected local endpoints
+# Your model's context window, in tokens. Drives the status-line budget
+# indicator and history compaction. Conservative default (8192) — set it to
+# what your model actually supports; it is not auto-detected because the
+# OpenAI-compatible /v1 surface doesn't expose it reliably.
+#
+# IMPORTANT: the server must actually SERVE this window. Ollama defaults to
+# 4096 unless the model's Modelfile sets num_ctx or the service sets
+# OLLAMA_CONTEXT_LENGTH — the /v1 endpoint cannot request it per-call. A
+# too-small server window shows up as responses truncating "before they
+# finished", especially on reasoning models whose thinking phase invisibly
+# consumes the remainder. Cheap fix without touching the service:
+#   printf 'FROM qwen3.5:9b\nPARAMETER num_ctx 8192\n' | ollama create qwen35-8k -f -
+context_tokens = 8192
+# "generic" (default) | "llama_server" | "llama_server_broker" -- opts into
+# backend-specific features. "llama_server": KV-cache persistence, see
+# "KV-cache persistence" above. "llama_server_broker": multi-process GPU
+# sharing via aivyx-broker, see "Multi-process GPU sharing (aivyx-broker)"
+# above -- requires broker_base_url below. No effect on any other backend.
+# kind = "llama_server"
+# Only meaningful when kind = "llama_server". Bytes, not GiB; default 10 GiB.
+# kvcache_max_bytes = 10737418240
+# Overrides where the kvcache store directory lives (default:
+# ~/.local/share/aivyx-coder/kvcache). Supports a leading `~`. Set this
+# to the same directory as a locally delegated-from `aivyx-pa` process's
+# own kvcache_store_path (and point both at the same llama-server) to
+# share one store -- see aivyx-pa's own docs/MCP_RECIPES.md.
+# kvcache_store_path = "~/.local/share/shared-kvcache"
+# REQUIRED when kind = "llama_server_broker" -- address of a running
+# aivyx-broker instance. Replaces base_url as the address this process
+# actually connects to on that path.
+# broker_base_url = "http://127.0.0.1:8899"
+# Model routing only: whether this server is on your own network. Unset,
+# its address decides (see "Model routing"); set "local" for a LAN box
+# with a public-looking name, or "cloud" to keep routing off it.
+# locality = "local"
+
+[permissions]
+# A path-separator entry (or a bare "~") is an exact absolute location,
+# ~-expanded and symlink-canonicalized. A bare entry with no separator
+# (e.g. ".env", "*.pem") is a basename-glob pattern instead, matching any
+# file with that name anywhere rather than one fixed location.
+# This list is MERGED with the built-in security defaults (union,
+# de-duplicated), never a replacement for them -- there is no way to
+# remove a built-in default via config, only add to it.
+deny_paths = ["~/.ssh", "~/.aws", ".env", "*.pem"]
+max_tool_iterations_per_turn = 25
+
+# Commands the model may run by name (run_command), or that skip the
+# confirmation prompt (run_shell). Empty by default — nothing runnable until
+# you opt in.
+# [[permissions.allowed_commands]]
+# name = "test"
+# program = "cargo"
+# args = ["test"]
+# timeout_secs = 600   # optional; defaults to 300
+
+[sandbox]
+require_enforcement = true
+extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
+# Opt-outs from the default confinement policy, all off by default; see
+# "Landlock + seccomp" under "Security model" before turning one on.
+# allow_unix_sockets = false           # true: commands may reach local daemons
+#                                      # (ssh-agent, gpg-agent, docker, D-Bus)
+#                                      # and get SSH_AUTH_SOCK etc. back. The
+#                                      # sandbox then no longer contains code
+#                                      # execution (systemd-run --user).
+# allow_leaving_process_group = false  # true: setsid/setpgid allowed (nextest,
+#                                      # start_new_session=True); a process
+#                                      # that leaves can outlive the call
+# share_system_tmp = false             # true: shared /tmp writable instead of
+#                                      # a private per-session TMPDIR
+
+[git]
+checkpoints = true   # snapshot the worktree before every mutating tool call
+# Generated files (.gitignore syntax), hidden from the change summary, /diff
+# and the /undo and /redo previews, and never auto-staged by /commit — only while
+# untracked, like .gitignore: a file git tracks is always shown. [] = off.
+# ignore = ["__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", ".mypy_cache/",
+#           ".ruff_cache/", "node_modules/", ".venv/", ".DS_Store"]
+
+[repo_map]
+enabled = true       # append a ranked symbol map to the system prompt
+budget_tokens = 1024 # rough token budget the map may consume per request
+
+[editor_context]
+enabled = true  # a no-op until some editor integration writes the context file
+
+[editor_approval]
+enabled = true  # a no-op until an external editor plugin writes a response file
+
+# Enforced verification (docs/HISTORY.md Phase 12 Part B): after file edits,
+# before a turn is allowed to end, auto-run this named allowed_commands
+# entry via run_command and let the model react to the result — fix and
+# retry on failure, or actually end the turn on success. Off by default;
+# setting `command` alone is the opt-in, no separate enable flag. `command`
+# must match a `[[permissions.allowed_commands]]` name, or a startup
+# warning fires and verification stays disabled.
+# [verification]
+# command = "test"            # references [[permissions.allowed_commands]]
+# max_auto_verify_retries = 3 # (edit, re-verify) cycles before giving up
+#                              # on this round of edits — never silently:
+#                              # the turn still ends, with a loud notice.
+# scoped_command = "test_scoped" # optional; another allowed_commands entry
+#                              # whose args may contain "{touched_paths}",
+#                              # run first on interim retries to skip the
+#                              # full suite's cost — see "Enforced
+#                              # verification" above for the substitution
+#                              # semantics and the cargo-specific caveat.
+
+# REPL/interactive-process support (repl_start/repl_send/repl_stop):
+# timing knobs for deciding when a call has "enough" output to return,
+# and for auto-killing a forgotten session. All optional — zero-config
+# works out of the box with the defaults shown.
+# [repl]
+# quiet_window_ms = 300     # how long output must be silent before repl_send returns
+# max_wait_secs = 10        # hard per-call backstop, in case output never goes quiet
+# idle_timeout_secs = 600   # auto-kill a session with no repl_send activity for this long
+
+# /council — several local models answer, cross-rank, and a chairman
+# synthesizes. Off until at least two members AND a chairman are set. Any
+# OpenAI-compatible endpoint works per seat; with one GPU, pointing members
+# at Ollama (which swaps models per request) alongside a resident
+# llama-server daily driver is the intended shape.
+[council]
+tail_budget_tokens = 3072  # recent-conversation digest members see
+# members = [
+#   { base_url = "http://localhost:11434/v1", model = "qwen3.5:9b" },
+#   { base_url = "http://localhost:11434/v1", model = "ornith:9b" },
+# ]
+# chairman = { base_url = "http://localhost:11434/v1", model = "qwen3.6:27b" }
+
+# Shared skill library (load_skill tool + a skill-discovery listing
+# folded into the system prompt): step-by-step process guidance (e.g.
+# systematic debugging, writing a plan, brainstorming and scoping) from
+# the aivyx-skills crate's bundled skills, plus optional project/user
+# overlay directories. On by default -- the one exception to this
+# project's usual "off until configured" posture for a new feature
+# section, since a fresh install should get real skill guidance with
+# zero setup.
+[skills]
+enabled = true
+# project_dir = ".aivyx/skills"  # optional project-level overlay; tilde-expanded, must directly contain <skill-name>/SKILL.md subdirectories, one per skill
+# user_dir = "~/.config/aivyx-coder/skills"  # optional user-level overlay; same required shape as project_dir
+
+# Nonagon-style team delegation, mission structure, and specialist
+# sessions (delegate_to_specialist, decompose_task, verify_output,
+# synthesize_results, spawn_specialist, query_specialist,
+# close_specialist): lets the lead delegate to a specialist roster
+# (implementer/reviewer/tester by default, or your own -- see roster_path
+# below), narrower-scoped than delegate_task's sub-agent; record a mission
+# plan / verification verdicts / a final synthesis against it; and open a
+# resumable multi-exchange session with one specialist instead of a single
+# delegate_to_specialist exchange. Off by default.
+[team]
+enabled = false
+# max_concurrent_specialist_sessions = 3  # spawn_specialist sessions open at once
+# specialist_session_idle_timeout_secs = 600  # drop an idle session on the next specialist-session tool call made after this long
+# roster_path = "~/my-team.toml"  # a custom roster (TOML: {lead, members: [{name, role, persona, tool_allowlist, extra_deny_paths, task}]}; `task` is an optional model-routing task kind, see "Model routing") instead of the built-in implementer/reviewer/tester roster; validated at startup (unknown lead/duplicate member/unknown tool all refuse to start rather than run with a broken roster)
+#
+# spawn_specialist/query_specialist/close_specialist are normally
+# lead-facing, but a roster member's own tool_allowlist may name them too
+# -- doing so lets that specialist open/query/close sessions directly
+# with PEER specialists, not just the lead. Nesting is capped at one hop:
+# a specialist the lead spawns may spawn peers of its own, but a
+# specialist spawned BY another specialist cannot spawn further. A
+# session can only be queried or closed by whoever opened it, with one
+# exception -- the lead can still close (but not query) any session as a
+# supervisory override, so a specialist-owned session doesn't get
+# permanently stranded if its owning specialist's own session ever goes
+# away.
