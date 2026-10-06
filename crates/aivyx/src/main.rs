@@ -40,6 +40,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_flag_has_a_command_line_reference_heading() {
+        use clap::CommandFactory;
+        let manual = include_str!("../../../docs/manual/reference/01-command-line.md");
+        let missing: Vec<String> = Cli::command()
+            .get_arguments()
+            .filter_map(|a| a.get_long())
+            .map(|l| format!("--{l}"))
+            .filter(|f| !manual.contains(&format!("### `{f}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/manual/reference/01-command-line.md has no heading for: {missing:?}"
+        );
+    }
+
+    #[test]
     fn validate_mcp_server_session_limits_rejects_zero_ttl() {
         let err = validate_mcp_server_session_limits(0, 8).unwrap_err();
         assert!(err.to_string().contains("session_ttl_secs"));

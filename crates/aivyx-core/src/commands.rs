@@ -154,6 +154,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_command_has_a_slash_command_reference_heading() {
+        let manual = include_str!("../../../docs/manual/reference/02-slash-commands.md");
+        let missing: Vec<&str> = COMMANDS
+            .iter()
+            .map(|c| c.name)
+            .filter(|name| !manual.contains(&format!("### `{name}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/manual/reference/02-slash-commands.md has no heading for: {missing:?}"
+        );
+    }
+
+    #[test]
     fn parse_slash_command_recognizes_bare_and_argument_forms() {
         assert_eq!(parse_slash_command("/foo", "/foo"), Some(""));
         assert_eq!(parse_slash_command("  /foo  ", "/foo"), Some(""));
