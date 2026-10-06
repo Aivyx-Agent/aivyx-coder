@@ -1541,10 +1541,8 @@ fn new_input_box() -> TextArea<'static> {
 /// the bindings that actually exist in the key-handling loop above
 /// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`a`/`n` during an approval prompt,
 /// and the `/diff` pager's own keys -- the transcript has no scrolling
-/// binding, so none is claimed for it), then
-/// one line pointing at the real undo mechanism (git-ref checkpoints) --
-/// included unconditionally since there is no in-app undo command yet;
-/// remove this line if one is ever added.
+/// binding, so none is claimed for it), then the test-command line
+/// (`/undo` itself is listed with the other commands).
 fn help_text(tests_line: &str) -> String {
     let mut lines = vec!["Available commands:".to_string()];
     for cmd in aivyx_core::commands::COMMANDS {
