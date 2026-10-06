@@ -43,7 +43,9 @@ GROUPS = {
     "MCP servers": (f"Your `[[mcp.servers]]`' resources and prompts. Their own tools appear as "
                     f"`mcp__<server>__<tool>`. See [MCP]({GUIDE}/13-mcp.md).",
                     ["list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "get_mcp_prompt"]),
-    "Images": ("`generate_svg` uses your model; `generate_image` needs `[vision] enabled = true`.",
+    "Images": ("`generate_svg` uses your own model and returns the SVG (save it with `write_file`). "
+               "`generate_image` needs `[vision] enabled = true`, saves under `assets/generated/`, and "
+               "asks once for that folder per session.",
                ["generate_svg", "generate_image", "generate_3d"]),
 }
 # Test doubles and fixtures, never registered.

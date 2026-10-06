@@ -25,6 +25,9 @@ directories are the platform's equivalents.
 The whole `~/.config/aivyx-coder` and `~/.local/state/aivyx-coder` trees are
 on the built-in deny list: the model can't read or write them — so it can't
 plant a memory, edit its own config, or approve its own permission prompt.
+The KV-cache directory is protected the same way, wherever you put it: a
+saved slot *is* model context, so it's added to the deny list at every
+start.
 
 ## Inside the project
 

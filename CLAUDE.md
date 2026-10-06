@@ -17,7 +17,7 @@ assume shared code or conventions between them.
 
 The security boundary was designed before the tools that need it (see
 `docs/HISTORY.md` for phase history) and is the load-bearing property of
-this codebase — read the "Security model" section of `README.md` in full
+this codebase — read `docs/manual/reference/05-security-model.md` in full
 before touching `aivyx-sandbox`, `aivyx-tools`, or the permission-gate
 logic in `aivyx-core`.
 
@@ -34,7 +34,15 @@ cargo clippy --workspace --all-targets
 # Single crate / single test
 cargo test -p aivyx-core
 cargo test -p aivyx-core some_test_name
+
+# Regenerate the manual's generated reference pages after changing the
+# config schema or a tool (the scripts fail on anything uncovered)
+python3 scripts/gen-config-reference.py > docs/manual/reference/03-configuration.md
+python3 scripts/gen-tools-reference.py  > docs/manual/reference/04-tools.md
 ```
+
+Tests fail if a CLI flag or slash command has no section in
+`docs/manual/reference/01-command-line.md` / `02-slash-commands.md`.
 
 - The real sandbox (Linux Landlock + seccomp) is on by default. To build
   without it (non-Linux, or a kernel without Landlock), use
@@ -42,8 +50,8 @@ cargo test -p aivyx-core some_test_name
   (see `sandbox.require_enforcement` below), not just the build. The macOS
   release leg (`.github/workflows/release.yml`, `aarch64-apple-darwin`) is
   a real, shipped instance of this `--no-default-features` build, not just
-  a theoretical one — see "Sandbox internals" below and README.md's
-  "Platform support" section.
+  a theoretical one — see "Sandbox internals" below and the "Platform support"
+  section of `docs/manual/guide/02-install-and-first-run.md`.
 - Config lives at `~/.config/aivyx-coder/config.toml` (written `0600` on
   first run — it may hold an `api_key`). Sessions persist under
   `~/.local/state/aivyx-coder/sessions/<project-key>/`, one file per
@@ -67,8 +75,8 @@ Workspace crates (`crates/*`), roughly bottom-up:
 | `aivyx-config` | `Settings` — XDG config loading, defaults, `0600` writing |
 | `aivyx-core` | `Agent`/`AgentConfig`/`AgentEvent`, the turn loop, `EditFormat` (native tool-call JSON vs. prompted SEARCH/REPLACE), `council` (multi-model `/council` mode), `session` (persistence + `--resume`), `session_list` + `agent/session_commands.rs` (`/sessions`, `/resume N` — pure listing/formatting in `session_list`, command dispatch and `Agent::switch_to` in `session_commands`/`agent/mod.rs`), `edit_blocks` (SEARCH/REPLACE parsing), `routing_commands` (`/models`, `/model`), `undo` + `agent/undo_commands.rs` (`/undo`/`/redo`/`/checkpoints`: each user message is bracketed by two worktree snapshots and recorded as undoable iff the trees differ; the ledger persists in the session; confirmations go through a separate command prompter, not the gate); main-loop calls carry a `RouteHint` (`code_edit` by default, a team member's `task` via `set_route_task`), `/architect` routes as `plan` when no `[architect]` is configured; `changes` + `agent/change_commands.rs` (per-turn change summary, `/diff`, `/commit` — drafts via a one-shot `collect_text`, commits through the shared `aivyx_tools::confined_git`); `test_detect` + `agent/test_command.rs` (`/test`: detected-or-configured test command, run confined, streamed via `AgentEvent::TestOutput`/`TestFinished`, outcome noted for the model) |
 | `aivyx-tui` | The ratatui terminal UI: `app::run` (`app.rs` — spawns the agent as a background task, `tokio::select!`s over input/agent-events/permission-requests), `permission.rs` (`TuiPrompter` bridges `PermissionPrompter::prompt` from the background agent task to the render loop via a `oneshot` reply — fails closed to Deny if the render loop is gone), status line (context-budget indicator, plan-mode badge) |
-| `aivyx-acp` | An [Agent Client Protocol](https://agentclientprotocol.com) frontend (JSON-RPC over stdio, via the `agent-client-protocol` crate) — the same `Agent` core embedded directly in an editor (Zed's Agent panel; VS Code via the third-party `formulahendry.acp-client` extension) instead of the terminal. `translate.rs` (pure `AgentEvent` → ACP `SessionUpdate`/`StopReason` mapping, no I/O), `prompter.rs` (`AcpPrompter` — `PermissionPrompter` over `session/request_permission`; `DeferredPrompter`/`PrompterInstaller` bridge the gap between `ConfirmationGate` construction, which happens before any ACP connection exists, and `NewSessionRequest`, which is when a real connection first does), `session.rs` (one session per process; `session/prompt` runs `Agent::run_turn` inside `connection.spawn(...)`, not inline in the request handler — a deadlock fix, since `AcpPrompter`'s own `session/request_permission` round-trip needs the dispatch loop the handler would otherwise be blocking). See `docs/superpowers/specs/2026-07-20-acp-editor-integration-design.md` and README's "Editor integration (ACP)" section. |
-| `aivyx-mcp-server` | A third frontend, over stdio via the `rmcp` crate: exposes aivyx-coder as an MCP server (`code`/`code_reply` tools) for delegation from another local MCP client instead of a terminal or editor. `tiers.rs` (`AccessLevel::{Plan,Edit,Execute}`, each additive over the previous, capped by the required `[mcp_server].max_access_level` config — no default, refuses to start unset), `session.rs` (`build_session_agent` builds one fresh, isolated `Agent` per MCP session via `tier_registry`, filtering the shared `mcp_registry` base down to the session's tier; `TieredPrompter` auto-resolves every in-tier call, since an MCP-server session has no human to prompt), `server.rs` (the `rmcp`-facing layer: `code`/`code_reply` tool definitions, an in-memory TTL-evicted session map). See README's "MCP server integration" section. |
+| `aivyx-acp` | An [Agent Client Protocol](https://agentclientprotocol.com) frontend (JSON-RPC over stdio, via the `agent-client-protocol` crate) — the same `Agent` core embedded directly in an editor (Zed's Agent panel; VS Code via the third-party `formulahendry.acp-client` extension) instead of the terminal. `translate.rs` (pure `AgentEvent` → ACP `SessionUpdate`/`StopReason` mapping, no I/O), `prompter.rs` (`AcpPrompter` — `PermissionPrompter` over `session/request_permission`; `DeferredPrompter`/`PrompterInstaller` bridge the gap between `ConfirmationGate` construction, which happens before any ACP connection exists, and `NewSessionRequest`, which is when a real connection first does), `session.rs` (one session per process; `session/prompt` runs `Agent::run_turn` inside `connection.spawn(...)`, not inline in the request handler — a deadlock fix, since `AcpPrompter`'s own `session/request_permission` round-trip needs the dispatch loop the handler would otherwise be blocking). See `docs/superpowers/specs/2026-07-20-acp-editor-integration-design.md` and `docs/manual/guide/12-editor-integration.md`. |
+| `aivyx-mcp-server` | A third frontend, over stdio via the `rmcp` crate: exposes aivyx-coder as an MCP server (`code`/`code_reply` tools) for delegation from another local MCP client instead of a terminal or editor. `tiers.rs` (`AccessLevel::{Plan,Edit,Execute}`, each additive over the previous, capped by the required `[mcp_server].max_access_level` config — no default, refuses to start unset), `session.rs` (`build_session_agent` builds one fresh, isolated `Agent` per MCP session via `tier_registry`, filtering the shared `mcp_registry` base down to the session's tier; `TieredPrompter` auto-resolves every in-tier call, since an MCP-server session has no human to prompt), `server.rs` (the `rmcp`-facing layer: `code`/`code_reply` tool definitions, an in-memory TTL-evicted session map). See `docs/manual/guide/13-mcp.md`. |
 | `aivyx` (`crates/aivyx`) | The binary — `agent_builder.rs` builds `Agent` + every collaborator identically regardless of frontend (only the `PermissionPrompter` differs); `main.rs` wires config → backend → agent → either the TUI or, behind `--acp`/`--mcp-server`, `aivyx-acp`/`aivyx-mcp-server`; `routing.rs` wraps the backend in a `RoutedBackend` when `[routing] enabled = true` (off ⇒ the very same `Arc`, tested with `Arc::ptr_eq`), rejects a `[routing.endpoints.backend]` table and any endpoint `aivyx-route`'s `effective_locality()` calls cloud (cloud kind, non-local `base_url` host, or `locality = "cloud"`), gives the default endpoint (`default_endpoint`) the address chat connects to plus `[backend] locality`, so a remote `[backend]` model is cloud and never routed to (and never residency-polled; `cloud_backend_notice` then puts a startup notice in the transcript and `RoutedBackend::with_no_route_hint` makes the no-candidate routing error name `[backend] locality`), and runs discovery at startup when `discover = true` — and, when a residency source exists (an Ollama/llama-router `[routing.endpoints]` entry, the default backend, or `vram_bytes`), spawns a 5 s residency poll (`ResidencySources`/`spawn_residency_refresh`, holding only a `Weak` so it exits with the router); `/models` shows the resulting residency block |
 
 ### Data flow for one turn
@@ -80,7 +88,7 @@ exists so session-only state like `set_tasks` can auto-allow without
 dishonestly claiming to be a `Read`) → `gate.check()` walks a fixed tier
 order: deny_paths hard block (path-only) → `.git`/global-git-config write
 block (`touches_git_metadata`/`touches_global_git_config`, same tier,
-`Write`/`Delete`/`Move` only — see README's "Security model") → `Read`/
+`Write`/`Delete`/`Move` only — see `docs/manual/reference/05-security-model.md`) → `Read`/
 `Internal` auto-allow → plan-mode deny (checked *before* the cache below, specifically so an
 approval granted before entering plan mode can't leak through) →
 Always-Allow cache lookup, keyed on the **exact** target — full path or full
@@ -148,8 +156,8 @@ All of it (`aivyx-confine`'s `sandbox-backend` feature) is Linux-only —
 `--no-default-features` build has none of this; this is no longer purely
 hypothetical, since the shipped `aarch64-apple-darwin` release binary
 (`.github/workflows/release.yml`) is built exactly that way and runs with
-`NoopConfiner` (no OS-level confinement, gate-only) — see README.md's
-"Platform support" section.
+`NoopConfiner` (no OS-level confinement, gate-only) — see the "Platform support" section of
+`docs/manual/guide/02-install-and-first-run.md`.
 
 - **Landlock** (ABI V7): write grants are `cwd` + a private per-confiner
   temp dir exported as `TMPDIR` (the shared `/tmp` only with `[sandbox]
@@ -206,13 +214,13 @@ debugging truncated/odd responses: it serves its own default context window
 (often 4096) unless the Modelfile sets `num_ctx` or `OLLAMA_CONTEXT_LENGTH`
 is set — the `/v1` endpoint can't request a larger window per-call.
 `llama-server` is recommended for serious use since the window is explicit
-on the command line (`-c N`). See `README.md` "Serving" for full setup
+on the command line (`-c N`). See `docs/manual/guide/09-local-model-servers.md` for full setup
 (including a CUDA/ccache build gotcha) and the `[backend] context_tokens`
 config field.
 
 ## Known, deliberately-undefended limitations
 
-Documented in `README.md` "Known limitations" — worth checking before
+Documented in `docs/manual/guide/15-troubleshooting.md` ("Known limitations") — worth checking before
 assuming a gap is a bug: indirect prompt injection (a heuristic scan — see
 `aivyx-sandbox`'s `InjectionTaint`/`scan_for_injection_markers`, now sourced
 from the `aivyx-injection-guard` crate — always runs, in every mode, but
@@ -226,9 +234,10 @@ than partial hunks.
 
 ## Where to look next
 
-- `README.md` — the primary reference: full security model, config
-  reference, tool table, serving setup. More authoritative and current than
-  any summary here.
+- `docs/manual/` — the primary reference: the user guide, the full security
+  model, the configuration and tool references (both generated — see
+  below), serving setup. More authoritative and current than any summary
+  here. `README.md` is now just an overview that points into it.
 - `ROADMAP.md` — current status, in brief.
 - `docs/HISTORY.md` — full phase-by-phase history, every design decision
   and its evidence, including the project's own audit history.

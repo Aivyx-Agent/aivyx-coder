@@ -107,4 +107,20 @@ For speed, `scoped_command` can name a second command that runs only the
 tests for the files touched, with `{touched_paths}` in its arguments; a full
 run is still required before edits count as verified. Not every test runner
 can select tests by file — `cargo test <path>` silently matches nothing, so
-Rust projects need a small wrapper script.
+Rust projects need a small wrapper script. A broken `scoped_command` makes
+verification fail for that batch rather than quietly using the full one.
+
+Because its arguments change on every retry, the scoped command doesn't use
+the per-exact-command approval cache: it runs directly, inside the sandbox.
+That's a deliberate, narrow exception to the rule that the model never
+shapes a command's arguments — the only varying input is files it already
+had approval to edit.
+
+## The model's own git tools
+
+Besides `git_commit`, the model can create and switch branches
+(`git_branch`), push (`git_push`) and open a pull request through the `gh`
+CLI (`git_pr`). Each asks first, like a command. `git_push` can never
+force-push, branch and remote names starting with `-` are refused (git would
+read them as options), and `git_pr` checks that the branch is pushed and
+`gh` is signed in before trying.

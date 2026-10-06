@@ -59,7 +59,7 @@ pub struct Settings {
     pub repl: ReplSettings,
     pub skills: SkillsSettings,
     /// Task-aware model routing (`aivyx-route`). Off unless
-    /// `[routing] enabled = true`; see README's "Model routing".
+    /// `[routing] enabled = true`; see docs/manual/guide/08-models-and-routing.md.
     pub routing: aivyx_route::RoutingConfig,
 }
 
@@ -817,9 +817,9 @@ pub struct BackendSettings {
     /// own doc comment. Default `Generic`: no behavior change for
     /// existing configs.
     pub kind: BackendKind,
-    /// Maximum bytes the kvcache store (docs/README's KV-cache persistence
-    /// section) will hold on disk before evicting the least-recently-used
-    /// entry. Only meaningful when `kind = "llama_server"`. Default 10 GiB.
+    /// Maximum bytes the kvcache store (see the manual's "Local model
+    /// servers" chapter, KV-cache persistence) will hold on disk before
+    /// evicting the least-recently-used entry. Only meaningful when `kind = "llama_server"`. Default 10 GiB.
     pub kvcache_max_bytes: u64,
     /// Overrides where the kvcache store directory lives. `None`
     /// (default) preserves the historical per-app `ProjectDirs`-derived

@@ -2202,7 +2202,7 @@ impl Agent {
         let Some(council) = &self.council else {
             self.emit(AgentEvent::CouncilNote(
                 "no council is configured — add at least two [council] members and a \
-                 chairman to config.toml (see the README's Council section)"
+                 chairman to config.toml (see docs/manual/guide/10-autonomous-and-advanced-modes.md)"
                     .to_string(),
             ));
             self.emit(AgentEvent::TurnComplete);
@@ -2269,7 +2269,7 @@ impl Agent {
         if self.architect.is_none() {
             self.emit(AgentEvent::ArchitectNote(
                 "no architect is configured — add [architect] base_url and model to \
-                 config.toml (see the README's Architect/editor section)"
+                 config.toml (see docs/manual/guide/10-autonomous-and-advanced-modes.md)"
                     .to_string(),
             ));
             self.emit(AgentEvent::TurnComplete);

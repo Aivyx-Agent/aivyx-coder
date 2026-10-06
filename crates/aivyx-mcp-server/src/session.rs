@@ -165,7 +165,7 @@ pub async fn build_session_agent(
         ConfirmationGate::new(
             prompter,
             config.deny_paths.clone(),
-            Vec::new(), // no pre-approved commands -- see README's MCP-server "Security note"
+            Vec::new(), // no pre-approved commands -- see the manual's MCP chapter (docs/manual/guide/13-mcp.md)
             plan_mode.clone(),
             autonomous_mode.clone(),
             config.cwd.clone(),

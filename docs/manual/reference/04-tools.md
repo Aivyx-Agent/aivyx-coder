@@ -133,7 +133,7 @@ Your `[[mcp.servers]]`' resources and prompts. Their own tools appear as `mcp__<
 
 ## Images
 
-`generate_svg` uses your model; `generate_image` needs `[vision] enabled = true`.
+`generate_svg` uses your own model and returns the SVG (save it with `write_file`). `generate_image` needs `[vision] enabled = true`, saves under `assets/generated/`, and asks once for that folder per session.
 
 | Tool | Asks first? | What it does |
 |---|---|---|

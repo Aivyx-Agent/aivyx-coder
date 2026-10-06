@@ -113,8 +113,8 @@ pub(crate) fn confine_options(sandbox: &aivyx_config::SandboxSettings) -> Confin
 /// already has that exact name, in which case `--auto` refuses rather
 /// than silently adding a confusing second, synthetic one of the same
 /// name. Absent both a configured name and a detected command, `--auto`
-/// cannot proceed either. See README's "Enforced verification"/
-/// "Autonomous mode" for why a deterministic verify step is what makes
+/// cannot proceed either. See the manual's "Autonomous and advanced modes"
+/// guide chapter for why a deterministic verify step is what makes
 /// auto-approving edits defensible at all.
 ///
 /// Because of the two refusals above, whenever this returns `Ok`,

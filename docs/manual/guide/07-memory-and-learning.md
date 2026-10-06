@@ -46,7 +46,9 @@ part of the workspace plus an architecture overview — with every page write
 approved as usual. Later, bare `/wiki` regenerates only the pages whose
 source changed since they were written; `/wiki <page>` regenerates one. The
 repository map lists the pages so the model can read the right one when it
-needs it.
+needs it. Each page is its own turn, so a configured `[verification]
+command` runs once per page — a slow test suite makes a first full `/wiki`
+slow.
 
 ## Skills
 
