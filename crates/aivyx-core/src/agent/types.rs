@@ -225,6 +225,9 @@ pub(crate) struct AgentsFileConfig {
     pub(crate) global_path: Option<PathBuf>,
     pub(crate) budget_tokens: u32,
     pub(crate) deny_paths: Vec<PathBuf>,
+    /// A config pack's instructions, `(pack name, AGENTS.md path)`, set by
+    /// `Agent::set_pack_instructions` when a pack is in use here.
+    pub(crate) pack: Option<(String, PathBuf)>,
 }
 
 /// `deny_paths` needed to check a reported editor-context file path before

@@ -469,6 +469,7 @@ pub(crate) async fn build_agent(
     cli: &Cli,
     settings: &Settings,
     prompter: Arc<dyn PermissionPrompter>,
+    pack: Option<&crate::packs::PackLayer>,
 ) -> anyhow::Result<BuiltAgent> {
     tracing::info!(
         base_url = %settings.backend.base_url,
@@ -1272,6 +1273,9 @@ pub(crate) async fn build_agent(
     if let Some(notice) = crate::routing::cloud_backend_notice(settings) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
+    for notice in pack.iter().flat_map(|p| p.notices.iter()) {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice.clone()));
+    }
     if let Some(notice) = carved_root_cargo_notice(&cwd, &deny_paths) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
     }
@@ -1479,6 +1483,10 @@ pub(crate) async fn build_agent(
             settings.agents_file.budget_tokens,
             deny_paths.clone(),
         );
+        // A config pack in use here adds its own instructions layer.
+        if let Some(pack) = pack.filter(|p| p.agents_file.is_file()) {
+            agent.set_pack_instructions(pack.name.clone(), pack.agents_file.clone());
+        }
     }
 
     // Absence of a context file is not an error — the feature is off only

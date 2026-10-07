@@ -58,9 +58,21 @@ pub struct Settings {
     pub persona: PersonaSettings,
     pub repl: ReplSettings,
     pub skills: SkillsSettings,
+    /// Config packs: which publishers' packs `aivyx-coder pack install`
+    /// accepts. See docs/manual/guide/16-packs.md.
+    pub pack: PackSettings,
     /// Task-aware model routing (`aivyx-route`). Off unless
     /// `[routing] enabled = true`; see docs/manual/guide/08-models-and-routing.md.
     pub routing: aivyx_route::RoutingConfig,
+}
+
+/// `[pack]`: config packs. `trusted_publishers` holds base64 Ed25519
+/// verifying keys whose signed packs `aivyx-coder pack install` accepts,
+/// on top of the keys built into the binary. Empty by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PackSettings {
+    pub trusted_publishers: Vec<String>,
 }
 
 /// Enforced verification (ROADMAP.md Phase 12 Part B): after file edits,
@@ -2448,6 +2460,14 @@ mod tests {
             settings.team.roster_path,
             Some("/tmp/my-roster.toml".to_string())
         );
+    }
+
+    #[test]
+    fn pack_trusted_publishers_round_trip_and_default_empty() {
+        assert!(Settings::default().pack.trusted_publishers.is_empty());
+        let settings: Settings =
+            toml::from_str("[pack]\ntrusted_publishers = [\"AAAA\"]\n").unwrap();
+        assert_eq!(settings.pack.trusted_publishers, vec!["AAAA"]);
     }
 
     #[test]

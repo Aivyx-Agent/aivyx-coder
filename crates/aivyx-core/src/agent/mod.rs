@@ -1044,7 +1044,18 @@ impl Agent {
             global_path,
             budget_tokens,
             deny_paths,
+            pack: None,
         });
+    }
+
+    /// Adds a config pack's `AGENTS.md` as a third instructions source,
+    /// between the user's and the project's (project wins over pack, both
+    /// over the user's). Only takes effect when `AGENTS.md` support is on
+    /// (`set_agents_file` was called) — it's the same feature.
+    pub fn set_pack_instructions(&mut self, pack_name: String, path: PathBuf) {
+        if let Some(config) = &mut self.agents_file_config {
+            config.pack = Some((pack_name, path));
+        }
     }
 
     /// Enables editor-context awareness: a per-project JSON file an editor
@@ -1176,11 +1187,12 @@ impl Agent {
         };
         let budget_chars = (config.budget_tokens as f64 * self.chars_per_token) as usize;
         let global_path = config.global_path.clone();
+        let pack = config.pack.clone();
         let project_path = cwd.join("AGENTS.md");
         let budget_tokens = config.budget_tokens;
 
         let mut sections: Vec<String> = Vec::new();
-        let mut over_budget_labels: Vec<&str> = Vec::new();
+        let mut over_budget_labels: Vec<String> = Vec::new();
 
         if let Some(path) = &global_path
             && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
@@ -1189,7 +1201,7 @@ impl Agent {
             let content = content.trim();
             if !content.is_empty() {
                 if content.chars().count() > budget_chars {
-                    over_budget_labels.push("user-level AGENTS.md");
+                    over_budget_labels.push("user-level AGENTS.md".into());
                 }
                 if let Some(finding) =
                     aivyx_sandbox::scan_for_injection_markers(content, "user-level AGENTS.md")
@@ -1200,13 +1212,32 @@ impl Agent {
             }
         }
 
+        let mut has_pack = false;
+        if let Some((name, path)) = &pack
+            && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
+            && let Ok(content) = tokio::fs::read_to_string(path).await
+        {
+            let content = content.trim();
+            if !content.is_empty() {
+                let label = format!("pack {name} AGENTS.md");
+                if content.chars().count() > budget_chars {
+                    over_budget_labels.push(label.clone());
+                }
+                if let Some(finding) = aivyx_sandbox::scan_for_injection_markers(content, &label) {
+                    self.injection_taint.flag(finding);
+                }
+                sections.push(format!("Pack instructions ({name}):\n{content}"));
+                has_pack = true;
+            }
+        }
+
         if !aivyx_sandbox::path_is_denied(&project_path, &config.deny_paths)
             && let Ok(content) = tokio::fs::read_to_string(&project_path).await
         {
             let content = content.trim();
             if !content.is_empty() {
                 if content.chars().count() > budget_chars {
-                    over_budget_labels.push("project AGENTS.md");
+                    over_budget_labels.push("project AGENTS.md".into());
                 }
                 if let Some(finding) =
                     aivyx_sandbox::scan_for_injection_markers(content, "project AGENTS.md")
@@ -1228,12 +1259,15 @@ impl Agent {
             0 => None,
             1 => Some(sections.remove(0)),
             _ => {
-                let project = sections.remove(1);
-                let global = sections.remove(0);
-                Some(format!(
-                    "{global}\n\n(Project instructions take precedence over user preferences \
-                     if they conflict.)\n\n{project}"
-                ))
+                let last = sections.pop().expect("at least two sections");
+                let note = if has_pack {
+                    "(If these conflict, project instructions take precedence over pack \
+                     instructions, and both over user preferences.)"
+                } else {
+                    "(Project instructions take precedence over user preferences if they \
+                     conflict.)"
+                };
+                Some(format!("{}\n\n{note}\n\n{last}", sections.join("\n\n")))
             }
         };
     }

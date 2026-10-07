@@ -10,6 +10,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod agent_builder;
+mod packs;
 mod routing;
 mod setup_wizard;
 
@@ -222,11 +223,164 @@ struct Cli {
     /// InitializeResponse wiring).
     #[arg(long)]
     setup: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Config packs: install one, switch it on for a project, and more.
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum PackAction {
+    /// Install a pack's aivyx-coder part (verifies its signature first)
+    Install { file: std::path::PathBuf },
+    /// Use an installed pack in this project (or every project)
+    Use {
+        name: String,
+        /// Use it in every project
+        #[arg(long)]
+        global: bool,
+    },
+    /// Stop using a pack in this project (or the one used everywhere)
+    Off {
+        /// Switch off the pack used in every project
+        #[arg(long)]
+        global: bool,
+    },
+    /// Installed packs and where they're in use
+    List,
+    /// Delete an installed pack
+    Remove { name: String },
+    /// Check a pack folder's aivyx-coder part (for pack authors)
+    Check { dir: std::path::PathBuf },
+    /// Verify a pack file and show what it contains
+    Inspect {
+        file: std::path::PathBuf,
+        /// Show a pack signed by a key you haven't trusted yet
+        #[arg(long)]
+        allow_untrusted: bool,
+    },
+}
+
+/// The config pack in use for the current directory, applied to this
+/// session's settings (in memory only). A problem finding it is logged, never
+/// fatal: the session runs without the pack.
+fn apply_pack_layer(settings: &mut Settings) -> Option<packs::PackLayer> {
+    let packs = packs::PacksDir::user().ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    let mut layer = packs::resolve_layer(&packs, &cwd)?;
+    packs::apply_to_settings(&mut layer, settings);
+    tracing::info!(pack = %layer.name, version = %layer.version, "config pack in use");
+    Some(layer)
+}
+
+/// Ask, at a terminal, before a pack's MCP server may run. Without a
+/// terminal the answer is no.
+fn ask_mcp_consent(server: &aivyx_config::McpServerConfig) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        println!("MCP server {} left off (no terminal to ask).", server.name);
+        return false;
+    }
+    print!(
+        "This pack wants to run an MCP server:\n  {}: {}\nAllow it? [y/N] ",
+        server.name,
+        packs::command_line(server)
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    matches!(line.trim(), "y" | "Y" | "yes")
+}
+
+/// `aivyx-coder pack …`. Reads `config.toml` only for trusted keys and
+/// never creates it.
+fn run_pack(action: PackAction) -> anyhow::Result<()> {
+    let packs = packs::PacksDir::user()?;
+    let trusted = || -> anyhow::Result<Vec<String>> {
+        let settings = Settings::load_existing()?.unwrap_or_default();
+        packs::trusted_publishers(&settings).map_err(anyhow::Error::msg)
+    };
+    match action {
+        PackAction::Install { file } => {
+            let installed = packs::install(&packs, &file, &trusted()?).map_err(anyhow::Error::msg)?;
+            println!(
+                "Installed {} v{}. Use it in a project with `aivyx-coder pack use {}` \
+                 (add --global for every project).",
+                installed.name, installed.version, installed.name
+            );
+        }
+        PackAction::Use { name, global } => {
+            let scope = if global {
+                packs::GLOBAL.to_string()
+            } else {
+                packs::project_scope(&std::env::current_dir()?)
+            };
+            let used = packs::use_pack(&packs, &name, scope, &mut ask_mcp_consent)
+                .map_err(anyhow::Error::msg)?;
+            let mcp = if used.mcp.is_empty() {
+                String::new()
+            } else {
+                format!(" with {} MCP server(s)", used.mcp.len())
+            };
+            let place = if global { "every project" } else { "this project" };
+            println!("Using pack {name}{mcp} in {place}. It applies next time aivyx-coder starts.");
+        }
+        PackAction::Off { global } => {
+            let scope = if global {
+                packs::GLOBAL.to_string()
+            } else {
+                packs::project_scope(&std::env::current_dir()?)
+            };
+            if packs::off(&packs, &scope).map_err(anyhow::Error::msg)? {
+                println!("Pack switched off.");
+            } else {
+                println!("No pack was in use there.");
+            }
+        }
+        PackAction::List => print!("{}", packs::render_list(&packs, &std::env::current_dir()?)),
+        PackAction::Remove { name } => {
+            packs::remove(&packs, &name).map_err(anyhow::Error::msg)?;
+            println!("Removed pack {name}.");
+        }
+        PackAction::Check { dir } => {
+            let result = packs::check_coder_part(&dir);
+            print!("{}", packs::render_check(&result));
+            if result.is_err() {
+                anyhow::bail!("the pack has problems (see above)");
+            }
+        }
+        PackAction::Inspect { file, allow_untrusted } => {
+            let bundle = aivyx_pack::read_bundle(&file)?;
+            match aivyx_pack::verify_bundle(&bundle, &trusted()?) {
+                Ok(_) => println!("signature: VERIFIED (trusted publisher)"),
+                Err(e @ aivyx_pack::PackError::UntrustedPublisher { .. }) if allow_untrusted => {
+                    println!("signature: NOT TRUSTED — {e}");
+                }
+                Err(e) => return Err(e.into()),
+            }
+            print!("{}", packs::render_inspect(&bundle.payload).map_err(anyhow::Error::msg)?);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `pack …` works on files only: no agent, no setup wizard, and it
+    // never writes config.toml.
+    if let Some(Command::Pack { action }) = cli.command {
+        return run_pack(action);
+    }
 
     // Must run before Settings::load()'s own first-run-writes-defaults
     // behavior could otherwise fire silently -- the wizard is specifically
@@ -284,8 +438,11 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!(e.to_string()));
         };
         settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
+        let pack = apply_pack_layer(&mut settings);
         let (deferred, acp_prompter_installer) = aivyx_acp::deferred_prompter();
-        let built = crate::agent_builder::build_agent(&cli, &settings, Arc::new(deferred)).await?;
+        let built =
+            crate::agent_builder::build_agent(&cli, &settings, Arc::new(deferred), pack.as_ref())
+                .await?;
         return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
             agent: built.agent,
             events_rx: built.events_rx,
@@ -315,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut settings = Settings::load()?;
     settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
+    let pack = apply_pack_layer(&mut settings);
 
     // Checked before `build_agent` (which does real, non-trivial work --
     // migrating a legacy session file, restoring one, probing a backend --
@@ -335,7 +493,8 @@ async fn main() -> anyhow::Result<()> {
 
     let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
     let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
-    let mut built = crate::agent_builder::build_agent(&cli, &settings, prompter).await?;
+    let mut built =
+        crate::agent_builder::build_agent(&cli, &settings, prompter, pack.as_ref()).await?;
 
     if cli.mcp_server {
         let Some(max_access_level_str) = settings.mcp_server.max_access_level.as_deref() else {
