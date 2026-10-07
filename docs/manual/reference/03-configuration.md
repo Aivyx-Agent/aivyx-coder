@@ -168,6 +168,14 @@ The shared library of `SKILL.md` capability packages the model can load.
 | `project_dir` | string | `".aivyx/skills"` | An extra skills directory for this project, holding one `<skill-name>/SKILL.md` per skill. |
 | `user_dir` | string | `"~/.config/aivyx-coder/skills"` | An extra personal skills directory, same layout. |
 
+### `[pack]`
+
+Config packs: whose signed packs `aivyx-coder pack install` accepts. See [Packs](../guide/16-packs.md).
+
+| Key | Type | Example | Meaning |
+|---|---|---|---|
+| `trusted_publishers` | list of string |  | Base64 Ed25519 keys (from `aivyx-pack keygen`) of publishers whose packs you trust, on top of the keys built in. |
+
 ## Ways of working
 
 ### `[verification]`

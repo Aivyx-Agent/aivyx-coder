@@ -77,6 +77,9 @@ and command waits for your approval (`y` to allow).
   ways, Docker.
   [Editor integration](docs/manual/guide/12-editor-integration.md) ·
   [MCP](docs/manual/guide/13-mcp.md) · [Docker](docs/manual/guide/14-docker.md)
+- **Takes on a specialty** — signed packs add instructions, skills, a team
+  and MCP servers for one kind of work, switched on per project.
+  [Packs](docs/manual/guide/16-packs.md)
 
 ## Platform support
 

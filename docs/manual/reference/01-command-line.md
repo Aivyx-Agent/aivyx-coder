@@ -2,6 +2,7 @@
 
 ```
 aivyx-coder [FLAGS]
+aivyx-coder pack <install|use|off|list|remove|check|inspect> …
 ```
 
 Run it from the project you want to work on: the current directory is the
@@ -100,3 +101,50 @@ Print the flags and exit.
 ### `--version`
 
 Print the version and exit.
+
+## Subcommands
+
+`aivyx-coder pack …` manages config packs — see [Packs](../guide/16-packs.md).
+These work on files only: no model, no session, and they never create
+`config.toml`.
+
+### `pack install`
+
+`aivyx-coder pack install <file>` — verifies the pack's signature against
+`[pack] trusted_publishers` and the built-in keys, checks its aivyx-coder
+part, and keeps it under `~/.config/aivyx-coder/packs/<name>/<version>/`,
+replacing an older version.
+
+### `pack use`
+
+`aivyx-coder pack use <name> [--global]` — use an installed pack in this
+project, or with `--global` in every project. Asks before allowing each of
+the pack's MCP servers (no terminal: none allowed).
+
+### `pack off`
+
+`aivyx-coder pack off [--global]` — stop using the pack in this project, or
+the one used everywhere.
+
+### `pack list`
+
+`aivyx-coder pack list` — installed packs, their versions and where each is
+in use.
+
+### `pack remove`
+
+`aivyx-coder pack remove <name>` — delete an installed pack and switch it
+off everywhere.
+
+### `pack check`
+
+`aivyx-coder pack check <folder>` — for pack authors: checks a pack
+folder's aivyx-coder part (its `AGENTS.md`, skills, roster and MCP servers)
+and lists every problem.
+
+### `pack inspect`
+
+`aivyx-coder pack inspect <file> [--allow-untrusted]` — verifies a pack and
+shows what it contains, including the exact commands its MCP servers would
+run, and whether it passes its checks. `--allow-untrusted` shows a pack
+signed by a key you haven't trusted yet.

@@ -26,6 +26,7 @@ looking things up, and a developer part for contributors.
 13. [MCP](guide/13-mcp.md)
 14. [Docker](guide/14-docker.md)
 15. [Troubleshooting](guide/15-troubleshooting.md)
+16. [Packs](guide/16-packs.md)
 
 ## Part 2 — Reference
 

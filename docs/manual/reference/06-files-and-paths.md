@@ -11,6 +11,8 @@ directories are the platform's equivalents.
 | Config | `~/.config/aivyx-coder/config.toml` (mode `0600`; `--setup` keeps the previous one as `config.toml.bak`) |
 | Your personal instructions | `~/.config/aivyx-coder/AGENTS.md` — loaded into every project; `remember_preference` proposes edits to it |
 | The log, including every permission decision | `~/.config/aivyx-coder/aivyx.log` |
+| Installed packs | `~/.config/aivyx-coder/packs/<name>/<version>/` |
+| Which pack each project uses, and the MCP servers you allowed | `~/.config/aivyx-coder/packs/active.toml` (mode `0600`) |
 
 ## Per-project state
 

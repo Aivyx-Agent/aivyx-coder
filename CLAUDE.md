@@ -79,6 +79,19 @@ Workspace crates (`crates/*`), roughly bottom-up:
 | `aivyx-mcp-server` | A third frontend, over stdio via the `rmcp` crate: exposes aivyx-coder as an MCP server (`code`/`code_reply` tools) for delegation from another local MCP client instead of a terminal or editor. `tiers.rs` (`AccessLevel::{Plan,Edit,Execute}`, each additive over the previous, capped by the required `[mcp_server].max_access_level` config — no default, refuses to start unset), `session.rs` (`build_session_agent` builds one fresh, isolated `Agent` per MCP session via `tier_registry`, filtering the shared `mcp_registry` base down to the session's tier; `TieredPrompter` auto-resolves every in-tier call, since an MCP-server session has no human to prompt), `server.rs` (the `rmcp`-facing layer: `code`/`code_reply` tool definitions, an in-memory TTL-evicted session map). See `docs/manual/guide/13-mcp.md`. |
 | `aivyx` (`crates/aivyx`) | The binary — `agent_builder.rs` builds `Agent` + every collaborator identically regardless of frontend (only the `PermissionPrompter` differs); `main.rs` wires config → backend → agent → either the TUI or, behind `--acp`/`--mcp-server`, `aivyx-acp`/`aivyx-mcp-server`; `routing.rs` wraps the backend in a `RoutedBackend` when `[routing] enabled = true` (off ⇒ the very same `Arc`, tested with `Arc::ptr_eq`), rejects a `[routing.endpoints.backend]` table and any endpoint `aivyx-route`'s `effective_locality()` calls cloud (cloud kind, non-local `base_url` host, or `locality = "cloud"`), gives the default endpoint (`default_endpoint`) the address chat connects to plus `[backend] locality`, so a remote `[backend]` model is cloud and never routed to (and never residency-polled; `cloud_backend_notice` then puts a startup notice in the transcript and `RoutedBackend::with_no_route_hint` makes the no-candidate routing error name `[backend] locality`), and runs discovery at startup when `discover = true` — and, when a residency source exists (an Ollama/llama-router `[routing.endpoints]` entry, the default backend, or `vram_bytes`), spawns a 5 s residency poll (`ResidencySources`/`spawn_residency_refresh`, holding only a `Weak` so it exits with the router); `/models` shows the resulting residency block |
 
+### Config packs
+
+`crates/aivyx/src/packs.rs` owns config packs (the shared `aivyx-pack`
+format, `format = 2`, pinned git dep): `pack install|use|off|list|remove|
+check|inspect`, `packs/<name>/<version>/` plus `packs/active.toml` (which
+pack each canonical project path — or `*` — uses, and the MCP servers the
+user approved with their exact command). At startup `main::apply_pack_layer`
+resolves the cwd's pack and applies it to an in-memory copy of `Settings`
+(roster if unset, skills into a free slot, approved MCP servers), and
+`Agent::set_pack_instructions` adds its `AGENTS.md` between the user's and
+the project's. Nothing ever edits the user's files. See
+`docs/manual/guide/16-packs.md`.
+
 ### Data flow for one turn
 
 model emits a tool call → `ToolExecutor::dispatch` (`aivyx-tools/src/lib.rs`)

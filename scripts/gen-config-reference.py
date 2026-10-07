@@ -58,7 +58,7 @@ PRIMITIVES = {
 GROUPS = [
     ("The model", ["backend", "routing"]),
     ("Safety", ["permissions", "sandbox", "git"]),
-    ("Context the model gets", ["repo_map", "agents_file", "editor_context", "skills"]),
+    ("Context the model gets", ["repo_map", "agents_file", "editor_context", "skills", "pack"]),
     ("Ways of working", ["verification", "autonomous", "architect", "council", "sub_agent", "team"]),
     ("Tools", ["web", "lsp", "repl", "vision", "mcp", "persona"]),
     ("Running inside other tools", ["mcp_server", "editor_approval"]),
@@ -74,6 +74,7 @@ INTROS = {
     "agents_file": f"Project and personal instructions (`AGENTS.md`) loaded into every turn. See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
     "editor_context": f"Your editor's open file, cursor and selection, read from a small JSON file. See [Editor integration]({GUIDE}/12-editor-integration.md).",
     "skills": "The shared library of `SKILL.md` capability packages the model can load.",
+    "pack": f"Config packs: whose signed packs `aivyx-coder pack install` accepts. See [Packs]({GUIDE}/16-packs.md).",
     "verification": f"Check the work after edits by running a test command before a turn may end. See [Undo, diff, commit and test]({GUIDE}/05-undo-diff-commit-test.md).",
     "autonomous": f"Limits for `--auto` runs. See [Autonomous and advanced modes]({GUIDE}/10-autonomous-and-advanced-modes.md).",
     "architect": "The model that plans for `/architect <task>`.",
@@ -130,6 +131,7 @@ MEANINGS = {
     "verification.command": "Name of a `[[permissions.allowed_commands]]` entry to run after edits, before a turn may end. Setting it turns verification on.",
     "skills.project_dir": "An extra skills directory for this project, holding one `<skill-name>/SKILL.md` per skill.",
     "skills.user_dir": "An extra personal skills directory, same layout.",
+    "pack.trusted_publishers": "Base64 Ed25519 keys (from `aivyx-pack keygen`) of publishers whose packs you trust, on top of the keys built in.",
     "team.roster_path": "A team-config TOML to use instead of the built-in coding team.",
     "web.allow_private_targets": "Let `web_fetch` reach loopback, private and link-local addresses. Off by default.",
 }

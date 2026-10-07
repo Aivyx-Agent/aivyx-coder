@@ -57,6 +57,32 @@ mod tests {
     }
 
     #[test]
+    fn every_subcommand_has_a_command_line_reference_heading() {
+        use clap::CommandFactory;
+        let manual = include_str!("../../../docs/manual/reference/01-command-line.md");
+        let mut missing = Vec::new();
+        for cmd in Cli::command().get_subcommands() {
+            for sub in cmd.get_subcommands() {
+                let heading = format!("### `{} {}`", cmd.get_name(), sub.get_name());
+                if !manual.contains(&heading) {
+                    missing.push(heading);
+                }
+            }
+        }
+        assert!(missing.is_empty(), "docs/manual/reference/01-command-line.md lacks: {missing:?}");
+    }
+
+    #[test]
+    fn pack_subcommands_parse() {
+        let cli = Cli::try_parse_from(["aivyx-coder", "pack", "use", "bm", "--global"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pack { action: PackAction::Use { ref name, global: true } }) if name == "bm"
+        ));
+        assert!(Cli::try_parse_from(["aivyx-coder", "pack", "frobnicate"]).is_err());
+    }
+
+    #[test]
     fn validate_mcp_server_session_limits_rejects_zero_ttl() {
         let err = validate_mcp_server_session_limits(0, 8).unwrap_err();
         assert!(err.to_string().contains("session_ttl_secs"));
