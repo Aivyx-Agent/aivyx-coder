@@ -28,19 +28,35 @@ GUIDE = "../guide"
 ROOT_STRUCT = "Settings"
 
 
+def cargo_metadata():
+    """`cargo metadata`, offline first. Offline fails when any locked
+    package, even one only another platform needs, was never downloaded
+    (a fresh machine), so it falls back to letting cargo fetch it."""
+    errors = []
+    for extra in (["--offline"], []):
+        try:
+            return subprocess.run(
+                ["cargo", "metadata", "--format-version", "1", *extra],
+                cwd=ROOT, capture_output=True, text=True, check=True,
+            ).stdout
+        except OSError as err:
+            errors.append(str(err))
+        except subprocess.CalledProcessError as err:
+            errors.append(err.stderr.strip())
+    sys.exit("gen-config-reference: `cargo metadata` failed:\n" + "\n".join(errors))
+
+
 def dependency_sources(names):
-    """`src/**/*.rs` of the named Cargo dependencies (e.g. aivyx-route)."""
-    try:
-        meta = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--offline"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return []
-    out = []
-    for pkg in json.loads(meta)["packages"]:
+    """`src/**/*.rs` of the named Cargo dependencies (e.g. aivyx-route).
+    Exits if one is missing: its types would silently drop out of the
+    reference (whole `[routing]` tables, enum values shown as type names)."""
+    out, found = [], set()
+    for pkg in json.loads(cargo_metadata())["packages"]:
         if pkg["name"] in names:
+            found.add(pkg["name"])
             out += sorted(pathlib.Path(pkg["manifest_path"]).parent.glob("src/**/*.rs"))
+    if missing := names - found:
+        sys.exit(f"gen-config-reference: no source for {', '.join(sorted(missing))}")
     return out
 
 
