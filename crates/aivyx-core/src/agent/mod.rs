@@ -301,6 +301,13 @@ pub struct Agent {
     /// 11c design doc / plan for why event-stream inference is unreliable
     /// here.
     last_turn_paused: bool,
+    /// The autonomous run's goal (`set_autonomous_goal`), restated in the
+    /// system prompt once compaction has dropped the turn that carried it —
+    /// an unattended run has no user to ask to restate it.
+    autonomous_goal: Option<String>,
+    /// Set once compaction has said the fixed prompt alone overflows
+    /// `context_limit`, so the notice isn't repeated every turn.
+    budget_too_small_reported: bool,
     /// `(map, budget_tokens)` when the repo map is enabled; re-rendered
     /// once per turn (cheap after the first pass — only changed files
     /// re-parse) into `repo_map_text`.
@@ -521,6 +528,8 @@ impl Agent {
             autonomous_mode,
             injection_taint: InjectionTaint::new(),
             last_turn_paused: false,
+            autonomous_goal: None,
+            budget_too_small_reported: false,
             repo_map: None,
             kv_cache: None,
             kv_slot_id: None,
@@ -584,6 +593,12 @@ impl Agent {
     /// `last_turn_paused` field's doc comment for why this exists.
     pub fn last_turn_paused(&self) -> bool {
         self.last_turn_paused
+    }
+
+    /// Records the goal of an autonomous run, so it survives compaction —
+    /// see the `autonomous_goal` field.
+    pub fn set_autonomous_goal(&mut self, goal: impl Into<String>) {
+        self.autonomous_goal = Some(goal.into());
     }
 
     /// The text of the most recent assistant message of the latest turn
@@ -1671,10 +1686,24 @@ impl Agent {
     fn system_prompt_text(&self) -> String {
         let mut system = self.system_prompt.clone();
         if self.history_truncated {
-            system.push_str(
-                "\n\n(Note: earlier parts of this conversation were truncated to fit the \
-                 model's context window. Ask the user to restate anything you're missing.)",
-            );
+            match &self.autonomous_goal {
+                Some(goal) if self.autonomous_mode.active() => {
+                    system.push_str(
+                        "\n\n(Note: earlier parts of this conversation were truncated to fit \
+                         the model's context window. The goal of this unattended run, as \
+                         first given: ",
+                    );
+                    system.push_str(goal);
+                    system.push_str(
+                        " — check the project's current state (files, git status, your task \
+                         list) for what's already done.)",
+                    );
+                }
+                _ => system.push_str(
+                    "\n\n(Note: earlier parts of this conversation were truncated to fit the \
+                     model's context window. Ask the user to restate anything you're missing.)",
+                ),
+            }
         }
         if self.plan_mode.active() {
             system.push_str("\n\n");
@@ -1823,6 +1852,20 @@ impl Agent {
             self.emit(AgentEvent::Error(
                 "earlier conversation was truncated to fit the model's context window".to_string(),
             ));
+        }
+
+        // Every droppable turn is gone and the prompt still doesn't fit:
+        // aivyx-coder's own instructions and tools nearly fill the budget,
+        // so from now on each turn will lose all the ones before it.
+        if !self.budget_too_small_reported && self.estimate_prompt_tokens() > high {
+            self.budget_too_small_reported = true;
+            self.emit(AgentEvent::Error(format!(
+                "the prompt is about {} tokens even without earlier turns — more than \
+                 backend.context_tokens ({}) leaves room for, so each turn will drop the ones \
+                 before it. Set [backend] context_tokens to your model's real context window.",
+                self.estimate_prompt_tokens(),
+                self.context_limit
+            )));
         }
     }
 

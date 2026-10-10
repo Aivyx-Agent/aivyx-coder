@@ -5669,6 +5669,45 @@ fn compaction_drops_oldest_turns_and_surfaces_a_notice() {
 }
 
 #[test]
+fn compaction_that_cannot_fit_says_the_budget_is_too_small_once() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    // The fixed prompt alone (1,000 chars = 250 tokens at the default
+    // 4 chars/token) is over the 80-token high-water mark, so dropping
+    // every earlier turn still can't make it fit.
+    agent.context_limit = 100;
+    agent.system_prompt = "s".repeat(1_000);
+    for i in 0..3 {
+        agent.history.push(user_msg(&format!("u{i}")));
+        agent.history.push(assistant_msg(&format!("a{i}")));
+    }
+
+    agent.compact_if_needed(Path::new("."));
+    agent.history.push(user_msg("u3"));
+    agent.compact_if_needed(Path::new("."));
+
+    let too_small: Vec<_> = drain(&mut rx)
+        .into_iter()
+        .filter(|e| matches!(e, AgentEvent::Error(m) if m.contains("context_tokens (100)")))
+        .collect();
+    assert_eq!(too_small.len(), 1, "said once per session, not every turn");
+}
+
+#[test]
+fn a_truncated_autonomous_run_restates_its_goal() {
+    let (mut agent, _rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.set_autonomous_goal("add Saturday hours to site/index.html");
+    agent.history_truncated = true;
+
+    agent.autonomous_mode.set_active(true);
+    let text = agent.system_prompt_text();
+    assert!(text.contains("add Saturday hours to site/index.html"), "{text}");
+    assert!(!text.contains("Ask the user"), "no user to ask in an unattended run");
+
+    agent.autonomous_mode.set_active(false);
+    assert!(agent.system_prompt_text().contains("Ask the user"));
+}
+
+#[test]
 fn no_compaction_when_well_under_the_window() {
     let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
     agent.context_limit = 100_000;

@@ -406,6 +406,9 @@ pub async fn run(
             let deadline = Instant::now() + autonomous.max_duration;
             let mut iterations_used = 0u32;
             let mut next_message = Some(autonomous.goal.clone());
+            // Kept by the agent too: compaction can drop the turn that
+            // carried it, and there's no one to ask to restate it.
+            agent.set_autonomous_goal(autonomous.goal.clone());
             while let Some(message) = next_message.take() {
                 if iterations_used >= autonomous.max_iterations || Instant::now() >= deadline {
                     let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
