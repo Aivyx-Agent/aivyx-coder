@@ -25,6 +25,13 @@ FROM alpine:latest
 
 RUN apk add --no-cache git bash coreutils
 
+# Run it as the user who owns the project (`docker run --user`, see
+# docs/manual/guide/14-docker.md): as root, git refuses a bind-mounted
+# repository it doesn't own ("dubious ownership"), which breaks checkpoints
+# and --auto. Any uid can write this home.
+RUN mkdir -p /home/coder && chmod 1777 /home/coder
+ENV HOME=/home/coder
+
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/aivyx-coder /usr/local/bin/aivyx-coder
 
 ENTRYPOINT ["aivyx-coder"]

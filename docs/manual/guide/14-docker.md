@@ -13,11 +13,13 @@ skip the build. Or build it yourself:
 
 ```bash
 docker build -t aivyx-coder .
+mkdir -p ~/.config/aivyx-coder ~/.local/state/aivyx-coder
 docker run -it --rm \
+  --user "$(id -u):$(id -g)" \
   --add-host=host.docker.internal:host-gateway \
   -v "$(pwd)":/workspace -w /workspace \
-  -v "$HOME/.config/aivyx-coder":/root/.config/aivyx-coder \
-  -v "$HOME/.local/state/aivyx-coder":/root/.local/state/aivyx-coder \
+  -v "$HOME/.config/aivyx-coder":/home/coder/.config/aivyx-coder \
+  -v "$HOME/.local/state/aivyx-coder":/home/coder/.local/state/aivyx-coder \
   aivyx-coder
 ```
 
@@ -25,7 +27,14 @@ The three `-v` flags bind-mount the project directory being worked on,
 plus `aivyx-coder`'s own config and session-state directories, so
 `config.toml` and session history survive across separate `docker run`
 invocations rather than being lost every time the container exits (each
-run is otherwise a fresh, ephemeral container). If the LLM backend
+run is otherwise a fresh, ephemeral container). Create the two directories
+first, as above — otherwise Docker creates them owned by root.
+
+`--user` runs it as you, so the files it writes are yours, and git accepts
+the project. As root, git refuses a mounted repository owned by someone
+else ("detected dubious ownership"): checkpoints and `/undo` stop working,
+and `--auto` refuses to start because it finds no git worktree. The image's
+home, `/home/coder`, is writable by any user. If the LLM backend
 (Ollama, llama-server, etc.) runs on the host rather than inside another
 container, set `base_url` in `config.toml` to
 `http://host.docker.internal:<port>/v1` — the `--add-host` flag above is
