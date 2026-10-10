@@ -51,11 +51,16 @@ pub(crate) struct Selection {
 ///
 /// `None` when no home/state directory can be determined at all.
 pub(crate) fn editor_context_file_path(cwd: &Path) -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
-    let state_dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    // This crate's own tests use a per-process temporary directory, so
+    // running them never writes into the real state directory.
+    let state_dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("aivyx-coder-test-state-{}", std::process::id()))
+    } else {
+        let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
+        dirs.state_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dirs.data_local_dir().to_path_buf())
+    };
 
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let key = format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()));
@@ -107,6 +112,11 @@ mod tests {
         assert_ne!(a1, b, "different directories must not collide");
         assert!(a1.extension().is_some_and(|e| e == "json"));
         assert!(a1.to_string_lossy().contains("editor-context"));
+        assert!(
+            a1.starts_with(std::env::temp_dir()),
+            "tests must not write into the real state directory: {}",
+            a1.display()
+        );
     }
 
     #[test]

@@ -87,11 +87,7 @@ enum Decision {
 /// `std`'s `DefaultHasher` doesn't guarantee that; this crate can't import
 /// `aivyx-core`'s copy since the dependency points the other way).
 fn state_subdir_path(cwd: &Path, filename_suffix: &str) -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
-    let state_dir = dirs
-        .state_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    let state_dir = state_dir()?;
 
     let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let key = format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()));
@@ -99,6 +95,23 @@ fn state_subdir_path(cwd: &Path, filename_suffix: &str) -> Option<PathBuf> {
         state_dir
             .join("editor-approval")
             .join(format!("{key}-{filename_suffix}.json")),
+    )
+}
+
+/// `~/.local/state/aivyx-coder` (or the platform's equivalent). This
+/// crate's own tests use a per-process temporary directory instead, so
+/// running them never writes into the real one.
+fn state_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(
+            std::env::temp_dir().join(format!("aivyx-coder-test-state-{}", std::process::id())),
+        );
+    }
+    let dirs = directories::ProjectDirs::from("", "", "aivyx-coder")?;
+    Some(
+        dirs.state_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dirs.data_local_dir().to_path_buf()),
     )
 }
 
@@ -291,6 +304,11 @@ mod tests {
             "request and response paths must differ"
         );
         assert!(a1.to_string_lossy().contains("editor-approval"));
+        assert!(
+            a1.starts_with(std::env::temp_dir()),
+            "tests must not write into the real state directory: {}",
+            a1.display()
+        );
     }
 
     fn write_request(path: &str, diff: Option<DiffContent>) -> PermissionRequest {
