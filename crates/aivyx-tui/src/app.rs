@@ -485,6 +485,11 @@ pub async fn run(
 
     let mut guard = TerminalGuard::init()?;
     let mut crossterm_events = EventStream::new();
+    // Once the agent task returns (an `--auto` run that stopped) both
+    // channels are closed and `recv()` is ready forever with `None`; stop
+    // polling them, or the loop redraws at 100% CPU until the user quits.
+    let mut agent_events_open = true;
+    let mut permissions_open = true;
 
     loop {
         guard.terminal().draw(|frame| app.render(frame))?;
@@ -601,14 +606,16 @@ pub async fn run(
 
                 app.input.input(event);
             }
-            maybe_agent_event = agent_events_rx.recv() => {
-                if let Some(event) = maybe_agent_event {
-                    app.handle_agent_event(event);
+            maybe_agent_event = agent_events_rx.recv(), if agent_events_open => {
+                match maybe_agent_event {
+                    Some(event) => app.handle_agent_event(event),
+                    None => agent_events_open = false,
                 }
             }
-            maybe_modal = permission_rx.recv() => {
-                if let Some(modal) = maybe_modal {
-                    app.open_permission(modal);
+            maybe_modal = permission_rx.recv(), if permissions_open => {
+                match maybe_modal {
+                    Some(modal) => app.open_permission(modal),
+                    None => permissions_open = false,
                 }
             }
             _ = async {
