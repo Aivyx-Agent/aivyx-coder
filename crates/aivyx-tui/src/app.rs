@@ -58,13 +58,29 @@ fn goal_achieved(
     let tasks_signal =
         (!tasks.is_empty()).then(|| tasks.iter().all(|t| t.status == TaskStatus::Done));
     let mission_signal = mission_plan
-        .filter(|p| !p.mission.is_empty() || !p.steps.is_empty())
+        .filter(|p| mission_in_use(p))
         .map(|p| p.summary.is_some());
     match (tasks_signal, mission_signal) {
         (None, None) => false,
         _ => tasks_signal.unwrap_or(true) && mission_signal.unwrap_or(true),
     }
 }
+
+/// Whether a mission plan was ever engaged — `agent_builder.rs` constructs
+/// an empty placeholder whenever `[team] enabled = true`, which doesn't count.
+fn mission_in_use(plan: &MissionPlan) -> bool {
+    !plan.mission.is_empty() || !plan.steps.is_empty()
+}
+
+/// Sent instead of the generic "continue" when the model has neither a task
+/// list nor a mission. A task list marked done is the only way an
+/// autonomous run can finish, so a model that did the work without one
+/// would otherwise be told to keep going until the budget ran out — and a
+/// small model then invents work, undoing what it got right.
+const NO_TASK_LIST_MESSAGE: &str = "You have no task list, and a task list is how this run \
+ends. If the goal is already achieved, call set_tasks with the steps you completed, each \
+marked done, and stop. Otherwise call set_tasks with your plan, then carry it out. Don't \
+start work the goal didn't ask for.";
 
 /// What the autonomous driver sends next, given whether the turn that just
 /// finished paused (Phase 12A), the current task list, the current mission
@@ -83,6 +99,12 @@ fn next_autonomous_message(
     }
     if goal_achieved(tasks, mission_plan, open_specialist_sessions) {
         return None;
+    }
+    if tasks.is_empty()
+        && !mission_plan.is_some_and(mission_in_use)
+        && open_specialist_sessions.is_empty()
+    {
+        return Some(NO_TASK_LIST_MESSAGE.to_string());
     }
     Some("continue working toward the goal".to_string())
 }
@@ -2644,8 +2666,39 @@ mod tests {
         );
         assert_eq!(
             next_autonomous_message(false, &[], None, &[]),
+            Some(NO_TASK_LIST_MESSAGE.to_string()),
+            "no tasks ever set -> ask for a task list (the only way to finish), not more work"
+        );
+    }
+
+    #[test]
+    fn no_task_list_message_says_how_to_finish() {
+        assert!(NO_TASK_LIST_MESSAGE.contains("set_tasks"));
+        assert!(NO_TASK_LIST_MESSAGE.contains("already achieved"));
+        assert!(NO_TASK_LIST_MESSAGE.contains("marked done"));
+    }
+
+    #[test]
+    fn a_used_mission_without_tasks_keeps_the_generic_continue() {
+        let unsynthesized = mission_with_summary(None);
+        assert_eq!(
+            next_autonomous_message(false, &[], Some(&unsynthesized), &[]),
+            Some("continue working toward the goal".to_string())
+        );
+        let pristine = MissionPlan {
+            mission: String::new(),
+            steps: vec![],
+            summary: None,
+        };
+        assert_eq!(
+            next_autonomous_message(false, &[], Some(&pristine), &[]),
+            Some(NO_TASK_LIST_MESSAGE.to_string()),
+            "a never-decomposed placeholder plan counts as no plan"
+        );
+        assert_eq!(
+            next_autonomous_message(false, &[], None, &[open_session("s1")]),
             Some("continue working toward the goal".to_string()),
-            "no tasks ever set -> keep going until budget exhausts, not stuck forever"
+            "an open specialist session blocks finishing, so set_tasks alone wouldn't end the run"
         );
     }
 
