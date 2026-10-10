@@ -195,9 +195,47 @@ pub fn context_warning(configured: u32, served: &ServedContext) -> Option<String
     }
 }
 
+/// The context window to budget for: the server's own figure when it
+/// reports a *larger* window than `backend.context_tokens` (the setting
+/// means "the model's window", and the default 8192 is written into every
+/// first-run config, so an unchanged default would otherwise leave most of
+/// a bigger window unused — and aivyx-coder's fixed prompt alone is about
+/// that size). A smaller served window keeps the configured value;
+/// `context_warning` says so. Returns the notice to show when it differs.
+/// llama-server reports the per-slot window, so `-np` is accounted for.
+pub fn effective_context_tokens(configured: u32, served: &ServedContext) -> (u32, Option<String>) {
+    match served {
+        ServedContext::Known(n) if *n > configured => (
+            *n,
+            Some(format!(
+                "using the server's {n}-token context window (backend.context_tokens is \
+                 {configured})."
+            )),
+        ),
+        _ => (configured, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_context_uses_a_larger_served_window() {
+        let (tokens, notice) = effective_context_tokens(8192, &ServedContext::Known(32768));
+        assert_eq!(tokens, 32768);
+        let notice = notice.expect("says it's using the server's window");
+        assert!(notice.contains("32768") && notice.contains("8192"), "{notice}");
+
+        for served in [
+            ServedContext::Known(8192),
+            ServedContext::Known(4096),
+            ServedContext::OllamaDefaultUnknown,
+            ServedContext::Unknown,
+        ] {
+            assert_eq!(effective_context_tokens(8192, &served), (8192, None));
+        }
+    }
 
     #[test]
     fn parses_llama_server_props() {

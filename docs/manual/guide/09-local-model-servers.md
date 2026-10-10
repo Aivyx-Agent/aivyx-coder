@@ -8,7 +8,13 @@ GPU with other programs, and the embedded engine.
 match the context window your server **actually serves**. Too small a
 served window makes replies stop mid-thought; too large a setting makes
 aivyx-coder overfill it. Setup reads the served window where the server
-reports it.
+reports it, and at every start-up, when the server reports a larger window
+than `context_tokens` (llama-server, Ollama with `num_ctx`, Lemonade),
+aivyx-coder uses the server's and says so. llama-server reports the window
+per slot, so `-np 2` with `-c 32768` gives 16384. With vLLM, which doesn't
+report it, set it yourself: aivyx-coder's own instructions and tools take
+roughly 8,000 tokens, so a setting near that drops every earlier turn — a
+notice says when that happens.
 
 ## Choosing a server
 aivyx speaks the OpenAI-compatible `/v1` API, so any local server works.

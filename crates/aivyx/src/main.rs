@@ -555,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
                 base_registry: built.mcp_registry,
                 deny_paths: built.deny_paths,
                 cwd: built.cwd,
-                context_tokens: settings.backend.context_tokens,
+                context_tokens: built.context_tokens,
                 edit_format,
                 // Same boolean `agent_builder.rs` computes for its own
                 // top-level `agent.set_broker_mode` call -- every MCP

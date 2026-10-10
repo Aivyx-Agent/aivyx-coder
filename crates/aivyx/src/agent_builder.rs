@@ -194,6 +194,9 @@ pub(crate) fn effective_allowed_commands(
 /// inline before handing off to `aivyx_tui::run`.
 pub(crate) struct BuiltAgent {
     pub(crate) agent: Agent,
+    /// `backend.context_tokens`, or the server's larger served window —
+    /// see `aivyx_llm::effective_context_tokens`.
+    pub(crate) context_tokens: u32,
     pub(crate) events_rx: mpsc::UnboundedReceiver<aivyx_core::AgentEvent>,
     pub(crate) cwd: PathBuf,
     pub(crate) plan_mode: PlanMode,
@@ -715,6 +718,40 @@ pub(crate) async fn build_agent(
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
 
+    // Best-effort probe of the *served* context window (llama-server
+    // /props, Ollama /api/show). A smaller-than-configured window means
+    // silent mid-response truncation, the exact failure the Phase 2 A/B
+    // spent a round diagnosing — warned about, advisory only. A larger one
+    // is used instead of `backend.context_tokens` (see
+    // `effective_context_tokens`): the first-run default of 8192 is about
+    // the size of the fixed prompt, so keeping it would drop every earlier
+    // turn. An unreachable/unknown server keeps the configured value.
+    // Skipped for MistralRs (embedded inference, no served endpoint to
+    // probe at all) and for LlamaServerBroker (the real request path goes
+    // through `broker_base_url`, not `settings.backend.base_url` — which
+    // broker-mode users often leave at its default — so probing the latter
+    // would just fire against the wrong address).
+    let mut context_tokens = settings.backend.context_tokens;
+    if settings.backend.kind != aivyx_config::BackendKind::MistralRs
+        && settings.backend.kind != aivyx_config::BackendKind::LlamaServerBroker
+    {
+        let served =
+            aivyx_llm::probe_served_context(&settings.backend.base_url, &settings.backend.model)
+                .await;
+        if let Some(warning) = aivyx_llm::context_warning(settings.backend.context_tokens, &served)
+        {
+            tracing::warn!(%warning, "context window mismatch");
+            let _ = events_tx.send(aivyx_core::AgentEvent::Error(warning));
+        }
+        let (effective, notice) =
+            aivyx_llm::effective_context_tokens(settings.backend.context_tokens, &served);
+        context_tokens = effective;
+        if let Some(notice) = notice {
+            tracing::info!(%notice, "context window");
+            let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
+        }
+    }
+
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(WriteFileTool));
@@ -1052,7 +1089,7 @@ pub(crate) async fn build_agent(
             plan_mode: plan_mode.clone(),
             autonomous_mode: autonomous_mode.clone(),
             injection_taint: injection_taint.clone(),
-            context_tokens: settings.backend.context_tokens,
+            context_tokens,
             edit_format,
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
@@ -1152,7 +1189,7 @@ pub(crate) async fn build_agent(
                 plan_mode: plan_mode.clone(),
                 autonomous_mode: autonomous_mode.clone(),
                 injection_taint: injection_taint.clone(),
-                context_tokens: settings.backend.context_tokens,
+                context_tokens,
                 edit_format,
                 verification: verification.clone(),
                 max_iterations: settings.sub_agent.max_iterations,
@@ -1217,7 +1254,7 @@ pub(crate) async fn build_agent(
             plan_mode: plan_mode.clone(),
             autonomous_mode: autonomous_mode.clone(),
             injection_taint: injection_taint.clone(),
-            context_tokens: settings.backend.context_tokens,
+            context_tokens,
             edit_format,
             verification: verification.clone(),
             max_iterations: settings.sub_agent.max_iterations,
@@ -1243,29 +1280,6 @@ pub(crate) async fn build_agent(
         executor.set_checkpointer_at(cwd.clone(), deny_paths.clone(), Arc::clone(cp));
     }
     let system_prompt = build_system_prompt(&executor, edit_format);
-
-    // Best-effort probe of the *served* context window (llama-server
-    // /props, Ollama /api/show) — a smaller-than-configured window means
-    // silent mid-response truncation, the exact failure the Phase 2 A/B
-    // spent a round diagnosing. Advisory only: the warning lands in the
-    // transcript as a notice; an unreachable/unknown server stays silent.
-    // Skipped for MistralRs (embedded inference, no served endpoint to
-    // probe at all) and for LlamaServerBroker (the real request path goes
-    // through `broker_base_url`, not `settings.backend.base_url` — which
-    // broker-mode users often leave at its default — so probing the latter
-    // would just fire against the wrong address).
-    if settings.backend.kind != aivyx_config::BackendKind::MistralRs
-        && settings.backend.kind != aivyx_config::BackendKind::LlamaServerBroker
-    {
-        let served =
-            aivyx_llm::probe_served_context(&settings.backend.base_url, &settings.backend.model)
-                .await;
-        if let Some(warning) = aivyx_llm::context_warning(settings.backend.context_tokens, &served)
-        {
-            tracing::warn!(%warning, "context window mismatch");
-            let _ = events_tx.send(aivyx_core::AgentEvent::Error(warning));
-        }
-    }
 
     // A `[backend]` routing counts as cloud leaves routed calls (the main
     // loop's included) with nothing to pick unless another local model is
@@ -1422,7 +1436,7 @@ pub(crate) async fn build_agent(
         system_prompt,
         AgentConfig {
             max_tool_iterations: settings.permissions.max_tool_iterations_per_turn,
-            context_tokens: settings.backend.context_tokens,
+            context_tokens,
             edit_format,
         },
         Arc::clone(&tasks),
@@ -1639,6 +1653,7 @@ pub(crate) async fn build_agent(
     };
 
     Ok(BuiltAgent {
+        context_tokens,
         agent,
         events_rx,
         cwd,

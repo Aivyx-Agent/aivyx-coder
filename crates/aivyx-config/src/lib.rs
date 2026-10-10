@@ -813,9 +813,11 @@ pub struct BackendSettings {
     /// The model's context window, in tokens — used to show a live budget
     /// indicator and to trigger context compaction before the window
     /// overflows. Conservative default; **set this to your model's actual
-    /// window** (qwen3.5/qwen3.6 support far more than the default). Not
-    /// auto-detected: the OpenAI-compatible `/v1` surface doesn't expose it
-    /// reliably across Ollama/vLLM/llama.cpp.
+    /// window** (qwen3.5/qwen3.6 support far more than the default). When
+    /// the server reports a larger window (llama-server, Ollama with
+    /// `num_ctx`, Lemonade), aivyx-coder uses that instead and says so at
+    /// start-up; a smaller one gets a warning. vLLM and other servers don't
+    /// report it, so this value is used as-is.
     pub context_tokens: u32,
     /// How edit content travels: "native" sends edits as edit_file /
     /// write_file tool-call arguments; "prompted" teaches the model to
