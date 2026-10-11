@@ -18,6 +18,8 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-util = "0.7.18"
 tui-textarea = "0.7.0"
+# Already in the tree through ratatui; measures text for transcript wrapping.
+unicode-width = "0.2.0"
 
 [features]
 # Real OS-level confinement (Landlock filesystem scoping + a seccomp-bpf

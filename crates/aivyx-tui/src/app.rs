@@ -1159,12 +1159,19 @@ impl App {
             .iter()
             .flat_map(chat_line_to_lines)
             .collect();
-        if !self.transcript.iter().any(|l| matches!(l, ChatLine::User(_))) {
+        // Until the first message — `/help` (which echoes no "you >" line)
+        // already says the same and more, so the hint goes then too.
+        if !self
+            .transcript
+            .iter()
+            .any(|l| matches!(l, ChatLine::User(_) | ChatLine::Help(_)))
+        {
             lines.extend(first_message_hint(&self.tests_line));
         }
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
+        let lines = hang_wrap(lines, content_width);
 
         let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
         // `Paragraph::scroll` applies its offset *after* wrapping, so the
@@ -1246,7 +1253,9 @@ impl App {
             render_command_hint(frame, hint_area, &hints);
         }
 
-        let base = if self.streaming_active {
+        let base = if self.pending_permission.is_some() {
+            "waiting for your answer"
+        } else if self.streaming_active {
             "streaming... (Ctrl+C to cancel)"
         } else if self.autonomous {
             "autonomous run — Ctrl+C to stop"
@@ -1702,7 +1711,11 @@ fn render_permission_modal_in(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Permission required")
+        .title(if aivyx_sandbox::is_one_off_command(request) {
+            "Confirm"
+        } else {
+            "Permission required"
+        })
         .style(Style::default().fg(Color::Yellow));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1764,6 +1777,10 @@ fn render_permission_modal_in(
 
     let footer_text = if request.tool_name == "commit" {
         "[y] Commit    [e] Edit message    [n] / [Esc] / [Enter] Cancel"
+    } else if request.tool_name == "undo" {
+        "[y] Undo    [n] / [Esc] / [Enter] Cancel"
+    } else if request.tool_name == "redo" {
+        "[y] Redo    [n] / [Esc] / [Enter] Cancel"
     } else if offer_always_allow(request) {
         "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny"
     } else {
@@ -1963,15 +1980,101 @@ fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'s
     text.lines()
         .enumerate()
         .map(|(i, line)| {
-            let prefix = if i == 0 { prefix } else { indent.as_str() };
-            Line::from(format!("{prefix}{line}")).style(style)
+            let prefix = if i == 0 { prefix.to_string() } else { indent.clone() };
+            // Two spans — prefix, then body — so `hang_wrap` can wrap the
+            // body under the prefix instead of back at the left edge.
+            Line::from(vec![Span::raw(prefix), Span::raw(line.to_string())]).style(style)
         })
         .collect()
+}
+
+/// Wraps each two-span (prefix, body) line from `prefixed_lines` to
+/// `width` columns, indenting continuation rows to the prefix's width — the
+/// terminal's own soft wrap would start them at the left edge, so a long
+/// path or a wrapped thought looked like a separate, unlabelled line.
+/// Breaks at spaces where it can, mid-word where a word alone is too wide.
+/// Other lines pass through for the paragraph's own wrapping.
+fn hang_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    let width = usize::from(width);
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let [prefix, body] = line.spans.as_slice() else {
+            out.push(line);
+            continue;
+        };
+        let indent = prefix.content.width();
+        if indent + body.content.width() <= width || width <= indent + 8 {
+            out.push(line);
+            continue;
+        }
+        let room = width - indent;
+        let pad = " ".repeat(indent);
+        for (i, row) in wrap_words(&body.content, room).into_iter().enumerate() {
+            let lead = if i == 0 { prefix.content.to_string() } else { pad.clone() };
+            out.push(Line::from(vec![Span::raw(lead), Span::raw(row)]).style(line.style));
+        }
+    }
+    out
+}
+
+/// `text` in rows of at most `room` columns, breaking after spaces where
+/// possible and inside a word only when it alone doesn't fit.
+fn wrap_words(text: &str, room: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0;
+    for word in text.split_inclusive(' ') {
+        let word_width: usize = word.chars().map(|c| c.width().unwrap_or(0)).sum();
+        if row_width + word_width.saturating_sub(usize::from(word.ends_with(' '))) > room && !row.is_empty() {
+            rows.push(std::mem::take(&mut row).trim_end().to_string());
+            row_width = 0;
+        }
+        for c in word.chars() {
+            let w = c.width().unwrap_or(0);
+            if row_width + w > room && !(c == ' ' && row_width == room) {
+                rows.push(std::mem::take(&mut row).trim_end().to_string());
+                row_width = 0;
+            }
+            if c == ' ' && row_width == 0 && !rows.is_empty() {
+                continue;
+            }
+            row.push(c);
+            row_width += w;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row.trim_end().to_string());
+    }
+    rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_prefixed_lines_keep_their_hanging_indent() {
+        let lines = prefixed_lines(
+            "edited /tmp/a/very/long/path/to/the/project/calc.py",
+            "  tool result: ",
+            Style::default(),
+        );
+        let rows: Vec<String> = hang_wrap(lines, 40).iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "  tool result: edited".to_string(),
+                "               /tmp/a/very/long/path/to/".to_string(),
+                "               the/project/calc.py".to_string(),
+            ]
+        );
+        assert!(rows.iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 40));
+        // Short lines and unprefixed lines are left alone.
+        let short = prefixed_lines("ok", "  tool result: ", Style::default());
+        assert_eq!(hang_wrap(short, 40)[0].to_string(), "  tool result: ok");
+    }
 
     #[test]
     fn tool_calls_read_as_what_they_touch() {
@@ -3666,12 +3769,55 @@ mod tests {
     }
 
     #[test]
+    fn the_status_line_says_it_is_waiting_while_a_modal_is_open() {
+        let mut app = App::new(None, PlanMode::new());
+        app.streaming_active = true;
+        let (modal, _rx) = commit_modal("Fix the average");
+        app.pending_permission = Some(modal);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("waiting for your answer"), "{rendered}");
+        assert!(!rendered.contains("streaming..."), "{rendered}");
+    }
+
+    #[test]
+    fn help_output_replaces_the_welcome_hint() {
+        let mut app = App::new(None, PlanMode::new());
+        app.transcript.push(ChatLine::Help("Available commands:\n  /help".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(!rendered.contains("Ask for a change or a question"), "{rendered}");
+    }
+
+    #[test]
     fn commit_edit_input_quotes_the_draft() {
         assert_eq!(
             commit_edit_input("Say \"hi\""),
             "/commit -m \"Say \\\"hi\\\"\""
         );
         assert_eq!(commit_edit_input("Fix it"), "/commit -m \"Fix it\"");
+    }
+
+    #[test]
+    fn the_undo_confirmation_says_undo_and_cancel() {
+        let request = PermissionRequest {
+            tool_name: "undo".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Other("take back the last turn".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: Some("calc.py (+1 −1)".to_string()),
+            diff: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("[y] Undo"), "{rendered}");
+        assert!(rendered.contains("Confirm"), "{rendered}");
+        assert!(!rendered.contains("Deny"), "{rendered}");
     }
 
     #[test]
