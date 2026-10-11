@@ -1728,9 +1728,12 @@ impl Agent {
             // to know a test command even exists unless told here. Not
             // shown in plan mode: no edits happen there, so running tests
             // is moot.
+            // "Exactly as written": each run then asks to approve the same
+            // command, so the user can allow it once ([a] Always Allow)
+            // instead of approving every variation the model invents.
             system.push_str(&format!(
                 "\n\nThis project's tests run with `{}`. After changing code, run them (with \
-                 run_shell) before telling the user it works.",
+                 run_shell, exactly that command, unchanged) before telling the user it works.",
                 tests.display()
             ));
         }

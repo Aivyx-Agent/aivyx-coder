@@ -6796,8 +6796,8 @@ fn system_prompt_tells_the_model_the_test_command_when_tests_are_set() {
     let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
     let tests = sh_tests("pytest");
     let sentence = format!(
-        "This project's tests run with `{}`. After changing code, run them (with run_shell) \
-         before telling the user it works.",
+        "This project's tests run with `{}`. After changing code, run them (with run_shell, \
+         exactly that command, unchanged) before telling the user it works.",
         tests.display()
     );
     agent.set_tests(Some(tests));
