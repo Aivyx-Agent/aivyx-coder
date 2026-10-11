@@ -38,11 +38,18 @@ impl TerminalGuard {
 
     fn init_after_raw_mode() -> io::Result<Self> {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         // Start from a blank screen even where the alternate screen isn't
         // cleared on entry, so first-run setup text can't show through.
-        terminal.clear()?;
+        // Cleared here rather than with `Terminal::clear`, which (since
+        // ratatui 0.30) asks the terminal for its cursor position and fails
+        // startup outright on one that doesn't answer.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        )?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         install_panic_hook();
         Ok(Self { terminal })
     }
