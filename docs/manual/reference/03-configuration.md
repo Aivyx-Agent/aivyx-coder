@@ -265,7 +265,7 @@ The `web_fetch` and `web_search` tools. Inference stays local; these reach the n
 | `search_base_url` | string |  | Your SearXNG instance. Without it, `web_search` explains that it isn't set up. |
 | `max_search_results` | integer |  | Applied by `web_search`; results beyond this are dropped, not an error. |
 | `fetch_timeout_secs` | integer |  | Applied to both tools' HTTP client. |
-| `allow_private_targets` | bool |  | Let `web_fetch` reach loopback, private and link-local addresses. Off by default. |
+| `allow_private_targets` | bool |  | Let `web_fetch` reach local-network addresses (loopback, private, link-local, and 100.64.0.0/10 as used by Tailscale). Off by default. |
 
 ### `[lsp]`
 

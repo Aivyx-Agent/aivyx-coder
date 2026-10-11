@@ -105,9 +105,13 @@ impl Tool for WebFetchTool {
         let url = reqwest::Url::parse(&args.url)
             .map_err(|err| ToolError::InvalidArguments(format!("invalid URL: {err}")))?;
 
-        if !self.allow_private_targets {
-            resolve_and_check(&url).await?;
-        }
+        // The checked addresses, pinned for the connection below so a
+        // second DNS lookup can't hand back a different (private) one.
+        let pinned = if self.allow_private_targets {
+            None
+        } else {
+            Some(resolve_and_check(&url).await?)
+        };
 
         // Redirects must not be auto-followed: `resolve_and_check` only
         // validated the *initial* URL above, and reqwest's default client
@@ -120,9 +124,13 @@ impl Tool for WebFetchTool {
         // which naturally re-runs `resolve_and_check` against that exact
         // URL, keeping "every URL ever connected to has gone through
         // resolve_and_check exactly once" trivially true.
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(self.timeout)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        if let (Some(addrs), Some(host)) = (&pinned, url.host_str()) {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+        let client = builder
             .build()
             .map_err(|err| {
                 ToolError::ExecutionFailed(format!("failed to build HTTP client: {err}"))

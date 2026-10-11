@@ -328,7 +328,8 @@ pub struct WebSettings {
     /// Applied to both tools' HTTP client.
     pub fetch_timeout_secs: u64,
     /// When `false` (default), `web_fetch` refuses to connect to a
-    /// resolved loopback/private/link-local address. See
+    /// resolved local-network address (loopback, private, link-local,
+    /// carrier-grade NAT, or an IPv6 form embedding one). See
     /// `aivyx_tools::web::is_private_or_local`.
     pub allow_private_targets: bool,
 }

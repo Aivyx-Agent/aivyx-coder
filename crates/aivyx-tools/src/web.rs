@@ -32,7 +32,17 @@ pub(crate) fn is_private_or_local(ip: IpAddr) -> bool {
 }
 
 fn is_ipv4_private_or_local(v4: Ipv4Addr) -> bool {
-    v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+    let [a, b, ..] = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        // 0.0.0.0/8 ("this network"), not just 0.0.0.0.
+        || a == 0
+        // 100.64.0.0/10: carrier-grade NAT, where Tailscale and similar
+        // overlay networks put the machines on them.
+        || (a == 100 && (b & 0xc0) == 64)
+        || v4.is_broadcast()
+        || v4.is_multicast()
 }
 
 fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
@@ -43,10 +53,24 @@ fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
     if let Some(v4) = v6.to_ipv4_mapped() {
         return is_ipv4_private_or_local(v4);
     }
-    if v6.is_loopback() || v6.is_unspecified() {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
         return true;
     }
     let segments = v6.segments();
+    // Forms that carry an IPv4 address and reach it: IPv4-compatible
+    // (::a.b.c.d), NAT64 (64:ff9b::/96 and the local-use 64:ff9b:1::/48)
+    // and 6to4 (2002::/16, the address in the next 32 bits). Checked by the
+    // IPv4 they embed.
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    if segments[..6] == [0; 6] {
+        return is_ipv4_private_or_local(v4(segments[6], segments[7]));
+    }
+    if (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]) || segments[..3] == [0x64, 0xff9b, 1] {
+        return is_ipv4_private_or_local(v4(segments[6], segments[7]));
+    }
+    if segments[0] == 0x2002 {
+        return is_ipv4_private_or_local(v4(segments[1], segments[2]));
+    }
     // fc00::/7 - unique local addresses.
     if (segments[0] & 0xfe00) == 0xfc00 {
         return true;
@@ -59,18 +83,16 @@ fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
 }
 
 /// Resolves `url`'s host and refuses if any resolved address is
-/// loopback/private/link-local. Known limitation, accepted as a
-/// best-effort mitigation rather than the project's primary security
-/// boundary (which remains the sandbox/`ConfirmationGate` — see the
-/// AGENTS.md trust-boundary note in README.md for the same distinction
-/// applied to a different feature): this resolves DNS itself to check it,
-/// then `reqwest` resolves DNS again to actually connect: a DNS answer
-/// that changes between the two lookups (e.g. DNS rebinding) could in
-/// principle let a checked-safe hostname connect to a different, unchecked
-/// address. Closing that gap fully would need a custom `reqwest` resolver
-/// pinning the exact checked address for the subsequent connection — out
-/// of scope for this pass.
-pub(crate) async fn resolve_and_check(url: &reqwest::Url) -> Result<(), ToolError> {
+/// loopback/private/link-local; otherwise returns the addresses it checked.
+/// The caller must connect to exactly those (`reqwest`'s
+/// `resolve_to_addrs`), never resolve again: a DNS answer that changes
+/// between a check and a second lookup (DNS rebinding) would otherwise let
+/// a checked-safe name reach a private address. This is a best-effort
+/// guard for a tool with no per-call confirmation, not the project's main
+/// boundary (the sandbox and `ConfirmationGate`).
+pub(crate) async fn resolve_and_check(
+    url: &reqwest::Url,
+) -> Result<Vec<std::net::SocketAddr>, ToolError> {
     let host = url
         .host_str()
         .ok_or_else(|| ToolError::InvalidArguments("URL has no host".to_string()))?;
@@ -79,7 +101,8 @@ pub(crate) async fn resolve_and_check(url: &reqwest::Url) -> Result<(), ToolErro
         .await
         .map_err(|err| ToolError::ExecutionFailed(format!("failed to resolve host {host}: {err}")))?;
 
-    for addr in addrs {
+    let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+    for addr in &addrs {
         if is_private_or_local(addr.ip()) {
             return Err(ToolError::ExecutionFailed(format!(
                 "refusing to fetch {host}: resolved to {} (a private/local address) — set \
@@ -88,7 +111,10 @@ pub(crate) async fn resolve_and_check(url: &reqwest::Url) -> Result<(), ToolErro
             )));
         }
     }
-    Ok(())
+    if addrs.is_empty() {
+        return Err(ToolError::ExecutionFailed(format!("{host} has no addresses")));
+    }
+    Ok(addrs)
 }
 
 #[cfg(test)]
@@ -142,6 +168,34 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_shared_and_special_ranges_are_blocked() {
+        // 100.64.0.0/10: carrier-grade NAT — Tailscale gives tailnet
+        // machines addresses here.
+        assert!(is_private_or_local("100.64.0.1".parse().unwrap()));
+        assert!(is_private_or_local("100.127.255.254".parse().unwrap()));
+        assert!(!is_private_or_local("100.128.0.1".parse().unwrap()));
+        // The rest of 0.0.0.0/8, broadcast and multicast.
+        assert!(is_private_or_local("0.1.2.3".parse().unwrap()));
+        assert!(is_private_or_local("255.255.255.255".parse().unwrap()));
+        assert!(is_private_or_local("224.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_forms_embedding_a_private_ipv4_are_blocked() {
+        // NAT64 (well-known and local-use prefixes), 6to4, IPv4-compatible.
+        assert!(is_private_or_local("64:ff9b::7f00:1".parse().unwrap()));
+        assert!(is_private_or_local("64:ff9b::a9fe:a9fe".parse().unwrap()));
+        assert!(is_private_or_local("64:ff9b:1::c0a8:101".parse().unwrap()));
+        assert!(is_private_or_local("2002:7f00:1::1".parse().unwrap()));
+        assert!(is_private_or_local("::10.0.0.1".parse().unwrap()));
+        // The same forms around a public IPv4 stay allowed.
+        assert!(!is_private_or_local("64:ff9b::808:808".parse().unwrap()));
+        assert!(!is_private_or_local("2002:808:808::1".parse().unwrap()));
+        // IPv6 multicast.
+        assert!(is_private_or_local("ff02::1".parse().unwrap()));
+    }
+
+    #[test]
     fn ipv4_public_address_is_allowed() {
         assert!(!is_private_or_local("8.8.8.8".parse().unwrap()));
     }
@@ -181,6 +235,13 @@ mod tests {
         // Same reasoning as the IPv4 0.0.0.0 case: connect() to :: can
         // reach localhost, so it must be blocked like the loopback address.
         assert!(is_private_or_local("::".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolve_and_check_returns_the_addresses_it_checked() {
+        let url = reqwest::Url::parse("http://8.8.8.8:8080/").unwrap();
+        let addrs = resolve_and_check(&url).await.unwrap();
+        assert_eq!(addrs, vec!["8.8.8.8:8080".parse().unwrap()]);
     }
 
     #[tokio::test]

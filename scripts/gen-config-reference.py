@@ -149,7 +149,7 @@ MEANINGS = {
     "skills.user_dir": "An extra personal skills directory, same layout.",
     "pack.trusted_publishers": "Base64 Ed25519 keys (from `aivyx-pack keygen`) of publishers whose packs you trust, on top of the keys built in.",
     "team.roster_path": "A team-config TOML to use instead of the built-in coding team.",
-    "web.allow_private_targets": "Let `web_fetch` reach loopback, private and link-local addresses. Off by default.",
+    "web.allow_private_targets": "Let `web_fetch` reach local-network addresses (loopback, private, link-local, and 100.64.0.0/10 as used by Tailscale). Off by default.",
 }
 
 # ---------------------------------------------------------------------------
