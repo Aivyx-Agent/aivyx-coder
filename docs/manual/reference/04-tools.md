@@ -86,12 +86,12 @@ Only when `[web] enabled = true`. Inference stays local; these reach the network
 
 ## Language server
 
-Uses rust-analyzer (`[lsp]`).
+Uses rust-analyzer (`[lsp]`). The first call in a session asks before starting it: rust-analyzer builds the project, running its build scripts and proc macros. Plan mode never starts it; `--auto` only if `rust-analyzer` is in `[[permissions.allowed_commands]]`.
 
 | Tool | Asks first? | What it does |
 |---|---|---|
-| `go_to_definition` | no | Resolve the symbol at a file position (1-indexed line/column) to its actual definition site via rust-analyzer. Use this when the repo map's symbol list isn't enough to tell which exact definition a call site resolves to. |
-| `find_references` | no | Find every reference to the symbol at a file position (1-indexed line/column) across the whole workspace via rust-analyzer — unlike grep, this distinguishes the symbol from unrelated identifiers that merely share its name. |
+| `go_to_definition` | once | Resolve the symbol at a file position (1-indexed line/column) to its actual definition site via rust-analyzer. Use this when the repo map's symbol list isn't enough to tell which exact definition a call site resolves to. |
+| `find_references` | once | Find every reference to the symbol at a file position (1-indexed line/column) across the whole workspace via rust-analyzer — unlike grep, this distinguishes the symbol from unrelated identifiers that merely share its name. |
 
 ## Memory and learning
 

@@ -2,11 +2,11 @@ mod protocol;
 mod transport;
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aivyx_sandbox::ExecutionConfiner;
+use aivyx_sandbox::{ActionKind, ExecutionConfiner, PermissionRequest, PermissionTarget};
 use tokio::sync::Mutex;
 
 use crate::ToolError;
@@ -75,6 +75,50 @@ impl LspClient {
             opened_uris: HashSet::new(),
             next_doc_version: 1,
         });
+    }
+
+    /// What `go_to_definition`/`find_references` ask before running. The
+    /// server's first start is approved like a command: rust-analyzer
+    /// builds the project, running its build scripts and proc macros
+    /// (repo code), so it's asked once; while it's running, a query is
+    /// only a read of `path`.
+    pub(crate) fn permission_request(
+        &self,
+        tool_name: &str,
+        path: PathBuf,
+        arguments_preview: serde_json::Value,
+    ) -> PermissionRequest {
+        let (action, target, preview) = if self.is_running() {
+            (ActionKind::Read, PermissionTarget::Path(path), None)
+        } else {
+            (
+                ActionKind::Execute,
+                PermissionTarget::Command { program: self.program.clone(), args: Vec::new() },
+                Some(format!(
+                    "Start {} for this project. It builds the project, which runs its build \
+                     scripts and proc macros (sandboxed). Asked once: it keeps running for this \
+                     session.",
+                    self.program
+                )),
+            )
+        };
+        PermissionRequest {
+            tool_name: tool_name.to_string(),
+            action,
+            target,
+            arguments_preview,
+            preview,
+            diff: None,
+        }
+    }
+
+    /// Whether a server is up. A held lock means a query or an (already
+    /// approved) start is in progress, so that counts as running.
+    fn is_running(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|started| !started.connection.is_dead()),
+            Err(_) => true,
+        }
     }
 
     /// Ensures a live, initialized LSP session exists for `cwd`, spawning
@@ -308,7 +352,12 @@ async fn initialize(
     let params = serde_json::json!({
         "processId": std::process::id(),
         "rootUri": root_uri,
-        "capabilities": {},
+        // Without asking, rust-analyzer reports neither its progress nor
+        // when it's ready, and `wait_until_idle` can't tell.
+        "capabilities": {
+            "window": { "workDoneProgress": true },
+            "experimental": { "serverStatusNotification": true },
+        },
         "workspaceFolders": [{ "uri": root_uri, "name": "workspace" }],
     });
     tokio::time::timeout(timeout, connection.request("initialize", params))
@@ -318,7 +367,14 @@ async fn initialize(
                 "rust-analyzer did not respond to the initialize handshake within {}s",
                 timeout.as_secs()
             ))
-        })??;
+        })?
+        .map_err(|_| {
+            ToolError::ExecutionFailed(
+                "rust-analyzer exited while starting — check that `rust-analyzer --version` works \
+                 in this project (with rustup, a toolchain must be installed)"
+                    .to_string(),
+            )
+        })?;
     connection.notify("initialized", serde_json::json!({})).await?;
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget};
+use aivyx_sandbox::PermissionRequest;
 use aivyx_types::{ToolDefinition, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -63,14 +63,11 @@ impl Tool for FindReferencesTool {
     ) -> Result<PermissionRequest, ToolError> {
         let args: FindReferencesArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
-        Ok(PermissionRequest {
-            tool_name: self.name().to_string(),
-            action: ActionKind::Read,
-            target: PermissionTarget::Path(crate::path_resolve::resolve(cwd, &args.path)),
-            arguments_preview: json!({ "path": args.path, "line": args.line, "column": args.column }),
-            preview: None,
-            diff: None,
-        })
+        Ok(self.lsp.permission_request(
+            self.name(),
+            crate::path_resolve::resolve(cwd, &args.path),
+            json!({ "path": args.path, "line": args.line, "column": args.column }),
+        ))
     }
 
     async fn execute(
@@ -91,6 +88,7 @@ impl Tool for FindReferencesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivyx_sandbox::{ActionKind, PermissionTarget};
     use std::time::Duration;
 
     async fn ctx(dir: &Path) -> ToolExecutionContext {
@@ -102,18 +100,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_request_targets_the_resolved_file_path_as_a_read() {
+    async fn starting_rust_analyzer_is_asked_first_then_queries_are_reads() {
+        // rust-analyzer runs the project's build scripts and proc macros:
+        // repo code, so starting it is approved like a command (once — it
+        // stays running for the session).
         let dir = tempfile::tempdir().unwrap();
         let lsp = Arc::new(LspClient::new(Duration::from_secs(5)));
-        let tool = FindReferencesTool::new(lsp);
+        let tool = FindReferencesTool::new(Arc::clone(&lsp));
+        let args = json!({"path": "src/lib.rs", "line": 3, "column": 5});
 
-        let request = tool
-            .permission_request(&json!({"path": "src/lib.rs", "line": 3, "column": 5}), dir.path())
-            .unwrap();
-
-        assert_eq!(request.action, ActionKind::Read);
+        let first = tool.permission_request(&args, dir.path()).unwrap();
+        assert_eq!(first.action, ActionKind::Execute);
         assert_eq!(
-            request.target,
+            first.target,
+            PermissionTarget::Command { program: "rust-analyzer".into(), args: vec![] }
+        );
+        assert!(first.preview.unwrap().contains("build scripts"));
+
+        // Once a server is running, a query is just a read of the file.
+        let (client_reader, _server_writer) = tokio::io::duplex(4096);
+        let (_server_reader, client_writer) = tokio::io::duplex(4096);
+        lsp.wire_for_test(client_reader, client_writer).await;
+        let later = tool.permission_request(&args, dir.path()).unwrap();
+        assert_eq!(later.action, ActionKind::Read);
+        assert_eq!(
+            later.target,
             PermissionTarget::Path(dir.path().canonicalize().unwrap().join("src/lib.rs"))
         );
     }

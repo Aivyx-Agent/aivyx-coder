@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -34,7 +34,17 @@ pub(crate) struct Connection {
     /// rust-analyzer: an immediate post-spawn query returned `[]`, the
     /// identical query 10s later returned the correct result.
     open_progress_tokens: Arc<AtomicI64>,
+    /// rust-analyzer's own readiness report (`experimental/serverStatus`,
+    /// which `initialize` asks for): `STATUS_UNKNOWN` until the first one
+    /// arrives, then whether the workspace is fully loaded. Preferred over
+    /// the progress count — without it, a query right after start-up came
+    /// back empty ("no definition found").
+    status: Arc<AtomicU8>,
 }
+
+const STATUS_UNKNOWN: u8 = 0;
+const STATUS_BUSY: u8 = 1;
+const STATUS_QUIESCENT: u8 = 2;
 
 impl Connection {
     pub(crate) fn new(
@@ -45,13 +55,20 @@ impl Connection {
         let pending_for_task = pending.clone();
         let open_progress_tokens = Arc::new(AtomicI64::new(0));
         let progress_for_task = open_progress_tokens.clone();
-        let reader_task = tokio::spawn(read_loop(reader, pending_for_task, progress_for_task));
+        let status = Arc::new(AtomicU8::new(STATUS_UNKNOWN));
+        let reader_task = tokio::spawn(read_loop(
+            reader,
+            pending_for_task,
+            progress_for_task,
+            Arc::clone(&status),
+        ));
         Self {
             writer: Mutex::new(Box::new(writer)),
             pending,
             next_id: AtomicI64::new(1),
             reader_task,
             open_progress_tokens,
+            status,
         }
     }
 
@@ -85,7 +102,12 @@ impl Connection {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
         const DEBOUNCE: Duration = Duration::from_millis(400);
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        // How long to wait for a first `experimental/serverStatus` before
+        // treating the server as one that doesn't send it.
+        const STATUS_GRACE: Duration = Duration::from_secs(5);
+
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
         let mut idle_since: Option<tokio::time::Instant> = None;
 
         loop {
@@ -93,13 +115,18 @@ impl Connection {
             if now >= deadline {
                 return;
             }
-            if self.open_progress_tokens.load(Ordering::Relaxed) <= 0 {
-                let since = *idle_since.get_or_insert(now);
-                if now.duration_since(since) >= DEBOUNCE {
-                    return;
+            match self.status.load(Ordering::Relaxed) {
+                STATUS_QUIESCENT => return,
+                STATUS_BUSY => {}
+                _ if now.duration_since(start) < STATUS_GRACE => {}
+                // No status report: fall back to the progress count.
+                _ if self.open_progress_tokens.load(Ordering::Relaxed) <= 0 => {
+                    let since = *idle_since.get_or_insert(now);
+                    if now.duration_since(since) >= DEBOUNCE {
+                        return;
+                    }
                 }
-            } else {
-                idle_since = None;
+                _ => idle_since = None,
             }
             tokio::time::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now))).await;
         }
@@ -109,6 +136,14 @@ impl Connection {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
+        // Registered after the reader stopped (and cleared the map): no
+        // reply can come.
+        if self.is_dead() {
+            self.pending.lock().await.remove(&id);
+            return Err(ToolError::ExecutionFailed(
+                "LSP server closed the connection before responding".to_string(),
+            ));
+        }
 
         let message = serde_json::json!({
             "jsonrpc": "2.0",
@@ -162,11 +197,25 @@ async fn write_framed(
     writer.flush().await
 }
 
-async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap, progress: Arc<AtomicI64>) {
+async fn read_loop(
+    reader: impl AsyncRead + Unpin,
+    pending: PendingMap,
+    progress: Arc<AtomicI64>,
+    status: Arc<AtomicU8>,
+) {
     let mut reader = BufReader::new(reader);
     loop {
         match read_one_message(&mut reader).await {
             Ok(Some(value)) => {
+                if value.get("method").and_then(Value::as_str) == Some("experimental/serverStatus")
+                    && let Some(quiescent) = value
+                        .get("params")
+                        .and_then(|p| p.get("quiescent"))
+                        .and_then(Value::as_bool)
+                {
+                    let next = if quiescent { STATUS_QUIESCENT } else { STATUS_BUSY };
+                    status.store(next, Ordering::Relaxed);
+                }
                 if value.get("method").and_then(Value::as_str) == Some("$/progress")
                     && let Some(kind) = value
                         .get("params")
@@ -221,6 +270,10 @@ async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap, progress
             Err(_) => break,   // malformed framing: treat as dead, matching EOF
         }
     }
+    // Nothing will answer now: fail whoever is waiting rather than leaving
+    // them to their timeout (a server that dies at start-up otherwise
+    // reads as a handshake that never came).
+    pending.lock().await.clear();
 }
 
 /// The largest message body accepted from the language server.
@@ -298,6 +351,50 @@ mod tests {
         writer.write_all(header.as_bytes()).await.unwrap();
         writer.write_all(&body).await.unwrap();
         writer.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_request_fails_at_once_when_the_server_exits() {
+        // A server that dies at start-up (rustup with no toolchain, say)
+        // must not leave the handshake waiting out the whole timeout.
+        let (client_reader, server_writer) = tokio::io::duplex(4096);
+        let (_server_reader, client_writer) = tokio::io::duplex(4096);
+        let connection = Connection::new(client_reader, client_writer);
+        drop(server_writer);
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), connection.request("initialize", Value::Null))
+                .await
+                .expect("the request must fail promptly, not wait for a reply");
+        assert!(result.unwrap_err().to_string().contains("closed the connection"));
+    }
+
+    #[tokio::test]
+    async fn wait_until_idle_waits_for_the_servers_ready_report() {
+        let (client_reader, mut server_writer) = tokio::io::duplex(4096);
+        let (_server_reader, client_writer) = tokio::io::duplex(4096);
+        let connection = Connection::new(client_reader, client_writer);
+
+        let status = |quiescent: bool| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "experimental/serverStatus",
+                "params": { "health": "ok", "quiescent": quiescent },
+            })
+        };
+        write_raw_frame(&mut server_writer, status(false)).await;
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            write_raw_frame(&mut server_writer, status(true)).await;
+            server_writer
+        });
+
+        let started = std::time::Instant::now();
+        connection.wait_until_idle(Duration::from_secs(10)).await;
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(250), "returned while busy: {waited:?}");
+        assert!(waited < Duration::from_secs(3), "missed the ready report: {waited:?}");
+        drop(server.await.unwrap());
     }
 
     #[tokio::test]

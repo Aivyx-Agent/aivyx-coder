@@ -135,6 +135,8 @@ match the currently pending request is ignored.
 lookups through `rust-analyzer`: which definition a call really resolves
 to, and every place a symbol is used. They're always available; if
 `rust-analyzer` isn't on your `PATH`, the first call says so. It starts on
-first use, runs inside the sandbox, and each request is limited by
+first use, after asking you once per session — it builds the project, which
+runs the project's build scripts and proc macros. It runs inside the
+sandbox, and each request is limited by
 `[lsp] timeout_secs` (default 60, since the first index of a big project
 takes a while). Rust only for now.

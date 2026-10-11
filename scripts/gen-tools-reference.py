@@ -32,7 +32,10 @@ GROUPS = {
     "Planning": ("The model's own task list, shown in the TUI.", ["set_tasks"]),
     "Web": ("Only when `[web] enabled = true`. Inference stays local; these reach the network.",
             ["web_fetch", "web_search"]),
-    "Language server": ("Uses rust-analyzer (`[lsp]`).", ["go_to_definition", "find_references"]),
+    "Language server": ("Uses rust-analyzer (`[lsp]`). The first call in a session asks before starting it: "
+                 "rust-analyzer builds the project, running its build scripts and proc macros. "
+                 "Plan mode never starts it; `--auto` only if `rust-analyzer` is in "
+                 "`[[permissions.allowed_commands]]`.", ["go_to_definition", "find_references"]),
     "Memory and learning": (f"See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
                             ["memory_read", "memory_write", "memory_forget", "remember_preference",
                              "load_skill"]),
@@ -100,7 +103,14 @@ ASKS = {"Read": "no", "Internal": "no", "Network": "no", "Interact": "no",
         "Write": "yes", "Delete": "yes", "Execute": "yes", "Move": "yes",
         "McpTool": "yes", "Memory": "yes", "PersistentMemory": "yes"}
 # Tools whose PermissionRequest is built by a helper outside the impl block.
-ASK_OVERRIDES = {"spawn_specialist": "no", "query_specialist": "no", "close_specialist": "no"}
+ASK_OVERRIDES = {
+    "spawn_specialist": "no",
+    "query_specialist": "no",
+    "close_specialist": "no",
+    # Their requests come from LspClient: starting rust-analyzer asks once.
+    "go_to_definition": "once",
+    "find_references": "once",
+}
 
 
 def collect():
