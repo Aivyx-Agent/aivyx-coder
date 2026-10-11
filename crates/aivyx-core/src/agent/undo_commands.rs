@@ -21,7 +21,6 @@ use crate::undo::{
 /// the folder isn't a git repository.
 const NO_CHECKPOINTS: &str =
     "No checkpoints here — checkpoints are off or this folder isn't a git repository.";
-const NOTHING_TO_UNDO: &str = "Nothing to undo — no changes made in this session.";
 const TOO_OLD: &str = "That turn is too old to undo (only the newest 50 checkpoints are kept).";
 
 /// Which undo command a message is, if any.
@@ -178,12 +177,21 @@ impl Agent {
         !matches!(prompter.prompt(&request).await, UserResponse::Deny)
     }
 
+    /// Whether the project has saved conversations besides this one.
+    fn has_other_conversations(&self) -> bool {
+        let Some(store) = self.session_store() else {
+            return false;
+        };
+        let current = self.current_session_id();
+        store.list().iter().any(|m| Some(m.id.as_str()) != current && m.turns > 0)
+    }
+
     async fn undo_last_turn(&mut self) {
         let Some(cwd) = self.undo_cwd("/undo") else {
             return;
         };
         let Some(mark) = self.undo.marks.last().cloned() else {
-            self.info(NOTHING_TO_UNDO);
+            self.info(crate::undo::nothing_to_undo(false, self.has_other_conversations()));
             return;
         };
         if !oid_exists(&cwd, &mark.before_oid).await {
@@ -346,6 +354,7 @@ impl Agent {
         self.info(checkpoints_listing(
             &self.undo.marks,
             !self.undo.redo.is_empty(),
+            self.has_other_conversations(),
             local_offset_secs(),
             |m| missing.contains(&m.before_oid),
         ));

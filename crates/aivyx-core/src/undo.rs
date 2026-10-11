@@ -187,18 +187,30 @@ pub fn text_preview(user_text: &str) -> String {
     }
 }
 
+/// What `/undo` and `/checkpoints` say when this conversation has nothing
+/// to take back. Undo history belongs to each conversation, so when the
+/// project has others (`other_conversations`), point there — a fresh start
+/// otherwise reads as if earlier changes can't be undone.
+pub fn nothing_to_undo(redo_waiting: bool, other_conversations: bool) -> &'static str {
+    if redo_waiting {
+        "Nothing to undo — /redo puts back what the last /undo removed."
+    } else if other_conversations {
+        "Nothing to undo in this conversation. Changes from an earlier one can be undone \
+         there: /sessions lists them, /resume N switches."
+    } else {
+        "Nothing to undo — no changes made in this session."
+    }
+}
+
 pub fn checkpoints_listing(
     marks: &[TurnMark],
     redo_waiting: bool,
+    other_conversations: bool,
     local_offset_secs: i32,
     is_pruned: impl Fn(&TurnMark) -> bool,
 ) -> String {
     if marks.is_empty() {
-        return if redo_waiting {
-            "Nothing to undo — /redo puts back what the last /undo removed.".to_string()
-        } else {
-            "Nothing to undo — no changes made in this session.".to_string()
-        };
+        return nothing_to_undo(redo_waiting, other_conversations).to_string();
     }
     let mut text = "Undoable turns (newest first — /undo takes back the top one):".to_string();
     for (i, m) in marks.iter().rev().enumerate() {
@@ -357,7 +369,7 @@ mod tests {
         a.user_text_preview = "first".into();
         let mut b = mark(1_000 + 3_600);
         b.user_text_preview = "second".into();
-        let text = checkpoints_listing(&[a.clone(), b], false, 0, |m| m.created_unix == a.created_unix);
+        let text = checkpoints_listing(&[a.clone(), b], false, false, 0, |m| m.created_unix == a.created_unix);
         assert_eq!(
             text,
             "Undoable turns (newest first — /undo takes back the top one):\n\
@@ -365,9 +377,17 @@ mod tests {
              2  00:16 · \"first\"   too old to undo"
         );
         assert_eq!(
-            checkpoints_listing(&[], false, 0, |_| false),
+            checkpoints_listing(&[], false, false, 0, |_| false),
             "Nothing to undo — no changes made in this session."
         );
+    }
+
+    #[test]
+    fn nothing_to_undo_points_at_earlier_conversations_when_there_are_some() {
+        assert_eq!(nothing_to_undo(false, false), "Nothing to undo — no changes made in this session.");
+        let text = nothing_to_undo(false, true);
+        assert!(text.contains("/sessions") && text.contains("/resume"), "{text}");
+        assert!(nothing_to_undo(true, true).contains("/redo"));
     }
 
     #[test]
@@ -377,7 +397,7 @@ mod tests {
         // be misleading (changes *were* made; they were undone), and would
         // also hide that `/redo` is available.
         assert_eq!(
-            checkpoints_listing(&[], true, 0, |_| false),
+            checkpoints_listing(&[], true, false, 0, |_| false),
             "Nothing to undo — /redo puts back what the last /undo removed."
         );
     }
