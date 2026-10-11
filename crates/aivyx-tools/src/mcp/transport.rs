@@ -158,13 +158,32 @@ async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap) {
     }
 }
 
+/// The largest message accepted from a server: a line that never ends
+/// would otherwise grow without limit.
+const MAX_MESSAGE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub(crate) async fn read_one_message<R>(reader: &mut R) -> std::io::Result<Option<Value>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    read_one_message_capped(reader, MAX_MESSAGE_BYTES).await
+}
+
+async fn read_one_message_capped<R>(reader: &mut R, limit: u64) -> std::io::Result<Option<Value>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = (&mut *reader).take(limit + 1).read_line(&mut line).await?;
+        if n as u64 > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP message over {limit} bytes"),
+            ));
+        }
         if n == 0 {
             return Ok(None); // EOF before a full line
         }
@@ -183,6 +202,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_message_over_the_limit_is_refused_not_buffered() {
+        let mut reader = tokio::io::BufReader::new(&b"{\"ok\":1}\n0123456789012345678901234567890123456789\n"[..]);
+        let first = read_one_message_capped(&mut reader, 32).await.unwrap();
+        assert_eq!(first, Some(serde_json::json!({"ok": 1})));
+        let err = read_one_message_capped(&mut reader, 32).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     async fn write_raw_line(writer: &mut (impl AsyncWrite + Unpin), message: Value) {
         let mut body = serde_json::to_vec(&message).unwrap();

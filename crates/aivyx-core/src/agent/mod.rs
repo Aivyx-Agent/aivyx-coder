@@ -1211,7 +1211,7 @@ impl Agent {
 
         if let Some(path) = &global_path
             && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
-            && let Ok(content) = tokio::fs::read_to_string(path).await
+            && let Some(content) = read_instructions(path).await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -1230,7 +1230,7 @@ impl Agent {
         let mut has_pack = false;
         if let Some((name, path)) = &pack
             && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
-            && let Ok(content) = tokio::fs::read_to_string(path).await
+            && let Some(content) = read_instructions(path).await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -1247,7 +1247,7 @@ impl Agent {
         }
 
         if !aivyx_sandbox::path_is_denied(&project_path, &config.deny_paths)
-            && let Ok(content) = tokio::fs::read_to_string(&project_path).await
+            && let Some(content) = read_instructions(&project_path).await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -3569,4 +3569,19 @@ fn new_lines_note(previous: &str, current: &str) -> Option<String> {
         new_lines.len(),
         elide(&new_lines.join("\n"), NEW_LINES_NOTE_CAP)
     ))
+}
+
+/// An instructions file's text, read without blocking and only up to
+/// `READ_FILE_LIMIT`: the project's `AGENTS.md` is repo content, and a
+/// FIFO or a link to `/dev/zero` there must not stall every turn. `None`
+/// for anything unreadable, which callers treat as no file.
+async fn read_instructions(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        aivyx_tools::bounded_read::read_capped(&path, aivyx_tools::bounded_read::READ_FILE_LIMIT)
+    })
+    .await
+    .ok()?
+    .ok()
+    .map(|capped| capped.text)
 }

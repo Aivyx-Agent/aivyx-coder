@@ -1294,6 +1294,47 @@ async fn project_only_agents_md_is_injected_with_no_precedence_note() {
     assert!(!system.contains("take precedence"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn an_agents_md_that_is_a_pipe_or_device_is_skipped_without_hanging_the_turn() {
+    // A FIFO blocks on open and /dev/zero never ends; either one as the
+    // project's AGENTS.md must not stall every turn.
+    for kind in ["fifo", "zero"] {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        if kind == "fifo" {
+            let status = std::process::Command::new("mkfifo").arg(&agents).status().unwrap();
+            assert!(status.success());
+        } else {
+            std::os::unix::fs::symlink("/dev/zero", &agents).unwrap();
+        }
+        let global = dir.path().join("global-AGENTS.md");
+        std::fs::write(&global, "Global preference.").unwrap();
+
+        let (mut agent, _rx, mock) = build_agent(
+            vec![vec![StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            }]],
+            ToolRegistry::new(),
+            10,
+        );
+        agent.set_agents_file(Some(global), 1024, vec![]);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run_turn("hi".to_string(), dir.path(), CancellationToken::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{kind}: the turn hung on AGENTS.md"))
+        .unwrap();
+
+        let received = mock.received.lock().unwrap();
+        let system = received[0].messages[0].text_content();
+        assert!(system.contains("Global preference."), "{kind}");
+        assert!(!system.contains("Project instructions"), "{kind}");
+    }
+}
+
 #[tokio::test]
 async fn global_only_agents_md_is_injected_with_no_precedence_note() {
     let dir = tempfile::tempdir().unwrap();

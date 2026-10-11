@@ -223,6 +223,12 @@ async fn read_loop(reader: impl AsyncRead + Unpin, pending: PendingMap, progress
     }
 }
 
+/// The largest message body accepted from the language server.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Header lines are short (`Content-Length: n`); this bounds one that isn't.
+const MAX_HEADER_LINE_BYTES: u64 = 8 * 1024;
+
 pub(crate) async fn read_one_message<R>(reader: &mut R) -> std::io::Result<Option<Value>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -232,9 +238,15 @@ where
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
+        let n = (&mut *reader).take(MAX_HEADER_LINE_BYTES + 1).read_line(&mut line).await?;
         if n == 0 {
             return Ok(None); // EOF before a full header block
+        }
+        if n as u64 > MAX_HEADER_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LSP header line too long",
+            ));
         }
         let text = line.trim_end_matches(['\r', '\n']);
         if text.is_empty() {
@@ -250,6 +262,13 @@ where
             "LSP message missing Content-Length header",
         ));
     };
+    // The buffer is allocated up front, so a bogus length mustn't size it.
+    if length > MAX_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("LSP message of {length} bytes is over the {MAX_MESSAGE_BYTES}-byte limit"),
+        ));
+    }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).await?;
     let value: Value = serde_json::from_slice(&body)
@@ -260,6 +279,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_huge_content_length_is_refused_before_allocating() {
+        let mut reader =
+            tokio::io::BufReader::new(&b"Content-Length: 18446744073709551615\r\n\r\n{}"[..]);
+        let err = read_one_message(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
 
     /// Writes one framed JSON-RPC message directly to a raw writer — the
     /// same wire format `Connection` itself produces, used here to drive

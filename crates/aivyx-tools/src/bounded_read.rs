@@ -13,14 +13,14 @@ use std::io::{self, Read};
 use std::path::Path;
 
 /// How much of a file `read_file` shows.
-pub(crate) const READ_FILE_LIMIT: u64 = 1024 * 1024;
+pub const READ_FILE_LIMIT: u64 = 1024 * 1024;
 
 /// The largest file the editing tools will load whole.
 pub(crate) const WHOLE_FILE_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Up to `limit` bytes of a regular file's text.
 #[derive(Debug)]
-pub(crate) struct Capped {
+pub struct Capped {
     pub text: String,
     /// The file's full size in bytes.
     pub size: u64,
@@ -53,7 +53,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
 
 /// The first `limit` bytes of `path` as text. `InvalidData` if it isn't
 /// UTF-8 (a character cut by the limit doesn't count).
-pub(crate) fn read_capped(path: &Path, limit: u64) -> io::Result<Capped> {
+pub fn read_capped(path: &Path, limit: u64) -> io::Result<Capped> {
     let (file, size) = open_regular(path)?;
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;

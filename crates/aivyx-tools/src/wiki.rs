@@ -198,7 +198,10 @@ pub async fn stale_pages(
             continue;
         };
         let (fm, _) = parse_frontmatter(&content);
-        let Some(commit) = fm.generated_at_commit else {
+        // The page is repo content, so the commit must look like one before
+        // it goes on git's command line: `--output=<file>` would otherwise
+        // be read as an option and overwrite that file.
+        let Some(commit) = fm.generated_at_commit.filter(|c| is_commit_id(c)) else {
             out.push(StalePage {
                 name: spec.name.clone(),
                 covers: spec.covers.clone(),
@@ -231,6 +234,11 @@ pub async fn stale_pages(
         }
     }
     out
+}
+
+/// A full or abbreviated hex object id — what `stamp_page` writes.
+fn is_commit_id(value: &str) -> bool {
+    (4..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 const DEFAULT_SUMMARY: &str = "See page for details.";
@@ -448,6 +456,39 @@ mod git_tests {
         )
         .await;
 
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].reason, StaleReason::Stale);
+    }
+
+    #[tokio::test]
+    async fn stale_pages_never_passes_a_planted_commit_to_git_as_an_option() {
+        // A cloned repo controls its wiki pages: `--output=<file>` as the
+        // commit would make `git diff` overwrite that file, unsandboxed.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let victim = tempfile::tempdir().unwrap();
+        let victim_file = victim.path().join("notes.txt");
+        std::fs::write(&victim_file, "precious\n").unwrap();
+        let wiki_dir = dir.path().join("docs/wiki");
+        std::fs::create_dir_all(&wiki_dir).unwrap();
+        std::fs::write(
+            page_path(&wiki_dir, "aivyx-core"),
+            format!(
+                "---\ngenerated_at_commit: --output={}\n---\nbody\n",
+                victim_file.display()
+            ),
+        )
+        .unwrap();
+
+        let result = stale_pages(
+            dir.path(),
+            &wiki_dir,
+            &[spec("aivyx-core", &["tracked.txt"])],
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&victim_file).unwrap(), "precious\n");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].reason, StaleReason::Stale);
     }

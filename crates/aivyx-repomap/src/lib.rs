@@ -142,6 +142,11 @@ impl RepoMap {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .filter(|e| !is_denied(&e.path(), &self.deny_paths))
+            // Followed through symlinks, so a page linked to /dev/zero or a
+            // FIFO is dropped before anything opens it.
+            .filter(|e| {
+                std::fs::metadata(e.path()).is_ok_and(|m| m.is_file() && m.len() <= MAX_FILE_BYTES)
+            })
             .map(|e| {
                 let path = e.path();
                 let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
@@ -718,6 +723,33 @@ fn caller() {
 
         assert!(rendered.contains("docs/wiki/aivyx-core.md"));
         assert!(rendered.contains("Turn loop and orchestration."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wiki_pages_that_are_devices_or_pipes_are_skipped_without_reading() {
+        // The repo controls docs/wiki: a page symlinked to /dev/zero would
+        // be read until memory ran out, and a FIFO would block forever.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src.rs", "pub fn something() {}\n");
+        write(dir.path(), "docs/wiki/real.md", "---\nsummary: \"Real page.\"\n---\nBody.\n");
+        let wiki = dir.path().join("docs/wiki");
+        std::os::unix::fs::symlink("/dev/zero", wiki.join("zero.md")).unwrap();
+        let status = std::process::Command::new("mkfifo").arg(wiki.join("pipe.md")).status().unwrap();
+        assert!(status.success());
+
+        let root = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(RepoMap::new(root, vec![]).render(10_000));
+        });
+        let rendered = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("rendering must not block on a FIFO or read /dev/zero")
+            .unwrap();
+        assert!(rendered.contains("Real page."));
+        assert!(!rendered.contains("zero.md"));
+        assert!(!rendered.contains("pipe.md"));
     }
 
     #[test]
