@@ -32,6 +32,10 @@ pub struct LspClient {
     program: String,
     timeout: Duration,
     state: Mutex<Option<Started>>,
+    /// Set once a start was allowed (`ensure_started` only runs after the
+    /// permission gate said yes): a failed start or a respawn after a crash
+    /// isn't asked about again this session.
+    start_approved: std::sync::atomic::AtomicBool,
 }
 
 impl LspClient {
@@ -42,6 +46,7 @@ impl LspClient {
             program: "rust-analyzer".to_string(),
             timeout,
             state: Mutex::new(None),
+            start_approved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -56,6 +61,7 @@ impl LspClient {
             program: program.to_string(),
             timeout,
             state: Mutex::new(None),
+            start_approved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -80,15 +86,16 @@ impl LspClient {
     /// What `go_to_definition`/`find_references` ask before running. The
     /// server's first start is approved like a command: rust-analyzer
     /// builds the project, running its build scripts and proc macros
-    /// (repo code), so it's asked once; while it's running, a query is
-    /// only a read of `path`.
+    /// (repo code), so it's asked once a session; after that (running, or
+    /// restarting after a failure) a query is only a read of `path`.
     pub(crate) fn permission_request(
         &self,
         tool_name: &str,
         path: PathBuf,
         arguments_preview: serde_json::Value,
     ) -> PermissionRequest {
-        let (action, target, preview) = if self.is_running() {
+        let approved = self.start_approved.load(std::sync::atomic::Ordering::Relaxed);
+        let (action, target, preview) = if approved || self.is_running() {
             (ActionKind::Read, PermissionTarget::Path(path), None)
         } else {
             (
@@ -130,6 +137,7 @@ impl LspClient {
         cwd: &Path,
         confiner: &Arc<dyn ExecutionConfiner>,
     ) -> Result<(), ToolError> {
+        self.start_approved.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.state.lock().await;
 
         if let Some(started) = guard.as_mut() {
@@ -427,6 +435,24 @@ mod tests {
     use super::*;
     use aivyx_sandbox::NoopConfiner;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn an_approved_start_isnt_asked_again_after_it_fails() {
+        // The user allowed rust-analyzer once; a failed start (or a crash
+        // and respawn) must not turn every later call into a new question.
+        let client =
+            LspClient::with_program("definitely-not-a-real-binary-xyz", Duration::from_secs(5));
+        let ask = |client: &LspClient| {
+            client.permission_request("go_to_definition", PathBuf::from("/p/src/lib.rs"), serde_json::json!({}))
+        };
+        assert_eq!(ask(&client).action, ActionKind::Execute);
+
+        let confiner: Arc<dyn ExecutionConfiner> = Arc::new(aivyx_sandbox::NoopConfiner);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(client.go_to_definition(dir.path(), &confiner, "lib.rs", 1, 1).await.is_err());
+
+        assert_eq!(ask(&client).action, ActionKind::Read);
+    }
 
     /// Records whether `confine()` was invoked, without altering the
     /// command — lets a test assert the confiner was actually consulted.

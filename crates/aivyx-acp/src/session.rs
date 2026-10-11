@@ -345,14 +345,36 @@ fn respond_then_advertise(
     responder: Responder<NewSessionResponse>,
     connection: &ConnectionTo<Client>,
     session_id: SessionId,
+    startup_warnings: Vec<String>,
 ) -> Result<()> {
     let responded =
         responder.respond(NewSessionResponse::new(session_id.clone()).modes(session_modes()));
     let _ = connection.send_notification(SessionNotification::new(
-        session_id,
+        session_id.clone(),
         available_commands_update(),
     ));
+    for warning in startup_warnings {
+        let _ = connection.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(crate::translate::text_chunk(warning)),
+        ));
+    }
     responded
+}
+
+/// What building the agent queued before any session existed. Warnings
+/// (the model server is unreachable, the context window doesn't match)
+/// are shown as soon as the session opens; information ("using the
+/// server's 32768-token context window") is dropped — drained during the
+/// first prompt, it used to land inside the model's reply.
+fn startup_warnings(events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        if let AgentEvent::Error(text) = event {
+            warnings.push(text);
+        }
+    }
+    warnings
 }
 
 /// A minimal ACP server for when no `config.toml` exists yet:
@@ -606,6 +628,8 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     }
                 };
                 *new_session_plan_mode.lock().unwrap() = Some(built.plan_mode.clone());
+                let mut events_rx = built.events_rx;
+                let warnings = startup_warnings(&mut events_rx);
                 let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
                 // Installs the real prompter behind the `DeferredPrompter`
                 // `ConfirmationGate` has been holding since `build_agent`
@@ -620,7 +644,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     );
                 *guard = Some(Session {
                     agent: built.agent,
-                    events_rx: built.events_rx,
+                    events_rx,
                     // The folder the agent was built for — the client's.
                     cwd: built.cwd,
                     session_id: session_id.clone(),
@@ -630,7 +654,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 });
                 drop(guard);
                 new_session_exists.store(true, Ordering::Release);
-                respond_then_advertise(responder, &connection, session_id)
+                respond_then_advertise(responder, &connection, session_id, warnings)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -708,6 +732,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_warnings_keep_warnings_and_drop_information() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(AgentEvent::Info("using the server's 32768-token context window".into())).unwrap();
+        tx.send(AgentEvent::Error("couldn't reach the model server".into())).unwrap();
+        assert_eq!(startup_warnings(&mut rx), vec!["couldn't reach the model server".to_string()]);
+        assert!(rx.try_recv().is_err(), "nothing left for the first prompt to pick up");
+    }
+
+    #[test]
     fn session_dir_is_the_canonical_folder_the_client_named() {
         let root = std::env::temp_dir().join(format!("acp-session-dir-{}", std::process::id()));
         let dir = root.join("proj");
@@ -743,7 +776,7 @@ mod tests {
                 .builder()
                 .on_receive_request(
                     async move |_req: NewSessionRequest, responder, connection| {
-                        respond_then_advertise(responder, &connection, SessionId::new("s-1"))
+                        respond_then_advertise(responder, &connection, SessionId::new("s-1"), Vec::new())
                     },
                     agent_client_protocol::on_receive_request!(),
                 )

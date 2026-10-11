@@ -31,7 +31,7 @@ fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
-fn text_chunk(text: String) -> ContentChunk {
+pub(crate) fn text_chunk(text: String) -> ContentChunk {
     ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
 }
 
