@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::bounded_read;
 use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
@@ -123,7 +124,7 @@ impl Tool for MoveFileTool {
                 directory_listing(from)
             )
         } else {
-            match std::fs::read_to_string(from) {
+            match bounded_read::read_whole(from) {
                 Ok(content) => {
                     format!("Move {} to {}\n\n{}", from.display(), to.display(), content)
                 }

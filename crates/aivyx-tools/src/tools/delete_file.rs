@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::bounded_read;
 use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
@@ -83,7 +84,7 @@ impl Tool for DeleteFileTool {
             )));
         }
 
-        let (preview, diff) = match std::fs::read_to_string(resolved) {
+        let (preview, diff) = match bounded_read::read_whole(resolved) {
             Ok(content) => (
                 Some(content.clone()),
                 Some(DiffContent { old_content: content, new_content: String::new() }),

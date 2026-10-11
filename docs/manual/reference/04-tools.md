@@ -20,7 +20,7 @@ Read, write and change files in the project.
 
 | Tool | Asks first? | What it does |
 |---|---|---|
-| `read_file` | no | Read the full contents of a text file. |
+| `read_file` | no | Read the contents of a text file (the first 1 MiB of a larger one). |
 | `write_file` | yes | Create a file or overwrite it entirely with new content. Creates parent directories as needed. |
 | `edit_file` | yes | Replace an exact substring in an existing file with new text. old_string must match exactly once in the file (include enough surrounding context to make it unique), unless replace_all is set. |
 | `patch_file` | yes | Apply a unified-diff patch to an existing file. |

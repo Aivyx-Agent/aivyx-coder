@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::diff::unified_diff;
+use crate::bounded_read;
 use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
@@ -46,7 +47,7 @@ impl Tool for WriteFileTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let resolved = resolve(cwd, &args.path);
 
-        let (preview, diff) = match std::fs::read_to_string(&resolved) {
+        let (preview, diff) = match bounded_read::read_whole(&resolved) {
             Ok(old) => (
                 Some(unified_diff(&resolved.display().to_string(), &old, &args.content)),
                 Some(DiffContent { old_content: old, new_content: args.content.clone() }),
@@ -89,6 +90,7 @@ impl Tool for WriteFileTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let resolved = resolve(&ctx.cwd, &args.path);
 
+        bounded_read::check_write_target(&resolved)?;
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

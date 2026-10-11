@@ -194,7 +194,44 @@ async fn wait_for_quiet(
 fn drain_output(output: &Arc<std::sync::Mutex<VecDeque<u8>>>) -> String {
     let mut buf = output.lock().unwrap();
     let drained: VecDeque<u8> = std::mem::take(&mut *buf);
-    String::from_utf8_lossy(&drained.into_iter().collect::<Vec<u8>>()).into_owned()
+    plain_text(&String::from_utf8_lossy(&drained.into_iter().collect::<Vec<u8>>()))
+}
+
+/// What the model should read from a terminal: the text without control
+/// sequences (colours, cursor moves, titles — CSI `ESC [ … letter`, OSC
+/// `ESC ] … BEL/ST`, two-byte `ESC x`) and with `\r\n` as `\n`. A pty's
+/// raw output can be mostly redraw noise: Python 3.13's REPL turned
+/// `print(6*7)` → `42` into over a thousand characters.
+fn plain_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    // Parameters and intermediates, up to a final byte @–~.
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // Until BEL or ST (ESC \).
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Called by both `repl_send` and `repl_stop` to report a process's exit
@@ -381,6 +418,12 @@ impl Tool for ReplStartTool {
         command
             .args(&args.args)
             .current_dir(&ctx.cwd)
+            // Plain line mode: the model reads this output as text, and a
+            // full terminal makes REPLs redraw, colour and move the cursor
+            // (Python 3.13's REPL echoes every keystroke as a redraw).
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("PYTHON_BASIC_REPL", "1")
             .stdin(Stdio::from(slave.try_clone().map_err(|err| {
                 ToolError::ExecutionFailed(format!("failed to duplicate the pty slave fd: {err}"))
             })?))
@@ -713,6 +756,13 @@ impl Tool for ReplStopTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn terminal_control_sequences_are_stripped_for_the_model() {
+        let raw = "\u{1b}[?25l\u{1b}[1;35m>>> \u{1b}[0mprint(6*7)\r\n\u{1b}]0;title\u{7}42\r\n";
+        assert_eq!(plain_text(raw), ">>> print(6*7)\n42\n");
+        assert_eq!(plain_text("no escapes\n"), "no escapes\n");
+    }
     use std::time::Duration;
 
     fn ctx() -> ToolExecutionContext {

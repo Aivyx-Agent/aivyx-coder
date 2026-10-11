@@ -72,8 +72,11 @@ fn resolve_lexical(cwd: &Path, raw: &str) -> PathBuf {
 /// doesn't — so a not-yet-created `write_file` target still gets
 /// symlink-safe treatment via its (existing) parent directories.
 fn resolve_symlinks(path: &Path) -> PathBuf {
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut current = path;
+    // Path components still to re-append, innermost last.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    // Bounds dangling-link chains and loops (Linux's own limit is 40).
+    let mut hops = 0;
 
     loop {
         if let Ok(canonical) = current.canonicalize() {
@@ -84,10 +87,24 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
             return result;
         }
 
-        match (current.file_name(), current.parent()) {
+        // A symlink whose target doesn't exist (yet): canonicalize fails,
+        // but a write through it creates the target — so resolve to where
+        // it points, or a link inside the project would pass the gate's
+        // checks while the write lands outside (or in a denied path).
+        if hops < 40
+            && std::fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink())
+            && let Ok(target) = std::fs::read_link(&current)
+        {
+            hops += 1;
+            let base = current.parent().map(Path::to_path_buf).unwrap_or_default();
+            current = normalize(&if target.is_absolute() { target } else { base.join(target) });
+            continue;
+        }
+
+        match (current.file_name().map(ToOwned::to_owned), current.parent()) {
             (Some(name), Some(parent)) => {
                 tail.push(name);
-                current = parent;
+                current = parent.to_path_buf();
             }
             // No ancestor could be canonicalized (shouldn't happen on a
             // real filesystem — `/` always exists). Fail safe: return the
@@ -97,12 +114,60 @@ fn resolve_symlinks(path: &Path) -> PathBuf {
     }
 }
 
+/// `.`/`..` removed lexically, for a symlink target joined onto its
+/// link's folder.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !matches!(out.components().next_back(), Some(Component::RootDir) | None) {
+                    out.pop();
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_resolves_to_where_it_points() {
+        // A link inside the project to a file that doesn't exist yet: a
+        // write through it lands at the target, so that's what the gate
+        // must judge — not the in-project link path.
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().canonicalize().unwrap().join("planted.txt");
+        std::os::unix::fs::symlink(&target, project.path().join("notes.md")).unwrap();
+        assert_eq!(resolve(project.path(), "notes.md"), target);
+
+        // Relative targets resolve against the link's folder, through chains.
+        std::fs::create_dir(project.path().join("docs")).unwrap();
+        std::os::unix::fs::symlink("../notes.md", project.path().join("docs/link.md")).unwrap();
+        assert_eq!(resolve(project.path(), "docs/link.md"), target);
+
+        // A path *under* a dangling directory link resolves through it too.
+        std::os::unix::fs::symlink(outside.path().join("newdir"), project.path().join("d")).unwrap();
+        assert_eq!(
+            resolve(project.path(), "d/x.txt"),
+            outside.path().canonicalize().unwrap().join("newdir/x.txt")
+        );
+
+        // A loop doesn't hang.
+        std::os::unix::fs::symlink("loop-b", project.path().join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", project.path().join("loop-b")).unwrap();
+        let _ = resolve(project.path(), "loop-a");
+    }
 
     #[test]
     fn relative_path_joins_onto_cwd() {

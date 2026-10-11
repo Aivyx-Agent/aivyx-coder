@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+mod bounded_read;
 mod diff;
 mod generated;
 mod lsp;

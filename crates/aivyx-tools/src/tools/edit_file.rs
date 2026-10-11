@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::diff::unified_diff;
+use crate::bounded_read;
 use crate::path_resolve::resolve;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
@@ -147,7 +148,7 @@ impl Tool for EditFileTool {
         let args: EditFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
 
-        let old_content = std::fs::read_to_string(resolved).map_err(|err| {
+        let old_content = bounded_read::read_whole(resolved).map_err(|err| {
             ToolError::ExecutionFailed(format!("cannot edit {}: {err}", resolved.display()))
         })?;
         let new_content = apply_edit(
@@ -185,9 +186,13 @@ impl Tool for EditFileTool {
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let resolved = resolve(&ctx.cwd, &args.path);
 
-        let old_content = tokio::fs::read_to_string(&resolved).await.map_err(|err| {
-            ToolError::ExecutionFailed(format!("cannot edit {}: {err}", resolved.display()))
-        })?;
+        let read_path = resolved.clone();
+        let old_content = tokio::task::spawn_blocking(move || bounded_read::read_whole(&read_path))
+            .await
+            .map_err(|err| ToolError::ExecutionFailed(format!("edit_file task failed: {err}")))?
+            .map_err(|err| {
+                ToolError::ExecutionFailed(format!("cannot edit {}: {err}", resolved.display()))
+            })?;
         let new_content = apply_edit(
             &old_content,
             &args.old_string,
