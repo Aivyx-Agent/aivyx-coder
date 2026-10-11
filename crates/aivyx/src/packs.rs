@@ -9,6 +9,7 @@
 //! pack) and `packs/active.toml` (which project uses which pack, and the MCP
 //! servers the user approved).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aivyx_config::{McpServerConfig, Settings};
@@ -328,7 +329,7 @@ pub fn render_inspect(payload: &[u8]) -> Result<String, String> {
                     s.mcp_servers.len()
                 ));
                 for server in &s.mcp_servers {
-                    out.push_str(&format!("    MCP {}: {}\n", server.name, command_line(server)));
+                    out.push_str(&format!("    MCP {}\n", consent_text(server)));
                 }
             }
             Err(problems) => {
@@ -371,13 +372,19 @@ pub struct Use {
     pub mcp: Vec<ApprovedServer>,
 }
 
-/// An MCP server the user agreed to run.
+/// An MCP server the user agreed to run: everything that decides what
+/// runs — the command, its arguments and its environment (a variable like
+/// `LD_PRELOAD` or `NODE_OPTIONS` changes the code a command runs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovedServer {
     pub name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Approvals recorded before this field existed have none, so a server
+    /// that sets any is asked about again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl ApprovedServer {
@@ -386,6 +393,7 @@ impl ApprovedServer {
             name: server.name.clone(),
             command: server.command.clone(),
             args: server.args.clone(),
+            env: server.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
 
@@ -614,6 +622,18 @@ pub fn command_line(server: &McpServerConfig) -> String {
         .chain(server.args.iter().map(String::as_str))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// What the user is asked to approve: the command line, and on a second
+/// line the environment it runs with, if any (sorted).
+pub fn consent_text(server: &McpServerConfig) -> String {
+    let mut out = format!("{}: {}", server.name, command_line(server));
+    if !server.env.is_empty() {
+        let env: BTreeMap<_, _> = server.env.iter().collect();
+        let vars: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        out.push_str(&format!("\n    env: {}", vars.join(" ")));
+    }
+    out
 }
 
 /// `pack check`: what it prints.
@@ -894,6 +914,33 @@ mcp = "coder/mcp.toml"
         let layer = resolve_layer(&packs, &project).unwrap();
         assert!(layer.mcp_servers.is_empty());
         assert!(layer.notices.iter().any(|n| n.contains("changed since you approved it")));
+    }
+
+    #[test]
+    fn an_mcp_server_whose_env_changed_is_not_started() {
+        let packs = installed_packs("env-changed");
+        let project = tmp("env-changed-project");
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        // A later version of the pack adds an environment variable.
+        let dir = packs.find("business-manager").unwrap().dir;
+        rewrite(&dir, "coder/mcp.toml", |t| t + "env = { LD_PRELOAD = \"/tmp/x.so\" }\n");
+        let layer = resolve_layer(&packs, &project).unwrap();
+        assert!(layer.mcp_servers.is_empty(), "{:?}", layer.mcp_servers);
+        assert!(layer.notices.iter().any(|n| n.contains("changed since you approved it")));
+    }
+
+    #[test]
+    fn the_consent_text_shows_the_environment() {
+        let server = McpServerConfig {
+            name: "files".into(),
+            command: "mcp-files".into(),
+            args: vec!["--root".into(), ".".into()],
+            env: [("B".to_string(), "2".to_string()), ("A".to_string(), "1".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(consent_text(&server), "files: mcp-files --root .\n    env: A=1 B=2");
+        let bare = McpServerConfig { env: Default::default(), ..server };
+        assert_eq!(consent_text(&bare), "files: mcp-files --root .");
     }
 
     #[test]

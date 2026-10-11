@@ -47,9 +47,10 @@ which pack is in use. A project's own choice wins over the `--global` one.
 `aivyx-coder pack list` shows what's installed and where it's in use.
 
 If the pack has MCP servers, `pack use` shows each one's command line and
-asks before allowing it. An MCP server runs a program on your machine, so
-say no unless you know what it is. If a pack's server command ever
-changes, it stops running until you run `pack use` again.
+the environment variables it sets, and asks before allowing it. An MCP
+server runs a program on your machine, so say no unless you know what it
+is. If a pack's server command, arguments or environment ever change, it
+stops running until you run `pack use` again.
 
 ## What a pack changes — and what it doesn't
 

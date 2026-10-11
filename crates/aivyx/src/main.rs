@@ -316,9 +316,8 @@ fn ask_mcp_consent(server: &aivyx_config::McpServerConfig) -> bool {
         return false;
     }
     print!(
-        "This pack wants to run an MCP server:\n  {}: {}\nAllow it? [y/N] ",
-        server.name,
-        packs::command_line(server)
+        "This pack wants to run an MCP server:\n  {}\nAllow it? [y/N] ",
+        packs::consent_text(server)
     );
     let _ = std::io::stdout().flush();
     let mut line = String::new();
