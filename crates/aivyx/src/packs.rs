@@ -624,21 +624,40 @@ pub fn render_list(packs: &PacksDir, cwd: &Path) -> String {
     out
 }
 
-/// `command arg arg` for showing an MCP server to the user.
+/// `command arg arg` for showing an MCP server to the user: each word
+/// shown safely, and quoted when it has spaces so it can't read as two.
 pub fn command_line(server: &McpServerConfig) -> String {
     std::iter::once(server.command.as_str())
         .chain(server.args.iter().map(String::as_str))
+        .map(|word| {
+            let word = shown(word);
+            if word.is_empty() || word.contains(char::is_whitespace) {
+                format!("'{word}'")
+            } else {
+                word
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Pack text as it may reach the terminal: control characters escaped, so
+/// a pack can't hide part of what the user approves (`ESC [2K` erasing a
+/// line, a carriage return overwriting one).
+fn shown(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() })
+        .collect()
 }
 
 /// What the user is asked to approve: the command line, and on a second
 /// line the environment it runs with, if any (sorted).
 pub fn consent_text(server: &McpServerConfig) -> String {
-    let mut out = format!("{}: {}", server.name, command_line(server));
+    let mut out = format!("{}: {}", shown(&server.name), command_line(server));
     if !server.env.is_empty() {
         let env: BTreeMap<_, _> = server.env.iter().collect();
-        let vars: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let vars: Vec<String> =
+            env.iter().map(|(k, v)| format!("{}={}", shown(k), shown(v))).collect();
         out.push_str(&format!("\n    env: {}", vars.join(" ")));
     }
     out
@@ -949,6 +968,23 @@ mcp = "coder/mcp.toml"
         assert_eq!(consent_text(&server), "files: mcp-files --root .\n    env: A=1 B=2");
         let bare = McpServerConfig { env: Default::default(), ..server };
         assert_eq!(consent_text(&bare), "files: mcp-files --root .");
+    }
+
+    #[test]
+    fn the_consent_text_cannot_be_disguised_by_the_pack() {
+        // Escape codes could erase the env line before the user reads it,
+        // and an argument with spaces would read as several.
+        let server = McpServerConfig {
+            name: "files".into(),
+            command: "mcp-files".into(),
+            args: vec!["--root".into(), "a b".into()],
+            env: [("LD_PRELOAD".to_string(), "/tmp/x.so\u{1b}[1A\u{1b}[2K".to_string())].into(),
+            ..Default::default()
+        };
+        let text = consent_text(&server);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'), "{text:?}");
+        assert!(text.contains("LD_PRELOAD=/tmp/x.so\\u{1b}[1A"), "{text}");
+        assert!(text.contains("--root 'a b'"), "{text}");
     }
 
     #[test]
