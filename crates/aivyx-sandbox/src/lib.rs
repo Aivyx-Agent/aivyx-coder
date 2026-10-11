@@ -554,6 +554,53 @@ pub fn runs_code_later_for_request(request: &PermissionRequest) -> Option<&'stat
     }
 }
 
+/// For a `Write`/`Delete`/`Move` whose path (either end of a move) lies
+/// outside `project`, a short note for the approval prompt: checkpoints
+/// and `/undo` only cover the project, so such a change can't be taken
+/// back. `None` for anything else. Paths are compared as given — tools
+/// report canonical absolute paths and frontends pass the canonical project
+/// folder. Shared by every frontend, like `runs_code_later_for_request`.
+pub fn outside_project_for_request(request: &PermissionRequest, project: &Path) -> Option<&'static str> {
+    if !matches!(
+        request.action,
+        ActionKind::Write | ActionKind::Delete | ActionKind::Move
+    ) {
+        return None;
+    }
+    let outside = match &request.target {
+        PermissionTarget::Path(path) => !path.starts_with(project),
+        PermissionTarget::Move { from, to } => !from.starts_with(project) || !to.starts_with(project),
+        PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
+    };
+    outside.then_some("This is outside the project — /undo and checkpoints won't cover it.")
+}
+
+/// A command line as a person should read it: each word quoted as one
+/// POSIX shell word when it needs it, so `sh -c 'python3 -m unittest'`
+/// doesn't look like several separate arguments to `sh`. Shared by every
+/// frontend's approval prompt.
+pub fn display_command(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quotes `word` as a single POSIX shell word if it needs it — empty, or
+/// containing whitespace or a shell-meta character — single-quoted with the
+/// standard `'` → `'\''` escape; otherwise returned as-is.
+pub fn shell_quote_word(word: &str) -> String {
+    let needs_quoting = word.is_empty()
+        || word
+            .chars()
+            .any(|c| c.is_whitespace() || "'\"$`\\&|;()<>!*?[]{}~#".contains(c));
+    if !needs_quoting {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Denies every request. A safe stand-in wherever a `PermissionGate` is
 /// required but no real one (e.g. `ConfirmationGate`) has been wired up
 /// yet: since it fails closed, forgetting to swap it in later breaks a
@@ -804,6 +851,46 @@ mod tests {
             home,
             Some(xdg)
         ));
+    }
+
+    #[test]
+    fn display_command_quotes_words_that_need_it() {
+        let args = vec!["-c".to_string(), "python3 -m unittest 2>&1".to_string()];
+        assert_eq!(display_command("sh", &args), "sh -c 'python3 -m unittest 2>&1'");
+        assert_eq!(shell_quote_word("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote_word("cargo"), "cargo");
+        assert_eq!(shell_quote_word(""), "''");
+    }
+
+    // --- outside_project_for_request (audit 4, U1) ---
+
+    fn path_request(action: ActionKind, target: PermissionTarget) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: "write_file".into(),
+            action,
+            target,
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn outside_project_flags_only_changes_outside_the_folder() {
+        let project = Path::new("/work/proj");
+        let inside = path_request(ActionKind::Write, PermissionTarget::Path("/work/proj/a.py".into()));
+        let outside = path_request(ActionKind::Write, PermissionTarget::Path("/tmp/a.py".into()));
+        let sibling = path_request(ActionKind::Delete, PermissionTarget::Path("/work/proj2/a.py".into()));
+        let read = path_request(ActionKind::Read, PermissionTarget::Path("/tmp/a.py".into()));
+        let out_move = path_request(
+            ActionKind::Move,
+            PermissionTarget::Move { from: "/work/proj/a.py".into(), to: "/tmp/a.py".into() },
+        );
+        assert_eq!(outside_project_for_request(&inside, project), None);
+        assert!(outside_project_for_request(&outside, project).unwrap().contains("/undo"));
+        assert!(outside_project_for_request(&sibling, project).is_some());
+        assert_eq!(outside_project_for_request(&read, project), None);
+        assert!(outside_project_for_request(&out_move, project).is_some());
     }
 
     // --- runs_code_later (audit finding M1) ---

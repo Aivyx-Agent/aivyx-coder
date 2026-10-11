@@ -614,7 +614,10 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 // client via `session/request_permission`.
                 built
                     .prompter_installer
-                    .install(AcpPrompter::new(session_id.clone(), connection.clone()));
+                    .install(
+                        AcpPrompter::new(session_id.clone(), connection.clone())
+                            .with_project(built.cwd.clone()),
+                    );
                 *guard = Some(Session {
                     agent: built.agent,
                     events_rx: built.events_rx,

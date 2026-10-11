@@ -63,7 +63,7 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
 fn target_string(target: &PermissionTarget) -> String {
     match target {
         PermissionTarget::Path(path) => path.display().to_string(),
-        PermissionTarget::Command { program, args } => format!("{program} {}", args.join(" ")),
+        PermissionTarget::Command { program, args } => aivyx_sandbox::display_command(program, args),
         PermissionTarget::Other(description) => description.clone(),
         PermissionTarget::Move { from, to } => format!("{} -> {}", from.display(), to.display()),
     }
@@ -82,7 +82,11 @@ fn target_string(target: &PermissionTarget) -> String {
 /// every call to the same tool). Mirrors `ConfirmationGate::check`'s
 /// `request_id` (a fresh `uuid::Uuid::new_v4()` per pending decision) in
 /// `crates/aivyx-sandbox/src/confirmation.rs`.
-fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpdate {
+fn pending_tool_call(
+    request: &PermissionRequest,
+    call_id: &str,
+    project: Option<&std::path::Path>,
+) -> ToolCallUpdate {
     let title = target_string(&request.target);
     let mut content = match (request.action, &request.diff) {
         (ActionKind::Write | ActionKind::Delete, Some(diff)) => {
@@ -121,6 +125,10 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
         .into();
         content.push(warning);
     }
+    if let Some(note) = project.and_then(|p| aivyx_sandbox::outside_project_for_request(request, p)) {
+        let note: ToolCallContent = format!("⚠ {note}").into();
+        content.push(note);
+    }
     let kind = match request.action {
         ActionKind::Write => ToolKind::Edit,
         ActionKind::Delete => ToolKind::Delete,
@@ -141,12 +149,27 @@ fn pending_tool_call(request: &PermissionRequest, call_id: &str) -> ToolCallUpda
     ToolCallUpdate::new(call_id.to_string(), fields)
 }
 
+#[cfg(test)]
 pub(crate) fn permission_request_to_acp(
     session_id: SessionId,
     request: &PermissionRequest,
     call_id: &str,
 ) -> RequestPermissionRequest {
-    RequestPermissionRequest::new(session_id, pending_tool_call(request, call_id), options_for(request))
+    permission_request_to_acp_in(session_id, request, call_id, None)
+}
+
+/// With the "outside the project" note when `project` is known.
+pub(crate) fn permission_request_to_acp_in(
+    session_id: SessionId,
+    request: &PermissionRequest,
+    call_id: &str,
+    project: Option<&std::path::Path>,
+) -> RequestPermissionRequest {
+    RequestPermissionRequest::new(
+        session_id,
+        pending_tool_call(request, call_id, project),
+        options_for(request),
+    )
 }
 
 /// `RejectOnce`/`RejectAlways` both deny this one call — aivyx-coder's
@@ -178,11 +201,19 @@ fn acp_response_to_user_response(response: RequestPermissionResponse) -> UserRes
 pub struct AcpPrompter {
     session_id: SessionId,
     connection: ConnectionTo<Client>,
+    /// The session's project folder, for the "outside the project" note.
+    project: Option<std::path::PathBuf>,
 }
 
 impl AcpPrompter {
     pub fn new(session_id: SessionId, connection: ConnectionTo<Client>) -> Self {
-        Self { session_id, connection }
+        Self { session_id, connection, project: None }
+    }
+
+    /// Notes approvals for changes outside `project`.
+    pub fn with_project(mut self, project: std::path::PathBuf) -> Self {
+        self.project = Some(project);
+        self
     }
 }
 
@@ -190,7 +221,12 @@ impl AcpPrompter {
 impl PermissionPrompter for AcpPrompter {
     async fn prompt(&self, request: &PermissionRequest) -> UserResponse {
         let call_id = uuid::Uuid::new_v4().to_string();
-        let acp_request = permission_request_to_acp(self.session_id.clone(), request, &call_id);
+        let acp_request = permission_request_to_acp_in(
+            self.session_id.clone(),
+            request,
+            &call_id,
+            self.project.as_deref(),
+        );
         match self.connection.send_request(acp_request).block_task().await {
             Ok(response) => acp_response_to_user_response(response),
             // Connection gone / request failed — fail closed, matching
@@ -261,6 +297,46 @@ mod tests {
 
     fn sid() -> SessionId {
         SessionId::new("sess-1")
+    }
+
+    fn json_of(acp: &RequestPermissionRequest) -> String {
+        serde_json::to_string(acp).unwrap()
+    }
+
+    #[test]
+    fn a_command_title_is_quoted_like_the_terminal_shows_it() {
+        let request = PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "python3 -m unittest 2>&1".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let json = json_of(&permission_request_to_acp(sid(), &request, "call-1"));
+        assert!(json.contains("sh -c 'python3 -m unittest 2>&1'"), "{json}");
+    }
+
+    #[test]
+    fn a_write_outside_the_project_is_noted() {
+        let request = write_request(None);
+        let outside = json_of(&permission_request_to_acp_in(
+            sid(),
+            &request,
+            "call-1",
+            Some(std::path::Path::new("/elsewhere")),
+        ));
+        assert!(outside.contains("outside the project"), "{outside}");
+        let inside = json_of(&permission_request_to_acp_in(
+            sid(),
+            &request,
+            "call-1",
+            Some(std::path::Path::new("/project")),
+        ));
+        assert!(!inside.contains("outside the project"), "{inside}");
     }
 
     fn write_request(diff: Option<DiffContent>) -> PermissionRequest {

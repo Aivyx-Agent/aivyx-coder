@@ -382,6 +382,7 @@ pub async fn run(
     // Read before `autonomous` moves into the background task below --
     // there is no other point after this where it's still available.
     app.autonomous = autonomous.is_some();
+    app.project = cwd.canonicalize().ok().or_else(|| Some(cwd.clone()));
     if let Some(auto) = autonomous.as_ref() {
         // The autonomous driver below calls `agent.run_turn` directly,
         // never `push_user_message` -- without this, the goal never
@@ -736,6 +737,8 @@ struct App {
     /// human-driven session. (The welcome hint never shows in such a run --
     /// see `seed_autonomous_goal`.)
     autonomous: bool,
+    /// The project folder, for the "outside the project" note on approvals.
+    project: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -770,6 +773,7 @@ impl App {
             diff_view: None,
             tests_line: String::new(),
             autonomous: false,
+            project: None,
         }
     }
 
@@ -1300,7 +1304,7 @@ impl App {
         if !self.pending_permission_is_stale()
             && let Some(modal) = &self.pending_permission
         {
-            render_permission_modal(frame, &modal.request);
+            render_permission_modal_in(frame, &modal.request, self.project.as_deref());
         }
     }
 }
@@ -1682,7 +1686,17 @@ fn runs_code_later_warning(request: &PermissionRequest) -> Option<Line<'static>>
     )
 }
 
+#[cfg(test)]
 fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionRequest) {
+    render_permission_modal_in(frame, request, None);
+}
+
+/// The modal, with the "outside the project" note when `project` is known.
+fn render_permission_modal_in(
+    frame: &mut ratatui::Frame,
+    request: &PermissionRequest,
+    project: Option<&std::path::Path>,
+) {
     let area = centered_rect(70, 60, frame.area());
     frame.render_widget(Clear, area);
 
@@ -1701,6 +1715,9 @@ fn render_permission_modal(frame: &mut ratatui::Frame, request: &PermissionReque
     lines.extend(target_lines(&request.target));
     if let Some(warning) = runs_code_later_warning(request) {
         lines.push(warning);
+    }
+    if let Some(note) = project.and_then(|p| aivyx_sandbox::outside_project_for_request(request, p)) {
+        lines.push(Line::from(format!("⚠ {note}")).style(Style::default().fg(Color::Yellow)));
     }
     lines.push(Line::from(""));
 
@@ -1772,11 +1789,7 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
             // contains spaces) as a single shell word, so the line reads
             // as the real invocation rather than looking like several
             // separate arguments to `sh`.
-            let words: Vec<String> = std::iter::once(program.as_str())
-                .chain(args.iter().map(String::as_str))
-                .map(shell_quote_word)
-                .collect();
-            ("Command: ", words.join(" "))
+            ("Command: ", aivyx_sandbox::display_command(program, args))
         }
         PermissionTarget::Other(description) => ("Target: ", description.clone()),
         PermissionTarget::Move { from, to } => {
@@ -1795,23 +1808,6 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
             Line::from(format!("{prefix}{line}"))
         })
         .collect()
-}
-
-/// Quotes `word` as a single POSIX shell word if it needs it (U2) --
-/// otherwise returned as-is, so a simple program name or flag like `sh` or
-/// `-c` isn't cluttered with needless quotes. "Needs it" means empty, or
-/// containing whitespace or any shell-meta character; single-quoted with
-/// the standard `'` → `'\''` escape (safe inside single quotes, where
-/// nothing else is special).
-fn shell_quote_word(word: &str) -> String {
-    let needs_quoting = word.is_empty()
-        || word
-            .chars()
-            .any(|c| c.is_whitespace() || "'\"$`\\&|;()<>!*?[]{}~#".contains(c));
-    if !needs_quoting {
-        return word.to_string();
-    }
-    format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 fn diff_line(line: &str) -> Line<'static> {
@@ -2153,6 +2149,29 @@ mod tests {
     }
 
     #[test]
+    fn render_permission_modal_notes_a_write_outside_the_project() {
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path("/tmp/calc_fixed.py".into()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let draw = |project: Option<&std::path::Path>| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| render_permission_modal_in(frame, &request, project))
+                .unwrap();
+            render_to_string(&terminal)
+        };
+        let rendered = draw(Some(std::path::Path::new("/work/proj")));
+        assert!(rendered.contains("outside the project"), "{rendered}");
+        let inside = draw(Some(std::path::Path::new("/tmp")));
+        assert!(!inside.contains("outside the project"), "{inside}");
+    }
+
+    #[test]
     fn render_permission_modal_hides_always_allow_for_a_shell_startup_file() {
         let request = shell_startup_write_request();
         let backend = TestBackend::new(120, 40);
@@ -2234,14 +2253,14 @@ mod tests {
 
     #[test]
     fn shell_quote_word_leaves_simple_words_bare() {
-        assert_eq!(shell_quote_word("sh"), "sh");
-        assert_eq!(shell_quote_word("-c"), "-c");
-        assert_eq!(shell_quote_word("cargo"), "cargo");
+        assert_eq!(aivyx_sandbox::shell_quote_word("sh"), "sh");
+        assert_eq!(aivyx_sandbox::shell_quote_word("-c"), "-c");
+        assert_eq!(aivyx_sandbox::shell_quote_word("cargo"), "cargo");
     }
 
     #[test]
     fn shell_quote_word_escapes_an_embedded_single_quote() {
-        assert_eq!(shell_quote_word("it's broken"), "'it'\\''s broken'");
+        assert_eq!(aivyx_sandbox::shell_quote_word("it's broken"), "'it'\\''s broken'");
     }
 
     #[test]
