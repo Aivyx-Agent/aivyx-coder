@@ -46,7 +46,11 @@ runs aivyx-coder over standard input and output as an MCP server with two
 tools, `code` and `code_reply`, so another local MCP client — Aivyx PA, for
 example — can hand it a bounded coding task and follow up. Each task gets a
 fresh, isolated session that lives until it has been idle for
-`session_ttl_secs`.
+`session_ttl_secs`. Each call returns the session id and the session's
+answer, followed by a `Changed: …` line naming the files it changed, if
+any. A turn that fails (the model server is down, say) comes back as a tool
+error; an unknown session or an access level above the ceiling is refused
+as invalid parameters.
 
 It won't start until you set the highest access level callers may ask for:
 

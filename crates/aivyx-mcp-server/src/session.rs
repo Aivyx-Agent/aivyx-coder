@@ -262,6 +262,19 @@ pub async fn build_session_agent(
 /// mutating trust on the next call -- the taint must keep denying
 /// Write/Delete/Move/Command-class calls for the rest of the session, not
 /// just for the remainder of this one call.
+/// The text a `code`/`code_reply` caller gets: what streamed, else the
+/// agent's kept answer (`fallback`), then the `Changed: …` line if any.
+fn compose_result(streamed: String, fallback: Option<String>, changed: Option<String>) -> String {
+    let mut out = if streamed.trim().is_empty() { fallback.unwrap_or(streamed) } else { streamed };
+    if let Some(changed) = changed {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&changed);
+    }
+    out
+}
+
 pub async fn run_bounded_turn(
     agent: &mut Agent,
     events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
@@ -271,6 +284,14 @@ pub async fn run_bounded_turn(
     cancellation: CancellationToken,
 ) -> (Result<(), aivyx_core::AgentError>, String) {
     let mut accumulated = String::new();
+    // The turn-end `Changed: …` summary (an `Info` event), passed on to the
+    // caller, who otherwise can't tell what the session touched.
+    let mut changed: Option<String> = None;
+    let mut take = |event: &AgentEvent| match event {
+        AgentEvent::TextDelta(text) => accumulated.push_str(text),
+        AgentEvent::Info(line) if line.starts_with("Changed: ") => changed = Some(line.clone()),
+        _ => {}
+    };
     let max_iterations = max_iterations.max(1);
 
     let mut next_input = Some(input);
@@ -284,11 +305,7 @@ pub async fn run_bounded_turn(
             loop {
                 tokio::select! {
                     r = &mut run => break r,
-                    Some(event) = events_rx.recv() => {
-                        if let AgentEvent::TextDelta(text) = &event {
-                            accumulated.push_str(text);
-                        }
-                    }
+                    Some(event) = events_rx.recv() => take(&event),
                 }
             }
         };
@@ -297,9 +314,7 @@ pub async fn run_bounded_turn(
         // before select! polled the channel again) before deciding
         // whether to continue.
         while let Ok(event) = events_rx.try_recv() {
-            if let AgentEvent::TextDelta(text) = &event {
-                accumulated.push_str(text);
-            }
+            take(&event);
         }
         if result.is_ok()
             && agent.last_turn_paused()
@@ -310,6 +325,9 @@ pub async fn run_bounded_turn(
             next_input = Some("continue".to_string());
         }
     }
+    // A reasoning-only final answer is never streamed as text; the agent
+    // keeps it as the answer (`last_assistant_text`).
+    let mut accumulated = compose_result(accumulated, agent.last_assistant_text(), changed);
     let would_have_continued = result.is_ok() && agent.last_turn_paused();
     let injection_tainted = agent.injection_taint().current().is_some();
     let cancelled = cancellation.is_cancelled();
@@ -833,6 +851,56 @@ mod tests {
             ])
             .boxed())
         }
+    }
+
+    struct ThinkingOnlyBackend;
+    #[async_trait]
+    impl aivyx_llm::LlmBackend for ThinkingOnlyBackend {
+        fn model_id(&self) -> &str {
+            "thinking-only"
+        }
+        async fn stream_chat(
+            &self,
+            _request: aivyx_llm::ChatRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, aivyx_llm::LlmError>>,
+            aivyx_llm::LlmError,
+        > {
+            Ok(futures::stream::iter([
+                Ok(StreamEvent::ReasoningDelta("The answer is 42.".to_string())),
+                Ok(StreamEvent::Done { finish_reason: FinishReason::Stop }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bounded_turn_returns_a_thinking_only_answer() {
+        let mut cfg = config(full_registry());
+        cfg.llm = std::sync::Arc::new(ThinkingOnlyBackend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Plan, tx).await;
+        let (result, text) = run_bounded_turn(
+            &mut agent,
+            &mut rx,
+            "what is the answer".to_string(),
+            &std::env::temp_dir(),
+            3,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(text.contains("The answer is 42."), "{text:?}");
+    }
+
+    #[test]
+    fn compose_result_adds_the_changed_files_line() {
+        assert_eq!(
+            compose_result("Fixed it.".into(), None, Some("Changed: calc.py (+1 −1)".into())),
+            "Fixed it.\n\nChanged: calc.py (+1 −1)"
+        );
+        assert_eq!(compose_result(String::new(), Some("from thinking".into()), None), "from thinking");
+        assert_eq!(compose_result("streamed".into(), Some("ignored".into()), None), "streamed");
     }
 
     #[tokio::test]

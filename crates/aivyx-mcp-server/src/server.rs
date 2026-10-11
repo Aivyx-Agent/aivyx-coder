@@ -273,6 +273,20 @@ fn mcp_error(detail: impl Into<String>) -> McpError {
     McpError::internal_error(detail.into(), None)
 }
 
+/// The caller asked for something this server won't do (an unknown or
+/// over-ceiling access level, an unknown session): invalid params, not a
+/// server fault.
+fn caller_error(detail: impl Into<String>) -> McpError {
+    McpError::invalid_params(detail.into(), None)
+}
+
+/// A turn that failed (e.g. the model server is down) is a tool result
+/// marked as an error, so the calling model sees why, rather than a
+/// protocol error.
+fn turn_failed(error: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!("the session's turn failed: {error}"))])
+}
+
 #[derive(Clone)]
 pub struct AivyxCoderMcpServer {
     tool_router: ToolRouter<Self>,
@@ -308,9 +322,9 @@ impl AivyxCoderMcpServer {
         Parameters(params): Parameters<CodeParams>,
         cancellation: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
-        let level = AccessLevel::parse(&params.access_level).map_err(mcp_error)?;
+        let level = AccessLevel::parse(&params.access_level).map_err(caller_error)?;
         if !level.at_most(&self.max_access_level) {
-            return Err(mcp_error(format!(
+            return Err(caller_error(format!(
                 "access_level {:?} exceeds this server's configured ceiling",
                 params.access_level
             )));
@@ -335,7 +349,9 @@ impl AivyxCoderMcpServer {
         // code_reply's own turn failure, by contrast, still put_backs the
         // session (see below) because by then a real session_id already
         // exists for the caller to retry against.
-        result.map_err(|e| mcp_error(e.to_string()))?;
+        if let Err(e) = result {
+            return Ok(turn_failed(e));
+        }
 
         let session_id = uuid::Uuid::new_v4().to_string();
         {
@@ -366,7 +382,7 @@ impl AivyxCoderMcpServer {
             let mut sessions = self.sessions.lock().await;
             sessions.evict_stale();
             sessions.take(&params.session_id).ok_or_else(|| {
-                mcp_error(format!(
+                caller_error(format!(
                     "no session {:?} -- it may have expired (idle past the configured TTL) or \
                      is already processing another request",
                     params.session_id
@@ -401,7 +417,9 @@ impl AivyxCoderMcpServer {
             sessions.put_back(params.session_id.clone(), session);
         }
 
-        result.map_err(|e| mcp_error(e.to_string()))?;
+        if let Err(e) = result {
+            return Ok(turn_failed(e));
+        }
         let content = ContentBlock::json(CodeOutcome {
             session_id: params.session_id,
             result: text,
@@ -581,10 +599,8 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(
-            outcome.is_err(),
-            "execute must be rejected when the ceiling is plan"
-        );
+        let err = outcome.expect_err("execute must be rejected when the ceiling is plan");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
     }
 
     #[tokio::test]
@@ -599,6 +615,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(outcome.is_err());
+        let err = outcome.expect_err("an unknown session is the caller's mistake");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
     }
 }
