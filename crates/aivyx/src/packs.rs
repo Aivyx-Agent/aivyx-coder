@@ -419,17 +419,25 @@ impl ActiveState {
         }
     }
 
-    /// Owner-only, like `config.toml`.
+    /// Owner-only, like `config.toml`: created with that mode (no window at
+    /// the umask's default), and a file left from before is tightened too.
     pub fn save(&self, packs: &PacksDir) -> std::io::Result<()> {
+        use std::io::Write;
         std::fs::create_dir_all(&packs.0)?;
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         let path = Self::path(packs);
-        std::fs::write(&path, text)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(0o600);
+            let mut file = options.open(&path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(text.as_bytes())?;
         }
+        #[cfg(not(unix))]
+        options.open(&path)?.write_all(text.as_bytes())?;
         Ok(())
     }
 

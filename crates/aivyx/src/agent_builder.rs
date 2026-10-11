@@ -743,6 +743,11 @@ pub(crate) async fn build_agent(
             tracing::warn!(%warning, "context window mismatch");
             let _ = events_tx.send(aivyx_core::AgentEvent::Error(warning));
         }
+        if served == aivyx_llm::ServedContext::Unreachable {
+            let notice = aivyx_llm::unreachable_notice(&settings.backend.base_url);
+            tracing::warn!(%notice, "model server unreachable at startup");
+            let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
+        }
         let (effective, notice) =
             aivyx_llm::effective_context_tokens(settings.backend.context_tokens, &served);
         context_tokens = effective;

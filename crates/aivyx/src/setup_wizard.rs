@@ -92,7 +92,7 @@ pub(crate) fn verification_lines(
     }];
     match served {
         ServedContext::Known(n) => lines.push(format!("  served context window: {n} tokens")),
-        ServedContext::Unknown => lines.push(format!(
+        ServedContext::Unknown | ServedContext::Unreachable => lines.push(format!(
             "  couldn't read the served context window; using {default_context} tokens -- \
              if your server serves more, raise [backend] context_tokens in config.toml"
         )),

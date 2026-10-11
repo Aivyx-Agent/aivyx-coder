@@ -15,7 +15,7 @@ pub use kv_slot_pool::KvSlotPool;
 pub use openai_compat::OpenAiCompatBackend;
 pub use probe::{
     ServedContext, context_warning, effective_context_tokens, probe_served_context,
-    verify_model_responds,
+    unreachable_notice, verify_model_responds,
 };
 pub use routed::{BackendFactory, DEFAULT_COOLDOWN, ProfileRefresher, RouteRecord, RoutedBackend};
 pub use slot_pool_lock::{SlotPoolLock, fnv1a};

@@ -23,8 +23,20 @@ pub enum ServedContext {
     /// the server's default (typically 4096, or `OLLAMA_CONTEXT_LENGTH`),
     /// which the API does not expose.
     OllamaDefaultUnknown,
-    /// Nothing recognizable answered; no claim either way.
+    /// Something answered, but nothing recognizable; no claim either way.
     Unknown,
+    /// No request got any HTTP response: the server isn't running, or the
+    /// address is wrong.
+    Unreachable,
+}
+
+/// Said at startup when the model server didn't answer the probe, so the
+/// user finds out before typing a first message.
+pub fn unreachable_notice(base_url: &str) -> String {
+    format!(
+        "couldn't reach the model server at {base_url} -- is it running? Check [backend] \
+         base_url in config.toml, or run `aivyx-coder --setup`."
+    )
 }
 
 /// Queries the server behind `base_url` (the same `.../v1` URL the backend
@@ -36,8 +48,13 @@ pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext 
         Err(_) => return ServedContext::Unknown,
     };
 
+    // Whether any request got an HTTP response at all.
+    let mut reached = false;
+
     // llama-server: GET /props carries default_generation_settings.n_ctx.
-    if let Ok(response) = client.get(format!("{origin}/props")).send().await
+    let props = client.get(format!("{origin}/props")).send().await;
+    reached |= props.is_ok();
+    if let Ok(response) = props
         && response.status().is_success()
         && let Ok(json) = response.json::<serde_json::Value>().await
         && let Some(n_ctx) = parse_llama_props(&json)
@@ -47,11 +64,13 @@ pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext 
 
     // Ollama: POST /api/show returns the model's parameters (num_ctx only
     // if the Modelfile sets one).
-    if let Ok(response) = client
+    let show = client
         .post(format!("{origin}/api/show"))
         .json(&serde_json::json!({ "model": model }))
         .send()
-        .await
+        .await;
+    reached |= show.is_ok();
+    if let Ok(response) = show
         && response.status().is_success()
         && let Ok(json) = response.json::<serde_json::Value>().await
     {
@@ -63,10 +82,12 @@ pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext 
 
     // Lemonade Server: GET <base>/health lists each loaded model with the
     // context size it was launched with. Only a loaded model is listed.
-    if let Ok(response) = client
+    let health = client
         .get(format!("{}/health", base_url.trim_end_matches('/')))
         .send()
-        .await
+        .await;
+    reached |= health.is_ok();
+    if let Ok(response) = health
         && response.status().is_success()
         && let Ok(json) = response.json::<serde_json::Value>().await
         && let Some(n_ctx) = parse_lemonade_health(&json, model)
@@ -74,7 +95,7 @@ pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext 
         return ServedContext::Known(n_ctx);
     }
 
-    ServedContext::Unknown
+    if reached { ServedContext::Unknown } else { ServedContext::Unreachable }
 }
 
 /// How long `verify_model_responds` waits: long enough for a server that
@@ -191,7 +212,7 @@ pub fn context_warning(configured: u32, served: &ServedContext) -> Option<String
              cannot change it. If responses truncate mid-thought, create a derived model: \
              printf 'FROM <model>\\nPARAMETER num_ctx {configured}\\n' | ollama create <model>-ctx -f -"
         )),
-        ServedContext::Unknown => None,
+        ServedContext::Unknown | ServedContext::Unreachable => None,
     }
 }
 
@@ -235,6 +256,16 @@ mod tests {
         ] {
             assert_eq!(effective_context_tokens(8192, &served), (8192, None));
         }
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_is_unreachable() {
+        let served = probe_served_context("http://127.0.0.1:9/v1", "m").await;
+        assert_eq!(served, ServedContext::Unreachable);
+        assert_eq!(effective_context_tokens(8192, &served), (8192, None));
+        assert!(context_warning(8192, &served).is_none());
+        let notice = unreachable_notice("http://127.0.0.1:9/v1");
+        assert!(notice.contains("http://127.0.0.1:9/v1") && notice.contains("--setup"), "{notice}");
     }
 
     #[test]
