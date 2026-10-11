@@ -105,19 +105,46 @@ use crate::prompter::{AcpPrompter, PrompterInstaller};
 const MODE_CODE: &str = "code";
 const MODE_PLAN: &str = "plan";
 
-/// Everything the ACP frontend needs, built by `aivyx`'s
-/// `agent_builder::build_agent` (Task 1) before this crate's `run` takes
-/// over. `prompter_installer` exists because `build_agent` had to hand
-/// `ConfirmationGate` a `DeferredPrompter` (Task 4) — there's no real
-/// `ConnectionTo<Client>` yet at that point — and this is how the real
-/// `AcpPrompter` gets installed behind it, exactly once, from inside the
-/// `NewSessionRequest` handler below.
-pub struct AcpSessionConfig {
+/// One session's agent, built by `aivyx`'s `agent_builder::build_agent`
+/// for the folder the client names in `session/new`. `prompter_installer`
+/// exists because `build_agent` had to hand `ConfirmationGate` a
+/// `DeferredPrompter` (Task 4) — there's no `ConnectionTo<Client>` inside
+/// the builder — and this is how the real `AcpPrompter` gets installed
+/// behind it, exactly once, from inside the `NewSessionRequest` handler.
+pub struct AcpBuilt {
     pub agent: Agent,
     pub events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     pub cwd: PathBuf,
     pub plan_mode: PlanMode,
     pub prompter_installer: PrompterInstaller,
+}
+
+/// Builds the session's agent for a project folder (already checked to be
+/// a directory, canonical). Called once, from `session/new`: everything the
+/// agent derives from its folder — the sandbox's write grant, checkpoints
+/// and `/undo`, saved sessions, `AGENTS.md`, packs, test detection — must
+/// come from the folder the client named, not the one the editor happened
+/// to start this process in.
+pub type AcpSessionFactory = Box<
+    dyn FnOnce(PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AcpBuilt, String>> + Send>>
+        + Send,
+>;
+
+/// What `run` needs: how to build the one session's agent.
+pub struct AcpSessionConfig {
+    pub build: AcpSessionFactory,
+}
+
+/// The project folder for `session/new`'s `cwd`: canonical, and a
+/// directory, or a message for the client.
+fn session_dir(cwd: &std::path::Path) -> Result<PathBuf, String> {
+    let dir = cwd
+        .canonicalize()
+        .map_err(|e| format!("session cwd {} can't be used: {e}", cwd.display()))?;
+    if !dir.is_dir() {
+        return Err(format!("session cwd {} isn't a folder", cwd.display()));
+    }
+    Ok(dir)
 }
 
 struct Session {
@@ -499,7 +526,10 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
     // session lock entirely — see the module doc comment on why
     // `SetSessionModeRequest` must never contend on the same mutex a
     // spawned `PromptRequest` task can hold for a whole turn.
-    let plan_mode = config.plan_mode.clone();
+    // Filled when `session/new` builds the agent; only read once a session
+    // exists (`mode_exists`), and a std mutex held for a single clone.
+    let plan_mode_slot: Arc<std::sync::Mutex<Option<PlanMode>>> = Arc::default();
+    let new_session_plan_mode = Arc::clone(&plan_mode_slot);
     let session_exists = Arc::new(AtomicBool::new(false));
 
     let state: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
@@ -551,11 +581,31 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                         "this aivyx --acp process already hosts a session — one session per process",
                     ));
                 }
-                let Some(built) = init_config.take() else {
+                let Some(config) = init_config.take() else {
                     return responder.respond_with_error(agent_client_protocol::util::internal_error(
                         "session already consumed",
                     ));
                 };
+                let dir = match session_dir(&req.cwd) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(&e));
+                    }
+                };
+                // Built here, for the client's folder, rather than at
+                // startup for whatever folder the editor launched us in.
+                // No other request is in flight before the first session,
+                // so awaiting the build inline holds nothing up.
+                let built = match (config.build)(dir).await {
+                    Ok(built) => built,
+                    Err(e) => {
+                        return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                            format!("couldn't start the session: {e}"),
+                        ));
+                    }
+                };
+                *new_session_plan_mode.lock().unwrap() = Some(built.plan_mode.clone());
                 let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
                 // Installs the real prompter behind the `DeferredPrompter`
                 // `ConfirmationGate` has been holding since `build_agent`
@@ -568,15 +618,8 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 *guard = Some(Session {
                     agent: built.agent,
                     events_rx: built.events_rx,
-                    // The client's declared session `cwd` is authoritative
-                    // for the protocol (mandatory on `NewSessionRequest`),
-                    // not `AcpSessionConfig.cwd` (the directory `build_agent`
-                    // happened to be constructed with before any session
-                    // existed) — the two are expected to match under
-                    // Decision 4 (editor spawns one `aivyx --acp` process
-                    // per session/cwd) but the wire value wins if they ever
-                    // diverge.
-                    cwd: req.cwd.clone(),
+                    // The folder the agent was built for — the client's.
+                    cwd: built.cwd,
                     session_id: session_id.clone(),
                     tasks: Vec::new(),
                     mission_plan: None,
@@ -594,7 +637,9 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     return responder
                         .respond_with_error(agent_client_protocol::util::internal_error("no session"));
                 }
-                plan_mode.set_active(req.mode_id.0.as_ref() == MODE_PLAN);
+                if let Some(plan_mode) = plan_mode_slot.lock().unwrap().clone() {
+                    plan_mode.set_active(req.mode_id.0.as_ref() == MODE_PLAN);
+                }
                 responder.respond(SetSessionModeResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
@@ -658,6 +703,21 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_dir_is_the_canonical_folder_the_client_named() {
+        let root = std::env::temp_dir().join(format!("acp-session-dir-{}", std::process::id()));
+        let dir = root.join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let named = root.join("proj/../proj");
+        assert_eq!(session_dir(&named).unwrap(), dir.canonicalize().unwrap());
+
+        let file = root.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(session_dir(&file).unwrap_err().contains("isn't a folder"));
+        assert!(session_dir(&root.join("missing")).unwrap_err().contains("can't be used"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use agent_client_protocol::schema::v1::{ResourceLink, TextContent};
 
     /// Zed registers a session when the `session/new` response arrives and

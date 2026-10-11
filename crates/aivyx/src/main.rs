@@ -464,20 +464,38 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!(e.to_string()));
         };
         settings.apply_overrides(cli.base_url.clone(), cli.model.clone());
-        let pack = apply_pack_layer(&mut settings);
-        let (deferred, acp_prompter_installer) = aivyx_acp::deferred_prompter();
-        let built =
-            crate::agent_builder::build_agent(&cli, &settings, Arc::new(deferred), pack.as_ref())
-                .await?;
-        return aivyx_acp::run(aivyx_acp::AcpSessionConfig {
-            agent: built.agent,
-            events_rx: built.events_rx,
-            cwd: built.cwd,
-            plan_mode: built.plan_mode,
-            prompter_installer: acp_prompter_installer,
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()));
+        // The agent is built when the client opens its session, for the
+        // folder it names: an editor may start this process elsewhere, and
+        // everything the agent derives from its folder (sandbox, checkpoints,
+        // sessions, AGENTS.md, packs, tests) must match where tools act.
+        // One session per process, so changing directory here is safe.
+        let build: aivyx_acp::AcpSessionFactory = Box::new(move |dir| {
+            Box::pin(async move {
+                std::env::set_current_dir(&dir)
+                    .map_err(|e| format!("can't work in {}: {e}", dir.display()))?;
+                let mut settings = settings;
+                let pack = apply_pack_layer(&mut settings);
+                let (deferred, prompter_installer) = aivyx_acp::deferred_prompter();
+                let built = crate::agent_builder::build_agent(
+                    &cli,
+                    &settings,
+                    Arc::new(deferred),
+                    pack.as_ref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(aivyx_acp::AcpBuilt {
+                    agent: built.agent,
+                    events_rx: built.events_rx,
+                    cwd: built.cwd,
+                    plan_mode: built.plan_mode,
+                    prompter_installer,
+                })
+            })
+        });
+        return aivyx_acp::run(aivyx_acp::AcpSessionConfig { build })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()));
     }
 
     // A first plain launch at a terminal runs the setup wizard instead of

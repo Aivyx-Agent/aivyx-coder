@@ -7,4 +7,4 @@ mod session;
 mod translate;
 
 pub use prompter::{AcpPrompter, DeferredPrompter, PrompterInstaller, deferred_prompter};
-pub use session::{AcpSessionConfig, run, run_unconfigured};
+pub use session::{AcpBuilt, AcpSessionConfig, AcpSessionFactory, run, run_unconfigured};
