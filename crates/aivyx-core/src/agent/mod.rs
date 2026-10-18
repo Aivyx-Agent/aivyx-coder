@@ -218,6 +218,10 @@ pub struct Agent {
     llm: std::sync::Arc<dyn LlmBackend>,
     executor: ToolExecutor,
     system_prompt: String,
+    /// When set, `system_prompt_text` renders the tools this request
+    /// actually sends right after `system_prompt` (see
+    /// `set_advertise_tools`). Off by default: only the main agent opts in.
+    advertise_tools: bool,
     history: Vec<Message>,
     max_tool_iterations: u32,
     context_limit: u32,
@@ -515,6 +519,7 @@ impl Agent {
             llm,
             executor,
             system_prompt: system_prompt.into(),
+            advertise_tools: false,
             history: Vec::new(),
             // A misconfigured 0 would otherwise make every turn a silent
             // no-op (the tool-loop range would simply never iterate).
@@ -819,6 +824,57 @@ impl Agent {
         self.repo_map = Some((map, budget_tokens));
     }
 
+    /// Opts this `Agent` into listing its tools in the system prompt — the
+    /// main agent's "Available tools:" section. The list is rendered per
+    /// request from `request_tool_definitions`, so it always names exactly
+    /// the tools that request sends: plan mode, prompted edit format and
+    /// autonomous mode each withhold tools at runtime, and a list built
+    /// once at startup would keep advertising them. Sub-agents,
+    /// specialists and MCP-server sessions leave it off; their prompts
+    /// never listed tools.
+    pub fn set_advertise_tools(&mut self, enabled: bool) {
+        self.advertise_tools = enabled;
+    }
+
+    /// The tool definitions the next request sends: `plan_definitions()`
+    /// while plan mode is active, minus the native edit tools in prompted
+    /// edit format, minus `AUTONOMOUS_HIDDEN_TOOLS` in autonomous mode.
+    /// The single source for both the request's `tools` and the advertised
+    /// tool section, so the two cannot disagree.
+    pub fn request_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut tools = if self.plan_mode.active() {
+            self.executor.plan_definitions()
+        } else {
+            self.executor.definitions()
+        };
+        if self.edit_format == EditFormat::Prompted {
+            tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
+        }
+        if self.autonomous_mode.active() {
+            tools.retain(|d| !AUTONOMOUS_HIDDEN_TOOLS.contains(&d.name.as_str()));
+        }
+        tools
+    }
+
+    /// The advertised tool section for `tools`, or `None` when this agent
+    /// doesn't advertise tools.
+    fn tool_section(&self, tools: &[ToolDefinition]) -> Option<String> {
+        if !self.advertise_tools {
+            return None;
+        }
+        if tools.is_empty() {
+            return Some("\n\nYou have no tools available in this session.".to_string());
+        }
+        let mut section = String::from("\n\nAvailable tools:");
+        for def in tools {
+            section.push_str("\n- ");
+            section.push_str(&def.name);
+            section.push_str(": ");
+            section.push_str(&def.description);
+        }
+        Some(section)
+    }
+
     /// Sets the skill-discovery listing appended to the system prompt.
     /// `agent_builder.rs` computes `listing` once, at startup, from
     /// `aivyx_skills::SkillLoader::list()` -- `Agent` itself has no
@@ -934,7 +990,9 @@ impl Agent {
         self.kv_slot_id = Some(slot_id);
 
         let system_text = self.system_prompt_text();
-        let tools = self.executor.definitions();
+        // The same tools the turn's first request sends, matching the tool
+        // section `system_text` advertises.
+        let tools = self.request_tool_definitions();
         let key = CacheKey {
             backend_id: kv.backend_id.clone(),
             model_id: kv.model_id.clone(),
@@ -1685,14 +1743,20 @@ impl Agent {
     }
 
     /// The history-free portion of request assembly: system prompt +
-    /// mode/format notes + AGENTS.md + repo map + editor context. Extracted
+    /// advertised tool section (`set_advertise_tools`) + mode/format
+    /// notes + AGENTS.md + repo map + editor context. Extracted
     /// out of `assemble_messages` (Task 5) specifically so the kvcache
     /// warm-up path can build exactly this "stable prefix" text without
     /// ever touching `self.history` — see `ensure_kv_slot_checked_out`'s
     /// own doc comment for why reusing `assemble_messages` as-is would be
     /// fragile (it includes the current turn's just-pushed user message).
-    fn system_prompt_text(&self) -> String {
+    pub fn system_prompt_text(&self) -> String {
         let mut system = self.system_prompt.clone();
+        // Immediately after the base prompt, where the main agent's static
+        // prompt used to end with the same list.
+        if let Some(section) = self.tool_section(&self.request_tool_definitions()) {
+            system.push_str(&section);
+        }
         if self.history_truncated {
             match &self.autonomous_goal {
                 Some(goal) if self.autonomous_mode.active() => {
@@ -1781,6 +1845,9 @@ impl Agent {
     /// rendered repo map, which is real prompt weight every request.
     fn prompt_chars(&self) -> usize {
         message_chars(&self.system_prompt, &self.history)
+            + self
+                .tool_section(&self.request_tool_definitions())
+                .map_or(0, |s| s.chars().count())
             + self.repo_map_text.as_ref().map_or(0, |m| m.chars().count())
             + self
                 .agents_files_text
@@ -2604,20 +2671,7 @@ impl Agent {
 
             // Re-evaluated every iteration, not once per turn, so a
             // mid-turn toggle takes effect on the very next request.
-            let tools = {
-                let mut tools = if self.plan_mode.active() {
-                    self.executor.plan_definitions()
-                } else {
-                    self.executor.definitions()
-                };
-                if self.edit_format == EditFormat::Prompted {
-                    tools.retain(|d| !PROMPTED_EDIT_HIDDEN_TOOLS.contains(&d.name.as_str()));
-                }
-                if self.autonomous_mode.active() {
-                    tools.retain(|d| !AUTONOMOUS_HIDDEN_TOOLS.contains(&d.name.as_str()));
-                }
-                tools
-            };
+            let tools = self.request_tool_definitions();
             // `kv_slot_id` is always `None` here in broker mode (see
             // `broker_mode`'s own doc comment) -- the broker's own
             // occupancy tracking, not this client, is what makes

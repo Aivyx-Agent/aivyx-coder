@@ -1,11 +1,9 @@
-use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aivyx_config::Settings;
 use aivyx_core::EditFormat;
 use aivyx_sandbox::PermissionPrompter;
-use aivyx_tools::ToolExecutor;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -117,13 +115,16 @@ mod tests {
         assert!(Cli::try_parse_from(["aivyx-coder", "--resume=x"]).is_err());
     }
 
+    use aivyx_tools::ToolExecutor;
+
     fn prompt_test_executor() -> ToolExecutor {
         use aivyx_sandbox::{
             NoopConfiner, PermissionDecision, PermissionGate, PermissionRequest,
         };
         use aivyx_tools::{
-            DeleteFileTool, GitCommitTool, GitReadTool, ReadFileTool, ReplSendTool, ReplStartTool,
-            ReplStopTool, RunShellTool, ToolRegistry, new_shared_repl_session,
+            DeleteFileTool, EditFileTool, GitCommitTool, GitReadTool, ReadFileTool, ReplSendTool,
+            ReplStartTool, ReplStopTool, RunShellTool, ToolRegistry, WriteFileTool,
+            new_shared_repl_session,
         };
 
         struct AllowAll;
@@ -136,6 +137,8 @@ mod tests {
 
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(EditFileTool));
         registry.register(Arc::new(RunShellTool));
         registry.register(Arc::new(GitReadTool::new(vec![])));
         registry.register(Arc::new(GitCommitTool::new(vec![])));
@@ -160,24 +163,110 @@ mod tests {
         ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner))
     }
 
+    /// The main agent's system prompt as it was built before the tool list
+    /// followed each request: the whole list rendered once, at startup.
+    fn legacy_static_prompt(
+        executor: &ToolExecutor,
+        edit_format: EditFormat,
+        hidden: &[&str],
+    ) -> String {
+        use std::fmt::Write as _;
+        let unattended = !hidden.is_empty();
+        let mut prompt = build_system_prompt(edit_format, unattended);
+        let definitions: Vec<_> = executor
+            .definitions()
+            .into_iter()
+            .filter(|d| {
+                edit_format == EditFormat::Native
+                    || (d.name != "edit_file" && d.name != "write_file")
+            })
+            .filter(|d| !hidden.contains(&d.name.as_str()))
+            .collect();
+        if definitions.is_empty() {
+            prompt.push_str("\n\nYou have no tools available in this session.");
+            return prompt;
+        }
+        prompt.push_str("\n\nAvailable tools:");
+        for def in &definitions {
+            let _ = write!(prompt, "\n- {}: {}", def.name, def.description);
+        }
+        prompt
+    }
+
+    /// An `Agent` over `prompt_test_executor()`, the way `agent_builder`
+    /// builds the main one: `system_prompt` plus, when `advertise`, the
+    /// per-request tool section.
+    fn prompt_test_agent(
+        system_prompt: String,
+        edit_format: EditFormat,
+        autonomous: bool,
+        advertise: bool,
+    ) -> aivyx_core::Agent {
+        let llm: Arc<dyn aivyx_llm::LlmBackend> =
+            Arc::new(aivyx_llm::OpenAiCompatBackend::new("http://127.0.0.1:9/v1", "unused", None));
+        let autonomous_mode = aivyx_sandbox::AutonomousMode::new();
+        autonomous_mode.set_active(autonomous);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = aivyx_core::Agent::new(
+            llm,
+            prompt_test_executor(),
+            system_prompt,
+            aivyx_core::AgentConfig {
+                edit_format,
+                ..Default::default()
+            },
+            Arc::default(),
+            aivyx_sandbox::PlanMode::new(),
+            autonomous_mode,
+            tx,
+        );
+        agent.set_advertise_tools(advertise);
+        agent
+    }
+
     #[test]
     fn interactive_system_prompt_lists_every_tool_and_promises_approvals() {
-        let prompt = build_system_prompt(&prompt_test_executor(), EditFormat::Native, &[]);
+        let agent = prompt_test_agent(
+            build_system_prompt(EditFormat::Native, false),
+            EditFormat::Native,
+            false,
+            true,
+        );
+        let prompt = agent.system_prompt_text();
         assert!(prompt.starts_with(SYSTEM_PROMPT_PREAMBLE), "{prompt}");
         assert!(prompt.contains(TOOL_GUIDANCE_NATIVE), "{prompt}");
-        for tool in ["- run_shell:", "- git_commit:", "- read_file:"] {
+        for tool in ["- run_shell:", "- git_commit:", "- read_file:", "- write_file:"] {
             assert!(prompt.contains(tool), "{tool} missing: {prompt}");
         }
     }
 
     #[test]
+    fn act_mode_system_prompt_is_byte_identical_to_the_static_one() {
+        for format in [EditFormat::Native, EditFormat::Prompted] {
+            let legacy = legacy_static_prompt(&prompt_test_executor(), format, &[]);
+            let before = prompt_test_agent(legacy, format, false, false).system_prompt_text();
+            let after = prompt_test_agent(build_system_prompt(format, false), format, false, true)
+                .system_prompt_text();
+            assert_eq!(after, before, "{format:?}");
+        }
+        // The prompted list really drops the edit tools (non-vacuous: the
+        // registry has both).
+        let prompted = prompt_test_agent(
+            build_system_prompt(EditFormat::Prompted, false),
+            EditFormat::Prompted,
+            false,
+            true,
+        )
+        .system_prompt_text();
+        assert!(!prompted.contains("- write_file:"), "{prompted}");
+        assert!(!prompted.contains("- edit_file:"), "{prompted}");
+    }
+
+    #[test]
     fn autonomous_system_prompt_omits_the_tools_the_agent_withholds() {
         for format in [EditFormat::Native, EditFormat::Prompted] {
-            let prompt = build_system_prompt(
-                &prompt_test_executor(),
-                format,
-                aivyx_core::AUTONOMOUS_HIDDEN_TOOLS,
-            );
+            let agent = prompt_test_agent(build_system_prompt(format, true), format, true, true);
+            let prompt = agent.system_prompt_text();
             for hidden in aivyx_core::AUTONOMOUS_HIDDEN_TOOLS {
                 assert!(
                     !prompt.contains(hidden),
@@ -187,6 +276,11 @@ mod tests {
             assert!(!prompt.contains("approval prompt"), "{prompt}");
             assert!(prompt.contains("- read_file:"), "{prompt}");
             assert!(prompt.contains("- git_read:"), "{prompt}");
+            let sent: Vec<String> =
+                agent.request_tool_definitions().into_iter().map(|d| d.name).collect();
+            for name in &sent {
+                assert!(prompt.contains(&format!("\n- {name}: ")), "{name}: {prompt}");
+            }
         }
     }
 }
@@ -242,52 +336,25 @@ const TOOL_GUIDANCE_PROMPTED_AUTONOMOUS: &str = "Use the dedicated tools: git_re
 grep/glob for searching, read_file for reading files. File modifications are made with \
 SEARCH/REPLACE blocks.";
 
-/// Builds the tool-describing part of the system prompt from the tools
-/// actually registered, so it can't silently drift out of sync with what's
-/// sent to the model via `ChatRequest.tools` as the tool set grows. In
-/// prompted edit mode the edit tools are omitted here too — the agent
-/// withholds them from every request and teaches SEARCH/REPLACE blocks
-/// instead, so listing them would contradict the instructions. `hidden`
-/// names tools the agent withholds from every request
-/// (`aivyx_core::AUTONOMOUS_HIDDEN_TOOLS` under `--auto`, empty otherwise);
-/// they are left out here too, and a non-empty `hidden` selects the
-/// unattended preamble and guidance.
-fn build_system_prompt(
-    executor: &ToolExecutor,
-    edit_format: EditFormat,
-    hidden: &[&str],
-) -> String {
-    let unattended = !hidden.is_empty();
-    let guidance = match (edit_format, unattended) {
+/// Builds the main agent's base system prompt: preamble plus tool-use
+/// guidance, each with a variant per edit format and for `--auto`
+/// (`autonomous`). The "Available tools:" list is not part of it: the
+/// agent renders that per request (`Agent::set_advertise_tools`), from the
+/// very tools the request sends, so it follows plan mode, prompted edit
+/// format and `--auto` instead of being fixed at startup.
+fn build_system_prompt(edit_format: EditFormat, autonomous: bool) -> String {
+    let guidance = match (edit_format, autonomous) {
         (EditFormat::Native, false) => TOOL_GUIDANCE_NATIVE,
         (EditFormat::Prompted, false) => TOOL_GUIDANCE_PROMPTED,
         (EditFormat::Native, true) => TOOL_GUIDANCE_NATIVE_AUTONOMOUS,
         (EditFormat::Prompted, true) => TOOL_GUIDANCE_PROMPTED_AUTONOMOUS,
     };
-    let preamble = if unattended {
+    let preamble = if autonomous {
         SYSTEM_PROMPT_PREAMBLE_AUTONOMOUS
     } else {
         SYSTEM_PROMPT_PREAMBLE
     };
-    let definitions: Vec<_> = executor
-        .definitions()
-        .into_iter()
-        .filter(|d| {
-            edit_format == EditFormat::Native || (d.name != "edit_file" && d.name != "write_file")
-        })
-        .filter(|d| !hidden.contains(&d.name.as_str()))
-        .collect();
-    if definitions.is_empty() {
-        return format!(
-            "{preamble} {guidance}\n\nYou have no tools available in this session."
-        );
-    }
-
-    let mut prompt = format!("{preamble} {guidance}\n\nAvailable tools:");
-    for def in &definitions {
-        let _ = write!(prompt, "\n- {}: {}", def.name, def.description);
-    }
-    prompt
+    format!("{preamble} {guidance}")
 }
 
 #[derive(Parser, Debug)]

@@ -9662,3 +9662,186 @@ async fn redo_warns_about_generated_files_changed_after_the_undo() {
     );
     assert_eq!(infos(&mut rx), vec!["Redone: a.txt (+2 generated)".to_string()]);
 }
+
+/// Session-safe and mutating real tools, so the advertised-tool-list tests
+/// below see plan mode, prompted mode and autonomous mode each actually
+/// remove something.
+fn advertise_test_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::GrepTool::new(vec![])));
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(aivyx_tools::EditFileTool));
+    registry.register(Arc::new(aivyx_tools::DeleteFileTool));
+    registry.register(Arc::new(aivyx_tools::RunShellTool));
+    registry.register(Arc::new(aivyx_tools::GitCommitTool::new(vec![])));
+    registry
+}
+
+const ADVERTISE_TEST_TOOLS: &[&str] = &[
+    "read_file",
+    "grep",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "run_shell",
+    "git_commit",
+];
+
+/// The tool section exactly as the main agent's static prompt used to
+/// render it.
+fn rendered_tool_section(definitions: &[ToolDefinition]) -> String {
+    if definitions.is_empty() {
+        return "\n\nYou have no tools available in this session.".to_string();
+    }
+    let mut section = "\n\nAvailable tools:".to_string();
+    for def in definitions {
+        section.push_str(&format!("\n- {}: {}", def.name, def.description));
+    }
+    section
+}
+
+/// Asserts `system` is the base prompt `"system"` followed by exactly the
+/// section for `definitions` — then nothing, or the next `\n\n` section (a
+/// bare prefix match would accept a longer list that merely starts with it).
+fn assert_tool_section(system: &str, definitions: &[ToolDefinition], context: &str) {
+    let rest = system
+        .strip_prefix(&format!("system{}", rendered_tool_section(definitions)))
+        .unwrap_or_else(|| panic!("{context}: wrong tool section: {system}"));
+    assert!(
+        rest.is_empty() || rest.starts_with("\n\n"),
+        "{context}: tool section has extra entries: {system}"
+    );
+}
+
+fn tool_names(definitions: &[ToolDefinition]) -> Vec<String> {
+    definitions.iter().map(|d| d.name.clone()).collect()
+}
+
+#[test]
+fn advertised_tool_section_equals_the_request_tools_in_every_mode() {
+    for format in [EditFormat::Native, EditFormat::Prompted] {
+        for plan in [false, true] {
+            for auto in [false, true] {
+                let (mut agent, _rx, _mock) = build_agent_with_config(
+                    vec![],
+                    advertise_test_registry(),
+                    AgentConfig {
+                        edit_format: format,
+                        ..Default::default()
+                    },
+                );
+                agent.set_advertise_tools(true);
+                agent.plan_mode.set_active(plan);
+                agent.autonomous_mode.set_active(auto);
+                let mode = format!("{format:?} plan={plan} auto={auto}");
+
+                let defs = agent.request_tool_definitions();
+                let prompt = agent.system_prompt_text();
+                assert_tool_section(&prompt, &defs, &mode);
+                let sent = tool_names(&defs);
+                for name in ADVERTISE_TEST_TOOLS {
+                    assert_eq!(
+                        prompt.contains(&format!("\n- {name}: ")),
+                        sent.iter().any(|s| s == name),
+                        "{mode}: {name} advertised/sent mismatch: {prompt}"
+                    );
+                }
+                if plan {
+                    let plan_names = tool_names(&agent.executor.plan_definitions());
+                    let expected: Vec<String> = plan_names
+                        .into_iter()
+                        .filter(|n| !(auto && AUTONOMOUS_HIDDEN_TOOLS.contains(&n.as_str())))
+                        .collect();
+                    assert_eq!(sent, expected, "{mode}");
+                    let mutating = [
+                        "write_file",
+                        "edit_file",
+                        "delete_file",
+                        "run_shell",
+                        "git_commit",
+                    ];
+                    for name in mutating {
+                        assert!(!prompt.contains(&format!("\n- {name}: ")), "{mode}: {prompt}");
+                    }
+                }
+                if format == EditFormat::Prompted {
+                    for hidden in PROMPTED_EDIT_HIDDEN_TOOLS {
+                        assert!(!prompt.contains(&format!("\n- {hidden}: ")), "{mode}: {prompt}");
+                    }
+                }
+                if auto {
+                    for hidden in AUTONOMOUS_HIDDEN_TOOLS {
+                        assert!(!prompt.contains(&format!("\n- {hidden}: ")), "{mode}: {prompt}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn toggling_plan_mode_changes_the_advertised_tools_on_the_next_prompt() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], advertise_test_registry(), 5);
+    agent.set_advertise_tools(true);
+    assert!(agent.system_prompt_text().contains("\n- write_file: "));
+
+    agent.plan_mode.set_active(true);
+    let planning = agent.system_prompt_text();
+    assert!(!planning.contains("\n- write_file: "), "{planning}");
+    assert!(!planning.contains("\n- run_shell: "), "{planning}");
+    assert!(planning.contains("\n- read_file: "), "{planning}");
+
+    agent.plan_mode.set_active(false);
+    let acting = agent.system_prompt_text();
+    for name in ADVERTISE_TEST_TOOLS {
+        assert!(acting.contains(&format!("\n- {name}: ")), "{name}: {acting}");
+    }
+}
+
+#[test]
+fn an_empty_advertised_tool_set_says_so() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 5);
+    agent.set_advertise_tools(true);
+    assert_eq!(
+        agent.system_prompt_text(),
+        "system\n\nYou have no tools available in this session."
+    );
+}
+
+#[test]
+fn agents_that_do_not_advertise_tools_get_no_tool_section() {
+    let (agent, _rx, _mock) = build_agent(vec![], advertise_test_registry(), 5);
+    assert_eq!(agent.system_prompt_text(), "system");
+    agent.plan_mode.set_active(true);
+    assert!(!agent.system_prompt_text().contains("Available tools:"));
+    assert!(!agent.system_prompt_text().contains("no tools available"));
+}
+
+#[tokio::test]
+async fn the_request_sends_exactly_the_advertised_tools() {
+    let stop = || {
+        vec![StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        }]
+    };
+    let (mut agent, _rx, mock) = build_agent(vec![stop(), stop()], advertise_test_registry(), 5);
+    agent.set_advertise_tools(true);
+    agent.plan_mode.set_active(true);
+    agent
+        .run_turn("plan".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    agent.plan_mode.set_active(false);
+    agent
+        .run_turn("act".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    for request in received.iter() {
+        assert_tool_section(&request.messages[0].text_content(), &request.tools, "request");
+    }
+    assert!(!tool_names(&received[0].tools).contains(&"write_file".to_string()));
+    assert!(tool_names(&received[1].tools).contains(&"write_file".to_string()));
+}

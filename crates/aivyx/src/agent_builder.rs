@@ -1284,14 +1284,9 @@ pub(crate) async fn build_agent(
     if let Some(cp) = &checkpointer {
         executor.set_checkpointer_at(cwd.clone(), deny_paths.clone(), Arc::clone(cp));
     }
-    // Under `--auto` the agent withholds `AUTONOMOUS_HIDDEN_TOOLS` from every
-    // request, so the prompt must not advertise them either.
-    let hidden: &[&str] = if cli.auto.is_some() {
-        aivyx_core::AUTONOMOUS_HIDDEN_TOOLS
-    } else {
-        &[]
-    };
-    let system_prompt = build_system_prompt(&executor, edit_format, hidden);
+    // The tool list itself is rendered per request by the agent
+    // (`set_advertise_tools` below), so it always matches the tools sent.
+    let system_prompt = build_system_prompt(edit_format, cli.auto.is_some());
 
     // A `[backend]` routing counts as cloud leaves routed calls (the main
     // loop's included) with nothing to pick unless another local model is
@@ -1456,6 +1451,8 @@ pub(crate) async fn build_agent(
         autonomous_mode.clone(),
         events_tx,
     );
+    // Only the main agent lists its tools in the system prompt.
+    agent.set_advertise_tools(true);
     if let Some(router) = &router {
         agent.set_router(Arc::clone(router));
     }
