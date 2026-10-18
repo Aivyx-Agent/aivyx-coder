@@ -583,6 +583,12 @@ impl Tool for ReplSendTool {
         false
     }
 
+    /// `Interact` is denied by the gate in plan mode, and with `repl_start`
+    /// withheld there is nothing to interact with — don't offer it.
+    fn plan_visible(&self) -> bool {
+        false
+    }
+
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
@@ -696,6 +702,12 @@ impl Tool for ReplStopTool {
     }
 
     fn mutates_outside_session(&self) -> bool {
+        false
+    }
+
+    /// `Interact` is denied by the gate in plan mode, and with `repl_start`
+    /// withheld there is nothing to interact with — don't offer it.
+    fn plan_visible(&self) -> bool {
         false
     }
 

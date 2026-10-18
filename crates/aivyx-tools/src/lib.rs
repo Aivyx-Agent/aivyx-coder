@@ -100,6 +100,15 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Whether this tool is offered to the model while plan mode is active.
+    /// Defaults to `!mutates_outside_session()`. Override to `false` for a
+    /// tool that is session-safe (and so needs no checkpoint) but whose
+    /// `ActionKind` the gate still denies in plan mode (`repl_send`/
+    /// `repl_stop`: `Interact`), so it is never offered just to fail.
+    fn plan_visible(&self) -> bool {
+        !self.mutates_outside_session()
+    }
+
     /// Whether a call to this tool should be preceded by a git checkpoint.
     /// Defaults to `mutates_outside_session()`, which is correct for every
     /// tool that actually touches the filesystem — a checkpoint exists so a
@@ -201,7 +210,7 @@ impl ToolRegistry {
     pub fn plan_definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| !tool.mutates_outside_session())
+            .filter(|tool| tool.plan_visible())
             .map(|tool| tool.definition())
             .collect()
     }
@@ -673,11 +682,19 @@ mod tests {
         assert_eq!(all.len(), 15);
         assert_eq!(
             plan,
-            vec![
-                "read_file", "grep", "glob", "set_tasks", "git_read", "repl_send", "repl_stop"
-            ],
-            "web_fetch/web_search/generate_svg must NOT appear here -- network access is not session-safe"
+            vec!["read_file", "grep", "glob", "set_tasks", "git_read"],
+            "web_fetch/web_search/generate_svg must NOT appear here -- network access is not session-safe; \
+             repl_send/repl_stop must NOT either -- the gate denies Interact in plan mode"
         );
+        // Hiding them from plan mode must not change act-mode definitions or
+        // checkpoint behaviour.
+        assert!(all.contains(&"repl_send".to_string()));
+        assert!(all.contains(&"repl_stop".to_string()));
+        for name in ["repl_send", "repl_stop"] {
+            let tool = registry.get(name).unwrap();
+            assert!(!tool.mutates_outside_session(), "{name}");
+            assert!(!tool.needs_checkpoint(), "{name}");
+        }
     }
 
     #[tokio::test]
