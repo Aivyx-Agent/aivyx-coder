@@ -143,7 +143,7 @@ issue based on its output; it will run again automatically once you stop making 
 /// (what `repl_send`/`repl_stop` report) is independently denied by
 /// `ConfirmationGate` in autonomous mode as a backstop even though
 /// `repl_start` being hidden already makes a session unreachable there.
-const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit", "repl_start"];
+pub const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit", "repl_start"];
 
 /// Appended to the system prompt while autonomous mode is active.
 const AUTONOMOUS_PROMPT: &str = "You are running unattended (autonomous mode): no human will \

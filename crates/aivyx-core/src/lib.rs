@@ -17,7 +17,7 @@ pub mod test_detect;
 pub mod undo;
 pub mod wiki;
 
-pub use agent::{Agent, AgentConfig, AgentError, AgentEvent, EditFormat};
+pub use agent::{AUTONOMOUS_HIDDEN_TOOLS, Agent, AgentConfig, AgentError, AgentEvent, EditFormat};
 pub use architect::{Architect, ArchitectSeat};
 pub use council::{Council, CouncilSeat};
 pub use delegate::{DelegateTaskConfig, DelegateTaskTool};
