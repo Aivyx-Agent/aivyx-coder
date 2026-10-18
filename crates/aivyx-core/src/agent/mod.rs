@@ -218,6 +218,10 @@ pub struct Agent {
     llm: std::sync::Arc<dyn LlmBackend>,
     executor: ToolExecutor,
     system_prompt: String,
+    /// Base prompt used instead of `system_prompt` while plan mode is
+    /// active (and autonomous mode is not): the main agent's tool guidance
+    /// names tools plan mode withholds. `None` = always `system_prompt`.
+    plan_mode_system_prompt: Option<String>,
     /// When set, `system_prompt_text` renders the tools this request
     /// actually sends right after `system_prompt` (see
     /// `set_advertise_tools`). Off by default: only the main agent opts in.
@@ -519,6 +523,7 @@ impl Agent {
             llm,
             executor,
             system_prompt: system_prompt.into(),
+            plan_mode_system_prompt: None,
             advertise_tools: false,
             history: Vec::new(),
             // A misconfigured 0 would otherwise make every turn a silent
@@ -832,6 +837,23 @@ impl Agent {
     /// once at startup would keep advertising them. Sub-agents,
     /// specialists and MCP-server sessions leave it off; their prompts
     /// never listed tools.
+    /// Sets the base prompt used in place of the constructor's while plan
+    /// mode is active. Autonomous mode wins if both are active (plan mode
+    /// and `--auto` are mutually exclusive at startup, so this only
+    /// matters for a runtime toggle). Everything appended after the base
+    /// (tool list, plan note, AGENTS.md, ...) is unchanged.
+    pub fn set_plan_mode_system_prompt(&mut self, prompt: String) {
+        self.plan_mode_system_prompt = Some(prompt);
+    }
+
+    /// The base prompt a request sent right now starts from.
+    fn active_base_prompt(&self) -> &str {
+        match &self.plan_mode_system_prompt {
+            Some(plan) if self.plan_mode.active() && !self.autonomous_mode.active() => plan,
+            _ => &self.system_prompt,
+        }
+    }
+
     pub fn set_advertise_tools(&mut self, enabled: bool) {
         self.advertise_tools = enabled;
     }
@@ -1751,7 +1773,7 @@ impl Agent {
     /// own doc comment for why reusing `assemble_messages` as-is would be
     /// fragile (it includes the current turn's just-pushed user message).
     pub fn system_prompt_text(&self) -> String {
-        let mut system = self.system_prompt.clone();
+        let mut system = self.active_base_prompt().to_string();
         // Immediately after the base prompt, where the main agent's static
         // prompt used to end with the same list.
         if let Some(section) = self.tool_section(&self.request_tool_definitions()) {
@@ -1844,7 +1866,7 @@ impl Agent {
     /// tool-definition tokens) cancel out in the ratio. Includes the
     /// rendered repo map, which is real prompt weight every request.
     fn prompt_chars(&self) -> usize {
-        message_chars(&self.system_prompt, &self.history)
+        message_chars(self.active_base_prompt(), &self.history)
             + self
                 .tool_section(&self.request_tool_definitions())
                 .map_or(0, |s| s.chars().count())

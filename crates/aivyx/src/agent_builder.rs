@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     COUNCIL_IDLE_TIMEOUT, Cli, DEFAULT_COMMAND_TIMEOUT_SECS, base_url_looks_local,
-    build_system_prompt,
+    build_plan_system_prompt, build_system_prompt,
 };
 
 /// The `allowed_commands` entry name synthesized for `--auto` when no
@@ -1453,6 +1453,7 @@ pub(crate) async fn build_agent(
     );
     // Only the main agent lists its tools in the system prompt.
     agent.set_advertise_tools(true);
+    agent.set_plan_mode_system_prompt(build_plan_system_prompt());
     if let Some(router) = &router {
         agent.set_router(Arc::clone(router));
     }

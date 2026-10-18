@@ -9845,3 +9845,35 @@ async fn the_request_sends_exactly_the_advertised_tools() {
     assert!(!tool_names(&received[0].tools).contains(&"write_file".to_string()));
     assert!(tool_names(&received[1].tools).contains(&"write_file".to_string()));
 }
+
+#[test]
+fn plan_mode_system_prompt_replaces_the_base_and_is_counted() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let act_text = agent.system_prompt_text();
+    let act_chars = agent.prompt_chars();
+
+    // Without an alternative nothing changes in plan mode except the note.
+    agent.plan_mode.set_active(true);
+    assert!(agent.system_prompt_text().starts_with(&agent.system_prompt));
+    agent.plan_mode.set_active(false);
+
+    agent.set_plan_mode_system_prompt("PLAN-BASE-ONLY".to_string());
+    // Act mode is untouched by the alternative.
+    assert_eq!(agent.system_prompt_text(), act_text);
+    assert_eq!(agent.prompt_chars(), act_chars);
+
+    agent.plan_mode.set_active(true);
+    let plan_text = agent.system_prompt_text();
+    assert!(plan_text.starts_with("PLAN-BASE-ONLY"), "{plan_text}");
+    assert!(!plan_text.contains(&agent.system_prompt), "{plan_text}");
+    assert!(plan_text.contains(PLAN_MODE_PROMPT));
+    // prompt_chars counts the base that is actually sent.
+    assert_eq!(
+        agent.prompt_chars() + agent.system_prompt.chars().count(),
+        act_chars + "PLAN-BASE-ONLY".chars().count()
+    );
+
+    // Autonomous wins over plan: the act base stays.
+    agent.autonomous_mode.set_active(true);
+    assert!(agent.system_prompt_text().starts_with(&agent.system_prompt));
+}
