@@ -609,6 +609,8 @@ pub async fn run(
                                         "Wait for the reply to finish (or press Ctrl+C) first."
                                             .to_string(),
                                     ));
+                                } else if app.reject_input_after_autonomous_end() {
+                                    // Nothing reads `input_tx` any more.
                                 } else {
                                     app.push_user_message(text.clone());
                                     let _ = input_tx.send(text);
@@ -635,7 +637,10 @@ pub async fn run(
             maybe_agent_event = agent_events_rx.recv(), if agent_events_open => {
                 match maybe_agent_event {
                     Some(event) => app.handle_agent_event(event),
-                    None => agent_events_open = false,
+                    None => {
+                        agent_events_open = false;
+                        app.mark_autonomous_finished();
+                    }
                 }
             }
             maybe_modal = permission_rx.recv(), if permissions_open => {
@@ -737,6 +742,11 @@ struct App {
     /// human-driven session. (The welcome hint never shows in such a run --
     /// see `seed_autonomous_goal`.)
     autonomous: bool,
+    /// An `--auto` run's agent task has returned (goal achieved, budget
+    /// exhausted, cancelled, injection): its channels are closed, so the
+    /// status line must stop claiming it is running and typed text has
+    /// nowhere to go. Set by `mark_autonomous_finished`.
+    autonomous_finished: bool,
     /// The project folder, for the "outside the project" note on approvals.
     project: Option<std::path::PathBuf>,
 }
@@ -773,8 +783,35 @@ impl App {
             diff_view: None,
             tests_line: String::new(),
             autonomous: false,
+            autonomous_finished: false,
             project: None,
         }
+    }
+
+    /// Records that the agent's event channel closed. Only meaningful for
+    /// an `--auto` run, whose background task returns when the run stops;
+    /// an interactive session's channel never closes before the TUI quits.
+    fn mark_autonomous_finished(&mut self) {
+        if self.autonomous {
+            self.autonomous_finished = true;
+            self.streaming_active = false;
+        }
+    }
+
+    /// Called for Enter on non-empty text that no local command handled.
+    /// After an autonomous run has ended nothing reads the input channel,
+    /// so the text would be silently lost: say so in the transcript
+    /// instead and return `true` (do not send). `false` means send as
+    /// usual.
+    fn reject_input_after_autonomous_end(&mut self) -> bool {
+        if !self.autonomous_finished {
+            return false;
+        }
+        self.transcript.push(ChatLine::Notice(
+            "the autonomous run has ended; quit (Ctrl+C) and start aivyx-coder again to keep working"
+                .to_string(),
+        ));
+        true
     }
 
     /// Shows a permission modal. An open `/diff` pager is closed first so
@@ -1257,6 +1294,8 @@ impl App {
             "waiting for your answer"
         } else if self.streaming_active {
             "streaming... (Ctrl+C to cancel)"
+        } else if self.autonomous_finished {
+            "autonomous run finished — Ctrl+C to quit"
         } else if self.autonomous {
             "autonomous run — Ctrl+C to stop"
         } else {
@@ -3917,6 +3956,58 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("ready — Enter to send"), "{rendered}");
+    }
+
+    #[test]
+    fn autonomous_status_line_says_finished_once_the_run_has_ended() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        let draw = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            render_to_string(&terminal)
+        };
+        let before = draw(&app);
+        assert!(before.contains("autonomous run — Ctrl+C to stop"), "{before}");
+        assert!(!before.contains("autonomous run finished"), "{before}");
+
+        app.streaming_active = true;
+        app.mark_autonomous_finished();
+        let after = draw(&app);
+        assert!(
+            after.contains("autonomous run finished — Ctrl+C to quit"),
+            "{after}"
+        );
+        assert!(!after.contains("Ctrl+C to stop"), "{after}");
+        assert!(!after.contains("streaming..."), "{after}");
+    }
+
+    #[test]
+    fn interactive_session_ignores_a_closed_event_channel() {
+        let mut app = App::new(None, PlanMode::new());
+        app.mark_autonomous_finished();
+        assert!(!app.autonomous_finished);
+        assert!(!app.reject_input_after_autonomous_end());
+        assert!(app.transcript.is_empty());
+    }
+
+    #[test]
+    fn input_after_the_autonomous_run_ended_is_refused_with_a_notice() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        // Still running: input goes through as before.
+        assert!(!app.reject_input_after_autonomous_end());
+        assert!(app.transcript.is_empty());
+
+        app.mark_autonomous_finished();
+        assert!(app.reject_input_after_autonomous_end());
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(ChatLine::Notice(n)) if n == "the autonomous run has ended; quit (Ctrl+C) and start aivyx-coder again to keep working"
+            ),
+            "last transcript line is not the notice"
+        );
     }
 
     #[test]
