@@ -1,7 +1,7 @@
 {
   "id": "aivyx-coder",
   "name": "aivyx-coder",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "A terminal coding agent for local LLMs only (Lemonade, Ollama, llama.cpp, vLLM) -- never calls a cloud API.",
   "repository": "https://github.com/Aivyx-Agent/aivyx-coder",
   "license": "BUSL-1.1",
@@ -9,15 +9,15 @@
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.5.8/aivyx-coder-v0.5.8-darwin-aarch64.tar.gz",
-        "sha256": "5a09c95ab5712ee80d31d3aec16809247c5823724d2d04d92dd4c223e4697696",
-        "cmd": "./aivyx-coder-v0.5.8-darwin-aarch64/aivyx-coder",
+        "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.5.9/aivyx-coder-v0.5.9-darwin-aarch64.tar.gz",
+        "sha256": "6acd220fe1259b29262392bea48f8180ba5db159fb2f9699bab04306d4c7068c",
+        "cmd": "./aivyx-coder-v0.5.9-darwin-aarch64/aivyx-coder",
         "args": ["--acp"]
       },
       "linux-x86_64": {
-        "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.5.8/aivyx-coder-v0.5.8-x86_64-linux-musl.tar.gz",
-        "sha256": "a06b3cefcfb876f9f198256628f0df8ff0a89f49893fe986c8a7b269983e2867",
-        "cmd": "./aivyx-coder-v0.5.8-x86_64-linux-musl/aivyx-coder",
+        "archive": "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/v0.5.9/aivyx-coder-v0.5.9-x86_64-linux-musl.tar.gz",
+        "sha256": "44a92e20ee3470292613938382c4db3f1e6d9925fed48f864895d11babb45a41",
+        "cmd": "./aivyx-coder-v0.5.9-x86_64-linux-musl/aivyx-coder",
         "args": ["--acp"]
       }
     }
