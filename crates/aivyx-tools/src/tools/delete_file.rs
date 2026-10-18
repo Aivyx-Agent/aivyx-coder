@@ -35,8 +35,8 @@ impl Tool for DeleteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Delete a single file. Refuses to delete directories — use run_shell \
-                for that. The user sees the file's content (or a binary-file warning) and must \
+            description: "Delete a single file. Refuses to delete directories — delete the \
+                files inside them instead. The user sees the file's content (or a binary-file warning) and must \
                 approve before it's removed."
                 .to_string(),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(DeleteFileArgs)),
@@ -78,8 +78,8 @@ impl Tool for DeleteFileTool {
         })?;
         if metadata.is_dir() {
             return Err(ToolError::ExecutionFailed(format!(
-                "{} is a directory — delete_file only removes single files; use run_shell for \
-                 directory removal",
+                "{} is a directory — delete_file only removes single files; delete the \
+                 files inside it instead",
                 resolved.display()
             )));
         }

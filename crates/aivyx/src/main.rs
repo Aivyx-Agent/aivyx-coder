@@ -122,7 +122,8 @@ mod tests {
             NoopConfiner, PermissionDecision, PermissionGate, PermissionRequest,
         };
         use aivyx_tools::{
-            GitCommitTool, GitReadTool, ReadFileTool, RunShellTool, ToolRegistry,
+            DeleteFileTool, GitCommitTool, GitReadTool, ReadFileTool, ReplSendTool, ReplStartTool,
+            ReplStopTool, RunShellTool, ToolRegistry, new_shared_repl_session,
         };
 
         struct AllowAll;
@@ -138,6 +139,24 @@ mod tests {
         registry.register(Arc::new(RunShellTool));
         registry.register(Arc::new(GitReadTool::new(vec![])));
         registry.register(Arc::new(GitCommitTool::new(vec![])));
+        // The tools whose descriptions name other tools: the "no hidden
+        // name anywhere" assertion is only meaningful with them present.
+        let session = new_shared_repl_session();
+        let window = std::time::Duration::from_millis(50);
+        registry.register(Arc::new(DeleteFileTool));
+        registry.register(Arc::new(ReplStartTool::new(
+            Arc::clone(&session),
+            window,
+            window,
+            window,
+        )));
+        registry.register(Arc::new(ReplSendTool::new(
+            Arc::clone(&session),
+            window,
+            window,
+            None,
+        )));
+        registry.register(Arc::new(ReplStopTool::new(session)));
         ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner))
     }
 

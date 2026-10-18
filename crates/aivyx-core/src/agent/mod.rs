@@ -139,11 +139,19 @@ issue based on its output; it will run again automatically once you stop making 
 /// model retry-loop-on-unavailable-action failure mode Phase 8 already
 /// found and designed plan mode around. `repl_start` is hidden for the
 /// same reason — an unattended session has no one to review an
-/// interactive process's arbitrary back-and-forth, and `ActionKind::Interact`
-/// (what `repl_send`/`repl_stop` report) is independently denied by
-/// `ConfirmationGate` in autonomous mode as a backstop even though
-/// `repl_start` being hidden already makes a session unreachable there.
-pub const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &["run_shell", "git_commit", "repl_start"];
+/// interactive process's arbitrary back-and-forth. `repl_send`/`repl_stop`
+/// are hidden with it: they can do nothing without a `repl_start` session,
+/// their descriptions name `repl_start` (which the system prompt must not
+/// mention in `--auto`), and `ActionKind::Interact` (what they report) is
+/// independently denied by `ConfirmationGate` in autonomous mode as a
+/// backstop.
+pub const AUTONOMOUS_HIDDEN_TOOLS: &[&str] = &[
+    "run_shell",
+    "git_commit",
+    "repl_start",
+    "repl_send",
+    "repl_stop",
+];
 
 /// Appended to the system prompt while autonomous mode is active.
 const AUTONOMOUS_PROMPT: &str = "You are running unattended (autonomous mode): no human will \
