@@ -130,9 +130,14 @@ Deliberately not (yet) addressed — documented rather than hidden:
   - *Rarer edges* (details in aivyx-confine's README, "Known limits"):
     when aivyx-coder runs in `$HOME` or an ancestor of it, a symlinked
     `~/.cargo`/`~/.rustup` is not granted (a command could have planted
-    the link), so toolchains reached through one fail, and an existing
-    `~/.git-credentials` makes `$HOME` itself list-and-create only (no
-    `rm`/`mv` of its direct entries); a working directory
+    the link), so toolchains reached through one fail; and `$HOME` gets
+    stricter rules than a project: nothing can be created, deleted or
+    renamed directly in `~`, dot files and folders (`~/.bashrc`,
+    `~/.config`, `~/.local`), `~/bin` and dotfiles linked from elsewhere
+    are read-only, SSH/GPG keys, cloud and GitHub tokens, keyrings and
+    browser profiles are unreadable, and folders above a linked dotfile
+    folder accept no new entries. Visible folders (`~/Projects`) work as
+    usual; run aivyx-coder in a project directory to avoid all of this. A working directory
     inside a denied directory gets no access at all; an
     `extra_read_paths` entry inside the working directory that is a
     symlink grants nothing; a denied file nested about a thousand
