@@ -829,14 +829,6 @@ impl Agent {
         self.repo_map = Some((map, budget_tokens));
     }
 
-    /// Opts this `Agent` into listing its tools in the system prompt — the
-    /// main agent's "Available tools:" section. The list is rendered per
-    /// request from `request_tool_definitions`, so it always names exactly
-    /// the tools that request sends: plan mode, prompted edit format and
-    /// autonomous mode each withhold tools at runtime, and a list built
-    /// once at startup would keep advertising them. Sub-agents,
-    /// specialists and MCP-server sessions leave it off; their prompts
-    /// never listed tools.
     /// Sets the base prompt used in place of the constructor's while plan
     /// mode is active. Autonomous mode wins if both are active (plan mode
     /// and `--auto` are mutually exclusive at startup, so this only
@@ -854,6 +846,14 @@ impl Agent {
         }
     }
 
+    /// Opts this `Agent` into listing its tools in the system prompt — the
+    /// main agent's "Available tools:" section. The list is rendered per
+    /// request from `request_tool_definitions`, so it always names exactly
+    /// the tools that request sends: plan mode, prompted edit format and
+    /// autonomous mode each withhold tools at runtime, and a list built
+    /// once at startup would keep advertising them. Sub-agents,
+    /// specialists and MCP-server sessions leave it off; their prompts
+    /// never listed tools.
     pub fn set_advertise_tools(&mut self, enabled: bool) {
         self.advertise_tools = enabled;
     }
