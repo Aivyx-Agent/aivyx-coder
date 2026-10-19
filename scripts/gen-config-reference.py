@@ -128,7 +128,7 @@ MEANINGS = {
     "routing.tasks.tier": "The tier this task prefers. Keyed by task name (`chat`, `code_edit`, `plan`, `judge`, `summarize`, `compact`, `classify`, `embed`).",
     "routing.tasks.strengths": "Strengths this task prefers in a model.",
     "permissions.mode": "How permission is decided. `confirm` is the only mode: anything that isn't read-only asks you.",
-    "permissions.max_tool_iterations_per_turn": "Most tool-call round trips in one turn before it stops.",
+    "permissions.max_tool_iterations_per_turn": "Most tool-call round trips in one turn before it pauses. In the TUI and editors, the model then summarizes where it got to; send another message to continue.",
     "permissions.allowed_commands.name": "The name the model uses to ask for this command.",
     "permissions.allowed_commands.program": "The program to run.",
     "permissions.allowed_commands.args": "Its fixed arguments. The model can't add to them.",

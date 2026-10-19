@@ -141,7 +141,7 @@ impl Tool for SetTasksTool {
         {
             return Err(ToolError::ExecutionFailed(
                 "Plan mode is read-only: nothing can be done yet, so every task must stay \
-                 pending until the user approves the plan (Ctrl+P)."
+                 pending until the user approves the plan by switching to Act mode."
                     .to_string(),
             ));
         }
@@ -333,7 +333,7 @@ mod tests {
             panic!("expected ExecutionFailed, got {result:?}");
         };
         assert!(message.contains("Plan mode is read-only"));
-        assert!(message.contains("Ctrl+P"));
+        assert!(message.contains("switching to Act mode"));
         // Rejected outright — the existing list is untouched.
         assert_eq!(shared.lock().unwrap()[0].text, "keep me");
     }

@@ -96,7 +96,7 @@ What the model may touch and run: the deny list, pre-approved commands, and per-
 |---|---|---|---|
 | `mode` | `confirm` |  | How permission is decided. `confirm` is the only mode: anything that isn't read-only asks you. |
 | `deny_paths` | list of string | `["~/.ssh", "~/.aws", ".env", "*.pem"]` | Hard-blocked regardless of prompt/allow-list state, enforced by `ConfirmationGate` before any prompt or Always-Allow cache lookup. Entries may use a leading `~` for the home directory — see `resolved_deny_paths`. |
-| `max_tool_iterations_per_turn` | integer | `25` | Most tool-call round trips in one turn before it stops. |
+| `max_tool_iterations_per_turn` | integer | `25` | Most tool-call round trips in one turn before it pauses. In the TUI and editors, the model then summarizes where it got to; send another message to continue. |
 
 #### `[[permissions.allowed_commands]]`
 

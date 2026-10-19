@@ -99,9 +99,12 @@ max_auto_verify_retries = 3
 
 After edits, aivyx-coder runs the command (labelled `auto-verify:` in the
 transcript); on failure the model gets the output and tries to fix it, up
-to `max_auto_verify_retries` times. If it still fails, the turn ends with a
-loud notice pointing at the checkpoints. Each failure also says which
-failing lines are new since the previous attempt.
+to `max_auto_verify_retries` times. The command only runs again once the
+model has changed something: if it stops without a further change, the turn
+ends there. Either way, a turn that ends failing gets a loud notice
+pointing at the checkpoints. Each failure also says which failing lines are
+new since the previous attempt, or that the output didn't change at all, in
+which case the failure may predate the edits.
 
 For speed, `scoped_command` can name a second command that runs only the
 tests for the files touched, with `{touched_paths}` in its arguments; a full

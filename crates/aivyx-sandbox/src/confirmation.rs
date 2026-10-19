@@ -14,7 +14,7 @@ use crate::{
 /// plan mode the agent doesn't offer mutating tools at all, so reaching it
 /// means the model invented a call to a tool it wasn't offered.
 const PLAN_MODE_DENIAL: &str = "plan mode is active — no file modifications or command execution \
-until the user approves the plan and switches to Act mode (Ctrl+P). Explore with the read/search \
+until the user approves the plan and switches to Act mode. Explore with the read/search \
 tools and record your plan with set_tasks instead.";
 
 /// Told to the model when an autonomous-mode edit/write target resolves

@@ -2442,6 +2442,100 @@ async fn max_tool_iterations_pauses_the_turn_without_losing_history() {
 }
 
 #[tokio::test]
+async fn a_turn_at_the_cap_summarizes_before_pausing_when_enabled() {
+    // Live-test finding (2026-10-19): every long fix-loop turn stopped on
+    // the cap after its last tool result, with no word on where it got to.
+    let looping = vec![
+        StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    // A server ignoring `tool_choice: none` might still send a call.
+    let summary = vec![
+        StreamEvent::TextDelta("Read the file; next I would edit it.\n\n".to_string()),
+        StreamEvent::TextDelta("<tool_call>\n<function=read_file>".to_string()),
+        StreamEvent::ToolCallComplete(tool_call("x", "read_file")),
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ];
+    let (mut agent, mut rx, mock) = build_agent(vec![looping, summary], ToolRegistry::new(), 1);
+    agent.set_summarize_on_pause(true);
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnPaused(_))));
+    assert!(agent.last_turn_paused());
+    let received = mock.received.lock().unwrap();
+    assert_eq!(received.len(), 2);
+    let request = &received[1];
+    assert_eq!(request.tool_choice, ToolChoice::None);
+    assert!(
+        request
+            .messages
+            .last()
+            .unwrap()
+            .text_content()
+            .contains("limit on tool calls")
+    );
+    // The reply is kept as an ordinary assistant message; the request and
+    // the stray call are not.
+    let last = agent.history.last().unwrap();
+    assert_eq!(last.role, Role::Assistant);
+    // The written-out call is cut off, in history and on screen.
+    assert_eq!(last.text_content(), "Read the file; next I would edit it.");
+    let shown: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "Read the file; next I would edit it.");
+    assert_eq!(count_tool_calls(&agent.history), 1);
+    assert!(
+        !agent
+            .history
+            .iter()
+            .any(|m| m.text_content().contains("limit on tool calls"))
+    );
+}
+
+#[test]
+fn strip_text_tool_call_cuts_at_the_first_marker() {
+    assert_eq!(strip_text_tool_call("  done.  "), "done.");
+    assert_eq!(
+        strip_text_tool_call("next: apply\n<function=run_command>\n<tool_call>"),
+        "next: apply"
+    );
+    assert_eq!(strip_text_tool_call("[TOOL_CALLS][{}]"), "");
+}
+
+#[tokio::test]
+async fn a_turn_at_the_cap_does_not_summarize_by_default() {
+    let looping = vec![
+        StreamEvent::ToolCallComplete(tool_call("c", "read_file")),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let (mut agent, _rx, mock) = build_agent(vec![looping], ToolRegistry::new(), 1);
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(agent.last_turn_paused());
+    assert_eq!(mock.received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_paused_turn_resumes_cleanly_from_a_follow_up_message() {
     // After pausing on the cap, the agent's history/session already hold
     // everything dispatched so far; a plain follow-up `run_turn` call
@@ -4576,6 +4670,21 @@ fn fail_once_then_pass_verify_command_spec(marker: &std::path::Path) -> CommandS
     }
 }
 
+/// One `write_file` call to `path`, as a complete scripted response.
+fn write_call_response(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId(id.to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": content }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
 fn auto_verify_calls(history: &[Message]) -> usize {
     history
         .iter()
@@ -4678,6 +4787,9 @@ async fn empty_response_notice_only_fires_once_the_turn_actually_ends() {
         vec![
             write_call,
             reasoning_only("checking the fix"),
+            // A retry only runs after a change (see
+            // `changed_since_verification`).
+            write_call_response("c2", "out.txt", "fixed\n"),
             reasoning_only("looks correct now"),
         ],
         registry,
@@ -4774,15 +4886,15 @@ async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
             finish_reason: FinishReason::ToolCalls,
         },
     ];
-    // One response ends the model's tool calls, then one more scripted
-    // no-op response per retry (the loop re-enters the model after
-    // each failed verification so it can react).
+    // One response ends the model's tool calls; after each failed
+    // verification the model makes another edit (a retry only runs after a
+    // change) and ends again.
     let (mut agent, mut rx, _) = build_agent(
         vec![
             write_call,
             text_response("done"),
+            write_call_response("c2", "out.txt", "again\n"),
             text_response("trying again"),
-            text_response("still trying"),
         ],
         registry,
         10,
@@ -4802,6 +4914,20 @@ async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
         ),
         "expected the exhausted-retries notice, got {events:?}"
     );
+    // `exit 1` prints the same thing every time, so the second failure is
+    // identical to the first: the model is told, and so is the user.
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(msg) if msg.contains("may predate them"))
+        ),
+        "expected the unchanged-output hint, got {events:?}"
+    );
+    assert!(
+        auto_verify_result_texts(&agent.history)
+            .last()
+            .is_some_and(|t| t.contains("identical to the previous verification run")),
+        "the model must see that the output didn't change"
+    );
     assert_eq!(
         auto_verify_calls(&agent.history),
         2,
@@ -4812,6 +4938,54 @@ async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
     // unverified — the very next attempt to end a turn must re-check.
     assert_eq!(agent.verify_retries, 0);
     assert!(agent.unverified_edits);
+}
+
+#[tokio::test]
+async fn a_failed_verification_is_not_rerun_without_a_change() {
+    // Live-test finding (2026-10-19): after a failed run, every reply
+    // without tool calls re-ran verification on an unchanged worktree, and
+    // the turn ended "still failing after 3 attempt(s)".
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![verify_command_spec(
+        "verify", false,
+    )])));
+
+    let (mut agent, mut rx, mock) = build_agent(
+        vec![
+            write_call_response("c1", "out.txt", "hi\n"),
+            text_response("done"),
+            text_response("that failure is unrelated to my edit"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 3);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    assert_eq!(
+        auto_verify_calls(&agent.history),
+        1,
+        "no change after the failed run, so no second run"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error(msg) if msg.contains("still failing after 1 attempt(s)")
+                && msg.contains("no changes made after the last failed run")
+        )),
+        "expected the no-rerun notice, got {events:?}"
+    );
+    assert_eq!(mock.received.lock().unwrap().len(), 3);
+    assert_eq!(agent.verify_retries, 0);
+    assert!(agent.unverified_edits, "the edit is still unverified");
 }
 
 #[tokio::test]
@@ -4907,6 +5081,7 @@ async fn touched_paths_accumulate_across_multiple_retry_iterations() {
             write_a,
             write_b,
             text_response("trying"),
+            write_call_response("c3", "b.txt", "b2\n"),
             text_response("still trying"),
             text_response("giving up"),
         ],
@@ -5210,6 +5385,7 @@ async fn fix_and_retry_note_lists_only_lines_new_since_the_first_attempt() {
         vec![
             write_call,
             text_response("done"),
+            write_call_response("c9", "out.txt", "again\n"),
             text_response("trying again"),
         ],
         registry,
@@ -5271,7 +5447,12 @@ async fn starts_broken_then_fixed_leaves_the_passing_result_unmodified() {
         },
     ];
     let (mut agent, _rx, _mock) = build_agent(
-        vec![write_call, text_response("done"), text_response("trying again")],
+        vec![
+            write_call,
+            text_response("done"),
+            write_call_response("c9", "out.txt", "again\n"),
+            text_response("trying again"),
+        ],
         registry,
         10,
     );
@@ -5372,7 +5553,12 @@ async fn last_verification_output_updates_after_every_call_regardless_of_outcome
         },
     ];
     let (mut agent, _rx, _mock) = build_agent(
-        vec![write_call, text_response("done"), text_response("trying again")],
+        vec![
+            write_call,
+            text_response("done"),
+            write_call_response("c9", "out.txt", "again\n"),
+            text_response("trying again"),
+        ],
         registry,
         10,
     );

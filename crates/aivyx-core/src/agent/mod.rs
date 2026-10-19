@@ -79,9 +79,12 @@ const DEFAULT_CHARS_PER_TOKEN: f64 = 4.0;
 /// Appended to the system prompt while plan mode is active. The withheld
 /// tools (see `ToolExecutor::plan_definitions`) are the enforcement; this
 /// note is what makes the model *plan* instead of flailing at their absence.
+/// It names no key: how the user switches modes depends on the frontend
+/// (Ctrl+P in the TUI, the mode picker in an ACP editor), and each frontend
+/// shows its own hint.
 const PLAN_MODE_PROMPT: &str = "PLAN MODE is active: tools that modify files or run commands are \
 withheld. Explore with the read and search tools, record a step-by-step plan with set_tasks, \
-then summarize the plan and ask the user to press Ctrl+P to approve it and switch to Act mode. \
+then summarize the plan and ask the user to approve it by switching to Act mode. \
 Do not claim to have made any changes — you cannot make any in this mode.";
 
 /// The tools hidden from the model (but kept registered — the synthesized
@@ -317,6 +320,12 @@ pub struct Agent {
     /// 11c design doc / plan for why event-stream inference is unreliable
     /// here.
     last_turn_paused: bool,
+    /// Whether a turn that hits `max_tool_iterations` first asks the model
+    /// for a short summary (`summarize_at_cap`). Off by default: callers
+    /// that auto-continue a paused turn (delegated sub-agents, specialist
+    /// and MCP-server sessions) would pay a request for text nobody reads.
+    /// The TUI and ACP turn it on (`set_summarize_on_pause`).
+    summarize_on_pause: bool,
     /// The autonomous run's goal (`set_autonomous_goal`), restated in the
     /// system prompt once compaction has dropped the turn that carried it —
     /// an unattended run has no user to ask to restate it.
@@ -415,6 +424,17 @@ pub struct Agent {
     /// `run_turn_inner`'s completion check) so the feature never silently
     /// disables itself for the rest of the session.
     verify_retries: u32,
+    /// Whether any mutating tool call has succeeded since the last
+    /// verification attempt. A failed attempt is only retried after the
+    /// model changes something — re-running the same command on the same
+    /// worktree can only repeat the same failure, and reporting it as
+    /// "still failing after N attempts" blamed edits that were never made.
+    changed_since_verification: bool,
+    /// Whether the last full verification run failed with output identical
+    /// to the run before it — the changes in between did not affect the
+    /// result, so the failure may well predate them. Feeds the end-of-turn
+    /// notice.
+    last_verification_unchanged: bool,
     /// The raw `run_auto_verification` output text from the immediately
     /// preceding FULL verification run, regardless of outcome. Kept in its
     /// own slot, separate from `last_scoped_verification_output`, so each
@@ -546,6 +566,7 @@ impl Agent {
             autonomous_mode,
             injection_taint: InjectionTaint::new(),
             last_turn_paused: false,
+            summarize_on_pause: false,
             autonomous_goal: None,
             budget_too_small_reported: false,
             repo_map: None,
@@ -569,6 +590,8 @@ impl Agent {
             verification: None,
             unverified_edits: false,
             verify_retries: 0,
+            changed_since_verification: false,
+            last_verification_unchanged: false,
             last_full_verification_output: None,
             last_scoped_verification_output: None,
             verification_touched_paths: Vec::new(),
@@ -939,6 +962,11 @@ impl Agent {
     /// slot lifecycle on this path, so this process must not also try.
     pub fn set_broker_mode(&mut self, enabled: bool) {
         self.broker_mode = enabled;
+    }
+
+    /// See the `summarize_on_pause` field.
+    pub fn set_summarize_on_pause(&mut self, enabled: bool) {
+        self.summarize_on_pause = enabled;
     }
 
     /// Tags this agent's main-loop calls as `task` (e.g. a specialist's
@@ -2078,11 +2106,16 @@ impl Agent {
         // Decision 2).
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
-            if !passed
-                && let Some(previous) = &self.last_full_verification_output
-                && let Some(note) = new_lines_note(previous, &current_text)
-            {
-                text.push_str(&note);
+            if !passed && let Some(previous) = &self.last_full_verification_output {
+                if *previous == current_text {
+                    // Identical output: whatever changed since the previous
+                    // run did not affect the result. Say so, so a small
+                    // model doesn't keep "fixing" its unrelated edits.
+                    self.last_verification_unchanged = true;
+                    text.push_str(UNCHANGED_FAILURE_NOTE);
+                } else if let Some(note) = new_lines_note(previous, &current_text) {
+                    text.push_str(&note);
+                }
             }
             self.last_full_verification_output = Some(current_text);
         }
@@ -2177,6 +2210,8 @@ impl Agent {
         cwd: &Path,
         cancellation: &CancellationToken,
     ) -> bool {
+        self.changed_since_verification = false;
+        self.last_verification_unchanged = false;
         if let Some(scoped) = verification.scoped.clone()
             && !self.verification_touched_paths.is_empty()
         {
@@ -2563,6 +2598,9 @@ impl Agent {
         cancellation: CancellationToken,
     ) -> Result<(), AgentError> {
         let wiki_dir = cwd.join(crate::wiki::WIKI_DIR);
+        // Paused pages are continued automatically, so a summary at each
+        // pause would be a wasted request; restored below.
+        let summarize_on_pause = std::mem::replace(&mut self.summarize_on_pause, false);
 
         for page in pages {
             if cancellation.is_cancelled() {
@@ -2650,8 +2688,84 @@ impl Agent {
             }
         }
 
+        self.summarize_on_pause = summarize_on_pause;
         self.emit(AgentEvent::TurnComplete);
         Ok(())
+    }
+
+    /// The turn hit `max_tool_iterations` mid-work: one more request, with
+    /// tool calls disabled (`ToolChoice::None`, same tool list so the
+    /// server's prompt cache still matches), asks the model to say where it
+    /// got to — otherwise the turn just stops after its last tool result and
+    /// the user is left to read the tool log (live test, 2026-10-19). The
+    /// request is not kept in history; the reply is, as an ordinary
+    /// assistant message, so a continuing turn sees it. The reply is
+    /// buffered rather than streamed: with tools still listed, a small model
+    /// may write a tool call out as text anyway (Qwen3.5 appended a raw
+    /// `<tool_call>` block in the live re-test), and that is cut off before
+    /// anyone sees it. Best-effort: on any failure the turn pauses exactly
+    /// as it did before.
+    async fn summarize_at_cap(&mut self, cancellation: &CancellationToken) {
+        // Autonomous mode continues on its own, like the callers that leave
+        // `summarize_on_pause` off.
+        if !self.summarize_on_pause || self.autonomous_mode.active() || cancellation.is_cancelled()
+        {
+            return;
+        }
+        let mut messages = self.assemble_messages();
+        messages.push(Message::text(Role::User, CAP_SUMMARY_REQUEST));
+        let request = ChatRequest {
+            messages,
+            tools: self.request_tool_definitions(),
+            tool_choice: ToolChoice::None,
+            temperature: None,
+            max_tokens: None,
+            id_slot: self.kv_slot_id,
+            slot_hint: None,
+            route: Some(aivyx_llm::RouteHint {
+                task: self.route_task.clone(),
+                session: Some(self.route_session.clone()),
+                estimated_prompt_tokens: self.estimate_prompt_tokens(),
+            }),
+        };
+        let mut stream = match self.llm.stream_chat(request).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(%err, "cap summary request failed");
+                return;
+            }
+        };
+        let mut text = String::new();
+        loop {
+            let next_event = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                event = stream.next() => event,
+            };
+            let Some(event) = next_event else { break };
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => {
+                    if text.len() + delta.len() > MAX_ASSISTANT_TEXT_BYTES {
+                        break;
+                    }
+                    text.push_str(&delta);
+                }
+                Ok(StreamEvent::ReasoningDelta(delta)) => {
+                    self.emit(AgentEvent::ReasoningDelta(delta));
+                }
+                // A server that ignores `tool_choice: none` may still send a
+                // call; it's dropped, never dispatched or recorded.
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "cap summary stream failed");
+                    break;
+                }
+            }
+        }
+        let text = strip_text_tool_call(&text);
+        if !text.is_empty() {
+            self.emit(AgentEvent::TextDelta(text.to_string()));
+            self.history.push(Message::text(Role::Assistant, text));
+        }
     }
 
     /// Runs one user turn: sends the request, streams the response live via
@@ -3004,7 +3118,11 @@ impl Agent {
                 if self.unverified_edits
                     && let Some(verification) = self.verification.clone()
                 {
-                    if self.verify_retries < verification.max_retries {
+                    // A retry needs something new to verify: with no change
+                    // since the last failed attempt, the same command on
+                    // the same worktree can only fail the same way.
+                    let can_rerun = self.verify_retries == 0 || self.changed_since_verification;
+                    if can_rerun && self.verify_retries < verification.max_retries {
                         self.verify_retries += 1;
                         let passed = self
                             .run_verification_attempt(&verification, cwd, &cancellation)
@@ -3033,7 +3151,24 @@ impl Agent {
                     // checkpoint (Phase 11c) so the loop's next attempt
                     // starts from known-good state instead of building on
                     // top of a broken one.
+                    let attempts = self.verify_retries;
                     self.verify_retries = 0;
+                    let mut failing = format!(
+                        "verification (`{}`) still failing after {attempts} attempt(s)",
+                        verification.command_name
+                    );
+                    if !can_rerun {
+                        failing.push_str(
+                            ", with no changes made after the last failed run (so it was not \
+                             run again)",
+                        );
+                    }
+                    if self.last_verification_unchanged {
+                        failing.push_str(
+                            "; its output did not change after this round of edits, so the \
+                             failure may predate them",
+                        );
+                    }
                     if self.autonomous_mode.active()
                         && let Some(pre_experiment_ref) = self.pre_experiment_ref.take()
                     {
@@ -3046,10 +3181,8 @@ impl Agent {
                                 self.unverified_edits = false;
                                 self.verification_touched_paths.clear();
                                 self.emit(AgentEvent::Error(format!(
-                                    "verification (`{}`) still failing after {} attempt(s) — \
-                                     discarded this round of edits and restored the worktree to \
-                                     the pre-experiment checkpoint.",
-                                    verification.command_name, verification.max_retries
+                                    "{failing} — discarded this round of edits and restored the \
+                                     worktree to the pre-experiment checkpoint."
                                 )));
                             }
                             Err(err) => {
@@ -3059,21 +3192,18 @@ impl Agent {
                                 // rather than silently pretending the
                                 // discard happened.
                                 self.emit(AgentEvent::Error(format!(
-                                    "verification (`{}`) still failing after {} attempt(s), and \
-                                     the automatic discard/rewind itself failed ({err}) — ending \
-                                     the turn with the worktree left as-is. The worktree was \
-                                     checkpointed before each edit; `git log \
-                                     refs/aivyx/checkpoints/` to inspect or rewind manually.",
-                                    verification.command_name, verification.max_retries
+                                    "{failing}, and the automatic discard/rewind itself failed \
+                                     ({err}) — ending the turn with the worktree left as-is. The \
+                                     worktree was checkpointed before each edit; `git log \
+                                     refs/aivyx/checkpoints/` to inspect or rewind manually."
                                 )));
                             }
                         }
                     } else {
                         self.emit(AgentEvent::Error(format!(
-                            "verification (`{}`) still failing after {} attempt(s) — ending the \
-                             turn anyway. The worktree was checkpointed before each edit; `git \
-                             log refs/aivyx/checkpoints/` to inspect or rewind.",
-                            verification.command_name, verification.max_retries
+                            "{failing} — ending the turn anyway. The worktree was checkpointed \
+                             before each edit; `git log refs/aivyx/checkpoints/` to inspect or \
+                             rewind."
                         )));
                     }
                 }
@@ -3186,6 +3316,9 @@ impl Agent {
                 // checkpointed instead of comparing refs. Only the first such
                 // call in the batch sets `batch_start_ref`; later ones must
                 // not move it forward.
+                if (checkpointed || is_edit_call) && matches!(result.output, ToolOutput::Ok(_)) {
+                    self.changed_since_verification = true;
+                }
                 if checkpointed && matches!(result.output, ToolOutput::Ok(_)) {
                     if batch_start_ref.is_none() {
                         batch_start_ref = self.executor.latest_checkpoint_ref(&cancellation).await;
@@ -3281,6 +3414,7 @@ impl Agent {
                 // `AgentEvent::TurnPaused`'s doc comment and ROADMAP.md
                 // Phase 12 Part A.
                 self.last_turn_paused = true;
+                self.summarize_at_cap(&cancellation).await;
                 self.emit(AgentEvent::TurnPaused(format!(
                     "reached the {}-round-trip cap for this turn while still working — \
                      send another message to continue; nothing has been lost.",
@@ -3625,6 +3759,38 @@ fn command_reported_success(output: &str) -> bool {
 /// dynamic, context-budget-driven cap, since this note is a bounded
 /// addition to an already-capped tool result, not the whole history.
 const NEW_LINES_NOTE_CAP: usize = 2000;
+
+/// Sent (not kept in history) when a turn reaches its tool-call cap; see
+/// `Agent::summarize_at_cap`.
+const CAP_SUMMARY_REQUEST: &str = "You have reached this turn's limit on tool calls, so no more \
+tools can run now. In a few sentences, tell the user what you did, what is still left to do, \
+and what you would do next. Reply in plain text only. The user can send another message to let \
+you continue.";
+
+/// Where a model's written-out tool call starts, in the text-form syntaxes
+/// local chat templates use (Qwen/Hermes, Qwen3-Coder, Llama 3, Mistral).
+const TEXT_TOOL_CALL_MARKERS: &[&str] = &[
+    "<tool_call>",
+    "<function=",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+];
+
+/// `text` up to the first written-out tool call, trimmed.
+fn strip_text_tool_call(text: &str) -> &str {
+    let end = TEXT_TOOL_CALL_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+        .unwrap_or(text.len());
+    text[..end].trim()
+}
+
+/// Appended to a failing verification result whose output is identical to
+/// the previous run's.
+const UNCHANGED_FAILURE_NOTE: &str = "\n\nThis output is identical to the previous verification \
+     run, so the changes made since then did not affect it — this failure may predate them. If \
+     your changes are unrelated to it, say so instead of changing them again.";
 
 /// Compares `current` (this verification run's raw output) against
 /// `previous` (the immediately preceding run's raw output, whatever its

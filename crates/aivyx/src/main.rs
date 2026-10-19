@@ -734,7 +734,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut settings = settings;
                 let pack = apply_pack_layer(&mut settings);
                 let (deferred, prompter_installer) = aivyx_acp::deferred_prompter();
-                let built = crate::agent_builder::build_agent(
+                let mut built = crate::agent_builder::build_agent(
                     &cli,
                     &settings,
                     Arc::new(deferred),
@@ -742,6 +742,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+                built.agent.set_summarize_on_pause(true);
                 Ok(aivyx_acp::AcpBuilt {
                     agent: built.agent,
                     events_rx: built.events_rx,
@@ -868,6 +869,9 @@ async fn main() -> anyhow::Result<()> {
     // `--mcp-server` returns just above this), so `/resume` keeps refusing
     // there regardless of a configured `Store` session target.
     built.agent.enable_session_switching();
+    // A person reads the TUI: a turn that hits the tool-call cap says where
+    // it got to before pausing (skipped in autonomous mode, which goes on).
+    built.agent.set_summarize_on_pause(true);
     aivyx_tui::run(
         built.agent,
         built.events_rx,

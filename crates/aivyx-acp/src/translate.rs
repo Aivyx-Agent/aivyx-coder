@@ -143,6 +143,12 @@ fn build_merged_plan(
     Plan::new(entries)
 }
 
+/// `text` as a markdown blockquote paragraph marked ⚠, separated from
+/// whatever message text comes before or after it.
+fn notice_paragraph(text: &str) -> String {
+    format!("\n\n> ⚠ {}\n\n", text.trim().replace('\n', "\n> "))
+}
+
 /// The longest run of consecutive backticks in `text`.
 fn longest_backtick_run(text: &str) -> usize {
     text.split(|c| c != '`').map(str::len).max().unwrap_or(0)
@@ -162,9 +168,15 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // response is for the turn's *final* outcome). Surfaced the same way
         // as `CouncilNote`/`ArchitectNote` — and the same way the TUI already
         // renders it, as a transcript line rather than a fatal condition.
-        AgentEvent::CouncilNote(text)
-        | AgentEvent::ArchitectNote(text)
-        | AgentEvent::Error(text) => SessionUpdate::AgentMessageChunk(text_chunk(text.clone())),
+        // ACP has no notice update kind, so it goes out as message text —
+        // but set apart as a ⚠ blockquote paragraph of its own: the TUI
+        // styles it differently from the model's reply, and here it must
+        // not read as the model's own words or run into them (live test,
+        // 2026-10-19: the compaction notice did both).
+        AgentEvent::Error(text) => SessionUpdate::AgentMessageChunk(text_chunk(notice_paragraph(text))),
+        AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) => {
+            SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
+        }
         // Its own paragraph: an Info (e.g. the change summary) arrives right
         // after the model's reply and must not run into its last sentence.
         AgentEvent::Info(text) => {
@@ -976,11 +988,26 @@ mod tests {
     fn error_becomes_plain_message_text_not_dropped() {
         let update =
             translate_event(&sid(), &AgentEvent::Error("backend timed out".to_string())).unwrap();
-        assert!(matches!(update, SessionUpdate::AgentMessageChunk(_)));
+        let SessionUpdate::AgentMessageChunk(chunk) = update else {
+            panic!("expected an AgentMessageChunk, got {update:?}");
+        };
+        let ContentBlock::Text(text) = chunk.content else {
+            panic!("expected text content");
+        };
+        // Set apart from the model's reply: its own ⚠ blockquote paragraph.
+        assert_eq!(text.text, "\n\n> ⚠ backend timed out\n\n");
         // Non-terminal: an Error event must never itself resolve the
         // in-flight `session/prompt` call.
         assert!(
             terminal_stop_reason(&AgentEvent::Error("backend timed out".to_string())).is_none()
+        );
+    }
+
+    #[test]
+    fn a_multi_line_notice_stays_inside_its_blockquote() {
+        assert_eq!(
+            notice_paragraph("first line\nsecond line\n"),
+            "\n\n> ⚠ first line\n> second line\n\n"
         );
     }
 
