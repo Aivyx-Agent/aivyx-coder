@@ -133,19 +133,17 @@ impl Tool for SetTasksTool {
             )));
         }
 
-        if self.plan_mode.active()
+        // Plan mode: nothing can be done yet, so every task is recorded as
+        // pending. This used to reject the whole list, and a small model
+        // marking "read the file" done lost its plan — and with it the
+        // Ctrl+P hand-off, which only starts a plan that has tasks (audit
+        // 6, 2026-10-19).
+        let plan_mode = self.plan_mode.active();
+        let reset = plan_mode
             && args
                 .tasks
                 .iter()
-                .any(|item| !matches!(item.status, TaskItemStatus::Pending))
-        {
-            return Err(ToolError::ExecutionFailed(
-                "Plan mode is read-only: nothing can be done yet, so every task must stay \
-                 pending until the user approves the plan by switching to Act mode."
-                    .to_string(),
-            ));
-        }
-
+                .any(|item| !matches!(item.status, TaskItemStatus::Pending));
         let new_tasks: Vec<Task> = args
             .tasks
             .into_iter()
@@ -153,11 +151,21 @@ impl Tool for SetTasksTool {
             .map(|(i, item)| Task {
                 id: (i + 1) as u32,
                 text: strip_leading_number(&item.text),
-                status: item.status.into(),
+                status: if plan_mode {
+                    TaskStatus::Pending
+                } else {
+                    item.status.into()
+                },
             })
             .collect();
 
-        let summary = summarize(&new_tasks);
+        let mut summary = summarize(&new_tasks);
+        if reset {
+            summary.push_str(
+                "\n(Plan mode is read-only, so every task is pending until the user approves \
+                 the plan by switching to Act mode.)",
+            );
+        }
         *self.tasks.lock().unwrap() = new_tasks;
         Ok(ToolOutput::Ok(summary))
     }
@@ -309,12 +317,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_rejects_a_non_pending_task_and_leaves_the_list_untouched() {
-        let shared = Arc::new(Mutex::new(vec![Task {
-            id: 1,
-            text: "keep me".to_string(),
-            status: TaskStatus::Pending,
-        }]));
+    async fn plan_mode_records_every_task_as_pending_and_says_so() {
+        let shared = Arc::new(Mutex::new(Vec::new()));
         let plan_mode = PlanMode::new();
         plan_mode.set_active(true);
         let tool = SetTasksTool::new(Arc::clone(&shared), plan_mode);
@@ -329,13 +333,14 @@ mod tests {
             )
             .await;
 
-        let Err(ToolError::ExecutionFailed(message)) = result else {
-            panic!("expected ExecutionFailed, got {result:?}");
+        let Ok(ToolOutput::Ok(message)) = result else {
+            panic!("expected Ok, got {result:?}");
         };
-        assert!(message.contains("Plan mode is read-only"));
+        assert!(message.contains("every task is pending"), "{message}");
         assert!(message.contains("switching to Act mode"));
-        // Rejected outright — the existing list is untouched.
-        assert_eq!(shared.lock().unwrap()[0].text, "keep me");
+        let tasks = shared.lock().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.status == TaskStatus::Pending));
     }
 
     #[tokio::test]

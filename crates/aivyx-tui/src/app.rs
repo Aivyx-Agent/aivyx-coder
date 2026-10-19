@@ -149,15 +149,26 @@ const CANCELLED_TURN_MARKER: &str = "— stopped (Ctrl+C)";
 /// turn already gets U3's own `CANCELLED_TURN_MARKER` line, and showing
 /// both made it look like two different things happened to the same
 /// reply -- the plan-mode reminder is suppressed in that case.
+///
+/// `has_pending_tasks` picks the wording: Ctrl+P only starts the plan by
+/// itself when there's a pending task list to carry out (see
+/// `plan_approval_message`); without one it just leaves plan mode, and the
+/// notice used to promise a start that never came (audit 6, 2026-10-19).
 fn plan_mode_turn_notice(
     plan_mode_active: bool,
     had_model_activity: bool,
     cancelled: bool,
+    has_pending_tasks: bool,
 ) -> Option<&'static str> {
-    if plan_mode_active && had_model_activity && !cancelled {
+    if !(plan_mode_active && had_model_activity && !cancelled) {
+        None
+    } else if has_pending_tasks {
         Some("Plan mode — nothing was changed. Press Ctrl+P to approve the plan and start.")
     } else {
-        None
+        Some(
+            "Plan mode — nothing was changed. Press Ctrl+P to leave plan mode, then tell it to go \
+             ahead.",
+        )
     }
 }
 
@@ -1052,6 +1063,7 @@ impl App {
                     self.plan_mode.active(),
                     self.turn_had_model_activity,
                     self.cancel_requested,
+                    self.tasks.iter().any(|t| t.status == TaskStatus::Pending),
                 ) {
                     self.transcript.push(ChatLine::Notice(notice.to_string()));
                 }
@@ -3059,15 +3071,24 @@ mod tests {
 
     #[test]
     fn plan_mode_turn_notice_only_fires_when_both_plan_mode_and_real_activity() {
-        assert!(plan_mode_turn_notice(true, true, false).is_some());
-        assert_eq!(plan_mode_turn_notice(true, false, false), None);
-        assert_eq!(plan_mode_turn_notice(false, true, false), None);
-        assert_eq!(plan_mode_turn_notice(false, false, false), None);
+        assert!(plan_mode_turn_notice(true, true, false, true).is_some());
+        assert_eq!(plan_mode_turn_notice(true, false, false, true), None);
+        assert_eq!(plan_mode_turn_notice(false, true, false, true), None);
+        assert_eq!(plan_mode_turn_notice(false, false, false, true), None);
         assert!(
-            plan_mode_turn_notice(true, true, false)
+            plan_mode_turn_notice(true, true, false, true)
                 .unwrap()
                 .contains("Ctrl+P")
         );
+    }
+
+    #[test]
+    fn plan_mode_turn_notice_only_promises_a_start_when_there_is_a_plan_to_start() {
+        let with_plan = plan_mode_turn_notice(true, true, false, true).unwrap();
+        assert!(with_plan.contains("approve the plan and start"));
+        let without = plan_mode_turn_notice(true, true, false, false).unwrap();
+        assert!(!without.contains("and start"), "{without}");
+        assert!(without.contains("leave plan mode"));
     }
 
     #[test]
@@ -3075,9 +3096,9 @@ mod tests {
         // Fix round 1 (Important): a cancelled turn already gets U3's own
         // "— stopped (Ctrl+C)" marker -- showing the plan-mode reminder
         // too made it look like two different things happened.
-        assert_eq!(plan_mode_turn_notice(true, true, true), None);
+        assert_eq!(plan_mode_turn_notice(true, true, true, true), None);
         // Plan mode + real activity + NOT cancelled must still show it.
-        assert!(plan_mode_turn_notice(true, true, false).is_some());
+        assert!(plan_mode_turn_notice(true, true, false, true).is_some());
     }
 
     #[test]

@@ -12,9 +12,10 @@ magenta **PLAN** badge in the status line shows it's on.
   and if it invents a call anyway, the permission gate refuses it. This is
   enforced, not a suggestion: approvals you gave earlier don't apply while
   plan mode is on, and the model has no way to switch it off.
-- Every task in the plan must stay *pending*, so the model can't report
-  work as done when nothing was changed. Each reply ends with a reminder:
-  "Plan mode — nothing was changed."
+- Every task in the plan is recorded as *pending* (whatever status the
+  model gives it), so the model can't report work as done when nothing
+  was changed. Each reply ends with a reminder: "Plan mode — nothing was
+  changed."
 
 `/test` still works in plan mode — you typed it, so it isn't the model
 acting.
@@ -23,8 +24,10 @@ acting.
 
 Press **Ctrl+P** again. Plan mode turns off, and if there's a pending task
 list and nothing is running, aivyx-coder sends "The plan is approved. Carry
-it out now, task by task." for you, so work starts straight away. From then
-on every change asks for approval as usual.
+it out now, task by task." for you, so work starts straight away. With no
+task list, Ctrl+P only leaves plan mode (the reminder says so), and you
+tell it to go ahead yourself. From then on every change asks for approval
+as usual.
 
 ## Tips
 
