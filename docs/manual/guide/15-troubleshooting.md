@@ -97,6 +97,16 @@ Deliberately not (yet) addressed — documented rather than hidden:
     to a hard-coded `/tmp` path fails (`share_system_tmp = true` to opt
     out). The lead's is deleted when aivyx-coder exits normally (after a
     crash it's left in the system temp dir as `aivyx-confine-*`).
+  - *No listing above the project*: a confined command can't list
+    directories outside the ones it's granted, including `/`, `/tmp` and
+    the project's parents. A tool that walks upward looking for a config
+    file fails with `Permission denied` on the first directory it can't
+    list. For example, `just`'s own test suite does this from temp
+    directories, and fails confined in `global::*` and `init::*`.
+    `extra_read_paths` doesn't help once the walk reaches `/`. Skip those
+    tests in the configured test command (`-- --skip global::`), or run
+    them yourself; granting read on `/` would expose every directory name
+    on the machine.
   - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put
     children in their own process groups (cargo-nextest's per-test process
     groups, Python's `start_new_session=True`, the `setsid` tool,
