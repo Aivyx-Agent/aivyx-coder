@@ -82,6 +82,21 @@ fn target_string(target: &PermissionTarget) -> String {
 /// every call to the same tool). Mirrors `ConfirmationGate::check`'s
 /// `request_id` (a fresh `uuid::Uuid::new_v4()` per pending decision) in
 /// `crates/aivyx-sandbox/src/confirmation.rs`.
+/// The call's raw input for the editor. A command whose tool gives no
+/// arguments preview (`run_shell` leaves it `{}`: the TUI already shows the
+/// command line) gets its program and arguments, so the editor sees what
+/// will run without parsing the title.
+fn raw_input(request: &PermissionRequest) -> serde_json::Value {
+    match &request.target {
+        PermissionTarget::Command { program, args }
+            if request.arguments_preview == serde_json::json!({}) =>
+        {
+            serde_json::json!({ "program": program, "args": args })
+        }
+        _ => request.arguments_preview.clone(),
+    }
+}
+
 fn pending_tool_call(
     request: &PermissionRequest,
     call_id: &str,
@@ -145,7 +160,7 @@ fn pending_tool_call(
         .status(ToolCallStatus::Pending)
         .title(title)
         .content(content)
-        .raw_input(request.arguments_preview.clone());
+        .raw_input(raw_input(request));
     ToolCallUpdate::new(call_id.to_string(), fields)
 }
 
@@ -401,6 +416,35 @@ mod tests {
             acp.tool_call.fields.title.as_deref(),
             Some("/project/old.rs -> /project/new.rs")
         );
+    }
+
+    #[test]
+    fn a_shell_command_with_no_arguments_preview_sends_its_command_as_raw_input() {
+        // Live test (2026-10-19): run_shell approvals reached the editor
+        // with rawInput {}.
+        let request = PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            action: ActionKind::Execute,
+            target: PermissionTarget::Command {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "ls -la".to_string()],
+            },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let acp = permission_request_to_acp(sid(), &request, "call-1");
+        assert_eq!(
+            acp.tool_call.fields.raw_input,
+            Some(serde_json::json!({ "program": "sh", "args": ["-c", "ls -la"] }))
+        );
+        // A tool that does give a preview keeps it.
+        let named = PermissionRequest {
+            arguments_preview: serde_json::json!({ "name": "test" }),
+            ..request
+        };
+        let acp = permission_request_to_acp(sid(), &named, "call-1");
+        assert_eq!(acp.tool_call.fields.raw_input, Some(serde_json::json!({ "name": "test" })));
     }
 
     // --- M1: warn + hide Always Allow for files that run code later ---
