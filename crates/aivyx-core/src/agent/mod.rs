@@ -71,6 +71,19 @@ const COMPACT_LOW_WATER: f64 = 0.60;
 /// lossy than dropping whole earlier turns.
 const ELIDE_TOOL_RESULT_CHARS: usize = 4000;
 
+/// Tool results compaction never clears inside the current turn: the
+/// latest ones are what the model is working from right now.
+const KEEP_RECENT_TOOL_RESULTS: usize = 4;
+
+/// What a cleared tool result says instead — the call stays in history (the
+/// call/result pairing must hold), only its body goes.
+const CLEARED_TOOL_RESULT: &str =
+    "[result cleared to fit the context window — run the tool again if you still need it]";
+
+/// How many dropped requests compaction remembers, and how much of each.
+const DROPPED_REQUESTS_KEPT: usize = 2;
+const DROPPED_REQUEST_CHARS: usize = 600;
+
 /// Starting characters-per-token ratio for the size estimator, before the
 /// backend's real `prompt_tokens` calibrate it to the running model. ~4 is
 /// the standard rough approximation for English/code.
@@ -333,6 +346,12 @@ pub struct Agent {
     /// Set once compaction has said the fixed prompt alone overflows
     /// `context_limit`, so the notice isn't repeated every turn.
     budget_too_small_reported: bool,
+    /// The user's own words from the most recent turns compaction dropped
+    /// (oldest first, at most `DROPPED_REQUESTS_KEPT`), restated in the
+    /// truncation note — otherwise a "continue" after compaction leaves the
+    /// model with no idea what the task was (live test, 2026-10-19: it
+    /// invented a test for a function that doesn't exist).
+    dropped_requests: Vec<String>,
     /// `(map, budget_tokens)` when the repo map is enabled; re-rendered
     /// once per turn (cheap after the first pass — only changed files
     /// re-parse) into `repo_map_text`.
@@ -569,6 +588,7 @@ impl Agent {
             summarize_on_pause: false,
             autonomous_goal: None,
             budget_too_small_reported: false,
+            dropped_requests: Vec::new(),
             repo_map: None,
             kv_cache: None,
             kv_slot_id: None,
@@ -759,6 +779,7 @@ impl Agent {
         self.last_test_passed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.history_truncated = false;
+        self.dropped_requests.clear();
         if targets_store {
             if let Some(SessionTarget::Store {
                 id,
@@ -1646,6 +1667,7 @@ impl Agent {
         let specialist_sessions = state.specialist_sessions.clone();
         let plan_mode_active = state.plan_mode_active;
         self.history_truncated = false;
+        self.dropped_requests.clear();
         self.restore_session(state);
         self.plan_mode.set_active(plan_mode_active);
         if let Some(pool) = &self.specialist_session_pool {
@@ -1821,10 +1843,27 @@ impl Agent {
                          list) for what's already done.)",
                     );
                 }
-                _ => system.push_str(
-                    "\n\n(Note: earlier parts of this conversation were truncated to fit the \
-                     model's context window. Ask the user to restate anything you're missing.)",
-                ),
+                _ => {
+                    system.push_str(
+                        "\n\n(Note: earlier parts of this conversation were truncated to fit \
+                         the model's context window.",
+                    );
+                    if !self.dropped_requests.is_empty() {
+                        system.push_str(
+                            " The user's most recent earlier request(s), as they wrote them — \
+                             a later \"continue\" means carry on with this:",
+                        );
+                        for request in &self.dropped_requests {
+                            system.push_str("\n- ");
+                            system.push_str(request);
+                        }
+                        system.push_str(
+                            "\nCheck the project's current state (files, git status, your task \
+                             list) for what's already done.",
+                        );
+                    }
+                    system.push_str(" Ask the user to restate anything else you're missing.)");
+                }
             }
         }
         if self.plan_mode.active() {
@@ -1953,10 +1992,21 @@ impl Agent {
             // the two would stop compaction dead the first time a droppable
             // group has no tool call in it, even though more still needs to
             // go to reach the low-water mark.
+            let request = self
+                .history
+                .first()
+                .filter(|m| m.role == Role::User)
+                .map(|m| m.text_content().split_whitespace().collect::<Vec<_>>().join(" "));
             let Some(dropped_calls) = drop_oldest_group(&mut self.history) else {
                 break;
             };
             dropped = true;
+            if let Some(request) = request.filter(|r| !is_bare_continue(r)) {
+                let request: String = request.chars().take(DROPPED_REQUEST_CHARS).collect();
+                self.dropped_requests.push(request);
+                let excess = self.dropped_requests.len().saturating_sub(DROPPED_REQUESTS_KEPT);
+                self.dropped_requests.drain(..excess);
+            }
             for call in &dropped_calls {
                 if let Some(request) = self.executor.reconstruct_permission_request(call, cwd) {
                     self.executor.forget_permission(&request);
@@ -1975,6 +2025,15 @@ impl Agent {
             }
         }
 
+        // Only the current turn is left and it still doesn't fit: one long
+        // turn of reads can outgrow the window on its own. Clear the oldest
+        // tool results' bodies, keeping the latest few whole.
+        while self.estimate_prompt_tokens() > low
+            && clear_oldest_tool_result(&mut self.history, KEEP_RECENT_TOOL_RESULTS)
+        {
+            dropped = true;
+        }
+
         if dropped {
             self.history_truncated = true;
             self.emit(AgentEvent::Error(
@@ -1982,19 +2041,59 @@ impl Agent {
             ));
         }
 
-        // Every droppable turn is gone and the prompt still doesn't fit:
-        // aivyx-coder's own instructions and tools nearly fill the budget,
-        // so from now on each turn will lose all the ones before it.
         if !self.budget_too_small_reported && self.estimate_prompt_tokens() > high {
             self.budget_too_small_reported = true;
-            self.emit(AgentEvent::Error(format!(
-                "the prompt is about {} tokens even without earlier turns — more than \
-                 backend.context_tokens ({}) leaves room for, so each turn will drop the ones \
-                 before it. Set [backend] context_tokens to your model's real context window.",
-                self.estimate_prompt_tokens(),
-                self.context_limit
-            )));
+            let fixed = self.estimate_fixed_prompt_tokens();
+            let message = if fixed > high {
+                // aivyx-coder's own instructions and tools nearly fill the
+                // budget, so from now on each turn will lose all the ones
+                // before it.
+                format!(
+                    "the prompt is about {fixed} tokens before any conversation (instructions, \
+                     tools, repo map) — more than backend.context_tokens ({}) leaves room for, \
+                     so each turn will drop the ones before it. Set [backend] context_tokens to \
+                     your model's real context window.",
+                    self.context_limit
+                )
+            } else {
+                format!(
+                    "this turn alone is about {} tokens — nearly all of backend.context_tokens \
+                     ({}) — even after clearing its earlier tool results. Asking for smaller \
+                     steps, or a larger context window, will help.",
+                    self.estimate_prompt_tokens().saturating_sub(fixed),
+                    self.context_limit
+                )
+            };
+            self.emit(AgentEvent::Error(message));
         }
+    }
+
+    /// The prompt's estimated size with no conversation at all: the base
+    /// prompt, tool section, repo map, instructions files and skills.
+    fn estimate_fixed_prompt_tokens(&self) -> u32 {
+        let history = message_chars("", &self.history);
+        (self.prompt_chars().saturating_sub(history) as f64 / self.chars_per_token).ceil() as u32
+    }
+
+    /// The backend refused the last request as larger than its context
+    /// window — the estimate came in low (it calibrates on the previous
+    /// request, and code tokenizes denser than prose). Recalibrate from the
+    /// token count the error names when there is one, otherwise assume 25%
+    /// more tokens per char, then compact again. Returns whether the
+    /// request is worth retrying.
+    fn recover_from_context_overflow(&mut self, message: &str, cwd: &Path) -> bool {
+        let before = self.chars_per_token;
+        match (overflow_token_count(message), self.last_request_chars) {
+            (Some(tokens), Some(chars)) if tokens > 0 => {
+                self.chars_per_token = (chars as f64 / tokens as f64).clamp(1.0, 12.0);
+            }
+            _ => self.chars_per_token = (self.chars_per_token * 0.8).max(1.0),
+        }
+        // Calibration is also lowered when the count is unparseable but the
+        // ratio was already at its floor: no point retrying the same size.
+        let before_tokens = self.estimate_prompt_tokens();
+        self.compact_if_needed(cwd);
+        self.chars_per_token < before || self.estimate_prompt_tokens() < before_tokens
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -2795,6 +2894,7 @@ impl Agent {
         self.refresh_editor_context(cwd).await;
         self.ensure_kv_slot_checked_out().await;
 
+        let mut overflow_retried = false;
         for iteration in 1..=self.max_tool_iterations {
             if cancellation.is_cancelled() {
                 break;
@@ -2835,7 +2935,23 @@ impl Agent {
             let mut stream = match self.llm.stream_chat(request).await {
                 Ok(stream) => {
                     self.report_route();
+                    overflow_retried = false;
                     stream
+                }
+                // Not on the last iteration: a retry there would skip the
+                // pause below and end the turn as if complete.
+                Err(err)
+                    if !overflow_retried
+                        && iteration < self.max_tool_iterations
+                        && is_context_overflow(&err.to_string())
+                        && self.recover_from_context_overflow(&err.to_string(), cwd) =>
+                {
+                    // Once per request: compacted and recalibrated, so the
+                    // same request, smaller, goes again (this iteration
+                    // spent nothing — no tool ran).
+                    overflow_retried = true;
+                    tracing::warn!(%err, "context overflow — compacted and retrying");
+                    continue;
                 }
                 Err(err) => {
                     self.emit(AgentEvent::Error(err.to_string()));
@@ -3518,6 +3634,60 @@ fn drop_oldest_group(history: &mut Vec<Message>) -> Option<Vec<ToolCall>> {
             })
             .collect(),
     )
+}
+
+/// Clears the body of the oldest `ToolOutput::Ok` result not yet cleared,
+/// leaving the newest `keep_last` results alone. `false` when there's none
+/// left to clear.
+fn clear_oldest_tool_result(history: &mut [Message], keep_last: usize) -> bool {
+    let positions: Vec<(usize, usize)> = history
+        .iter()
+        .enumerate()
+        .flat_map(|(m, message)| {
+            message
+                .content
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| matches!(block, ContentBlock::ToolResult(_)))
+                .map(move |(b, _)| (m, b))
+        })
+        .collect();
+    let clearable = positions.len().saturating_sub(keep_last);
+    for &(m, b) in &positions[..clearable] {
+        if let ContentBlock::ToolResult(result) = &mut history[m].content[b]
+            && let ToolOutput::Ok(text) = &mut result.output
+            && text.chars().count() > CLEARED_TOOL_RESULT.len()
+        {
+            *text = CLEARED_TOOL_RESULT.to_string();
+            return true;
+        }
+    }
+    false
+}
+
+/// A request that says nothing but "go on" — not worth restating.
+fn is_bare_continue(text: &str) -> bool {
+    let t = text.trim().trim_end_matches(['.', '!']).to_ascii_lowercase();
+    matches!(t.as_str(), "continue" | "go on" | "keep going" | "carry on" | "go ahead")
+}
+
+/// Whether a backend error says the request didn't fit its context window
+/// (llama.cpp: "exceeds the available context size"; vLLM/OpenAI-style:
+/// "maximum context length").
+fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("exceeds the available context size")
+        || m.contains("exceed_context_size")
+        || m.contains("maximum context length")
+        || m.contains("context_length_exceeded")
+}
+
+/// The request's real token count when the error names it — llama.cpp's
+/// "request (32997 tokens) exceeds…".
+fn overflow_token_count(message: &str) -> Option<u32> {
+    let at = message.find(" tokens)")?;
+    let start = message[..at].rfind('(')? + 1;
+    message[start..at].trim().parse().ok()
 }
 
 /// Elides the body of any `ToolOutput::Ok` result longer than `cap` chars to

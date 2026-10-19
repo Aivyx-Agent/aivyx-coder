@@ -5919,6 +5919,153 @@ fn compaction_that_cannot_fit_says_the_budget_is_too_small_once() {
     assert_eq!(too_small.len(), 1, "said once per session, not every turn");
 }
 
+/// Refuses its first request the way llama.cpp does when a prompt doesn't
+/// fit, then serves `inner`.
+struct OverflowOnceBackend {
+    inner: Arc<MockBackend>,
+    refused: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl LlmBackend for OverflowOnceBackend {
+    fn model_id(&self) -> &str {
+        "overflow-once"
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        if !self.refused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.inner.received.lock().unwrap().push(request);
+            return Err(LlmError::BackendError {
+                status: 400,
+                body: r#"{"error":{"code":400,"message":"request (900 tokens) exceeds the available context size (100 tokens), try increasing it","type":"exceed_context_size_error"}}"#.to_string(),
+            });
+        }
+        self.inner.stream_chat(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_context_overflow_compacts_and_retries_the_request_once() {
+    // Live test (2026-10-19): the estimate came in low and llama-server
+    // refused a 32,997-token request; the turn just failed.
+    let (mut agent, mut rx, mock) = build_agent(vec![text_response("done")], ToolRegistry::new(), 10);
+    agent.llm = Arc::new(OverflowOnceBackend {
+        inner: mock.clone(),
+        refused: std::sync::atomic::AtomicBool::new(false),
+    });
+    agent.context_limit = 1_000;
+    for i in 0..6 {
+        agent.history.push(user_msg(&format!("u{i} {}", "x".repeat(400))));
+        agent.history.push(assistant_msg(&format!("a{i} {}", "y".repeat(400))));
+    }
+
+    agent
+        .run_turn("go".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+    let received = mock.received.lock().unwrap();
+    assert_eq!(received.len(), 2, "refused once, then retried once");
+    assert!(
+        received[1].messages.len() < received[0].messages.len(),
+        "the retry must be smaller"
+    );
+    assert_eq!(agent.history.last().unwrap().text_content(), "done");
+}
+
+#[test]
+fn overflow_errors_are_recognised_and_their_token_count_read() {
+    let llama = r#"backend returned an error response (400): {"error":{"code":400,"message":"request (32997 tokens) exceeds the available context size (32768 tokens), try increasing it"}}"#;
+    assert!(is_context_overflow(llama));
+    assert_eq!(overflow_token_count(llama), Some(32997));
+    assert!(is_context_overflow("This model's maximum context length is 8192 tokens"));
+    assert!(!is_context_overflow("backend went silent"));
+    assert_eq!(overflow_token_count("no count here"), None);
+}
+
+#[test]
+fn compaction_clears_old_tool_results_inside_one_long_turn() {
+    // One turn of many big reads: there's no earlier turn to drop, so the
+    // oldest results' bodies go instead, keeping the latest few whole.
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    // 10 results of ~500 chars ≈ 1,400 tokens against an 800-token
+    // high-water mark; the latest 4 kept whole still fit under it.
+    agent.context_limit = 1_000;
+    agent.history.push(user_msg("fix the bug"));
+    for i in 0..10 {
+        agent.history.push(assistant_msg_with_tool_call(ToolCall {
+            id: ToolCallId(format!("c{i}")),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({ "path": format!("f{i}.rs") }),
+            source: ToolCallSource::Native,
+        }));
+        agent.history.push(ok_tool_result_msg(&format!("c{i}"), &format!("r{i} {}", "z".repeat(500))));
+    }
+
+    agent.compact_if_needed(Path::new("."));
+
+    let results: Vec<String> = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult(ToolResult { output: ToolOutput::Ok(t), .. }) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 10, "calls and results stay paired");
+    assert_eq!(results[0], CLEARED_TOOL_RESULT);
+    assert!(results[6..].iter().all(|t| t != CLEARED_TOOL_RESULT), "the latest 4 stay whole");
+    assert!(agent.history_truncated);
+    assert!(agent.estimate_prompt_tokens() <= 800);
+    let events = drain(&mut rx);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("truncated"))));
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.contains("context_tokens"))),
+        "it fit after clearing, so no budget warning"
+    );
+}
+
+#[test]
+fn a_turn_too_big_on_its_own_is_blamed_not_the_instructions() {
+    let (mut agent, mut rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.context_limit = 1_000;
+    // The request alone is over the window; nothing else can be cleared.
+    agent.history.push(user_msg(&"q".repeat(5_000)));
+
+    agent.compact_if_needed(Path::new("."));
+
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Error(m) if m.starts_with("this turn alone is about"))),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn dropped_requests_are_restated_after_compaction() {
+    let (mut agent, _rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.context_limit = 300;
+    agent.history.push(user_msg("Add a contains(s, substring) built-in function"));
+    agent.history.push(assistant_msg(&"y".repeat(1_500)));
+    agent.history.push(user_msg("continue"));
+    agent.history.push(assistant_msg(&"y".repeat(500)));
+    agent.history.push(user_msg("continue"));
+
+    agent.compact_if_needed(Path::new("."));
+
+    let text = agent.system_prompt_text();
+    assert!(text.contains("Add a contains(s, substring) built-in function"), "{text}");
+    assert_eq!(agent.dropped_requests.len(), 1, "a bare continue isn't restated");
+    agent.clear_conversation();
+    assert!(agent.dropped_requests.is_empty());
+}
+
 #[test]
 fn a_truncated_autonomous_run_restates_its_goal() {
     let (mut agent, _rx, _) = build_agent(vec![], ToolRegistry::new(), 10);
