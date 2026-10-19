@@ -2823,14 +2823,21 @@ impl Agent {
         }
         let mut messages = self.assemble_messages();
         messages.push(Message::text(Role::User, CAP_SUMMARY_REQUEST));
+        let tools = self.request_tool_definitions();
+        // Same hint as the turn's own requests, so a broker keeps this on
+        // the slot that holds the conversation's prefix.
+        let slot_hint = self.broker_mode.then(|| SlotHint {
+            prefix_hash: compute_prefix_hash(&self.system_prompt_text(), &tools),
+            preferred_slot: self.kv_slot_id,
+        });
         let request = ChatRequest {
             messages,
-            tools: self.request_tool_definitions(),
+            tools,
             tool_choice: ToolChoice::None,
             temperature: None,
             max_tokens: None,
             id_slot: self.kv_slot_id,
-            slot_hint: None,
+            slot_hint,
             route: Some(aivyx_llm::RouteHint {
                 task: self.route_task.clone(),
                 session: Some(self.route_session.clone()),

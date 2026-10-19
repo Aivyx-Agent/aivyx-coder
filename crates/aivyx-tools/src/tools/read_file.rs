@@ -125,12 +125,14 @@ fn select_lines(capped: &bounded_read::Capped, offset: usize, limit: usize) -> S
         end += 1;
     }
     // A single line longer than the cap.
+    let mut line_cut = false;
     if out.len() > MAX_READ_CHARS {
         let mut cut = MAX_READ_CHARS;
         while !out.is_char_boundary(cut) {
             cut -= 1;
         }
         out.truncate(cut);
+        line_cut = true;
     }
     if start == 0 && end == total && !capped.truncated {
         return out;
@@ -143,8 +145,13 @@ fn select_lines(capped: &bounded_read::Capped, offset: usize, limit: usize) -> S
     } else {
         String::new()
     };
+    let cut_note = if line_cut {
+        format!(" (line {} is longer than {MAX_READ_CHARS} characters and was cut — grep it instead)", start + 1)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "\n[read_file: lines {}-{end} of {total_text}{next}]",
+        "\n[read_file: lines {}-{end} of {total_text}{cut_note}{next}]",
         start + 1
     ));
     out
@@ -235,6 +242,7 @@ mod tests {
         };
         assert!(text.len() < MAX_READ_CHARS + 300);
         assert!(text.contains("only the first 1.0 MiB of this 2.0 MiB file"), "{}", &text[text.len() - 200..]);
+        assert!(text.contains("line 1 is longer than 20000 characters and was cut"));
         assert!(text.contains("grep"));
     }
 }

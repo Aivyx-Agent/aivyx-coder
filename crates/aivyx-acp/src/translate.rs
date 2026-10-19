@@ -178,9 +178,11 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
             SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
         }
         // Its own paragraph: an Info (e.g. the change summary) arrives right
-        // after the model's reply and must not run into its last sentence.
+        // after the model's reply and must not run into its last sentence —
+        // nor into what follows, as a specialist's summary did with the
+        // lead's next words ("(+2 −0)Done.", audit 6).
         AgentEvent::Info(text) => {
-            SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{text}")))
+            SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{text}\n\n")))
         }
         // No pager over ACP: the diff goes to the client as a fenced block
         // its own markdown renderer can highlight — fenced with more
@@ -381,7 +383,7 @@ mod tests {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 assert_eq!(
                     chunk.content,
-                    ContentBlock::Text(TextContent::new("\n\nChanged: a.txt"))
+                    ContentBlock::Text(TextContent::new("\n\nChanged: a.txt\n\n"))
                 );
             }
             other => panic!("expected AgentMessageChunk, got {other:?}"),
