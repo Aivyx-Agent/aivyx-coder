@@ -325,12 +325,23 @@ pub async fn run_bounded_turn(
             next_input = Some("continue".to_string());
         }
     }
-    // A reasoning-only final answer is never streamed as text; the agent
-    // keeps it as the answer (`last_assistant_text`).
-    let mut accumulated = compose_result(accumulated, agent.last_assistant_text(), changed);
     let would_have_continued = result.is_ok() && agent.last_turn_paused();
     let injection_tainted = agent.injection_taint().current().is_some();
     let cancelled = cancellation.is_cancelled();
+    // Out of budget mid-work: ask where it got to, so the caller gets more
+    // than an empty result (live test, 2026-10-19). Not after an injection
+    // flag — that stop says why on its own, and the session's output is
+    // suspect.
+    if would_have_continued && iterations_used >= max_iterations && !injection_tainted && !cancelled
+    {
+        agent.summarize_progress(&cancellation).await;
+        while let Ok(event) = events_rx.try_recv() {
+            take(&event);
+        }
+    }
+    // A reasoning-only final answer is never streamed as text; the agent
+    // keeps it as the answer (`last_assistant_text`).
+    let mut accumulated = compose_result(accumulated, agent.last_assistant_text(), changed);
 
     if cancelled {
         accumulated.push_str(
@@ -933,6 +944,57 @@ mod tests {
             text.contains("reached its iteration budget"),
             "expected a cutoff notice, got: {text}"
         );
+    }
+
+    /// Like `LoopingBackend`, but answers a request with tool calls
+    /// disabled (the progress summary) with text.
+    struct LoopingThenSummarizingBackend;
+    #[async_trait]
+    impl aivyx_llm::LlmBackend for LoopingThenSummarizingBackend {
+        fn model_id(&self) -> &str {
+            "looping-then-summarizing"
+        }
+        async fn stream_chat(
+            &self,
+            request: aivyx_llm::ChatRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, aivyx_llm::LlmError>>,
+            aivyx_llm::LlmError,
+        > {
+            if request.tool_choice == aivyx_llm::ToolChoice::None {
+                return Ok(futures::stream::iter([
+                    Ok(StreamEvent::TextDelta("Read two files; the fix is next.".to_string())),
+                    Ok(StreamEvent::Done { finish_reason: FinishReason::Stop }),
+                ])
+                .boxed());
+            }
+            LoopingBackend.stream_chat(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bounded_turn_summarizes_progress_when_the_budget_runs_out() {
+        // Live test (2026-10-19): a call that ran out of iterations came
+        // back as nothing but the cutoff notice.
+        let mut cfg = config(full_registry());
+        cfg.llm = std::sync::Arc::new(LoopingThenSummarizingBackend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = build_session_agent(&cfg, AccessLevel::Plan, tx).await;
+        let (result, text) = run_bounded_turn(
+            &mut agent,
+            &mut rx,
+            "loop forever".to_string(),
+            &std::env::temp_dir(),
+            2,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            text.starts_with("Read two files; the fix is next."),
+            "expected the summary first, got: {text}"
+        );
+        assert!(text.contains("reached its iteration budget"), "{text}");
     }
 
     #[tokio::test]

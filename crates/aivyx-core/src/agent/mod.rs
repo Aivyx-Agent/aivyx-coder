@@ -2807,8 +2807,18 @@ impl Agent {
     async fn summarize_at_cap(&mut self, cancellation: &CancellationToken) {
         // Autonomous mode continues on its own, like the callers that leave
         // `summarize_on_pause` off.
-        if !self.summarize_on_pause || self.autonomous_mode.active() || cancellation.is_cancelled()
-        {
+        if !self.summarize_on_pause || self.autonomous_mode.active() {
+            return;
+        }
+        self.summarize_progress(cancellation).await;
+    }
+
+    /// The summary `summarize_at_cap` asks for, on demand — for a caller
+    /// that auto-continues paused turns and has now stopped for good (the
+    /// MCP server at its iteration budget, which otherwise handed back an
+    /// empty result). Streams it as `TextDelta` and keeps it in history.
+    pub async fn summarize_progress(&mut self, cancellation: &CancellationToken) {
+        if cancellation.is_cancelled() {
             return;
         }
         let mut messages = self.assemble_messages();
