@@ -20,12 +20,12 @@ Read, write and change files in the project.
 
 | Tool | Asks first? | What it does |
 |---|---|---|
-| `read_file` | no | Read the contents of a text file (the first 1 MiB of a larger one). |
+| `read_file` | no | Read a text file: up to 400 lines (and 20,000 characters) from `offset` (default line 1), or `limit` lines. |
 | `write_file` | yes | Create a file or overwrite it entirely with new content. Creates parent directories as needed. |
 | `edit_file` | yes | Replace an exact substring in an existing file with new text. old_string must match exactly once in the file (include enough surrounding context to make it unique), unless replace_all is set. |
 | `patch_file` | yes | Apply a unified-diff patch to an existing file. |
 | `move_file` | yes | Move or rename a file or directory. Refuses if the destination already exists (no overwrite) or if source and destination are on different filesystems (no copy+delete fallback). |
-| `delete_file` | yes | Delete a single file. Refuses to delete directories — use run_shell for that. |
+| `delete_file` | yes | Delete a single file. Refuses to delete directories — delete the files inside them instead. |
 
 ## Search
 
