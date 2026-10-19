@@ -281,7 +281,21 @@ fn resolve_team_config(
             toml::from_str::<aivyx_team::TeamConfig>(&raw)
                 .map_err(|e| anyhow::anyhow!("failed to parse roster file {path:?}: {e}"))?
         }
-        None => aivyx_team::default_coding_roster(),
+        None => {
+            // The built-in roster names every tool a member could use, but
+            // some exist only when configured (`run_command` needs
+            // `[[permissions.allowed_commands]]`): drop those rather than
+            // refuse to start, which made a bare `[team] enabled = true`
+            // fail on a default config (audit 6, 2026-10-19). A custom
+            // roster still has to name only real tools.
+            let mut team = aivyx_team::default_coding_roster();
+            for member in &mut team.members {
+                member
+                    .tool_allowlist
+                    .retain(|tool| available_tools.contains(&tool.as_str()));
+            }
+            team
+        }
     };
     team.validate(available_tools)
         .map_err(|e| anyhow::anyhow!("[team] roster is invalid: {e}"))?;
@@ -2144,39 +2158,39 @@ tool_allowlist = []
     }
 
     #[test]
-    fn resolve_team_config_default_roster_branch_genuinely_calls_validate() {
-        // Discriminates a wrong implementation that skips validate() for
-        // the `roster_path` unset (default-roster) branch: an
-        // available_tools list deliberately missing a tool the default
-        // roster actually needs must make this fail, since a real
-        // implementation validates that branch too. If validate() were
-        // skipped for the None arm, this would wrongly return Ok.
-        //
-        // "git_read" is used only by the "reviewer" member (every other
-        // tool in the default roster is shared by 2+ members -- read_file/
-        // grep/glob in particular -- so simply popping one occurrence
-        // from a flattened list would leave the tool still "available"
-        // via another member's identical entry; git_read is the one name
-        // that genuinely disappears when excluded).
+    fn the_default_roster_drops_tools_this_config_doesnt_register() {
+        // Audit 6: `[team] enabled = true` with no allowed_commands refused
+        // to start ("tester's tool_allowlist names an unavailable tool:
+        // run_command").
         let settings = Settings::default();
         let default_roster = aivyx_team::default_coding_roster();
-        let incomplete_tools: Vec<&str> = default_roster
+        let without_run_command: Vec<&str> = default_roster
             .members
             .iter()
             .flat_map(|m| m.tool_allowlist.iter().map(|s| s.as_str()))
-            .filter(|t| *t != "git_read")
+            .filter(|t| *t != "run_command")
             .collect();
-        assert!(
-            !incomplete_tools.contains(&"git_read"),
-            "test setup bug: git_read must be genuinely absent from the fixture"
-        );
-        let err = resolve_team_config(&settings, &incomplete_tools).unwrap_err();
-        assert!(
-            err.to_string().contains("roster is invalid"),
-            "excluding git_read from available_tools must make the default roster's own \
-             validate() call fail (the reviewer member names it), proving validate() is \
-             genuinely unconditional -- got: {err}"
-        );
+        let team = resolve_team_config(&settings, &without_run_command).unwrap();
+        let tester = team.members.iter().find(|m| m.name == "tester").unwrap();
+        assert!(!tester.tool_allowlist.iter().any(|t| t == "run_command"));
+        assert!(tester.tool_allowlist.iter().any(|t| t == "run_shell"));
+    }
+
+    #[test]
+    fn a_custom_roster_naming_an_unavailable_tool_still_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team.toml");
+        std::fs::write(
+            &path,
+            "lead = \"lead\"\n\
+             [[members]]\nname = \"lead\"\nrole = \"Lead\"\npersona = \"p\"\n\
+             tool_allowlist = [\"read_file\", \"run_command\"]\nextra_deny_paths = []\n",
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.team.roster_path = Some(path.to_string_lossy().into_owned());
+        let err = resolve_team_config(&settings, &["read_file"]).unwrap_err();
+        assert!(err.to_string().contains("run_command"), "{err}");
     }
 
     #[test]
