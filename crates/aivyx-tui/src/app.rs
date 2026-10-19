@@ -149,26 +149,15 @@ const CANCELLED_TURN_MARKER: &str = "— stopped (Ctrl+C)";
 /// turn already gets U3's own `CANCELLED_TURN_MARKER` line, and showing
 /// both made it look like two different things happened to the same
 /// reply -- the plan-mode reminder is suppressed in that case.
-///
-/// `has_pending_tasks` picks the wording: Ctrl+P only starts the plan by
-/// itself when there's a pending task list to carry out (see
-/// `plan_approval_message`); without one it just leaves plan mode, and the
-/// notice used to promise a start that never came (audit 6, 2026-10-19).
 fn plan_mode_turn_notice(
     plan_mode_active: bool,
     had_model_activity: bool,
     cancelled: bool,
-    has_pending_tasks: bool,
 ) -> Option<&'static str> {
-    if !(plan_mode_active && had_model_activity && !cancelled) {
-        None
-    } else if has_pending_tasks {
+    if plan_mode_active && had_model_activity && !cancelled {
         Some("Plan mode — nothing was changed. Press Ctrl+P to approve the plan and start.")
     } else {
-        Some(
-            "Plan mode — nothing was changed. Press Ctrl+P to leave plan mode, then tell it to go \
-             ahead.",
-        )
+        None
     }
 }
 
@@ -180,15 +169,18 @@ const PLAN_APPROVED_MESSAGE: &str = "The plan is approved. Carry it out now, tas
 /// also auto-send `PLAN_APPROVED_MESSAGE`, starting execution immediately
 /// instead of leaving the user to type the same thing themselves. Fires
 /// only on the specific transition this exists for: plan mode *was* on
-/// (so this toggle just turned it off), there's at least one pending task
-/// to carry out, and no turn is currently running to interrupt. With no
-/// tasks, today's behaviour (just the toggle notice) is kept.
+/// (so this toggle just turned it off), there's a plan to carry out, and
+/// no turn is currently running to interrupt. A plan is a pending task
+/// list *or* a plan-mode reply since plan mode last changed: a small model
+/// often gives its plan as text and asks "do you approve?", and the
+/// reminder under it says Ctrl+P approves (audit 6, 2026-10-19). With
+/// neither, just the toggle notice.
 fn plan_approval_message(
     plan_mode_was_on: bool,
-    has_pending_tasks: bool,
+    has_plan: bool,
     turn_idle: bool,
 ) -> Option<&'static str> {
-    if plan_mode_was_on && has_pending_tasks && turn_idle {
+    if plan_mode_was_on && has_plan && turn_idle {
         Some(PLAN_APPROVED_MESSAGE)
     } else {
         None
@@ -710,6 +702,9 @@ struct App {
     /// which call `run_turn` but never touch the model) -- the plan-mode
     /// "nothing was changed" notice must only follow the former.
     turn_had_model_activity: bool,
+    /// The model answered a turn in plan mode since plan mode last changed
+    /// — what Ctrl+P approves when there's no task list.
+    plan_presented: bool,
     /// Set `true` the moment Ctrl+C cancels an in-flight turn (the render
     /// loop's key handler, synchronously -- well before the background
     /// task's `run_turn` call returns and its events reach here), reset to
@@ -789,6 +784,7 @@ impl App {
             open_specialist_sessions: Vec::new(),
             plan_mode,
             turn_had_model_activity: false,
+            plan_presented: false,
             cancel_requested: false,
             turn_is_test_command: false,
             diff_view: None,
@@ -872,10 +868,12 @@ impl App {
     /// can forward it to the agent exactly like a typed message.
     fn toggle_plan_mode_and_maybe_approve(&mut self) -> Option<String> {
         let was_on = self.plan_mode.active();
+        let has_plan = self.plan_presented
+            || self.tasks.iter().any(|t| t.status == TaskStatus::Pending);
+        self.plan_presented = false;
         self.toggle_plan_mode();
-        let has_pending_tasks = self.tasks.iter().any(|t| t.status == TaskStatus::Pending);
         let turn_idle = !self.streaming_active;
-        let message = plan_approval_message(was_on, has_pending_tasks, turn_idle)?;
+        let message = plan_approval_message(was_on, has_plan, turn_idle)?;
         self.push_user_message(message.to_string());
         Some(message.to_string())
     }
@@ -1063,9 +1061,9 @@ impl App {
                     self.plan_mode.active(),
                     self.turn_had_model_activity,
                     self.cancel_requested,
-                    self.tasks.iter().any(|t| t.status == TaskStatus::Pending),
                 ) {
                     self.transcript.push(ChatLine::Notice(notice.to_string()));
+                    self.plan_presented = true;
                 }
                 self.turn_had_model_activity = false;
             }
@@ -3071,24 +3069,15 @@ mod tests {
 
     #[test]
     fn plan_mode_turn_notice_only_fires_when_both_plan_mode_and_real_activity() {
-        assert!(plan_mode_turn_notice(true, true, false, true).is_some());
-        assert_eq!(plan_mode_turn_notice(true, false, false, true), None);
-        assert_eq!(plan_mode_turn_notice(false, true, false, true), None);
-        assert_eq!(plan_mode_turn_notice(false, false, false, true), None);
+        assert!(plan_mode_turn_notice(true, true, false).is_some());
+        assert_eq!(plan_mode_turn_notice(true, false, false), None);
+        assert_eq!(plan_mode_turn_notice(false, true, false), None);
+        assert_eq!(plan_mode_turn_notice(false, false, false), None);
         assert!(
-            plan_mode_turn_notice(true, true, false, true)
+            plan_mode_turn_notice(true, true, false)
                 .unwrap()
                 .contains("Ctrl+P")
         );
-    }
-
-    #[test]
-    fn plan_mode_turn_notice_only_promises_a_start_when_there_is_a_plan_to_start() {
-        let with_plan = plan_mode_turn_notice(true, true, false, true).unwrap();
-        assert!(with_plan.contains("approve the plan and start"));
-        let without = plan_mode_turn_notice(true, true, false, false).unwrap();
-        assert!(!without.contains("and start"), "{without}");
-        assert!(without.contains("leave plan mode"));
     }
 
     #[test]
@@ -3096,9 +3085,9 @@ mod tests {
         // Fix round 1 (Important): a cancelled turn already gets U3's own
         // "— stopped (Ctrl+C)" marker -- showing the plan-mode reminder
         // too made it look like two different things happened.
-        assert_eq!(plan_mode_turn_notice(true, true, true, true), None);
+        assert_eq!(plan_mode_turn_notice(true, true, true), None);
         // Plan mode + real activity + NOT cancelled must still show it.
-        assert!(plan_mode_turn_notice(true, true, false, true).is_some());
+        assert!(plan_mode_turn_notice(true, true, false).is_some());
     }
 
     #[test]
@@ -3150,10 +3139,43 @@ mod tests {
         assert!(plan_approval_message(true, true, true).is_some());
         // Toggling it ON (plan_mode_was_on == false) never auto-sends.
         assert_eq!(plan_approval_message(false, true, true), None);
-        // No tasks -- keep today's behaviour (just the toggle notice).
+        // No plan (no tasks, no plan-mode reply) -- just the toggle notice.
         assert_eq!(plan_approval_message(true, false, true), None);
         // A turn is already running -- don't interrupt it.
         assert_eq!(plan_approval_message(true, true, false), None);
+    }
+
+    #[test]
+    fn ctrl_p_after_a_plan_given_as_text_starts_it_too() {
+        // Audit 6: the model answered with its plan as text and no task
+        // list; Ctrl+P under "Press Ctrl+P to approve the plan and start"
+        // only left plan mode.
+        let mut app = App::new(None, PlanMode::new());
+        app.plan_mode.set_active(true);
+        app.handle_agent_event(AgentEvent::TextDelta("Plan: 1. add subtract".to_string()));
+        app.handle_agent_event(AgentEvent::TurnComplete);
+        assert!(app.tasks.is_empty());
+
+        let sent = app.toggle_plan_mode_and_maybe_approve();
+
+        assert_eq!(sent, Some(PLAN_APPROVED_MESSAGE.to_string()));
+        assert!(!app.plan_mode.active());
+    }
+
+    #[test]
+    fn ctrl_p_with_no_plan_reply_only_toggles() {
+        let mut app = App::new(None, PlanMode::new());
+        // Plan mode on, then straight off: nothing to approve.
+        app.toggle_plan_mode_and_maybe_approve();
+        assert_eq!(app.toggle_plan_mode_and_maybe_approve(), None);
+        // A plan reply, then plan mode toggled off and on again: the old
+        // reply isn't approved by the next Ctrl+P.
+        app.handle_agent_event(AgentEvent::TextDelta("plan".to_string()));
+        app.handle_agent_event(AgentEvent::TurnComplete);
+        app.plan_mode.set_active(false);
+        app.plan_presented = false;
+        app.toggle_plan_mode_and_maybe_approve();
+        assert_eq!(app.toggle_plan_mode_and_maybe_approve(), None);
     }
 
     #[test]

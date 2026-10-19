@@ -22,12 +22,11 @@ acting.
 
 ## Approving the plan
 
-Press **Ctrl+P** again. Plan mode turns off, and if there's a pending task
-list and nothing is running, aivyx-coder sends "The plan is approved. Carry
-it out now, task by task." for you, so work starts straight away. With no
-task list, Ctrl+P only leaves plan mode (the reminder says so), and you
-tell it to go ahead yourself. From then on every change asks for approval
-as usual.
+Press **Ctrl+P** again. Plan mode turns off, and if the model has given
+a plan (a pending task list, or a reply since you turned plan mode on) and
+nothing is running, aivyx-coder sends "The plan is approved. Carry it out
+now, task by task." for you, so work starts straight away. From then on
+every change asks for approval as usual.
 
 ## Tips
 
