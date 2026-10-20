@@ -2185,8 +2185,10 @@ impl Agent {
             .executor
             .dispatch(call, cwd, cancellation.clone())
             .await;
-        let passed =
-            matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+        let vacuous = matches!(&result.output, ToolOutput::Ok(text)
+            if command_reported_success(text) && ran_no_tests(text));
+        let passed = !vacuous
+            && matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
 
         // Compare against the immediately preceding run (whatever its own
         // outcome was) using the *original* text, then store that same
@@ -2205,7 +2207,10 @@ impl Agent {
         // Decision 2).
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
-            if !passed && let Some(previous) = &self.last_full_verification_output {
+            if !passed
+                && !vacuous
+                && let Some(previous) = &self.last_full_verification_output
+            {
                 if *previous == current_text {
                     // Identical output: whatever changed since the previous
                     // run did not affect the result. Say so, so a small
@@ -2215,6 +2220,9 @@ impl Agent {
                 } else if let Some(note) = new_lines_note(previous, &current_text) {
                     text.push_str(&note);
                 }
+            }
+            if vacuous {
+                text.push_str(NO_TESTS_NOTE);
             }
             self.last_full_verification_output = Some(current_text);
         }
@@ -3940,6 +3948,52 @@ fn sanitize_for_display(raw: &str) -> String {
 fn command_reported_success(output: &str) -> bool {
     output.contains("exit status:") && output.contains("(success)")
 }
+
+/// Whether `output` is from a test runner that exited cleanly without
+/// running a single test: every `cargo test` binary reporting `0 passed;
+/// 0 failed`, every `go test` package `[no test files]`/`[no tests to
+/// run]`, or Jest/Vitest's `--passWithNoTests` notice. Such a run checked
+/// nothing, so it must not verify edits (live-test finding, 2026-10-20: a
+/// build with no tests at all was declared done on an exit-0 `cargo test`).
+/// Output from anything that isn't a recognised test runner is never
+/// "no tests", so a build or lint verification command is unaffected.
+fn ran_no_tests(output: &str) -> bool {
+    let mut cargo_results = output
+        .lines()
+        .filter_map(|line| line.split_once("test result: ").map(|(_, rest)| rest))
+        .peekable();
+    if cargo_results.peek().is_some() {
+        return cargo_results.all(|rest| {
+            let count = |label: &str| {
+                rest.split(';')
+                    .find_map(|part| part.trim().strip_suffix(label))
+                    .and_then(|n| n.rsplit(' ').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            };
+            count(" passed") == Some(0) && count(" failed") == Some(0)
+        });
+    }
+
+    let go_packages: Vec<&str> = output
+        .lines()
+        .filter(|line| {
+            line.starts_with("ok ") || line.starts_with("ok\t") || line.starts_with("? ")
+        })
+        .collect();
+    if !go_packages.is_empty() {
+        return go_packages.iter().all(|line| {
+            line.contains("[no test files]") || line.contains("[no tests to run]")
+        });
+    }
+
+    output.contains("No tests found, exiting with code 0")
+}
+
+/// Appended to an exit-0 verification result that ran no tests.
+const NO_TESTS_NOTE: &str = "\n\nThe verification command exited successfully but ran no tests, \
+     so it verified nothing and does not count as a pass. Write tests that exercise the change \
+     (for a command-line program, tests that run the built binary and check its output), then \
+     finish again.";
 
 /// Bound on the rendered new-lines note appended to a failing verification
 /// result — small and fixed, unlike `elide_oversized_tool_results`'s own

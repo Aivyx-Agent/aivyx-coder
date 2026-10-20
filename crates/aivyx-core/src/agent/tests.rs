@@ -5291,6 +5291,98 @@ async fn verification_never_fires_when_nothing_was_edited() {
 }
 
 #[test]
+fn ran_no_tests_spots_a_cargo_run_where_every_binary_ran_zero_tests() {
+    let none = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; \
+                0 filtered out; finished in 0.00s\n\n   Doc-tests recipe\n\nrunning 0 tests\n\n\
+                test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; \
+                finished in 0.00s\n\nexit status: 0 (success)";
+    assert!(ran_no_tests(none));
+
+    let some = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                exit status: 0 (success)";
+    assert!(!ran_no_tests(some), "10 passed must not read as 0 passed");
+
+    let quiet = "running 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; \
+                 0 measured; 0 filtered out; finished in 0.00s\nexit status: 0 (success)";
+    assert!(!ran_no_tests(quiet));
+}
+
+#[test]
+fn ran_no_tests_spots_go_and_js_runners_with_nothing_to_run() {
+    assert!(ran_no_tests(
+        "?   \texample.com/a\t[no test files]\n?   \texample.com/b\t[no test files]\n\
+         exit status: 0 (success)"
+    ));
+    assert!(!ran_no_tests(
+        "?   \texample.com/a\t[no test files]\nok  \texample.com/b\t0.002s\n\
+         exit status: 0 (success)"
+    ));
+    assert!(ran_no_tests(
+        "No tests found, exiting with code 0\nexit status: 0 (success)"
+    ));
+}
+
+#[test]
+fn ran_no_tests_ignores_output_that_is_not_from_a_test_runner() {
+    assert!(!ran_no_tests("exit status: 0 (success)"));
+    assert!(!ran_no_tests(
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.1s\n\
+         exit status: 0 (success)"
+    ));
+}
+
+#[tokio::test]
+async fn a_verification_that_ran_no_tests_does_not_count_as_a_pass() {
+    // Live-test finding (2026-10-20): a from-scratch build wrote no tests at
+    // all, `cargo test` printed "0 passed" and exited 0, and the autonomous
+    // run declared the goal achieved on a program that failed every case.
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![
+        stateful_verify_command_spec(
+            "verify",
+            "echo 'running 0 tests'; \
+             echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; \
+             exit 0",
+        ),
+    ])));
+
+    let (mut agent, mut rx, _) = build_agent(
+        vec![
+            write_call_response("c1", "out.txt", "hi\n"),
+            text_response("done"),
+            write_call_response("c2", "out.txt", "again\n"),
+            text_response("done again"),
+        ],
+        registry,
+        10,
+    );
+    agent.set_verification("verify".to_string(), 2);
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(msg) if msg.contains("still failing after 2 attempt"))
+        ),
+        "a run with no tests must not verify the edits, got {events:?}"
+    );
+    assert!(
+        auto_verify_result_texts(&agent.history)
+            .first()
+            .is_some_and(|t| t.contains("ran no tests")),
+        "the model must be told why an exit-0 run did not count"
+    );
+    assert!(agent.unverified_edits);
+}
+
+#[test]
 fn new_lines_note_reports_only_lines_absent_from_previous() {
     let previous = "test test_a ... FAILED\nfailures:\n    test_a\n";
     let current = "test test_a ... FAILED\ntest test_b ... FAILED\nfailures:\n    test_a\n    test_b\n";

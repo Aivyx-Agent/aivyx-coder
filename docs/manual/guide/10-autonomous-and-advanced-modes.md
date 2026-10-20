@@ -16,8 +16,11 @@ with the steps already done marked done — since that is how the run ends.
 asking because every batch of edits is tested. It uses your
 `[verification] command`, or else the test command `/test` would detect,
 and says which at start-up. It refuses to start if there's neither, or if
-`[verification] command` names no real `allowed_commands` entry. When a
-batch of edits keeps failing verification, it **rewinds** to the checkpoint
+`[verification] command` names no real `allowed_commands` entry. A test
+run that exits cleanly without running any tests (`cargo test` reporting
+`0 passed`, `go test` with `[no test files]`, Jest or Vitest with
+`--passWithNoTests`) doesn't count as a pass: the model is told it verified
+nothing and must write tests. When a batch of edits keeps failing verification, it **rewinds** to the checkpoint
 from before that batch, throws the failed attempt away, and carries on with
 the remaining budget.
 
