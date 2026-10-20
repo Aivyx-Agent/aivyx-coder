@@ -109,7 +109,8 @@ Deliberately not (yet) addressed — documented rather than hidden:
     them yourself; granting read on `/` would expose every directory name
     on the machine.
   - *The model is told when the sandbox may be the cause*: every failed
-    confined `run_command`, `run_shell` or `/test` run ends with a short
+    confined `run_command`, `run_shell` or `/test` run (and automatic
+    verification, which uses them) ends with a short
     line saying it ran in the sandbox and, if the failure could come from
     the restricted access, to say so instead of changing the code. When
     the output also mentions a permission error (`Permission denied`,

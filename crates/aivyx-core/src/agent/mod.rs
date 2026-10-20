@@ -522,6 +522,12 @@ pub struct Agent {
     /// by `clear_conversation`/`switch_to` since it no longer describes the
     /// conversation now in progress.
     last_test_passed: Option<bool>,
+    /// The outcome of the most recent automatic verification attempt
+    /// (`run_verification_attempt`): `Some(false)` if it failed, `None` if
+    /// none has run in this conversation. Lets `--auto` say so when the
+    /// model calls the goal achieved while the tests still fail. Reset
+    /// with `last_test_passed`.
+    last_verification_passed: Option<bool>,
     /// `[git] ignore`: `.gitignore`-syntax patterns for generated files.
     /// An untracked path matching one is left out of the change summary,
     /// `/diff`, the `/undo`/`/redo` previews and their result lists, and
@@ -623,6 +629,7 @@ impl Agent {
             tests: None,
             test_timeout: test_command::TEST_TIMEOUT,
             last_test_passed: None,
+            last_verification_passed: None,
             generated_ignore: aivyx_tools::default_generated_patterns(),
             events_tx,
         }
@@ -777,6 +784,7 @@ impl Agent {
         self.undo.clear();
         self.pending_notes.clear();
         self.last_test_passed = None;
+        self.last_verification_passed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.history_truncated = false;
         self.dropped_requests.clear();
@@ -827,6 +835,12 @@ impl Agent {
     /// `last_test_passed` field's doc comment.
     pub fn last_test_passed(&self) -> Option<bool> {
         self.last_test_passed
+    }
+
+    /// The outcome of the most recent automatic verification attempt --
+    /// see the `last_verification_passed` field's doc comment.
+    pub fn last_verification_passed(&self) -> Option<bool> {
+        self.last_verification_passed
     }
 
     /// Enables enforced verification (Phase 12 Part B): `command_name` must
@@ -1663,6 +1677,7 @@ impl Agent {
         self.undo.clear();
         self.pending_notes.clear();
         self.last_test_passed = None;
+        self.last_verification_passed = None;
 
         let specialist_sessions = state.specialist_sessions.clone();
         let plan_mode_active = state.plan_mode_active;
@@ -2276,7 +2291,9 @@ impl Agent {
             .kill_on_drop(true);
         let command = scoped.confiner.confine(command);
 
-        let output = aivyx_tools::run(command, scoped.spec.timeout, cancellation.clone()).await;
+        let output =
+            aivyx_tools::run_noting_sandbox(command, scoped.spec.timeout, cancellation.clone())
+                .await;
         let mut result = ToolResult {
             call_id: call.id.clone(),
             output: output.unwrap_or_else(|err| ToolOutput::Error(err.to_string())),
@@ -2319,6 +2336,19 @@ impl Agent {
     ) -> bool {
         self.changed_since_verification = false;
         self.last_verification_unchanged = false;
+        let passed = self.run_verification_commands(verification, cwd, cancellation).await;
+        self.last_verification_passed = Some(passed);
+        passed
+    }
+
+    /// `run_verification_attempt`'s commands: the scoped one first, when
+    /// configured and something was touched, then the full one.
+    async fn run_verification_commands(
+        &mut self,
+        verification: &VerificationConfig,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> bool {
         if let Some(scoped) = verification.scoped.clone()
             && !self.verification_touched_paths.is_empty()
         {

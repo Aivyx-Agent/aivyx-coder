@@ -12,6 +12,10 @@ when every task in its list is done, when its budget runs out, when three
 turns in a row fail (the model server is down, say, or rejects every
 request), or when you stop it. If the model works without a task list, it's asked to write one —
 with the steps already done marked done — since that is how the run ends.
+The model marks its own tasks done, so a run can end "goal achieved" with the
+tests still failing (when it decides the rest is out of its hands, for
+example a failure the sandbox causes); the notice then adds that the last
+verification run failed.
 
 **It needs a way to check its work.** Autonomous mode only edits without
 asking because every batch of edits is tested. It uses your

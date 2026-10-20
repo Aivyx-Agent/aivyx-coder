@@ -4721,6 +4721,7 @@ async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip()
     let (mut agent, mut rx, mock) =
         build_agent(vec![write_call, text_response("done")], registry, 10);
     agent.set_verification("verify".to_string(), 3);
+    assert_eq!(agent.last_verification_passed(), None, "nothing has run yet");
 
     agent
         .run_turn("go".to_string(), dir.path(), CancellationToken::new())
@@ -4733,6 +4734,7 @@ async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip()
         !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
         "a passing verification must not surface a failure notice"
     );
+    assert_eq!(agent.last_verification_passed(), Some(true));
     assert_eq!(
         auto_verify_calls(&agent.history),
         1,
@@ -4938,6 +4940,11 @@ async fn a_failing_verification_feeds_back_and_retries_until_exhausted() {
     // unverified — the very next attempt to end a turn must re-check.
     assert_eq!(agent.verify_retries, 0);
     assert!(agent.unverified_edits);
+    // What `--auto`'s "goal achieved" notice reads to warn that the tests
+    // still fail; a new conversation forgets it.
+    assert_eq!(agent.last_verification_passed(), Some(false));
+    agent.clear_conversation();
+    assert_eq!(agent.last_verification_passed(), None);
 }
 
 #[tokio::test]
@@ -5194,6 +5201,39 @@ async fn run_scoped_verification_reports_failure_for_a_nonzero_exit() {
         .await;
 
     assert!(!passed);
+}
+
+/// The scoped run is confined like `run_command`, so its failures get the
+/// same sandbox note.
+#[cfg(feature = "sandbox-backend")]
+#[tokio::test]
+async fn a_sandboxed_scoped_verification_failure_gets_the_sandbox_note() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+
+    let scoped = ScopedVerificationConfig {
+        spec: CommandSpec {
+            name: "fake_scoped".to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            timeout: Duration::from_secs(5),
+        },
+        confiner: aivyx_sandbox::build_confiner(
+            &cwd,
+            &[],
+            &[],
+            aivyx_sandbox::ConfineOptions::new(),
+        ),
+    };
+
+    let passed = agent
+        .run_scoped_verification(scoped, &[], &cwd, &CancellationToken::new())
+        .await;
+
+    assert!(!passed);
+    let text = auto_verify_result_texts(&agent.history).last().cloned().unwrap();
+    assert!(text.ends_with(aivyx_tools::SANDBOX_FAILURE_NOTE), "{text}");
 }
 
 #[tokio::test]

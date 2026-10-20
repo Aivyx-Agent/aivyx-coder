@@ -233,8 +233,21 @@ fn plan_approval_message(
     }
 }
 
-fn goal_achieved_notice(iterations_used: u32) -> String {
-    format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)")
+/// `last_verification_passed` is `Agent::last_verification_passed`: the
+/// model decides the goal is achieved (its tasks are all done), not the
+/// tests, so a run can end that way with verification still failing --
+/// which the notice then says rather than reading as plain success.
+fn goal_achieved_notice(iterations_used: u32, last_verification_passed: Option<bool>) -> String {
+    let notice =
+        format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)");
+    if last_verification_passed == Some(false) {
+        format!(
+            "{notice} -- but the last verification run failed, so check the result before \
+             relying on it"
+        )
+    } else {
+        notice
+    }
 }
 
 fn injection_detected_notice(iterations_used: u32, finding: &InjectionFinding) -> String {
@@ -527,7 +540,10 @@ pub async fn run(
                     &open_specialist_sessions,
                 );
                 if next_message.is_none() {
-                    agent.notify(goal_achieved_notice(iterations_used));
+                    agent.notify(goal_achieved_notice(
+                        iterations_used,
+                        agent.last_verification_passed(),
+                    ));
                 }
             }
         } else {
@@ -3465,9 +3481,17 @@ mod tests {
 
     #[test]
     fn goal_achieved_notice_reports_iterations() {
-        let message = goal_achieved_notice(4);
-        assert!(message.contains("goal achieved"));
-        assert!(message.contains('4'));
+        for verified in [None, Some(true)] {
+            let message = goal_achieved_notice(4, verified);
+            assert_eq!(message, "autonomous run stopped: goal achieved after 4 iteration(s)");
+        }
+    }
+
+    #[test]
+    fn goal_achieved_notice_says_when_the_last_verification_failed() {
+        let message = goal_achieved_notice(2, Some(false));
+        assert!(message.starts_with("autonomous run stopped: goal achieved after 2"), "{message}");
+        assert!(message.contains("the last verification run failed"), "{message}");
     }
 
     #[test]
