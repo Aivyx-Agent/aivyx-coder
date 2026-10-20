@@ -8778,7 +8778,8 @@ async fn test_passes_streams_output_and_notes_it_for_the_model() {
 
 /// A sandboxed `/test` run that fails on a denied read tells the model
 /// the sandbox may be the cause -- even when the denial scrolled out of
-/// the tail the note keeps.
+/// the tail the note keeps. Any other failure gets the short line; a pass
+/// gets nothing.
 #[cfg(feature = "sandbox-backend")]
 #[tokio::test]
 async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
@@ -8798,6 +8799,11 @@ async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
     assert!(note.ends_with(aivyx_tools::SANDBOX_DENIAL_NOTE), "{note}");
 
     agent.set_tests(Some(sh_tests("echo broken; exit 1")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let note = agent.pending_notes.last().unwrap();
+    assert!(note.ends_with(aivyx_tools::SANDBOX_FAILURE_NOTE), "{note}");
+
+    agent.set_tests(Some(sh_tests("echo fine")));
     agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
     let note = agent.pending_notes.last().unwrap();
     assert!(!note.contains("note from aivyx-coder"), "{note}");

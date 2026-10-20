@@ -206,9 +206,10 @@ applied in the forked child before `exec`:
   Python's `tempfile`, ...) just work. `[sandbox] share_system_tmp = true`
   restores the old shared-`/tmp` grant for tools that hard-code `/tmp`.
   Every confined command gets `AIVYX_CODER_SANDBOX=landlock` in its
-  environment; when a confined `run_command`/`run_shell`/`/test` run fails
-  with a permission error in its output, the model is told the sandbox may
-  be the cause and not to change the code to work around it.
+  environment; every failed confined `run_command`/`run_shell`/`/test` run
+  tells the model the sandbox may be the cause and not to change the code
+  to work around it (in more detail when the output shows a permission
+  error).
 - **Read** access: the working directory + a bounded list of common
   system/toolchain paths (`/usr`, `/lib`, `/bin`, `/etc`, `~/.cargo`,
   `~/.rustup`) + any `sandbox.extra_read_paths` you configure — again minus

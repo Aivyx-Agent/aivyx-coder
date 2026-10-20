@@ -166,9 +166,9 @@ mod tests {
         assert!(tmpdir.contains("aivyx-confine-"), "{tmpdir}");
     }
 
-    /// A sandboxed command that fails on a denied read gets the note
+    /// A sandboxed command that fails on a denied read gets the full note
     /// telling the model the sandbox may be the cause; one that fails for
-    /// another reason, or succeeds despite a denial, doesn't.
+    /// another reason gets the short line; one that succeeds gets neither.
     #[cfg(feature = "sandbox-backend")]
     #[tokio::test]
     async fn a_sandbox_denial_is_called_out_to_the_model() {
@@ -198,8 +198,10 @@ mod tests {
         assert!(denied.contains("(failed)"), "{denied}");
         assert!(denied.contains(crate::SANDBOX_DENIAL_NOTE), "{denied}");
 
+        // The denial a test swallowed: no permission error in sight.
         let other_failure = run("echo broken >&2; exit 3").await;
-        assert!(!other_failure.contains("sandbox"), "{other_failure}");
+        assert!(other_failure.ends_with(crate::SANDBOX_FAILURE_NOTE), "{other_failure}");
+        assert!(!other_failure.contains(crate::SANDBOX_DENIAL_NOTE), "{other_failure}");
 
         let survived = run("ls /tmp || true").await;
         assert!(survived.contains("(success)"), "{survived}");

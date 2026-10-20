@@ -138,6 +138,27 @@ pub const SANDBOX_DENIAL_NOTE: &str = "note from aivyx-coder: this command ran i
      sandbox-caused; they can widen access ([sandbox] extra_read_paths or share_system_tmp in \
      config.toml) or skip that test.";
 
+/// The short line every other failed sandboxed run gets. A test can
+/// swallow the error the sandbox caused (just's `search::tests::not_found`
+/// prints only "No justfile found error was expected"), so a permission
+/// error in the output can't be the only trigger.
+pub const SANDBOX_FAILURE_NOTE: &str = "note from aivyx-coder: this command ran inside \
+     aivyx-coder's sandbox (no reading outside the project and system/toolchain directories, \
+     not even listing /tmp or /; no writing outside the project and its TMPDIR). If a failure \
+     could come from that restricted access rather than the code, say so instead of changing \
+     the code to work around it.";
+
+/// The note a sandboxed run gets, if any: none when it succeeded,
+/// `SANDBOX_DENIAL_NOTE` when it failed with a permission error in its
+/// output, `SANDBOX_FAILURE_NOTE` when it failed otherwise.
+pub fn sandbox_note(failed: bool, saw_permission_error: bool) -> Option<&'static str> {
+    match (failed, saw_permission_error) {
+        (false, _) => None,
+        (true, true) => Some(SANDBOX_DENIAL_NOTE),
+        (true, false) => Some(SANDBOX_FAILURE_NOTE),
+    }
+}
+
 /// Whether command output mentions a permission error (`EACCES` from
 /// Landlock, `EPERM` from seccomp) in any of the usual spellings.
 pub fn mentions_permission_error(text: &str) -> bool {
@@ -154,8 +175,8 @@ pub fn mentions_permission_error(text: &str) -> bool {
 }
 
 /// `run` for a command the model chose (`run_command`, `run_shell`):
-/// when it ran sandboxed (`aivyx_sandbox::is_sandboxed`), failed, and its
-/// output mentions a permission error, `SANDBOX_DENIAL_NOTE` is appended.
+/// when it ran sandboxed (`aivyx_sandbox::is_sandboxed`) and failed,
+/// `sandbox_note`'s note is appended.
 pub async fn run_noting_sandbox(
     command: tokio::process::Command,
     timeout: Duration,
@@ -164,18 +185,18 @@ pub async fn run_noting_sandbox(
     let sandboxed = aivyx_sandbox::is_sandboxed(&command);
     let output = run(command, timeout, cancellation).await?;
     Ok(match output {
-        ToolOutput::Ok(text) if sandboxed && needs_sandbox_note(&text) => {
-            ToolOutput::Ok(format!("{text}\n--- {SANDBOX_DENIAL_NOTE}"))
-        }
+        ToolOutput::Ok(text) if sandboxed => match note_for_output(&text) {
+            Some(note) => ToolOutput::Ok(format!("{text}\n--- {note}")),
+            None => ToolOutput::Ok(text),
+        },
         other => other,
     })
 }
 
-/// A failed run (see `format_output`'s first line) whose output mentions
-/// a permission error.
-fn needs_sandbox_note(text: &str) -> bool {
+/// `sandbox_note` for `format_output`'s text: failed per its first line.
+fn note_for_output(text: &str) -> Option<&'static str> {
     let failed = text.lines().next().is_some_and(|first| first.ends_with("(failed)"));
-    failed && mentions_permission_error(text)
+    sandbox_note(failed, mentions_permission_error(text))
 }
 
 /// `Command::output` for a confined command: spawns `command` as the
@@ -417,19 +438,23 @@ mod tests {
     }
 
     #[test]
-    fn the_sandbox_note_needs_a_failure_that_mentions_a_permission_error() {
+    fn a_failure_gets_the_denial_note_only_when_it_mentions_a_permission_error() {
         let failed = |body: &str| format!("exit status: 101 (failed)\n--- stdout ---\n{body}");
         for body in [
             "Io { directory: \"/tmp\", io_error: Os { code: 13, kind: PermissionDenied } }",
             "ls: cannot open directory '/tmp': Permission denied",
             "socket: Operation not permitted",
         ] {
-            assert!(needs_sandbox_note(&failed(body)), "{body}");
+            assert_eq!(note_for_output(&failed(body)), Some(SANDBOX_DENIAL_NOTE), "{body}");
         }
-        assert!(!needs_sandbox_note(&failed("assertion `left == right` failed")));
-        assert!(!needs_sandbox_note(
-            "exit status: 0 (success)\n--- stdout ---\nPermission denied, retried fine"
-        ));
+        assert_eq!(
+            note_for_output(&failed("No justfile found error was expected")),
+            Some(SANDBOX_FAILURE_NOTE)
+        );
+        assert_eq!(
+            note_for_output("exit status: 0 (success)\n--- stdout ---\nPermission denied, retried"),
+            None
+        );
     }
 
     #[test]

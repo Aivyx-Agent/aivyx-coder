@@ -308,11 +308,10 @@ impl Agent {
 
         let secs = started.elapsed().as_secs_f64();
         let failed = matches!(&outcome, Outcome::Exited(status) if !status.success());
-        let sandbox_note = if sandboxed && failed && saw_permission_error {
-            format!("\n{}", aivyx_tools::SANDBOX_DENIAL_NOTE)
-        } else {
-            String::new()
-        };
+        let sandbox_note = aivyx_tools::sandbox_note(failed, saw_permission_error)
+            .filter(|_| sandboxed)
+            .map(|note| format!("\n{note}"))
+            .unwrap_or_default();
         let summary = match outcome {
             Outcome::Exited(status) if status.success() => format!("Tests passed ({secs:.1} s)"),
             Outcome::Exited(status) => match status.code() {

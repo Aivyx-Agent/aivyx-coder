@@ -108,14 +108,17 @@ Deliberately not (yet) addressed — documented rather than hidden:
     tests in the configured test command (`-- --skip global::`), or run
     them yourself; granting read on `/` would expose every directory name
     on the machine.
-  - *The model is told when the sandbox may be the cause*: when a
-    confined `run_command`, `run_shell` or `/test` run fails and its
-    output mentions a permission error (`Permission denied`,
-    `Operation not permitted`, `os error 13`, ...), a note is added to
-    what the model reads: the failure may come from the sandbox, it
-    shouldn't change the code to work around it, and it should tell you
-    which failure looks sandbox-caused. Without it, models "fix" working
-    code to get past the sandbox. Confined commands also see
+  - *The model is told when the sandbox may be the cause*: every failed
+    confined `run_command`, `run_shell` or `/test` run ends with a short
+    line saying it ran in the sandbox and, if the failure could come from
+    the restricted access, to say so instead of changing the code. When
+    the output also mentions a permission error (`Permission denied`,
+    `Operation not permitted`, `os error 13`, ...), a fuller note asks
+    it to tell you which failure looks sandbox-caused. The short line is
+    there because a test can swallow the real error: `just`'s
+    `search::tests::not_found` prints only "No justfile found error was
+    expected". Without either, models "fix" working code to get past the
+    sandbox. Confined commands also see
     `AIVYX_CODER_SANDBOX=landlock` in their environment.
   - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put
     children in their own process groups (cargo-nextest's per-test process
