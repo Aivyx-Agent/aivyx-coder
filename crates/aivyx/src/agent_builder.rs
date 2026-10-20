@@ -370,11 +370,14 @@ fn render_skills_listing(
 /// building a full `BuiltAgent`.
 async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBackend>> {
     match settings.backend.kind {
-        BackendKind::Generic | BackendKind::LlamaServer => Ok(Arc::new(OpenAiCompatBackend::new(
-            settings.backend.base_url.clone(),
-            settings.backend.model.clone(),
-            settings.backend.api_key.clone(),
-        ))),
+        BackendKind::Generic | BackendKind::LlamaServer => Ok(Arc::new(
+            OpenAiCompatBackend::new(
+                settings.backend.base_url.clone(),
+                settings.backend.model.clone(),
+                settings.backend.api_key.clone(),
+            )
+            .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
+        )),
         BackendKind::LlamaServerBroker => {
             let broker_url = settings.backend.broker_base_url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -385,11 +388,14 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             })?;
             // aivyx-broker serves `/v1/chat/completions`; the documented
             // `broker_base_url` has no `/v1`, and one that does keeps it.
-            Ok(Arc::new(OpenAiCompatBackend::new(
-                crate::routing::chat_base_url(&broker_url),
-                settings.backend.model.clone(),
-                settings.backend.api_key.clone(),
-            )))
+            Ok(Arc::new(
+                OpenAiCompatBackend::new(
+                    crate::routing::chat_base_url(&broker_url),
+                    settings.backend.model.clone(),
+                    settings.backend.api_key.clone(),
+                )
+                .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
+            ))
         }
         #[cfg(feature = "provider-mistral-rs")]
         BackendKind::MistralRs => {
@@ -1866,6 +1872,39 @@ mod tests {
             .map(|r| r.url.path().to_string())
             .collect();
         assert_eq!(paths, ["/v1/chat/completions"]);
+    }
+
+    #[tokio::test]
+    async fn backend_reasoning_effort_reaches_every_openai_compatible_kind() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for kind in [BackendKind::Generic, BackendKind::LlamaServer, BackendKind::LlamaServerBroker]
+        {
+            for effort in [Some("medium"), None] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .mount(&server)
+                    .await;
+                let mut settings = Settings::default();
+                settings.backend.kind = kind;
+                settings.backend.base_url = format!("{}/v1", server.uri());
+                settings.backend.broker_base_url = Some(server.uri());
+                settings.backend.reasoning_effort = effort.map(str::to_string);
+                let backend = build_llm_backend(&settings).await.unwrap();
+                let _ = backend
+                    .stream_chat(aivyx_llm::ChatRequest::new(vec![
+                        aivyx_types::Message::text(aivyx_types::Role::User, "hi"),
+                    ]))
+                    .await;
+                let requests = server.received_requests().await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+                let sent = body.get("chat_template_kwargs").map(|k| &k["reasoning_effort"]);
+                assert_eq!(sent.and_then(|v| v.as_str()), effort, "{kind:?}");
+                assert_eq!(body.get("reasoning_effort").and_then(|v| v.as_str()), effort);
+            }
+        }
     }
 
     #[tokio::test]

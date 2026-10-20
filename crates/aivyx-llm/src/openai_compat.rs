@@ -42,6 +42,7 @@ pub struct OpenAiCompatBackend {
     http: reqwest::Client,
     idle_timeout: Duration,
     debug_log: Option<Arc<Mutex<std::fs::File>>>,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatBackend {
@@ -81,7 +82,14 @@ impl OpenAiCompatBackend {
             http,
             idle_timeout,
             debug_log: debug_log_from_env(),
+            reasoning_effort: None,
         }
+    }
+
+    /// Sends `effort` with every request (`[backend] reasoning_effort`).
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 }
 
@@ -155,7 +163,8 @@ impl LlmBackend for OpenAiCompatBackend {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
-        let wire_request = WireRequest::from_chat_request(&self.model, &request);
+        let wire_request = WireRequest::from_chat_request(&self.model, &request)
+            .with_reasoning_effort(self.reasoning_effort.as_deref());
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         if let Some(log) = &self.debug_log {
@@ -347,6 +356,18 @@ struct WireRequest {
     id_slot: Option<u32>,
     #[serde(rename = "aivyx_slot_hint", skip_serializing_if = "Option::is_none")]
     slot_hint: Option<WireSlotHint>,
+    /// Read by Ollama and vLLM; llama-server ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    /// Passed to the model's chat template by llama-server and vLLM;
+    /// Ollama ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<WireTemplateKwargs>,
+}
+
+#[derive(Serialize)]
+struct WireTemplateKwargs {
+    reasoning_effort: String,
 }
 
 #[derive(Serialize)]
@@ -392,7 +413,18 @@ impl WireRequest {
             max_tokens: request.max_tokens,
             id_slot: request.id_slot,
             slot_hint: request.slot_hint.as_ref().map(WireSlotHint::from),
+            reasoning_effort: None,
+            chat_template_kwargs: None,
         }
+    }
+
+    fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        if let Some(effort) = effort {
+            self.reasoning_effort = Some(effort.to_string());
+            self.chat_template_kwargs =
+                Some(WireTemplateKwargs { reasoning_effort: effort.to_string() });
+        }
+        self
     }
 }
 
@@ -699,6 +731,29 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(text)) if text == "answer"));
         assert!(matches!(&events[1], Ok(StreamEvent::ReasoningDelta(text)) if text == "thought"));
+    }
+
+    #[test]
+    fn wire_request_omits_reasoning_effort_when_unset() {
+        let wire = WireRequest::from_chat_request("test-model", &ChatRequest::new(vec![]))
+            .with_reasoning_effort(None);
+        let json = serde_json::to_value(&wire).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+        assert!(json.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn wire_request_sends_reasoning_effort_both_ways() {
+        // Live-test finding (2026-10-20): Qwen3.8-27B at its default
+        // `xhigh` effort spent a 90-minute run thinking (3/13 hidden
+        // tests); at `medium` it passed 13/13 in 26 minutes. llama-server
+        // only honours the value inside chat_template_kwargs, Ollama only
+        // as the top-level field.
+        let wire = WireRequest::from_chat_request("test-model", &ChatRequest::new(vec![]))
+            .with_reasoning_effort(Some("medium"));
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["reasoning_effort"], "medium");
+        assert_eq!(json["chat_template_kwargs"], serde_json::json!({"reasoning_effort": "medium"}));
     }
 
     #[test]

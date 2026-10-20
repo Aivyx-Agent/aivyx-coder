@@ -46,6 +46,7 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `mistralrs_model_file` | string |  | Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
 | `mistralrs_chat_template_path` | string |  | Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
 | `mistralrs_constrain_tool_calls` | bool |  | Reserved for grammar-constrained tool calls in the embedded engine; not used yet. |
+| `reasoning_effort` | string |  | How hard a reasoning model thinks before it answers, e.g. `"medium"`. |
 
 ### `[routing]`
 

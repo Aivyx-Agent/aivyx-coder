@@ -897,6 +897,19 @@ pub struct BackendSettings {
     /// lands. Default off.
     #[serde(default)]
     pub mistralrs_constrain_tool_calls: bool,
+    /// How hard a reasoning model thinks before it answers, e.g.
+    /// `"medium"`. Unset (the default), the model uses its own default,
+    /// which for some models (Qwen3.8's `xhigh`) is far slower than an
+    /// unattended run can afford. Sent with every chat request, both as
+    /// the top-level `reasoning_effort` field (Ollama, vLLM) and in
+    /// `chat_template_kwargs` (llama-server, vLLM), which hands it to the
+    /// model's chat template. The valid values are the model's own (see
+    /// its model card); a value its template rejects fails the request
+    /// with the server's error. Applies to this `[backend]` model only,
+    /// not to `[architect]`, `[council]` or other routed models, and not
+    /// to `kind = "mistral_rs"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Phase kvcache-adoption — which local-LLM backend server this config
@@ -960,6 +973,7 @@ impl Default for BackendSettings {
             mistralrs_model_file: None,
             mistralrs_chat_template_path: None,
             mistralrs_constrain_tool_calls: false,
+            reasoning_effort: None,
         }
     }
 }

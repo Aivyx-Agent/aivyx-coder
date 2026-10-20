@@ -92,6 +92,29 @@ disabled, the aivyx edit benchmark went from 0/3 on affected tasks to
 this model class and costs both latency and, on llama-server, silent
 no-op turns.
 
+#### Reasoning effort
+
+Newer reasoning models instead take an effort level, and their default
+can be far too slow for agent work. Measured here with Qwen3.8-27B on an
+RTX 4090: at its default `xhigh`, an `--auto` build ran out of a 90-minute
+budget after four turns (one reply alone was 50k tokens); at `medium` it
+finished the same job, correctly, in 26 minutes. Set it per model in the
+config:
+
+```toml
+[backend]
+reasoning_effort = "medium"
+```
+
+aivyx-coder sends it with every request, both as `reasoning_effort` and
+in `chat_template_kwargs`, so it reaches the chat template on
+llama-server and vLLM and the effort setting on Ollama. The valid values
+are the model's own — Qwen3.8 takes `xhigh`, `medium` and `low` — and a
+value the template rejects fails the request with the server's error. A
+model whose template has no effort setting ignores it; for Qwen3.5 and
+earlier, use `enable_thinking` above instead. It applies to the
+`[backend]` model only.
+
 Prefer GGUFs from HuggingFace (`-hf repo:QUANT` downloads and caches
 them). Reusing Ollama's blob files directly (`ollama show --modelfile`
 reveals the path) sometimes works but is **not reliable**: Ollama's fork
