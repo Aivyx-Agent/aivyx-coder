@@ -8,8 +8,9 @@ aivyx-coder --auto "make the CSV parser handle quoted newlines"
 
 aivyx-coder works toward the goal without asking you. The terminal UI stays
 open so you can watch, and **Ctrl+C** stops it at any point. The run ends
-when every task in its list is done, when its budget runs out, or when you
-stop it. If the model works without a task list, it's asked to write one —
+when every task in its list is done, when its budget runs out, when three
+turns in a row fail (the model server is down, say, or rejects every
+request), or when you stop it. If the model works without a task list, it's asked to write one —
 with the steps already done marked done — since that is how the run ends.
 
 **It needs a way to check its work.** Autonomous mode only edits without

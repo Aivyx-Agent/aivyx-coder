@@ -150,6 +150,28 @@ fn cancel_at_deadline(
     (deadline_hit, timer)
 }
 
+/// Failed turns in a row that end an autonomous run. More than one, so a
+/// model server that is restarting doesn't end it; without a limit, a
+/// request the server always rejects (a `[backend] reasoning_effort` the
+/// model's template doesn't accept, say) used up every iteration in
+/// seconds and was reported as the budget running out.
+const MAX_FAILED_TURNS_IN_A_ROW: u32 = 3;
+
+/// `Some(notice)` once `failed_in_a_row` reaches
+/// `MAX_FAILED_TURNS_IN_A_ROW`.
+fn failed_turns_notice(
+    failed_in_a_row: u32,
+    iterations_used: u32,
+    error: &aivyx_core::AgentError,
+) -> Option<String> {
+    (failed_in_a_row >= MAX_FAILED_TURNS_IN_A_ROW).then(|| {
+        format!(
+            "autonomous run stopped: {failed_in_a_row} turns in a row failed, after \
+             {iterations_used} iteration(s) — {error}"
+        )
+    })
+}
+
 fn cancelled_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: cancelled by user after {iterations_used} iteration(s)")
 }
@@ -433,6 +455,7 @@ pub async fn run(
             // scope).
             let deadline = Instant::now() + autonomous.max_duration;
             let mut iterations_used = 0u32;
+            let mut failed_in_a_row = 0u32;
             let mut next_message = Some(autonomous.goal.clone());
             // Kept by the agent too: compaction can drop the turn that
             // carried it, and there's no one to ask to restate it.
@@ -447,7 +470,7 @@ pub async fn run(
                 let cancellation = CancellationToken::new();
                 *background_cancellation.lock().unwrap() = Some(cancellation.clone());
                 let (deadline_hit, timer) = cancel_at_deadline(deadline, cancellation.clone());
-                let _ = agent.run_turn(message, &cwd, cancellation.clone()).await;
+                let outcome = agent.run_turn(message, &cwd, cancellation.clone()).await;
                 timer.abort();
                 *background_cancellation.lock().unwrap() = None;
 
@@ -461,6 +484,18 @@ pub async fn run(
                     // send another message.
                     agent.notify(cancelled_notice(iterations_used));
                     break;
+                }
+                match &outcome {
+                    Ok(()) => failed_in_a_row = 0,
+                    Err(error) => {
+                        failed_in_a_row += 1;
+                        if let Some(notice) =
+                            failed_turns_notice(failed_in_a_row, iterations_used, error)
+                        {
+                            agent.notify(notice);
+                            break;
+                        }
+                    }
                 }
                 // Still load-bearing after `run_turn`'s own internal
                 // tool-call loop gained a mid-turn taint check of its own
@@ -3017,6 +3052,21 @@ mod tests {
         assert!(message.contains("budget exhausted"));
         assert!(message.contains('5'));
         assert!(message.contains("2/3 tasks done"));
+    }
+
+    #[test]
+    fn failed_turns_notice_waits_for_three_failures_in_a_row() {
+        // Live-test finding (2026-10-20): with a reasoning_effort the
+        // model's template rejected, every request failed and --auto used
+        // all 30 iterations in four seconds, then reported "budget
+        // exhausted".
+        let error = aivyx_core::AgentError::ResponseTooLarge;
+        assert_eq!(failed_turns_notice(1, 1, &error), None);
+        assert_eq!(failed_turns_notice(2, 5, &error), None);
+        let notice = failed_turns_notice(3, 6, &error).unwrap();
+        assert!(notice.starts_with("autonomous run stopped: 3 turns in a row failed"), "{notice}");
+        assert!(notice.contains("after 6 iteration(s)"), "{notice}");
+        assert!(notice.contains(&error.to_string()), "{notice}");
     }
 
     #[test]
