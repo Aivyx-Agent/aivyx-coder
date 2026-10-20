@@ -118,7 +118,8 @@ impl Default for VerificationSettings {
 pub struct AutonomousSettings {
     /// Total "continue" round-trips for the whole autonomous run.
     pub max_iterations: u32,
-    /// Wall-clock ceiling, in seconds, for the whole autonomous run.
+    /// Wall-clock ceiling, in seconds, for the whole autonomous run. A turn
+    /// still running when it passes is stopped.
     pub max_duration_secs: u64,
 }
 

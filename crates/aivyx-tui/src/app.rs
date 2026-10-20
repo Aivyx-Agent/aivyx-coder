@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -124,6 +125,29 @@ fn budget_exhausted_notice(iterations_used: u32, tasks: &[Task]) -> String {
          ({done_count}/{} tasks done)",
         tasks.len()
     )
+}
+
+/// Cancels `cancellation` once `deadline` passes, so a single long turn
+/// (up to its tool-call cap, each verification retry allowed its own
+/// command timeout) can't run past `[autonomous] max_duration_secs` — the
+/// driver loop only checks the deadline between turns. The flag is true
+/// only if the deadline did the cancelling, so the stop is reported as
+/// the budget running out, not as the user's Ctrl+C. Abort the returned
+/// task once the turn ends.
+fn cancel_at_deadline(
+    deadline: Instant,
+    cancellation: CancellationToken,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let deadline_hit = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&deadline_hit);
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline.into()).await;
+        if !cancellation.is_cancelled() {
+            flag.store(true, Ordering::SeqCst);
+            cancellation.cancel();
+        }
+    });
+    (deadline_hit, timer)
 }
 
 fn cancelled_notice(iterations_used: u32) -> String {
@@ -422,9 +446,16 @@ pub async fn run(
                 iterations_used += 1;
                 let cancellation = CancellationToken::new();
                 *background_cancellation.lock().unwrap() = Some(cancellation.clone());
+                let (deadline_hit, timer) = cancel_at_deadline(deadline, cancellation.clone());
                 let _ = agent.run_turn(message, &cwd, cancellation.clone()).await;
+                timer.abort();
                 *background_cancellation.lock().unwrap() = None;
 
+                if deadline_hit.load(Ordering::SeqCst) {
+                    let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
+                    agent.notify(budget_exhausted_notice(iterations_used, &tasks_snapshot));
+                    break;
+                }
                 if cancellation.is_cancelled() {
                     // The user hit Ctrl+C wanting this to stop — do not
                     // send another message.
@@ -2992,6 +3023,39 @@ mod tests {
     fn budget_exhausted_notice_handles_no_tasks_ever_set() {
         let message = budget_exhausted_notice(3, &[]);
         assert!(message.contains("0/0 tasks done"));
+    }
+
+    #[tokio::test]
+    async fn the_deadline_cancels_a_turn_still_running_when_it_passes() {
+        // Live-test finding (2026-10-20): max_duration_secs was checked only
+        // between turns, so one long turn ran past it until killed from outside.
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let (deadline_hit, _timer) = cancel_at_deadline(deadline, cancellation.clone());
+        tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .expect("the turn's token must be cancelled once the deadline passes");
+        assert!(deadline_hit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_user_cancel_before_the_deadline_is_not_reported_as_the_deadline() {
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (deadline_hit, timer) = cancel_at_deadline(deadline, cancellation.clone());
+        cancellation.cancel();
+        timer.abort();
+        assert!(!deadline_hit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_already_passed_deadline_cancels_at_once() {
+        let cancellation = CancellationToken::new();
+        let (deadline_hit, _timer) = cancel_at_deadline(Instant::now(), cancellation.clone());
+        tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .expect("a passed deadline must cancel immediately");
+        assert!(deadline_hit.load(Ordering::SeqCst));
     }
 
     #[test]

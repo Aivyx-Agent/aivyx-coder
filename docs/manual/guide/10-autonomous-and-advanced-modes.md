@@ -51,6 +51,9 @@ max_iterations = 20       # "continue" round trips for the whole run
 max_duration_secs = 3600  # wall-clock limit
 ```
 
+The time limit is exact: a turn still running when it passes is stopped,
+the same way Ctrl+C stops it, and the run reports the budget exhausted.
+
 Not with `--plan` or `--resume`, and not over ACP yet.
 
 ## Plan with a bigger model — `/architect`
