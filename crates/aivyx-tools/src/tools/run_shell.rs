@@ -9,7 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::process::run;
+use crate::process::run_noting_sandbox;
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 /// Applied to any command not covered by a per-command `timeout` in a
@@ -93,7 +93,7 @@ impl Tool for RunShellTool {
             .kill_on_drop(true);
         let command = ctx.confiner.confine(command);
 
-        run(command, SHELL_TIMEOUT, ctx.cancellation.clone()).await
+        run_noting_sandbox(command, SHELL_TIMEOUT, ctx.cancellation.clone()).await
     }
 }
 
@@ -164,6 +164,59 @@ mod tests {
             .find_map(|l| l.strip_prefix("tmpdir="))
             .expect("TMPDIR printed");
         assert!(tmpdir.contains("aivyx-confine-"), "{tmpdir}");
+    }
+
+    /// A sandboxed command that fails on a denied read gets the note
+    /// telling the model the sandbox may be the cause; one that fails for
+    /// another reason, or succeeds despite a denial, doesn't.
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn a_sandbox_denial_is_called_out_to_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let ctx = ToolExecutionContext {
+            cwd: cwd.clone(),
+            confiner: aivyx_sandbox::build_confiner(
+                &cwd,
+                &[],
+                &[],
+                aivyx_sandbox::ConfineOptions::new(),
+            ),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let run = |script: &'static str| {
+            let ctx = &ctx;
+            async move {
+                let output = RunShellTool.execute(json!({ "command": script }), ctx).await;
+                let Ok(ToolOutput::Ok(text)) = output else { panic!("expected Ok output") };
+                text
+            }
+        };
+
+        // Listing /tmp is denied confined -- the live failure this is for.
+        let denied = run("ls /tmp").await;
+        assert!(denied.contains("(failed)"), "{denied}");
+        assert!(denied.contains(crate::SANDBOX_DENIAL_NOTE), "{denied}");
+
+        let other_failure = run("echo broken >&2; exit 3").await;
+        assert!(!other_failure.contains("sandbox"), "{other_failure}");
+
+        let survived = run("ls /tmp || true").await;
+        assert!(survived.contains("(success)"), "{survived}");
+        assert!(!survived.contains("note from aivyx-coder"), "{survived}");
+    }
+
+    /// Unconfined (`NoopConfiner`), a permission error is just output:
+    /// the sandbox can't have caused it.
+    #[tokio::test]
+    async fn an_unconfined_permission_error_gets_no_sandbox_note() {
+        let ToolOutput::Ok(text) =
+            run_tool("echo 'Permission denied (os error 13)' >&2; exit 1").await.unwrap()
+        else {
+            panic!("expected Ok output")
+        };
+        assert!(text.contains("(failed)"), "{text}");
+        assert!(!text.contains("note from aivyx-coder"), "{text}");
     }
 
     #[tokio::test]

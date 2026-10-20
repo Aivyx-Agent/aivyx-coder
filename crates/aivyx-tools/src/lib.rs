@@ -53,7 +53,8 @@ pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use path_resolve::resolve;
 pub use process::{
-    CommandSpec, ProcessGroup, kill_all_process_groups, kill_process_group, output_in_group, run,
+    CommandSpec, ProcessGroup, SANDBOX_DENIAL_NOTE, kill_all_process_groups, kill_process_group,
+    mentions_permission_error, output_in_group, run, run_noting_sandbox,
 };
 pub use tools::{
     CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GenerateImageTool,

@@ -76,10 +76,43 @@ fn build_confiner_with_parent_env(
 ) -> Arc<dyn ExecutionConfiner> {
     let restore = options.allow_unix_sockets;
     let inner = default_confiner_with_options(cwd, extra_read_paths, deny_paths, options);
-    if restore {
+    let inner = if restore {
         Arc::new(RestoreSessionIpcEnv { inner, parent_env })
     } else {
         inner
+    };
+    if cfg!(feature = "sandbox-backend") {
+        Arc::new(MarkSandboxed { inner })
+    } else {
+        inner
+    }
+}
+
+/// Set (to `"landlock"`) on every command `build_confiner` confines in a
+/// build with the real sandbox, so a caller can tell afterwards that a
+/// failure may be the sandbox's doing (see `is_sandboxed`), and the
+/// command itself can tell it runs confined.
+pub const SANDBOX_ENV: &str = "AIVYX_CODER_SANDBOX";
+
+/// Whether `command` was confined by `build_confiner`'s real sandbox
+/// (it carries `SANDBOX_ENV`). `false` for `NoopConfiner` and for builds
+/// without `sandbox-backend`.
+pub fn is_sandboxed(command: &tokio::process::Command) -> bool {
+    command
+        .as_std()
+        .get_envs()
+        .any(|(key, value)| key == SANDBOX_ENV && value.is_some())
+}
+
+struct MarkSandboxed {
+    inner: Arc<dyn ExecutionConfiner>,
+}
+
+impl ExecutionConfiner for MarkSandboxed {
+    fn confine(&self, command: tokio::process::Command) -> tokio::process::Command {
+        let mut command = self.inner.confine(command);
+        command.env(SANDBOX_ENV, "landlock");
+        command
     }
 }
 
@@ -1052,6 +1085,35 @@ mod build_confiner_tests {
             echo_ipc_env(confiner.as_ref(), &cwd, Some("/explicit")).await,
             "/explicit|:0"
         );
+    }
+
+    #[test]
+    fn only_the_real_sandbox_marks_its_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for options in [ConfineOptions::new(), ConfineOptions::new().allow_unix_sockets(true)] {
+            let confiner = build_confiner_with_parent_env(&cwd, &[], &[], options, parent(&[]));
+            let command = confiner.confine(tokio::process::Command::new("true"));
+            assert_eq!(is_sandboxed(&command), cfg!(feature = "sandbox-backend"));
+        }
+        let plain = NoopConfiner.confine(tokio::process::Command::new("true"));
+        assert!(!is_sandboxed(&plain));
+    }
+
+    #[cfg(feature = "sandbox-backend")]
+    #[tokio::test]
+    async fn a_confined_command_can_see_it_is_sandboxed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let confiner =
+            build_confiner_with_parent_env(&cwd, &[], &[], ConfineOptions::new(), parent(&[]));
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "printf '%s' \"$AIVYX_CODER_SANDBOX\""])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null());
+        let output = confiner.confine(command).output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "landlock");
     }
 
     #[tokio::test]

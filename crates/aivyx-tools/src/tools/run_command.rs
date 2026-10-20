@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::process::{CommandSpec, run};
+use crate::process::{CommandSpec, run_noting_sandbox};
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -117,7 +117,7 @@ impl Tool for RunCommandTool {
             .kill_on_drop(true);
         let command = ctx.confiner.confine(command);
 
-        run(command, spec.timeout, ctx.cancellation.clone()).await
+        run_noting_sandbox(command, spec.timeout, ctx.cancellation.clone()).await
     }
 }
 

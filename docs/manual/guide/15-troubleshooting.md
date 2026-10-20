@@ -102,11 +102,21 @@ Deliberately not (yet) addressed — documented rather than hidden:
     the project's parents. A tool that walks upward looking for a config
     file fails with `Permission denied` on the first directory it can't
     list. For example, `just`'s own test suite does this from temp
-    directories, and fails confined in `global::*` and `init::*`.
+    directories, and fails confined in `global::*`, `init::*` and
+    `search::tests::not_found`.
     `extra_read_paths` doesn't help once the walk reaches `/`. Skip those
     tests in the configured test command (`-- --skip global::`), or run
     them yourself; granting read on `/` would expose every directory name
     on the machine.
+  - *The model is told when the sandbox may be the cause*: when a
+    confined `run_command`, `run_shell` or `/test` run fails and its
+    output mentions a permission error (`Permission denied`,
+    `Operation not permitted`, `os error 13`, ...), a note is added to
+    what the model reads: the failure may come from the sandbox, it
+    shouldn't change the code to work around it, and it should tell you
+    which failure looks sandbox-caused. Without it, models "fix" working
+    code to get past the sandbox. Confined commands also see
+    `AIVYX_CODER_SANDBOX=landlock` in their environment.
   - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put
     children in their own process groups (cargo-nextest's per-test process
     groups, Python's `start_new_session=True`, the `setsid` tool,

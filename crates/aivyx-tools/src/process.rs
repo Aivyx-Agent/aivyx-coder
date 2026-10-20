@@ -124,6 +124,60 @@ pub async fn run(
     }
 }
 
+/// What the model is told when a sandboxed command fails with a
+/// permission error: it can't otherwise tell a failure the sandbox
+/// caused from a real bug, and "fixes" the code to work around its own
+/// environment (a live run did exactly that to a project's justfile
+/// search, which failed only because `/tmp` isn't listable confined).
+pub const SANDBOX_DENIAL_NOTE: &str = "note from aivyx-coder: this command ran inside \
+     aivyx-coder's sandbox and its output mentions a permission error. The sandbox lets \
+     commands read only the project, toolchain and system directories, and write only the \
+     project and a private TMPDIR -- even listing /tmp or / is denied -- and blocks some \
+     system calls. A failure that happens only because of the sandbox is not a bug in this \
+     code: don't change the code to work around it. Tell the user which failure looks \
+     sandbox-caused; they can widen access ([sandbox] extra_read_paths or share_system_tmp in \
+     config.toml) or skip that test.";
+
+/// Whether command output mentions a permission error (`EACCES` from
+/// Landlock, `EPERM` from seccomp) in any of the usual spellings.
+pub fn mentions_permission_error(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "Permission denied",
+        "PermissionDenied",
+        "permission denied",
+        "Operation not permitted",
+        "os error 13",
+        "EACCES",
+        "EPERM",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+/// `run` for a command the model chose (`run_command`, `run_shell`):
+/// when it ran sandboxed (`aivyx_sandbox::is_sandboxed`), failed, and its
+/// output mentions a permission error, `SANDBOX_DENIAL_NOTE` is appended.
+pub async fn run_noting_sandbox(
+    command: tokio::process::Command,
+    timeout: Duration,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput, ToolError> {
+    let sandboxed = aivyx_sandbox::is_sandboxed(&command);
+    let output = run(command, timeout, cancellation).await?;
+    Ok(match output {
+        ToolOutput::Ok(text) if sandboxed && needs_sandbox_note(&text) => {
+            ToolOutput::Ok(format!("{text}\n--- {SANDBOX_DENIAL_NOTE}"))
+        }
+        other => other,
+    })
+}
+
+/// A failed run (see `format_output`'s first line) whose output mentions
+/// a permission error.
+fn needs_sandbox_note(text: &str) -> bool {
+    let failed = text.lines().next().is_some_and(|first| first.ends_with("(failed)"));
+    failed && mentions_permission_error(text)
+}
+
 /// `Command::output` for a confined command: spawns `command` as the
 /// leader of its own process group, collects whatever stdout/stderr the
 /// caller piped (an unpiped stream comes back empty; stdin is the
@@ -360,6 +414,22 @@ mod tests {
         let result = format_stream(b"END_MARKER".to_vec(), MAX_OUTPUT_BYTES + 10);
         assert!(result.contains("truncated"));
         assert!(result.ends_with("END_MARKER"));
+    }
+
+    #[test]
+    fn the_sandbox_note_needs_a_failure_that_mentions_a_permission_error() {
+        let failed = |body: &str| format!("exit status: 101 (failed)\n--- stdout ---\n{body}");
+        for body in [
+            "Io { directory: \"/tmp\", io_error: Os { code: 13, kind: PermissionDenied } }",
+            "ls: cannot open directory '/tmp': Permission denied",
+            "socket: Operation not permitted",
+        ] {
+            assert!(needs_sandbox_note(&failed(body)), "{body}");
+        }
+        assert!(!needs_sandbox_note(&failed("assertion `left == right` failed")));
+        assert!(!needs_sandbox_note(
+            "exit status: 0 (success)\n--- stdout ---\nPermission denied, retried fine"
+        ));
     }
 
     #[test]

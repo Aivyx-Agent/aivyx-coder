@@ -8776,6 +8776,47 @@ async fn test_passes_streams_output_and_notes_it_for_the_model() {
     );
 }
 
+/// A sandboxed `/test` run that fails on a denied read tells the model
+/// the sandbox may be the cause -- even when the denial scrolled out of
+/// the tail the note keeps.
+#[cfg(feature = "sandbox-backend")]
+#[tokio::test]
+async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let confiner =
+        aivyx_sandbox::build_confiner(&cwd, &[], &[], aivyx_sandbox::ConfineOptions::new());
+    let executor = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAllGate), confiner);
+    let (tx, _rx) = unbounded_channel();
+    let mut agent = Agent::new(Arc::new(PanickingBackend), executor, "system",
+        AgentConfig::default(), Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+
+    agent.set_tests(Some(sh_tests("ls /tmp; seq 1 200; exit 1")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let note = agent.pending_notes.last().unwrap();
+    assert!(!note.contains("Permission denied"), "scrolled out of the tail: {note}");
+    assert!(note.ends_with(aivyx_tools::SANDBOX_DENIAL_NOTE), "{note}");
+
+    agent.set_tests(Some(sh_tests("echo broken; exit 1")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let note = agent.pending_notes.last().unwrap();
+    assert!(!note.contains("note from aivyx-coder"), "{note}");
+}
+
+/// Unconfined, a permission error in test output can't be the sandbox's.
+#[tokio::test]
+async fn unconfined_test_failure_gets_no_sandbox_note() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let (mut agent, _rx) = undo_agent_with_events(&cwd, false).await;
+    agent.set_tests(Some(sh_tests("echo 'Permission denied (os error 13)'; exit 1")));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let note = agent.pending_notes.last().unwrap();
+    assert!(note.contains("Permission denied"), "{note}");
+    assert!(!note.contains("note from aivyx-coder"), "{note}");
+}
+
 #[tokio::test]
 async fn test_failure_reports_the_exit_code() {
     let dir = tempfile::tempdir().unwrap();
