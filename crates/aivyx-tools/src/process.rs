@@ -209,14 +209,40 @@ pub struct ProcessGroup {
 
 impl ProcessGroup {
     pub fn of(child: &tokio::process::Child) -> Self {
-        Self { pgid: child.id() }
+        let pgid = child.id();
+        if let Some(pgid) = pgid {
+            live_groups().insert(pgid);
+        }
+        Self { pgid }
     }
 
     /// Kills the group if it hasn't been killed already.
     pub fn kill(&mut self) {
         if let Some(pgid) = self.pgid.take() {
+            live_groups().remove(&pgid);
             kill_process_group(pgid);
         }
+    }
+}
+
+/// Every group a `ProcessGroup` still owns, so they can be killed even when
+/// the owners never get dropped — the process ending on a signal.
+static LIVE_GROUPS: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn live_groups() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<u32>> {
+    LIVE_GROUPS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Kills every process group a `ProcessGroup` still owns. For a process
+/// about to exit on a signal (`SIGTERM`, or `SIGHUP` when its terminal
+/// goes away): it never unwinds, so no `ProcessGroup` is dropped, and a
+/// running command — a test binary stuck in a loop — would otherwise
+/// outlive it indefinitely, reparented to init.
+pub fn kill_all_process_groups() {
+    let groups = std::mem::take(&mut *live_groups());
+    for pgid in groups {
+        kill_process_group(pgid);
     }
 }
 

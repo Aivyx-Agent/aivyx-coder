@@ -52,7 +52,9 @@ pub fn deny_aware_pathspecs(dir: &Path, deny: &[PathBuf]) -> Vec<String> {
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
 pub use path_resolve::resolve;
-pub use process::{CommandSpec, ProcessGroup, kill_process_group, output_in_group, run};
+pub use process::{
+    CommandSpec, ProcessGroup, kill_all_process_groups, kill_process_group, output_in_group, run,
+};
 pub use tools::{
     CoderTextCompleter, DeleteFileTool, EditFileTool, FindReferencesTool, GenerateImageTool,
     GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool, GitBranchTool, GitCommitTool, GitPrTool,

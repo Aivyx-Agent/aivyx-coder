@@ -656,6 +656,30 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// On `SIGTERM`, or `SIGHUP` when the terminal goes away, kills every
+/// command still running and exits. The process ends without unwinding, so
+/// no `ProcessGroup` gets dropped: without this a running `cargo test` — a
+/// test binary stuck in a loop — outlived aivyx-coder indefinitely
+/// (live-test finding, 2026-10-20). `SIGKILL` can't be caught; it still
+/// orphans whatever was running.
+fn spawn_exit_signal_handler() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut terminate), Ok(mut hangup)) =
+        (signal(SignalKind::terminate()), signal(SignalKind::hangup()))
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        // The shell's convention for "ended by signal N": 128 + N.
+        let code = tokio::select! {
+            _ = terminate.recv() => 128 + 15,
+            _ = hangup.recv() => 128 + 1,
+        };
+        aivyx_tools::kill_all_process_groups();
+        std::process::exit(code);
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -665,6 +689,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Command::Pack { action }) = cli.command {
         return run_pack(action);
     }
+
+    spawn_exit_signal_handler();
 
     // Must run before Settings::load()'s own first-run-writes-defaults
     // behavior could otherwise fire silently -- the wizard is specifically

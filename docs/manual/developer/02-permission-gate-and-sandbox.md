@@ -68,7 +68,9 @@ Linux-only, behind the default-on `sandbox-backend` feature;
 - **Process groups** — every confined spawn leads its own group, owned by an
   `aivyx_tools::ProcessGroup` that kills it on finish, timeout, cancel or
   drop. Use `aivyx_tools::run` / `output_in_group`, never a bare
-  `.output()` on a confined command.
+  `.output()` on a confined command. Live groups are also recorded in a
+  process-wide registry; the binary's `SIGTERM`/`SIGHUP` handler kills them
+  all with `kill_all_process_groups` before exiting, since nothing unwinds.
 - **`require_enforcement`** is checked twice, fail-closed when true: the
   parent failing to build the ruleset, and the child seeing
   `RulesetStatus::NotEnforced`. `PartiallyEnforced` (an older kernel ABI) is

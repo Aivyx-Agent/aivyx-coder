@@ -200,7 +200,11 @@ hypothetical, since the shipped `aarch64-apple-darwin` release binary
   own an `aivyx_tools::ProcessGroup` (recorded right after `spawn()`,
   kills the group on finish/timeout/cancel/drop). Use
   `aivyx_tools::run` or `aivyx_tools::output_in_group` rather than a bare
-  `.output()`/`.status()` on a confined command.
+  `.output()`/`.status()` on a confined command. Every live group is also
+  in a process-wide registry: `main`'s `SIGTERM`/`SIGHUP` handler
+  (`spawn_exit_signal_handler`) kills them all via
+  `aivyx_tools::kill_all_process_groups` before exiting, since a signal
+  exit drops nothing. `SIGKILL` still orphans them.
 - **`sandbox.require_enforcement`** is checked at *two* points, both
   fail-closed when `true` / fail-open (log + run unconfined) when `false`:
   the parent failing to build the Landlock ruleset at all, and the forked

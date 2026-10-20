@@ -240,6 +240,9 @@ applied in the forked child before `exec`:
   `SIGKILL` when the call **finishes**, times out or is cancelled — so a
   `cargo run &` or a daemonising grandchild never outlives the tool call,
   and a background job holding the output pipe doesn't stall it either.
+  If aivyx-coder itself is stopped by `SIGTERM`, or by `SIGHUP` when its
+  terminal closes, it kills every group still running before it exits.
+  `SIGKILL` can't be caught, so it still leaves them running.
   Commands also can't signal processes outside their own sandbox (Landlock
   ABI 6+), including aivyx-coder and servers an earlier command started.
 
