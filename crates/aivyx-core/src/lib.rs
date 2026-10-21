@@ -7,6 +7,7 @@ pub mod delegate;
 pub mod delegate_to_specialist;
 pub mod edit_blocks;
 pub mod editor_context;
+mod failing_tests;
 pub mod mission_tools;
 pub mod routing_commands;
 pub mod session;

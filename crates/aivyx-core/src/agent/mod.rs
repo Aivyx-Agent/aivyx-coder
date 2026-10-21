@@ -26,6 +26,8 @@ use crate::specialist_sessions::SpecialistSessionPool;
 use crate::undo::TurnMark;
 
 mod change_commands;
+mod progress_check;
+use progress_check::kept_edits_notice;
 mod session_commands;
 mod test_command;
 #[cfg(test)]
@@ -3343,31 +3345,47 @@ impl Agent {
                     if self.autonomous_mode.active()
                         && let Some(pre_experiment_ref) = self.pre_experiment_ref.take()
                     {
-                        match self
-                            .executor
-                            .restore_to_checkpoint(&pre_experiment_ref, &cancellation)
+                        // Discard only edits that didn't help: a round that
+                        // fixed failing tests and broke none is kept even
+                        // though something that failed before it still does
+                        // (live finding, 2026-10-21: correct fixes to three
+                        // bugs were thrown away over a test that fails only
+                        // inside the sandbox).
+                        if let Some(progress) = self
+                            .edits_made_progress(&pre_experiment_ref, cwd, &cancellation)
                             .await
                         {
-                            Ok(()) => {
-                                self.unverified_edits = false;
-                                self.verification_touched_paths.clear();
-                                self.emit(AgentEvent::Error(format!(
-                                    "{failing} — discarded this round of edits and restored the \
-                                     worktree to the pre-experiment checkpoint."
-                                )));
-                            }
-                            Err(err) => {
-                                // Rewind itself failed (e.g. a git error) —
-                                // fall back to interactive mode's behavior:
-                                // leave the state as-is and say so loudly,
-                                // rather than silently pretending the
-                                // discard happened.
-                                self.emit(AgentEvent::Error(format!(
-                                    "{failing}, and the automatic discard/rewind itself failed \
-                                     ({err}) — ending the turn with the worktree left as-is. The \
-                                     worktree was checkpointed before each edit; `git log \
-                                     refs/aivyx/checkpoints/` to inspect or rewind manually."
-                                )));
+                            self.unverified_edits = false;
+                            self.verification_touched_paths.clear();
+                            self.emit(AgentEvent::Error(kept_edits_notice(&failing, &progress)));
+                        } else {
+                            match self
+                                .executor
+                                .restore_to_checkpoint(&pre_experiment_ref, &cancellation)
+                                .await
+                            {
+                                Ok(()) => {
+                                    self.unverified_edits = false;
+                                    self.verification_touched_paths.clear();
+                                    self.emit(AgentEvent::Error(format!(
+                                        "{failing} — discarded this round of edits and restored \
+                                         the worktree to the pre-experiment checkpoint."
+                                    )));
+                                }
+                                Err(err) => {
+                                    // Rewind itself failed (e.g. a git error) —
+                                    // fall back to interactive mode's behavior:
+                                    // leave the state as-is and say so loudly,
+                                    // rather than silently pretending the
+                                    // discard happened.
+                                    self.emit(AgentEvent::Error(format!(
+                                        "{failing}, and the automatic discard/rewind itself \
+                                         failed ({err}) — ending the turn with the worktree left \
+                                         as-is. The worktree was checkpointed before each edit; \
+                                         `git log refs/aivyx/checkpoints/` to inspect or rewind \
+                                         manually."
+                                    )));
+                                }
                             }
                         }
                     } else {

@@ -2819,6 +2819,130 @@ async fn autonomous_mode_discards_and_rewinds_on_exhausted_verification() {
     );
 }
 
+/// A three-test "suite" in libtest's output format: `a::fixed_by_edit`
+/// fails until `fixed.txt` exists, `a::sandbox_only` always fails (like a
+/// test that only fails inside the sandbox), and `a::was_fine` fails once
+/// `broke.txt` exists.
+const FAKE_SUITE: &str = "fails=''; [ -e fixed.txt ] || fails=a::fixed_by_edit; \
+    fails=\"$fails a::sandbox_only\"; [ -e broke.txt ] && fails=\"$fails a::was_fine\"; \
+    n=$(echo $fails | wc -w); echo failures:; for t in $fails; do echo \"    $t\"; done; echo; \
+    echo \"test result: FAILED. $((3 - n)) passed; $n failed; 0 ignored; 0 measured; \
+    0 filtered out\"; \
+    exit 101";
+
+/// An autonomous agent over a real git repo at `dir` whose verification
+/// command (also its test command) is `FAKE_SUITE`, and whose model writes
+/// `file` and then says it's done.
+async fn progress_check_agent(
+    dir: &Path,
+    file: &str,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    let args = vec!["-c".to_string(), FAKE_SUITE.to_string()];
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: args.clone(),
+        timeout: Duration::from_secs(5),
+    }])));
+    let write_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": file, "content": "x\n" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![
+        write_call,
+        text_response("done; the remaining failure is the sandbox's"),
+        text_response("still done"),
+    ]));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(), vec![],
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
+    );
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    let (tx, rx) = unbounded_channel();
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode,
+        tx,
+    );
+    agent.set_verification("verify".to_string(), 3);
+    agent.set_tests(Some(crate::test_detect::EffectiveTests {
+        program: "sh".to_string(),
+        args,
+        source: crate::test_detect::TestSource::Config,
+    }));
+    (agent, rx)
+}
+
+fn error_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::Error(text) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Live finding (2026-10-21, just bug hunt in Docker): the model fixed all
+/// three planted bugs and rightly left alone a test that fails only in the
+/// sandbox; `--auto` discarded every fix because verification still failed.
+/// A round that fixed failing tests and broke none is now kept.
+#[tokio::test]
+async fn autonomous_mode_keeps_edits_that_fixed_tests_and_broke_none() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, mut rx) = progress_check_agent(dir.path(), "fixed.txt").await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(dir.path().join("fixed.txt").exists(), "the useful edit was discarded");
+    let errors = error_events(&mut rx);
+    let notice = errors.iter().find(|e| e.contains("was kept")).expect("a kept notice");
+    assert!(notice.contains("fixed 1 failing test(s) (a::fixed_by_edit)"), "{notice}");
+    assert!(notice.contains("as before these edits: a::sandbox_only"), "{notice}");
+    assert_eq!(agent.last_verification_passed(), Some(false));
+}
+
+/// Fixing one test while breaking another is not progress: discarded, as
+/// before.
+#[tokio::test]
+async fn autonomous_mode_still_discards_edits_that_broke_a_test() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    // Breaks `a::was_fine` and fixes nothing.
+    let (mut agent, mut rx) = progress_check_agent(dir.path(), "broke.txt").await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(!dir.path().join("broke.txt").exists(), "the harmful edit was kept");
+    let errors = error_events(&mut rx);
+    assert!(errors.iter().any(|e| e.contains("discarded this round")), "{errors:?}");
+}
+
 // ----- /undo (Task 2): recording a mark per changing turn -----
 
 /// Builds an agent over a real git repo at `dir`, wired so `write_file`

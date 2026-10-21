@@ -29,6 +29,16 @@ nothing and must write tests. When a batch of edits keeps failing verification, 
 from before that batch, throws the failed attempt away, and carries on with
 the remaining budget.
 
+A batch that made things better is kept, though. Before rewinding, it runs
+the test command on the edited files and again on the checkpoint, then
+puts the edits back and compares the failing tests. If the edits fixed at
+least one failing test and broke none, they stay, and the notice lists what
+they fixed and what still fails — a failure that was already there, such as
+a test that [only fails inside the sandbox](15-troubleshooting.md), says
+nothing about the edits. This needs output it can read (`cargo test`,
+pytest or `go test`); with anything else, or when part of the suite didn't
+report or fewer tests ran, it rewinds as before.
+
 **What it may do on its own:**
 
 - edit, write, delete and move files — but only inside the project folder,

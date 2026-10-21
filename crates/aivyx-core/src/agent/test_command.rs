@@ -23,7 +23,7 @@ const MAX_LINE_CHARS: usize = 2000;
 /// long time, not an ordinary over-long one. Keeps `CappedLines`'s
 /// buffer bounded for output like `yes | tr -d '\n'`, which never hits a
 /// newline at all.
-const MAX_LINE_BYTES: usize = 4 * MAX_LINE_CHARS;
+pub(super) const MAX_LINE_BYTES: usize = 4 * MAX_LINE_CHARS;
 const NO_TEST_COMMAND: &str = "No test command — set [verification] command in config.toml.";
 /// Identifies a `/test` note among `pending_notes` so a new run replaces
 /// the previous one instead of stacking (other notes, e.g. `/undo`'s, use
@@ -82,7 +82,7 @@ fn last_test_passed_for(outcome: &Outcome) -> Option<bool> {
 /// other stream's `select!` branch won while this one was mid-line —
 /// silently dropping the start of a line whenever a stderr line completed
 /// while stdout was mid-line (or vice versa).
-struct CappedLines<R> {
+pub(super) struct CappedLines<R> {
     reader: R,
     buf: Vec<u8>,
     cap: usize,
@@ -92,7 +92,7 @@ impl<R> CappedLines<R>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    fn new(reader: R, cap: usize) -> Self {
+    pub(super) fn new(reader: R, cap: usize) -> Self {
         Self {
             reader,
             buf: Vec::new(),
@@ -109,7 +109,7 @@ where
     /// `drain_capped_tail` in `aivyx-tools/src/process.rs` for the same
     /// convention. A non-UTF-8 byte is decoded lossily (`finish_capped_line`)
     /// rather than treated as an error at all.
-    async fn next_line(&mut self) -> Option<String> {
+    pub(super) async fn next_line(&mut self) -> Option<String> {
         loop {
             let (done, used) = match self.reader.fill_buf().await {
                 Ok([]) => {
