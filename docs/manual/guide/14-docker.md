@@ -41,6 +41,28 @@ container, set `base_url` in `config.toml` to
 required for that hostname to resolve on Linux (confirmed: it does
 **not** resolve by default there, unlike Docker Desktop on Mac/Windows).
 
+## Toolchains
+
+The image holds `aivyx-coder`, `git`, `bash` and coreutils on Alpine —
+no compilers, language runtimes or package managers. A command that needs
+one (`cargo test`, `npm test`, `pytest`) fails inside the container with
+"not found", so `/test`, verification and `--auto` can't check anything.
+For such a project, build your own image on top with the toolchain added,
+for example for Rust:
+
+```dockerfile
+FROM ghcr.io/aivyx-agent/aivyx-coder:latest
+RUN apk add --no-cache cargo rust rust-clippy musl-dev
+```
+
+The sandbox lets commands read the system directories Alpine installs
+into (`/usr`, `/lib`) and `~/.cargo`, so a toolchain added this way works
+confined. Dependencies are downloaded into the container's home
+(`/home/coder`), so mount a directory there, or give the image a fetched
+cache, to avoid downloading them on every run. Some test suites also expect
+tools or settings a minimal image lacks (an editor, a `$USER` variable);
+those tests fail in the container whatever the code does.
+
 ## The sandbox in a container
 
 The real OS-level sandbox (Linux Landlock + seccomp) is on by default
