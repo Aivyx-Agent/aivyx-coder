@@ -39,6 +39,12 @@ nothing about the edits. This needs output it can read (`cargo test`,
 pytest or `go test`); with anything else, or when part of the suite didn't
 report or fewer tests ran, it rewinds as before.
 
+Tests you know fail only inside the sandbox can be listed in
+`[verification] sandbox_failures` ([details](15-troubleshooting.md)): the
+model is told they aren't its task, and a verification run whose only
+failures they are counts as passed, so the run can end with the goal
+achieved.
+
 **What it may do on its own:**
 
 - edit, write, delete and move files — but only inside the project folder,

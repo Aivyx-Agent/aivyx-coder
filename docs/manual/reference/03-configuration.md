@@ -188,6 +188,7 @@ Check the work after edits by running a test command before a turn may end. See 
 | `command` | string | `"test"` | Name of a `[[permissions.allowed_commands]]` entry to run after edits, before a turn may end. Setting it turns verification on. |
 | `max_auto_verify_retries` | integer | `3` | How many (edit, re-verify) cycles may fail before the agent gives up on this round of edits and lets the turn end anyway, with a loud notice rather than silence. Clamped to a minimum of 1 by the agent. |
 | `scoped_command` | string | `"test_scoped"` | Another `[[permissions.allowed_commands]]` entry name, whose `args` may contain the literal token `"{touched_paths}"` — substituted at runtime with the files touched since edits became unverified, one argv entry per path. |
+| `sandbox_failures` | list of string | `["global::*"]` | Tests that fail only inside the sandbox, not because of a bug — one that lists `/tmp` or walks up to `/`, say. The model is told to leave them alone, and a test run whose only failures are these counts as passed. |
 
 ### `[autonomous]`
 

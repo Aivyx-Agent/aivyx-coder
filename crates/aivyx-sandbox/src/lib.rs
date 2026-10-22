@@ -81,7 +81,7 @@ fn build_confiner_with_parent_env(
     } else {
         inner
     };
-    if cfg!(feature = "sandbox-backend") {
+    if has_sandbox() {
         Arc::new(MarkSandboxed { inner })
     } else {
         inner
@@ -93,6 +93,12 @@ fn build_confiner_with_parent_env(
 /// failure may be the sandbox's doing (see `is_sandboxed`), and the
 /// command itself can tell it runs confined.
 pub const SANDBOX_ENV: &str = "AIVYX_CODER_SANDBOX";
+
+/// Whether this build confines commands with the real sandbox: every
+/// command `build_confiner`'s confiner confines is then `is_sandboxed`.
+pub fn has_sandbox() -> bool {
+    cfg!(feature = "sandbox-backend")
+}
 
 /// Whether `command` was confined by `build_confiner`'s real sandbox
 /// (it carries `SANDBOX_ENV`). `false` for `NoopConfiner` and for builds

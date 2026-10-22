@@ -112,6 +112,9 @@ pub struct DelegateTaskConfig {
     /// `(command_name, max_retries)`, mirroring `Agent::set_verification`'s
     /// parameters — `None` if `[verification].command` isn't configured.
     pub verification: Option<(String, u32)>,
+    /// `[verification] sandbox_failures`, for the sub-agent's own
+    /// verification (see `Agent::set_sandbox_failures`).
+    pub sandbox_failures: crate::SandboxFailures,
     /// Total LLM round-trip budget granted to the sub-agent across its
     /// whole delegated task — not `Agent::AgentConfig::max_tool_iterations`
     /// (which bounds round-trips *within one `run_turn` call*; the
@@ -200,6 +203,7 @@ fn build_sub_agent(
     if let Some((command, max_retries)) = &config.verification {
         sub_agent.set_verification(command.clone(), *max_retries);
     }
+    sub_agent.set_sandbox_failures(config.sandbox_failures.clone());
     // Must be the *same* shared instance the parent's `Agent` and
     // `ConfirmationGate` hold — see `DelegateTaskConfig::injection_taint`'s
     // doc comment for why a fresh, disconnected instance here would let a
@@ -473,6 +477,7 @@ mod tests {
             context_tokens: 8192,
             edit_format: EditFormat::Native,
             verification: None,
+            sandbox_failures: Default::default(),
             max_iterations,
             broker_mode: false,
             generated_ignore: aivyx_tools::default_generated_patterns(),

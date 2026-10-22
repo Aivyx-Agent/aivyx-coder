@@ -10,6 +10,7 @@ pub mod editor_context;
 mod failing_tests;
 pub mod mission_tools;
 pub mod routing_commands;
+pub mod sandbox_failures;
 pub mod session;
 pub mod session_list;
 pub mod specialist_enforcement;
@@ -23,6 +24,7 @@ pub use architect::{Architect, ArchitectSeat};
 pub use council::{Council, CouncilSeat};
 pub use delegate::{DelegateTaskConfig, DelegateTaskTool};
 pub use delegate_to_specialist::{DelegateToSpecialistConfig, DelegateToSpecialistTool};
+pub use sandbox_failures::SandboxFailures;
 pub use mission_tools::{
     DecomposeTaskTool, MissionToolsConfig, SynthesizeResultsTool, VerifyOutputTool,
 };

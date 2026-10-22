@@ -1090,6 +1090,29 @@ pub(crate) async fn build_agent(
                 settings.verification.max_auto_verify_retries,
             )
         });
+    // `[verification] sandbox_failures`, for the main agent and every
+    // sub-agent alike. Only with the real sandbox: unconfined, those tests
+    // failing is a real failure.
+    let sandbox_failures = {
+        let (list, rejected) =
+            aivyx_core::SandboxFailures::new(&settings.verification.sandbox_failures);
+        if !rejected.is_empty() {
+            tracing::warn!(
+                ?rejected,
+                "verification.sandbox_failures: ignoring blank entries and a bare `*` (it \
+                 would excuse every failure)"
+            );
+        }
+        if aivyx_sandbox::has_sandbox() || list.is_empty() {
+            list
+        } else {
+            tracing::warn!(
+                "verification.sandbox_failures is ignored: this build runs commands without \
+                 the sandbox"
+            );
+            aivyx_core::SandboxFailures::default()
+        }
+    };
     // Computed once and reused for both the `delegate_task` sub-agent
     // (below) and the top-level `agent.set_broker_mode` call further down
     // — both must agree on whether this process is talking to
@@ -1117,6 +1140,7 @@ pub(crate) async fn build_agent(
             context_tokens,
             edit_format,
             verification: verification.clone(),
+            sandbox_failures: sandbox_failures.clone(),
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
             generated_ignore: settings.git.ignore.clone(),
@@ -1217,6 +1241,7 @@ pub(crate) async fn build_agent(
                 context_tokens,
                 edit_format,
                 verification: verification.clone(),
+                sandbox_failures: sandbox_failures.clone(),
                 max_iterations: settings.sub_agent.max_iterations,
                 broker_mode,
                 generated_ignore: settings.git.ignore.clone(),
@@ -1282,6 +1307,7 @@ pub(crate) async fn build_agent(
             context_tokens,
             edit_format,
             verification: verification.clone(),
+            sandbox_failures: sandbox_failures.clone(),
             max_iterations: settings.sub_agent.max_iterations,
             broker_mode,
             generated_ignore: settings.git.ignore.clone(),
@@ -1636,6 +1662,8 @@ pub(crate) async fn build_agent(
              entry name — enforced verification is disabled until this is fixed"
         );
     }
+
+    agent.set_sandbox_failures(sandbox_failures);
 
     // `/test` resolves to this same effective command in every mode this
     // agent runs under (interactive, ACP, `--auto`) — only automatic,

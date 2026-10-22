@@ -435,6 +435,11 @@ pub struct Agent {
     /// `[verification]` support (ROADMAP.md Phase 12 Part B); `None`
     /// disables the feature entirely.
     verification: Option<VerificationConfig>,
+    /// `[verification] sandbox_failures`: tests that fail only inside the
+    /// sandbox. Named to the model, and excused by verification when they
+    /// are a run's only failures (`crate::sandbox_failures`). Empty unless
+    /// commands really run sandboxed (`agent_builder`).
+    sandbox_failures: crate::SandboxFailures,
     /// Set whenever a `write_file`/`edit_file` call succeeds; cleared only
     /// by a passing verification run. Deliberately spans turn boundaries —
     /// a turn pausing mid-edit (Phase 12 Part A) must not let unverified
@@ -616,6 +621,7 @@ impl Agent {
             council: None,
             architect: None,
             verification: None,
+            sandbox_failures: crate::SandboxFailures::default(),
             unverified_edits: false,
             verify_retries: 0,
             changed_since_verification: false,
@@ -857,6 +863,11 @@ impl Agent {
             max_retries: max_retries.max(1),
             scoped: None,
         });
+    }
+
+    /// Tests known to fail only inside the sandbox (see the field).
+    pub fn set_sandbox_failures(&mut self, failures: crate::SandboxFailures) {
+        self.sandbox_failures = failures;
     }
 
     /// Attaches scoped-verification support to an already-configured base
@@ -1915,6 +1926,12 @@ impl Agent {
                 tests.display()
             ));
         }
+        if !self.plan_mode.active()
+            && let Some(line) = self.sandbox_failures.prompt()
+        {
+            system.push_str("\n\n");
+            system.push_str(&line);
+        }
         if self.autonomous_mode.active() {
             system.push_str("\n\n");
             system.push_str(AUTONOMOUS_PROMPT);
@@ -2151,6 +2168,27 @@ impl Agent {
     /// 2026-07-22-autonomous-mode-injection-guard-design.md. Only
     /// `ToolOutput::Ok` content is scanned — `Error`/`Denied` results are
     /// tool-framing text, not ingested external content.
+    /// Tells the user that a verification run's only failures were known
+    /// sandbox failures, so it counted as passed.
+    fn excused_known_failures(&mut self, known: &crate::sandbox_failures::Assessment) {
+        self.info(format!(
+            "Verification: the only failing tests are on [verification] sandbox_failures ({}), \
+             so the run counts as passed.",
+            known.known.join(", ")
+        ));
+    }
+
+    /// For a command the model ran: when it failed and some of its failing
+    /// tests are known sandbox failures, say so in its output.
+    fn note_known_failures(&self, output: &mut ToolOutput) {
+        if let ToolOutput::Ok(text) = output
+            && !command_reported_success(text)
+            && let Some(known) = self.sandbox_failures.assess(text)
+        {
+            text.push_str(&known.note(false));
+        }
+    }
+
     fn record_tool_result(&mut self, result: ToolResult, source: &str) {
         if let ToolOutput::Ok(text) = &result.output
             && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, source)
@@ -2204,8 +2242,18 @@ impl Agent {
             .await;
         let vacuous = matches!(&result.output, ToolOutput::Ok(text)
             if command_reported_success(text) && ran_no_tests(text));
-        let passed = !vacuous
+        let mut passed = !vacuous
             && matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+        let known = match &result.output {
+            ToolOutput::Ok(text) if !passed && !vacuous => self.sandbox_failures.assess(text),
+            _ => None,
+        };
+        if let Some(known) = &known
+            && known.only_known()
+        {
+            passed = true;
+            self.excused_known_failures(known);
+        }
 
         // Compare against the immediately preceding run (whatever its own
         // outcome was) using the *original* text, then store that same
@@ -2240,6 +2288,9 @@ impl Agent {
             }
             if vacuous {
                 text.push_str(NO_TESTS_NOTE);
+            }
+            if let Some(known) = &known {
+                text.push_str(&known.note(true));
             }
             self.last_full_verification_output = Some(current_text);
         }
@@ -2300,8 +2351,18 @@ impl Agent {
             call_id: call.id.clone(),
             output: output.unwrap_or_else(|err| ToolOutput::Error(err.to_string())),
         };
-        let passed =
+        let mut passed =
             matches!(&result.output, ToolOutput::Ok(text) if command_reported_success(text));
+        let known = match &result.output {
+            ToolOutput::Ok(text) if !passed => self.sandbox_failures.assess(text),
+            _ => None,
+        };
+        if let Some(known) = &known
+            && known.only_known()
+        {
+            passed = true;
+            self.excused_known_failures(known);
+        }
 
         if let ToolOutput::Ok(text) = &mut result.output {
             let current_text = text.clone();
@@ -2310,6 +2371,9 @@ impl Agent {
                 && let Some(note) = new_lines_note(previous, &current_text)
             {
                 text.push_str(&note);
+            }
+            if let Some(known) = &known {
+                text.push_str(&known.note(true));
             }
             self.last_scoped_verification_output = Some(current_text);
         }
@@ -3470,10 +3534,14 @@ impl Agent {
                 let was_already_unverified = self.unverified_edits;
                 let call_description = describe_tool_call_target(&call);
                 let checkpointed = self.executor.needs_checkpoint(&call.name);
+                let runs_command = matches!(call.name.as_str(), "run_command" | "run_shell");
                 let mut result = self
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
                     .await;
+                if runs_command {
+                    self.note_known_failures(&mut result.output);
+                }
                 if is_edit_call && matches!(result.output, ToolOutput::Ok(_)) {
                     self.unverified_edits = true;
                     if let Some(path) = touched_path {

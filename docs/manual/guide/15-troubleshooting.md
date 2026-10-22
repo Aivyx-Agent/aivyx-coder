@@ -104,21 +104,44 @@ Deliberately not (yet) addressed — documented rather than hidden:
     list. For example, `just`'s own test suite does this from temp
     directories, and fails confined in `global::*`, `init::*` and
     `search::tests::not_found`.
-    `extra_read_paths` doesn't help once the walk reaches `/`. Skip those
-    tests in the configured test command (`-- --skip global::`), or run
-    them yourself; granting read on `/` would expose every directory name
-    on the machine.
+    `extra_read_paths` doesn't help once the walk reaches `/`. List those
+    tests in `[verification] sandbox_failures` (below), skip them in the
+    configured test command (`-- --skip global::`), or run them yourself;
+    granting read on `/` would expose every directory name on the machine.
+  - *Tests that fail only in the sandbox*: list them in `[verification]
+    sandbox_failures`, by name as the runner prints it or as a prefix
+    ending in `*`:
+
+    ```toml
+    [verification]
+    sandbox_failures = ["search::tests::not_found", "global::*", "init::*"]
+    ```
+
+    The model is told in its system prompt, and again under any test run
+    where they fail, that these failures aren't bugs and aren't its task.
+    A verification run whose only failures are on the list counts as
+    passed (with a notice saying so), so `--auto` can finish. Failures are
+    read from cargo's, pytest's and `go test`'s output; when the output
+    can't be read with confidence (another runner, a compile error, a
+    crash, output cut short), nothing is excused. Unlike skipping a test,
+    this needs no runner-specific flags and still runs the test. Ignored
+    when commands don't run sandboxed (a build without the sandbox), where
+    those failures would be real. A test that hides the permission error
+    it hit (just's `search::tests::not_found`) looks like an ordinary bug
+    otherwise: without the list, small models rewrite working code around
+    it.
   - *The model is told when the sandbox may be the cause*: every failed
     confined `run_command`, `run_shell` or `/test` run (and automatic
-    verification, which uses them) ends with a short
-    line saying it ran in the sandbox and, if the failure could come from
-    the restricted access, to say so instead of changing the code. When
-    the output also mentions a permission error (`Permission denied`,
-    `Operation not permitted`, `os error 13`, ...), a fuller note asks
-    it to tell you which failure looks sandbox-caused. The short line is
-    there because a test can swallow the real error: `just`'s
+    verification, which uses them) ends with a short SANDBOX note: it ran
+    in the sandbox, and if the failure could come from the restricted
+    access, the model is to leave it failing and name it in its answer,
+    not change code or tests to get around it. When the output also
+    mentions a permission error (`Permission denied`, `Operation not
+    permitted`, `os error 13`, ...), a fuller note spells this out as
+    numbered rules. The system prompt states the same rule. The short
+    note is there because a test can swallow the real error: `just`'s
     `search::tests::not_found` prints only "No justfile found error was
-    expected". Without either, models "fix" working code to get past the
+    expected". Without these, models "fix" working code to get past the
     sandbox. Confined commands also see
     `AIVYX_CODER_SANDBOX=landlock` in their environment.
   - *`setsid`/`setpgid` are blocked*: test runners and supervisors that put

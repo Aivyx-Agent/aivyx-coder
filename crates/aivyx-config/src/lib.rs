@@ -95,6 +95,14 @@ pub struct VerificationSettings {
     /// argv entry per path. `None` (the default) means every retry always
     /// runs the full `command`, exactly as before this field existed.
     pub scoped_command: Option<String>,
+    /// Tests that fail only inside the sandbox, not because of a bug — one
+    /// that lists `/tmp` or walks up to `/`, say. The model is told to
+    /// leave them alone, and a test run whose only failures are these
+    /// counts as passed. Each entry is a test name as the runner prints it
+    /// (`search::tests::not_found`), or a prefix ending in `*`
+    /// (`global::*`). Works for cargo, pytest and `go test` output; ignored
+    /// when commands don't run sandboxed.
+    pub sandbox_failures: Vec<String>,
 }
 
 impl Default for VerificationSettings {
@@ -103,6 +111,7 @@ impl Default for VerificationSettings {
             command: None,
             max_auto_verify_retries: 3,
             scoped_command: None,
+            sandbox_failures: Vec::new(),
         }
     }
 }

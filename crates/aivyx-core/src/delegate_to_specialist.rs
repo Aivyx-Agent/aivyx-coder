@@ -143,6 +143,9 @@ pub struct DelegateToSpecialistConfig {
     pub context_tokens: u32,
     pub edit_format: EditFormat,
     pub verification: Option<(String, u32)>,
+    /// `[verification] sandbox_failures`, for the sub-agent's own
+    /// verification (see `Agent::set_sandbox_failures`).
+    pub sandbox_failures: crate::SandboxFailures,
     pub max_iterations: u32,
     pub broker_mode: bool,
     /// Mirrors `DelegateTaskConfig::generated_ignore`'s doc comment in
@@ -203,6 +206,7 @@ fn build_specialist_agent(
     if let Some((command, max_retries)) = &config.verification {
         specialist.set_verification(command.clone(), *max_retries);
     }
+    specialist.set_sandbox_failures(config.sandbox_failures.clone());
     // Must be the parent's own *shared* instance -- see
     // `DelegateTaskConfig::injection_taint`'s doc comment in `delegate.rs`
     // for why a fresh, disconnected instance here would let a
@@ -590,6 +594,7 @@ mod delegation_tests {
             context_tokens: 8192,
             edit_format: EditFormat::Native,
             verification: None,
+            sandbox_failures: Default::default(),
             max_iterations: 3,
             broker_mode: false,
             generated_ignore: aivyx_tools::default_generated_patterns(),

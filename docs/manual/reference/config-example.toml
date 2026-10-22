@@ -113,6 +113,9 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 #                              # full suite's cost — see "Enforced
 #                              # verification" above for the substitution
 #                              # semantics and the cargo-specific caveat.
+# sandbox_failures = ["global::*"] # tests that fail only in the sandbox:
+#                              # named to the model as not its task, and a
+#                              # run whose only failures they are passes.
 
 # REPL/interactive-process support (repl_start/repl_send/repl_stop):
 # timing knobs for deciding when a call has "enough" output to return,

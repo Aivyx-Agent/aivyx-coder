@@ -2943,6 +2943,132 @@ async fn autonomous_mode_still_discards_edits_that_broke_a_test() {
     assert!(errors.iter().any(|e| e.contains("discarded this round")), "{errors:?}");
 }
 
+fn known_failures(patterns: &[&str]) -> crate::SandboxFailures {
+    let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+    crate::SandboxFailures::new(&patterns).0
+}
+
+/// Live finding (2026-10-21, 9B just bug hunt): a test that fails only in
+/// the sandbox and swallows the permission error looked like a real bug,
+/// and the model spent the run "fixing" working code around it. Listed in
+/// `[verification] sandbox_failures`, it's named in the system prompt, and
+/// a verification run whose only failure it is counts as passed.
+#[tokio::test]
+async fn verification_passes_when_only_known_sandbox_failures_remain() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, mut rx) = progress_check_agent(dir.path(), "fixed.txt").await;
+    agent.set_sandbox_failures(known_failures(&["a::sandbox_*"]));
+    assert!(agent.system_prompt_text().contains("a::sandbox_*"));
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(dir.path().join("fixed.txt").exists());
+    assert_eq!(agent.last_verification_passed(), Some(true));
+    let text = auto_verify_result_texts(&agent.history).last().cloned().unwrap();
+    assert!(text.contains("KNOWN SANDBOX FAILURES"), "{text}");
+    assert!(text.ends_with("Verification counts this run as passed."), "{text}");
+    let infos: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::Info(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        infos.iter().any(|i| i.contains("sandbox_failures (a::sandbox_only)")),
+        "{infos:?}"
+    );
+}
+
+/// A real failure next to a known one still fails verification; the note
+/// tells the model which is which.
+#[tokio::test]
+async fn a_real_failure_beside_a_known_one_still_fails_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    // Breaks `a::was_fine`.
+    let (mut agent, mut rx) = progress_check_agent(dir.path(), "broke.txt").await;
+    agent.set_sandbox_failures(known_failures(&["a::sandbox_only"]));
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(!dir.path().join("broke.txt").exists(), "the harmful edit was kept");
+    assert_eq!(agent.last_verification_passed(), Some(false));
+    let text = auto_verify_result_texts(&agent.history).first().cloned().unwrap();
+    assert!(text.contains("Leave them failing"), "{text}");
+    assert!(text.contains("The other failures are real: a::fixed_by_edit, a::was_fine"), "{text}");
+    assert!(!text.contains("counts this run as passed"), "{text}");
+    let errors = error_events(&mut rx);
+    assert!(errors.iter().any(|e| e.contains("discarded this round")), "{errors:?}");
+}
+
+/// The model's own test runs get the note too.
+#[tokio::test]
+async fn a_model_run_command_names_known_sandbox_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), FAKE_SUITE.to_string()],
+        timeout: Duration::from_secs(5),
+    }])));
+    let run_call = vec![
+        StreamEvent::ToolCallComplete(ToolCall {
+            id: ToolCallId("c1".to_string()),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({ "command": "verify" }),
+            source: ToolCallSource::Native,
+        }),
+        StreamEvent::Done {
+            finish_reason: FinishReason::ToolCalls,
+        },
+    ];
+    let llm: Arc<dyn LlmBackend> =
+        Arc::new(MockBackend::new(vec![run_call, text_response("seen")]));
+    let executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    let (tx, _rx) = unbounded_channel();
+    let mut agent = Agent::new(llm, executor, "system", AgentConfig::default(),
+        Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    agent.set_sandbox_failures(known_failures(&["a::sandbox_only"]));
+
+    agent
+        .run_turn("run the tests".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let text = agent
+        .history
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult(ToolResult { output: ToolOutput::Ok(text), .. }) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(text.contains("tests that fail only inside the sandbox"), "{text}");
+    assert!(text.contains("a::sandbox_only"), "{text}");
+    assert!(text.contains("The other failures are real: a::fixed_by_edit"), "{text}");
+}
+
+/// Plan mode runs no tests, so it isn't told about them.
+#[tokio::test]
+async fn plan_mode_prompt_leaves_out_known_sandbox_failures() {
+    let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
+    agent.set_sandbox_failures(known_failures(&["a::sandbox_only"]));
+    assert!(agent.system_prompt_text().contains("a::sandbox_only"));
+    agent.plan_mode.set_active(true);
+    assert!(!agent.system_prompt_text().contains("a::sandbox_only"));
+}
+
 // ----- /undo (Task 2): recording a mark per changing turn -----
 
 /// Builds an agent over a real git repo at `dir`, wired so `write_file`
@@ -7284,6 +7410,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
         context_tokens: 8192,
         edit_format: EditFormat::Native,
         verification: None,
+        sandbox_failures: Default::default(),
         max_iterations: 3,
         broker_mode: false,
         generated_ignore: aivyx_tools::default_generated_patterns(),
@@ -8971,6 +9098,28 @@ async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
     agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
     let note = agent.pending_notes.last().unwrap();
     assert!(!note.contains("note from aivyx-coder"), "{note}");
+}
+
+/// A sandboxed `/test` run names the known sandbox failures among its
+/// failures, even when they scrolled out of the tail the note keeps.
+#[cfg(feature = "sandbox-backend")]
+#[tokio::test]
+async fn sandboxed_test_run_names_known_sandbox_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let confiner =
+        aivyx_sandbox::build_confiner(&cwd, &[], &[], aivyx_sandbox::ConfineOptions::new());
+    let executor = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAllGate), confiner);
+    let (tx, _rx) = unbounded_channel();
+    let mut agent = Agent::new(Arc::new(PanickingBackend), executor, "system",
+        AgentConfig::default(), Arc::default(), PlanMode::new(), AutonomousMode::new(), tx);
+    agent.set_sandbox_failures(known_failures(&["a::sandbox_only"]));
+
+    agent.set_tests(Some(sh_tests(FAKE_SUITE)));
+    agent.run_turn("/test".into(), &cwd, CancellationToken::new()).await.unwrap();
+    let note = agent.pending_notes.last().unwrap();
+    assert!(note.contains("KNOWN SANDBOX FAILURES"), "{note}");
+    assert!(note.contains("The other failures are real: a::fixed_by_edit"), "{note}");
 }
 
 /// Unconfined, a permission error in test output can't be the sandbox's.

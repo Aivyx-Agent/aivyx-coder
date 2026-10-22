@@ -421,6 +421,9 @@ pub struct SpecialistSessionsConfig {
     pub context_tokens: u32,
     pub edit_format: EditFormat,
     pub verification: Option<(String, u32)>,
+    /// `[verification] sandbox_failures`, for the sub-agent's own
+    /// verification (see `Agent::set_sandbox_failures`).
+    pub sandbox_failures: crate::SandboxFailures,
     pub max_iterations: u32,
     pub broker_mode: bool,
     /// Mirrors `DelegateTaskConfig::generated_ignore`'s doc comment in
@@ -704,6 +707,7 @@ fn build_specialist_agent(
     if let Some((command, max_retries)) = &config.verification {
         agent.set_verification(command.clone(), *max_retries);
     }
+    agent.set_sandbox_failures(config.sandbox_failures.clone());
     agent.set_injection_taint(config.injection_taint.clone());
     agent.set_broker_mode(config.broker_mode);
     // See `SpecialistSessionsConfig::generated_ignore`'s doc comment --
@@ -1259,6 +1263,7 @@ mod specialist_session_tests {
             context_tokens: 8192,
             edit_format: EditFormat::Native,
             verification: None,
+            sandbox_failures: Default::default(),
             max_iterations: 3,
             broker_mode: false,
             generated_ignore: aivyx_tools::default_generated_patterns(),
