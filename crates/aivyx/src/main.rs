@@ -251,6 +251,7 @@ mod tests {
         let prompt = agent.system_prompt_text();
         assert!(prompt.starts_with(SYSTEM_PROMPT_PREAMBLE), "{prompt}");
         assert!(prompt.contains(TOOL_GUIDANCE_NATIVE), "{prompt}");
+        assert!(prompt.contains(SANDBOX_RULE), "{prompt}");
         for tool in ["- run_shell:", "- git_commit:", "- read_file:", "- write_file:"] {
             assert!(prompt.contains(tool), "{tool} missing: {prompt}");
         }
@@ -336,6 +337,7 @@ mod tests {
                 );
             }
             assert!(!prompt.contains("approval prompt"), "{prompt}");
+            assert!(prompt.contains(SANDBOX_RULE), "{prompt}");
             assert!(prompt.contains("- read_file:"), "{prompt}");
             assert!(prompt.contains("- git_read:"), "{prompt}");
             let sent: Vec<String> =
@@ -398,6 +400,14 @@ const TOOL_GUIDANCE_PROMPTED_AUTONOMOUS: &str = "Use the dedicated tools: git_re
 grep/glob for searching, read_file for reading files. File modifications are made with \
 SEARCH/REPLACE blocks.";
 
+/// Appended to the act and `--auto` prompts (plan mode runs no commands).
+/// The note a failed sandboxed command ends with says the same
+/// (`aivyx_tools::SANDBOX_DENIAL_NOTE`); small models follow a rule from
+/// the system prompt more reliably than one from a tool result alone.
+const SANDBOX_RULE: &str = "Commands may run in a sandbox; a failed one then ends with a \
+SANDBOX note from aivyx-coder. A failure the sandbox caused is not a bug: never change code or \
+tests to get around it. Leave it failing and name it in your final answer.";
+
 /// Plan mode's counterpart of `SYSTEM_PROMPT_PREAMBLE`: plan mode withholds
 /// every mutating tool, so no call can raise an approval prompt there.
 const SYSTEM_PROMPT_PREAMBLE_PLAN: &str = "You are aivyx, a local-only coding agent running in a terminal UI. \
@@ -437,7 +447,7 @@ fn build_system_prompt(edit_format: EditFormat, autonomous: bool) -> String {
     } else {
         SYSTEM_PROMPT_PREAMBLE
     };
-    format!("{preamble} {guidance}")
+    format!("{preamble} {guidance} {SANDBOX_RULE}")
 }
 
 #[derive(Parser, Debug)]

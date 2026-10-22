@@ -129,24 +129,37 @@ pub async fn run(
 /// caused from a real bug, and "fixes" the code to work around its own
 /// environment (a live run did exactly that to a project's justfile
 /// search, which failed only because `/tmp` isn't listable confined).
-pub const SANDBOX_DENIAL_NOTE: &str = "note from aivyx-coder: this command ran inside \
-     aivyx-coder's sandbox and its output mentions a permission error. The sandbox lets \
-     commands read only the project, toolchain and system directories, and write only the \
-     project and a private TMPDIR -- even listing /tmp or / is denied -- and blocks some \
-     system calls. A failure that happens only because of the sandbox is not a bug in this \
-     code: don't change the code to work around it. Tell the user which failure looks \
-     sandbox-caused; they can widen access ([sandbox] extra_read_paths or share_system_tmp in \
-     config.toml) or skip that test.";
+///
+/// Written as numbered rules, the instruction first: a small model (live
+/// run, Qwen3.5-9B, 2026-10-21) read the earlier prose version, said in
+/// its own reasoning that the sandbox was the cause, and then patched the
+/// search to skip unreadable directories and edited the test anyway. It
+/// was working towards "make the tests pass", so the note also says
+/// leaving the failure is the right result.
+pub const SANDBOX_DENIAL_NOTE: &str = "note from aivyx-coder -- SANDBOX. This command ran \
+     inside aivyx-coder's sandbox and its output shows a permission error. The sandbox lets \
+     commands read only the project and the system/toolchain directories (not /tmp or /, not \
+     even to list them), write only the project and a private TMPDIR, and blocks some system \
+     calls. A failure caused by the sandbox is NOT a bug in this project. Rules:\n\
+     1. Do not change any code or test to make it pass: no skipping unreadable directories, \
+     no ignoring the error, no editing the test.\n\
+     2. Leave that failure as it is. It is not part of your task: leaving it failing is the \
+     right result.\n\
+     3. Fix any other failures, then name the sandbox-caused one in your final answer. The \
+     user can widen access ([sandbox] extra_read_paths or share_system_tmp in config.toml) \
+     or skip that test.";
 
 /// The short line every other failed sandboxed run gets. A test can
 /// swallow the error the sandbox caused (just's `search::tests::not_found`
 /// prints only "No justfile found error was expected"), so a permission
-/// error in the output can't be the only trigger.
-pub const SANDBOX_FAILURE_NOTE: &str = "note from aivyx-coder: this command ran inside \
-     aivyx-coder's sandbox (no reading outside the project and system/toolchain directories, \
-     not even listing /tmp or /; no writing outside the project and its TMPDIR). If a failure \
-     could come from that restricted access rather than the code, say so instead of changing \
-     the code to work around it.";
+/// error in the output can't be the only trigger. Same rule as
+/// `SANDBOX_DENIAL_NOTE`, kept conditional: most failures are real.
+pub const SANDBOX_FAILURE_NOTE: &str = "note from aivyx-coder -- SANDBOX. This command ran \
+     inside aivyx-coder's sandbox: no reading outside the project and the system/toolchain \
+     directories (not /tmp or /, not even to list them), no writing outside the project and \
+     its TMPDIR. If a failure could come from that (for example a test that reads /tmp, $HOME \
+     or a directory above the project), it is not a bug: do not change code or tests to get \
+     around it. Leave it failing and name it in your final answer.";
 
 /// The note a sandboxed run gets, if any: none when it succeeded,
 /// `SANDBOX_DENIAL_NOTE` when it failed with a permission error in its
