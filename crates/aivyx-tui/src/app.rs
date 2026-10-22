@@ -721,7 +721,10 @@ pub async fn run(
             }
             maybe_agent_event = agent_events_rx.recv(), if agent_events_open => {
                 match maybe_agent_event {
-                    Some(event) => app.handle_agent_event(event),
+                    Some(event) => {
+                        app.handle_agent_event(event);
+                        agent_events_open = drain_agent_events(&mut app, &mut agent_events_rx);
+                    }
                     None => {
                         agent_events_open = false;
                         app.mark_autonomous_finished();
@@ -750,6 +753,24 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Handles every agent event already queued, so the next frame shows them
+/// all. Drawing once per event (one per streamed token) let a long `--auto`
+/// run fall minutes behind a fast model, since a frame's cost grows with
+/// the transcript, and the run's end showed only once the queue had been
+/// drawn through. Returns `false` once the channel has closed.
+fn drain_agent_events(app: &mut App, rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(event) => app.handle_agent_event(event),
+            Err(mpsc::error::TryRecvError::Empty) => return true,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                app.mark_autonomous_finished();
+                return false;
+            }
+        }
+    }
 }
 
 struct App {
@@ -1283,40 +1304,30 @@ impl App {
             .split(frame.area());
         let (input_area, status_area) = (layout[layout.len() - 2], layout[layout.len() - 1]);
 
-        let mut lines: Vec<Line> = self
-            .transcript
-            .iter()
-            .flat_map(chat_line_to_lines)
-            .collect();
         // Until the first message — `/help` (which echoes no "you >" line)
         // already says the same and more, so the hint goes then too.
-        if !self
+        let hint = if self
             .transcript
             .iter()
             .any(|l| matches!(l, ChatLine::User(_) | ChatLine::Help(_)))
         {
-            lines.extend(first_message_hint(&self.tests_line));
-        }
+            Vec::new()
+        } else {
+            first_message_hint(&self.tests_line)
+        };
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
-        let lines = hang_wrap(lines, content_width);
+        let newest_first = hint.into_iter().rev().chain(
+            self.transcript
+                .iter()
+                .rev()
+                .flat_map(|l| chat_line_to_lines(l).into_iter().rev()),
+        );
+        let (lines, scroll) = transcript_tail(newest_first, content_width, viewport_height);
 
-        let transcript = Paragraph::new(lines).wrap(Wrap { trim: false });
-        // `Paragraph::scroll` applies its offset *after* wrapping, so the
-        // offset must be computed from the wrapped (post-wrap) row count —
-        // `lines.len()` alone undercounts as soon as anything actually
-        // wraps, and the transcript stops reaching the true bottom.
-        //
-        // `line_count` must be measured BEFORE `.block(...)` is attached:
-        // once a block is set, ratatui adds the block's own vertical space
-        // (2 rows for `Borders::ALL`) into the count, which would double
-        // count against `viewport_height` (already border-excluded) and
-        // over-scroll by exactly that many rows.
-        let wrapped_rows = transcript.line_count(content_width) as u16;
-        let scroll = wrapped_rows.saturating_sub(viewport_height);
-
-        let transcript = transcript
+        let transcript = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title("aivyx-coder"))
             .scroll((scroll, 0));
         frame.render_widget(transcript, layout[0]);
@@ -2147,6 +2158,36 @@ fn hang_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// The bottom of the transcript, which is all a frame ever shows: given its
+/// lines newest first, the fewest that fill `height` rows once wrapped to
+/// `width`, oldest first, and the scroll offset that puts the newest row
+/// at the bottom. Wrapping the whole transcript instead made every frame
+/// cost more the longer a run went on.
+///
+/// Rows are counted per line with `line_count` (each `Line` wraps on its
+/// own, so the counts add up), and before any block is attached: a block's
+/// borders would be counted too and over-scroll by their height.
+fn transcript_tail(
+    newest_first: impl Iterator<Item = Line<'static>>,
+    width: u16,
+    height: u16,
+) -> (Vec<Line<'static>>, u16) {
+    let mut tail = Vec::new();
+    let mut rows = 0;
+    for line in newest_first {
+        if rows >= usize::from(height) {
+            break;
+        }
+        for row in hang_wrap(vec![line], width).into_iter().rev() {
+            rows += Paragraph::new(row.clone()).wrap(Wrap { trim: false }).line_count(width);
+            tail.push(row);
+        }
+    }
+    tail.reverse();
+    let scroll = rows.saturating_sub(usize::from(height));
+    (tail, u16::try_from(scroll).unwrap_or(u16::MAX))
 }
 
 /// `text` in rows of at most `room` columns, breaking after spaces where
@@ -4137,6 +4178,110 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("ready — Enter to send"), "{rendered}");
+    }
+
+    /// `lines` drawn the way the transcript is: wrapped, bordered, and
+    /// scrolled by `scroll`, into a `width` x `height` area.
+    fn draw_transcript(
+        lines: Vec<Line<'static>>,
+        scroll: u16,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL))
+            .scroll((scroll, 0))
+            .render(area, &mut buffer);
+        buffer
+    }
+
+    fn sample_transcript(turns: usize) -> Vec<ChatLine> {
+        let mut transcript = Vec::new();
+        for i in 0..turns {
+            transcript.push(ChatLine::User(format!("question {i}")));
+            transcript.push(ChatLine::Reasoning(format!("thinking about {i} ").repeat(i % 7 + 1)));
+            transcript.push(ChatLine::Info(format!("line a {i}\nline b {i}\n\nline d {i}")));
+            transcript.push(ChatLine::Assistant(format!("answer {i}, ").repeat(i % 13 + 1)));
+        }
+        transcript
+    }
+
+    fn newest_first_lines(transcript: &[ChatLine]) -> impl Iterator<Item = Line<'static>> + '_ {
+        transcript.iter().rev().flat_map(|l| chat_line_to_lines(l).into_iter().rev())
+    }
+
+    #[test]
+    fn the_transcript_tail_draws_exactly_what_the_whole_transcript_did() {
+        // Ends in a line too long for its 12-column box: hang_wrap leaves it
+        // whole, Paragraph wraps it, and its top rows must scroll off.
+        let mut overshoot = sample_transcript(2);
+        overshoot.push(ChatLine::Assistant("aaaa bbbb cccc dddd eeee ffff".into()));
+        overshoot.push(ChatLine::Assistant("end".into()));
+        let mut scrolled = 0;
+        for transcript in [0, 1, 3, 40].map(sample_transcript).into_iter().chain([overshoot]) {
+            for (width, height) in [(40, 12), (90, 30), (17, 5), (12, 5)] {
+                let (inner_w, inner_h) = (width - 2, height - 2);
+                let all: Vec<_> = transcript.iter().flat_map(chat_line_to_lines).collect();
+                let all = hang_wrap(all, inner_w);
+                let rows =
+                    Paragraph::new(all.clone()).wrap(Wrap { trim: false }).line_count(inner_w);
+                let scroll = rows.saturating_sub(inner_h.into()) as u16;
+                let want = draw_transcript(all, scroll, width, height);
+
+                let rev = newest_first_lines(&transcript);
+                let (tail, scroll) = transcript_tail(rev, inner_w, inner_h);
+                scrolled += usize::from(scroll > 0);
+                let got = draw_transcript(tail, scroll, width, height);
+                assert_eq!(got, want, "{} lines, {width}x{height}", transcript.len());
+            }
+        }
+        // Otherwise the scroll offset goes untested.
+        assert!(scrolled > 0);
+    }
+
+    #[test]
+    fn a_transcript_longer_than_u16_rows_still_shows_its_last_line() {
+        let mut transcript: Vec<ChatLine> =
+            (0..70_000).map(|i| ChatLine::Info(format!("row {i}"))).collect();
+        transcript.push(ChatLine::Assistant("the very last line".into()));
+        let rev = newest_first_lines(&transcript);
+        let (tail, scroll) = transcript_tail(rev, 60, 10);
+        let buffer = draw_transcript(tail, scroll, 62, 12);
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("the very last line"), "{text}");
+        assert!(text.contains("row 69999"), "{text}");
+    }
+
+    #[test]
+    fn queued_agent_events_are_all_handled_before_the_next_frame() {
+        let mut app = App::new(None, PlanMode::new());
+        app.autonomous = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for word in ["one ", "two ", "three"] {
+            tx.send(AgentEvent::TextDelta(word.to_string())).unwrap();
+        }
+        assert!(drain_agent_events(&mut app, &mut rx));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Assistant(text)) if text == "one two three"
+        ));
+        assert!(!app.autonomous_finished);
+
+        // A run that ended behind a queue of events finishes as soon as
+        // the queue is handled, not one frame per event later.
+        tx.send(AgentEvent::TextDelta(" four".to_string())).unwrap();
+        drop(tx);
+        assert!(!drain_agent_events(&mut app, &mut rx));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(ChatLine::Assistant(text)) if text == "one two three four"
+        ));
+        assert!(app.autonomous_finished);
     }
 
     #[test]
