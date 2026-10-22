@@ -56,9 +56,11 @@ never sent to the model. If the repository's `.git` is outside the folder
 you started in (a subfolder, or a linked worktree), the sandbox can't write
 it and `/commit` says so — start at the repository root, or commit with git.
 
-**Generated files** such as `__pycache__/`, `node_modules/` and
-`.pytest_cache/` are kept out of the change line, `/diff`, the undo
-previews and what `/commit` stages — as long as git doesn't track them. The
+**Generated files** such as `__pycache__/`, `node_modules/` and `target/`
+are kept out of the change line, `/diff`, the undo previews, what `/commit`
+stages, and checkpoints — as long as git doesn't track them. So a new
+project without a `.gitignore` doesn't copy its build output into every
+checkpoint, and `/undo` or an `--auto` rewind leaves that output alone. The
 list is `ignore` under `[git]`, in `.gitignore` syntax.
 
 ## Test

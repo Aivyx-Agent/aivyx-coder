@@ -708,6 +708,10 @@ pub(crate) async fn build_agent(
     if settings.git.checkpoints
         && let Some(detected) = GitCheckpointer::detect(&cwd, deny_paths.clone()).await
     {
+        // Untracked build output stays out of every snapshot: a fresh
+        // project without a .gitignore otherwise copies target/ in at each
+        // checkpoint (305 MB in one 33-minute --auto run, 2026-10-22).
+        let detected = detected.with_generated_ignore(settings.git.ignore.clone());
         checkpointer = Some(Arc::new(detected));
     }
     let has_checkpointer = checkpointer.is_some();

@@ -129,7 +129,7 @@ Worktree checkpoints (what `/undo` uses) and the generated-file ignore list. See
 | Key | Type | Example | Meaning |
 |---|---|---|---|
 | `checkpoints` | bool | `true` | Snapshot the worktree to `refs/aivyx/checkpoints/*` before every mutating tool call, so any agent change (including arbitrary `run_shell` effects) can be rewound with plain git commands. Never touches HEAD, the index, or the worktree; silently disabled when the working directory isn't a git repository. |
-| `ignore` | list of string |  | Generated files, in `.gitignore` syntax: hidden from aivyx-coder's own change views (the per-turn change summary, `/diff`, the `/undo`/`/redo` previews) and never auto-staged by `/commit`, but only while untracked — exactly like `.gitignore`, a file git already tracks is always shown. |
+| `ignore` | list of string |  | Generated files, in `.gitignore` syntax: hidden from aivyx-coder's own change views (the per-turn change summary, `/diff`, the `/undo`/`/redo` previews), never auto-staged by `/commit`, and kept out of checkpoints (so `/undo` and `--auto`'s rewind leave them alone), but only while untracked — exactly like `.gitignore`, a file git already tracks is always shown and snapshotted. |
 
 ## Context the model gets
 

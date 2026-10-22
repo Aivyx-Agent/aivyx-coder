@@ -248,9 +248,8 @@ pub struct ToolExecutor {
     /// that genuinely wants checkpoint/restore without undo-ledger
     /// tracking, but nothing in this codebase currently is one.
     checkpoint_cwd: Option<PathBuf>,
-    /// The deny paths `checkpointer` excludes from its snapshots, so
-    /// `checkpoint_now` can verify a snapshot against the same tree. Set
-    /// with `checkpoint_cwd`.
+    /// The deny paths `checkpointer` excludes from its snapshots, for
+    /// `worktree_tree_over`'s own staging. Set with `checkpoint_cwd`.
     checkpoint_deny_paths: Vec<PathBuf>,
 }
 
@@ -340,10 +339,9 @@ impl ToolExecutor {
         let checkpointer = self.checkpointer.as_ref()?;
         let cwd = self.checkpoint_cwd.as_deref()?;
         checkpointer.checkpoint(label, cancellation).await;
-        let tree = tokio::select! {
-            tree = self.current_worktree_tree(cwd) => tree?,
-            _ = cancellation.cancelled() => return None,
-        };
+        let tree = self
+            .current_worktree_tree(cwd, checkpointer, cancellation)
+            .await?;
         let refs = run_git(
             cwd,
             &[
@@ -364,10 +362,15 @@ impl ToolExecutor {
     }
 
     /// The tree oid of the worktree as the checkpointer would snapshot it
-    /// now: everything `git add -A` stages, minus the deny paths, staged
-    /// into a throwaway private index under the git dir (never the user's
-    /// index).
-    async fn current_worktree_tree(&self, cwd: &Path) -> Option<String> {
+    /// now, staged by the checkpointer itself (so with exactly its deny
+    /// path and generated-file rules) into a throwaway copy of its private
+    /// index under the git dir (never the user's index).
+    async fn current_worktree_tree(
+        &self,
+        cwd: &Path,
+        checkpointer: &GitCheckpointer,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
         // Per-call atomic-counter suffix, mirroring `worktree_tree_over`'s
         // identical index-naming scheme -- without it, concurrent calls on
         // the same executor (e.g. multiple MCP sessions in one process
@@ -391,20 +394,9 @@ impl ToolExecutor {
         if checkpointer_index.exists() {
             let _ = std::fs::copy(&checkpointer_index, &index);
         }
-        let index_str = index.to_str()?.to_string();
-        let env = [("GIT_INDEX_FILE", index_str.as_str())];
-        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-        add_args.extend(aivyx_checkpoint::exclude_pathspecs(
-            cwd,
-            &self.checkpoint_deny_paths,
-        ));
-        let add_args: Vec<&str> = add_args.iter().map(String::as_str).collect();
-        let tree = match run_git(cwd, &add_args, &env).await {
-            Ok(_) => run_git(cwd, &["write-tree"], &env).await.ok(),
-            Err(_) => None,
-        };
+        let tree = checkpointer.tree_in_index(&index, cancellation).await.ok();
         let _ = std::fs::remove_file(&index);
-        Some(tree?.trim().to_string())
+        tree
     }
 
     /// The tree of the worktree as it would be committed on top of `base`
@@ -1293,6 +1285,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_now_verifies_with_untracked_build_output_present() {
+        // The checkpointer leaves untracked generated files out; the tree
+        // `checkpoint_now` checks its snapshot against must too, or every
+        // snapshot in a project with a target/ fails to verify.
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        let cwd = dir.path().canonicalize().unwrap();
+        let checkpointer = GitCheckpointer::detect(&cwd, vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(default_generated_patterns());
+        executor.set_checkpointer_at(cwd.clone(), vec![], Arc::new(checkpointer));
+        std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
+        std::fs::write(cwd.join("target/debug/app"), "binary\n").unwrap();
+        std::fs::write(cwd.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let snapshot = executor.checkpoint_now("turn", &CancellationToken::new()).await;
+        let snapshot = snapshot.expect("the snapshot must verify");
+        let tree = run_git(&cwd, &["ls-tree", "-r", "--name-only", &snapshot], &[])
+            .await
+            .unwrap();
+        assert!(tree.contains("main.rs"), "{tree}");
+        assert!(!tree.contains("target/"), "{tree}");
+    }
+
+    #[tokio::test]
     async fn checkpoint_now_snapshots_the_current_worktree() {
         use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
 
@@ -1408,9 +1430,12 @@ mod tests {
 
         let expected = independent_worktree_tree(&cwd).await;
 
-        let results =
-            futures::future::join_all((0..30).map(|_| executor.current_worktree_tree(&cwd)))
-                .await;
+        let checkpointer = executor.checkpointer.clone().unwrap();
+        let cancellation = CancellationToken::new();
+        let results = futures::future::join_all(
+            (0..30).map(|_| executor.current_worktree_tree(&cwd, &checkpointer, &cancellation)),
+        )
+        .await;
 
         for (i, result) in results.iter().enumerate() {
             assert_eq!(

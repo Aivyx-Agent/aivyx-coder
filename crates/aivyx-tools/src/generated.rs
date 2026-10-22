@@ -1,6 +1,7 @@
 //! Generated files: build output and caches (`__pycache__/`,
-//! `node_modules/`, …) that aivyx-coder's own change views hide and
-//! `/commit` never auto-stages, matched with `.gitignore` semantics.
+//! `node_modules/`, `target/`, …) that aivyx-coder's own change views
+//! hide, `/commit` never auto-stages and checkpoints never snapshot,
+//! matched with `.gitignore` semantics.
 //!
 //! The matcher here is pure — it says only whether a path *looks*
 //! generated. Hiding applies to untracked paths alone (a file git already
@@ -22,6 +23,7 @@ pub const DEFAULT_GENERATED_PATTERNS: &[&str] = &[
     ".ruff_cache/",
     "node_modules/",
     ".venv/",
+    "target/",
     ".DS_Store",
 ];
 

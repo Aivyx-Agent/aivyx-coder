@@ -80,10 +80,11 @@ extra_read_paths = []   # extra paths shell commands may read, e.g. a venv
 [git]
 checkpoints = true   # snapshot the worktree before every mutating tool call
 # Generated files (.gitignore syntax), hidden from the change summary, /diff
-# and the /undo and /redo previews, and never auto-staged by /commit — only while
-# untracked, like .gitignore: a file git tracks is always shown. [] = off.
+# and the /undo and /redo previews, never auto-staged by /commit and kept out of
+# checkpoints — only while untracked, like .gitignore: a file git tracks is
+# always shown. [] = off.
 # ignore = ["__pycache__/", "*.pyc", "*.pyo", ".pytest_cache/", ".mypy_cache/",
-#           ".ruff_cache/", "node_modules/", ".venv/", ".DS_Store"]
+#           ".ruff_cache/", "node_modules/", ".venv/", "target/", ".DS_Store"]
 
 [repo_map]
 enabled = true       # append a ranked symbol map to the system prompt

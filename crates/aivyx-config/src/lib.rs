@@ -607,11 +607,13 @@ pub struct GitSettings {
     pub checkpoints: bool,
     /// Generated files, in `.gitignore` syntax: hidden from aivyx-coder's
     /// own change views (the per-turn change summary, `/diff`, the
-    /// `/undo`/`/redo` previews) and never auto-staged by `/commit`, but
-    /// only while untracked — exactly like `.gitignore`, a file git
-    /// already tracks is always shown. Covers build output and caches
-    /// that test runs and shell commands leave behind in a project with
-    /// no `.gitignore` of its own. `ignore = []` turns it off.
+    /// `/undo`/`/redo` previews), never auto-staged by `/commit`, and kept
+    /// out of checkpoints (so `/undo` and `--auto`'s rewind leave them
+    /// alone), but only while untracked — exactly like `.gitignore`, a
+    /// file git already tracks is always shown and snapshotted. Covers
+    /// build output and caches that test runs and shell commands leave
+    /// behind in a project with no `.gitignore` of its own. `ignore = []`
+    /// turns it off.
     pub ignore: Vec<String>,
 }
 
@@ -628,6 +630,7 @@ impl Default for GitSettings {
                 ".ruff_cache/",
                 "node_modules/",
                 ".venv/",
+                "target/",
                 ".DS_Store",
             ]
             .iter()
@@ -1439,6 +1442,7 @@ mod tests {
                 ".ruff_cache/",
                 "node_modules/",
                 ".venv/",
+                "target/",
                 ".DS_Store",
             ]
         );
