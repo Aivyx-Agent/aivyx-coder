@@ -171,7 +171,7 @@ fn build_sub_agent(
     let mut sub_agent = Agent::new(
         Arc::clone(&config.llm),
         sub_executor,
-        SUB_AGENT_SYSTEM_PROMPT,
+        format!("{SUB_AGENT_SYSTEM_PROMPT} {}", crate::FIXED_INPUTS_RULE),
         AgentConfig {
             // Deliberately 1, *not* `config.max_iterations`: the outer
             // loop in `execute()` re-invokes `run_turn` (via the
@@ -1000,6 +1000,19 @@ mod tests {
             request.slot_hint.is_some(),
             "the delegated sub-agent must attach a slot_hint when the parent is in broker mode"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_is_told_that_the_tasks_inputs_are_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockBackend::new(vec![text_response("done")]));
+        let llm: Arc<dyn LlmBackend> = Arc::clone(&mock) as Arc<dyn LlmBackend>;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tool = DelegateTaskTool::new(base_config(llm, tx, ToolRegistry::new(), 10));
+        let _ = tool.execute(delegate_call("anything"), &exec_ctx(dir.path())).await.unwrap();
+        let received = mock.received.lock().unwrap();
+        let request = received.last().expect("the sub-agent must have sent a request");
+        assert!(format!("{request:?}").contains(crate::FIXED_INPUTS_RULE), "{request:?}");
     }
 
     #[tokio::test]

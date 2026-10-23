@@ -182,7 +182,7 @@ fn build_specialist_agent(
     let mut specialist = Agent::new(
         Arc::clone(&config.llm),
         sub_executor,
-        member.persona.clone(),
+        format!("{} {}", member.persona, crate::FIXED_INPUTS_RULE),
         AgentConfig {
             // Deliberately 1, not `config.max_iterations` -- see
             // `delegate.rs`'s identical `max_tool_iterations: 1` comment
@@ -873,6 +873,10 @@ mod delegation_tests {
         assert!(
             format!("{first_request:?}").contains("You are the implementer specialist"),
             "expected the member's persona in the outgoing request, got: {first_request:?}"
+        );
+        assert!(
+            format!("{first_request:?}").contains(crate::FIXED_INPUTS_RULE),
+            "a specialist must be told the task's inputs are fixed: {first_request:?}"
         );
     }
 

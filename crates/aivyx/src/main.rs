@@ -252,6 +252,7 @@ mod tests {
         assert!(prompt.starts_with(SYSTEM_PROMPT_PREAMBLE), "{prompt}");
         assert!(prompt.contains(TOOL_GUIDANCE_NATIVE), "{prompt}");
         assert!(prompt.contains(SANDBOX_RULE), "{prompt}");
+        assert!(prompt.contains(aivyx_core::FIXED_INPUTS_RULE), "{prompt}");
         for tool in ["- run_shell:", "- git_commit:", "- read_file:", "- write_file:"] {
             assert!(prompt.contains(tool), "{tool} missing: {prompt}");
         }
@@ -338,6 +339,7 @@ mod tests {
             }
             assert!(!prompt.contains("approval prompt"), "{prompt}");
             assert!(prompt.contains(SANDBOX_RULE), "{prompt}");
+            assert!(prompt.contains(aivyx_core::FIXED_INPUTS_RULE), "{prompt}");
             assert!(prompt.contains("- read_file:"), "{prompt}");
             assert!(prompt.contains("- git_read:"), "{prompt}");
             let sent: Vec<String> =
@@ -447,7 +449,7 @@ fn build_system_prompt(edit_format: EditFormat, autonomous: bool) -> String {
     } else {
         SYSTEM_PROMPT_PREAMBLE
     };
-    format!("{preamble} {guidance} {SANDBOX_RULE}")
+    format!("{preamble} {guidance} {SANDBOX_RULE} {}", aivyx_core::FIXED_INPUTS_RULE)
 }
 
 #[derive(Parser, Debug)]

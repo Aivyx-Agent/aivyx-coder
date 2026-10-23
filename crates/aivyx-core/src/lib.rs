@@ -20,6 +20,16 @@ pub mod undo;
 pub mod wiki;
 
 pub use agent::{AUTONOMOUS_HIDDEN_TOOLS, Agent, AgentConfig, AgentError, AgentEvent, EditFormat};
+
+/// Part of every system prompt: the main agent's, a `delegate_task`
+/// sub-agent's and a specialist's. In the build tests a model edited a
+/// brief's data, and another a test's expected value taken from the brief,
+/// to make its own wrong tests pass (`read_only_paths` blocks the edit
+/// itself, when configured).
+pub const FIXED_INPUTS_RULE: &str = "The task's spec (a brief, requirements, a README you were \
+pointed to) and the data it gives you are fixed inputs: don't edit them unless the user asks you \
+to. When a test disagrees with them, the test or the code is wrong. Fix that, and never change \
+an expected value that came from the spec to match what your code returns.";
 pub use architect::{Architect, ArchitectSeat};
 pub use council::{Council, CouncilSeat};
 pub use delegate::{DelegateTaskConfig, DelegateTaskTool};

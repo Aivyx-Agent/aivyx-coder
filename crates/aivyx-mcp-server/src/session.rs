@@ -194,7 +194,7 @@ pub async fn build_session_agent(
     let mut agent = Agent::new(
         Arc::clone(&config.llm),
         executor,
-        SESSION_SYSTEM_PROMPT,
+        format!("{SESSION_SYSTEM_PROMPT} {}", aivyx_core::FIXED_INPUTS_RULE),
         AgentConfig {
             // Fixed at 1, exactly like delegate_task's own inner agent --
             // run_bounded_turn's outer loop (below) is what bounds the
@@ -624,6 +624,14 @@ mod tests {
             execute_names.contains(&"run_shell".to_string()),
             "execute must include run_shell"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_is_told_that_the_tasks_inputs_are_fixed() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let agent = build_session_agent(&config(full_registry()), AccessLevel::Edit, tx).await;
+        let prompt = agent.system_prompt_text();
+        assert!(prompt.contains(aivyx_core::FIXED_INPUTS_RULE), "{prompt}");
     }
 
     #[tokio::test]
