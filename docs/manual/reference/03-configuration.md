@@ -97,6 +97,7 @@ What the model may touch and run: the deny list, pre-approved commands, and per-
 |---|---|---|---|
 | `mode` | `confirm` |  | How permission is decided. `confirm` is the only mode: anything that isn't read-only asks you. |
 | `deny_paths` | list of string | `["~/.ssh", "~/.aws", ".env", "*.pem"]` | Hard-blocked regardless of prompt/allow-list state, enforced by `ConfirmationGate` before any prompt or Always-Allow cache lookup. Entries may use a leading `~` for the home directory — see `resolved_deny_paths`. |
+| `read_only_paths` | list of string | `["BRIEF.md", "data"]` | The task's fixed inputs — a brief, its data — which the model may read but never write, delete or move (`ConfirmationGate`). A relative entry is resolved against the project root (`data` covers everything under it); an entry with a glob character (`*`, `?`, `[`) matches any file of that name. |
 | `max_tool_iterations_per_turn` | integer | `25` | Most tool-call round trips in one turn before it pauses. In the TUI and editors, the model then summarizes where it got to; send another message to continue. |
 
 #### `[[permissions.allowed_commands]]`
@@ -189,6 +190,7 @@ Check the work after edits by running a test command before a turn may end. See 
 | `max_auto_verify_retries` | integer | `3` | How many (edit, re-verify) cycles may fail before the agent gives up on this round of edits and lets the turn end anyway, with a loud notice rather than silence. Clamped to a minimum of 1 by the agent. |
 | `scoped_command` | string | `"test_scoped"` | Another `[[permissions.allowed_commands]]` entry name, whose `args` may contain the literal token `"{touched_paths}"` — substituted at runtime with the files touched since edits became unverified, one argv entry per path. |
 | `sandbox_failures` | list of string | `["global::*"]` | Tests that fail only inside the sandbox, not because of a bug — one that lists `/tmp` or walks up to `/`, say. The model is told to leave them alone, and a test run whose only failures are these counts as passed. |
+| `final_checks` | list of string | `["clippy"]` | Commands (`[[permissions.allowed_commands]]` names) aivyx-coder runs itself when an autonomous run reaches its goal — a linter, say. Their results, with warning counts, go into the stop notice and `--report`, so the run's end doesn't rest on the model's claims. |
 
 ### `[autonomous]`
 

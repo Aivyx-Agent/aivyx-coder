@@ -75,6 +75,49 @@ max_duration_secs = 3600  # wall-clock limit
 The time limit is exact: a turn still running when it passes is stopped,
 the same way Ctrl+C stops it, and the run reports the budget exhausted.
 
+**What the run reports.** The model writes its own final answer, and it can
+be wrong. In the build tests, models said fields were `null` when they
+weren't, and that clippy was clean after it had printed three warnings. So
+the stop notice adds what aivyx-coder checked itself, one line each:
+
+```
+autonomous run stopped: goal achieved after 5 iteration(s)
+  verification: `test` passed
+  final check `clippy`: passed, 3 warnings
+  changed: 14 files (+2310 −12) — src/main.rs, src/db.rs, … and 9 more
+  read-only files changed: data/airports.csv
+```
+
+- **Final checks:** `[verification] final_checks` names allowed commands
+  (a linter, say) that aivyx-coder runs itself when the goal is reached.
+- **Changed:** compares the project with a snapshot taken when the run
+  started, leaving out build output.
+- **Read-only files changed:** any of those files that are in
+  `read_only_paths`.
+- **`--report run.json`:** writes all of this as JSON when the run stops,
+  for scripts and for looking back.
+
+A command that succeeds but prints compiler or linter warnings shows them in
+its result too (`exit status: 0 (success), 3 warnings`), so the model sees
+them.
+
+**Keep the task's inputs fixed.** When a run builds from a brief and its
+data, list them in `[permissions] read_only_paths`. The model can still read
+them, but it can't change them. In a build test, a model whose own tests
+disagreed with the brief's data changed the data. Every agent's
+instructions already say the spec and its data are fixed. `read_only_paths`
+enforces that for file edits. Commands are not covered: an approved command
+can still write those files.
+
+```toml
+[permissions]
+read_only_paths = ["BRIEF.md", "data"]
+
+[verification]
+command = "test"
+final_checks = ["clippy"]
+```
+
 Not with `--plan` or `--resume`, and not over ACP yet.
 
 ## Plan with a bigger model — `/architect`

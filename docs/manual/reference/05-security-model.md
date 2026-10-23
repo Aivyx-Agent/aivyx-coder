@@ -76,6 +76,27 @@ way to *remove* a built-in default through config. This covers:
   `~/.git-credentials` are always
   unreadable to commands, even with no `deny_paths` configured.
 
+### `read_only_paths` — fixed inputs
+
+`permissions.read_only_paths` lists files the model may **read but not
+change**: the task's own inputs, such as a brief and its data.
+
+- **What's refused:** a write, delete or move (either end) of a matching
+  path, at the same tier as `deny_paths`, in every mode, without a prompt.
+  The denial tells the model to fix its test or code instead.
+- **How entries match:**
+  - a relative entry is resolved against the project root, and covers
+    everything under it;
+  - an entry with `*`, `?` or `[` matches any file of that name.
+- **Who it applies to:** the main agent, `delegate_task` sub-agents (which
+  share its gate) and every specialist's scoped gate.
+
+This is a guard against the model's mistakes, not a security boundary.
+Commands are not covered: Landlock grants write access to the whole project,
+so an approved command can still change these files. An autonomous run's
+stop notice and `--report` mark any read-only file that changed anyway. Empty
+by default.
+
 ## 2. `ConfirmationGate` — human-in-the-loop, tiered trust
 
 Every tool call passes through the gate before it runs:

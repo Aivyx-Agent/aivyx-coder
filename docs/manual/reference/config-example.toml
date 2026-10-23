@@ -50,6 +50,11 @@ context_tokens = 8192
 # de-duplicated), never a replacement for them -- there is no way to
 # remove a built-in default via config, only add to it.
 deny_paths = ["~/.ssh", "~/.aws", ".env", "*.pem"]
+# The task's fixed inputs, which the model may read but never write, delete
+# or move: a brief, the data it gives. Relative entries are inside the
+# project ("data" covers everything under it); an entry with *, ? or [
+# matches any file of that name. Empty by default. Commands are not covered.
+# read_only_paths = ["BRIEF.md", "data"]
 max_tool_iterations_per_turn = 25
 
 # Commands the model may run by name (run_command), or that skip the
@@ -117,6 +122,10 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 # sandbox_failures = ["global::*"] # tests that fail only in the sandbox:
 #                              # named to the model as not its task, and a
 #                              # run whose only failures they are passes.
+# final_checks = ["clippy"]   # allowed_commands entries --auto runs itself
+#                              # when the goal is reached; results (with
+#                              # warning counts) go in the stop notice and
+#                              # --report.
 
 # REPL/interactive-process support (repl_start/repl_send/repl_stop):
 # timing knobs for deciding when a call has "enough" output to return,
