@@ -75,6 +75,13 @@ max_duration_secs = 3600  # wall-clock limit
 The time limit is exact: a turn still running when it passes is stopped,
 the same way Ctrl+C stops it, and the run reports the budget exhausted.
 
+**A last review (experimental).** With `final_review = true` under
+`[autonomous]`, the first time the goal is reached the model gets one more
+turn. It is asked to check the code against the task's spec field by field
+(names, types, status codes, `null` versus left out) and fix any mismatch,
+with a test. That turn counts against `max_iterations`, and it is skipped
+on the last one. It is off by default while we measure whether it helps.
+
 **What the run reports.** The model writes its own final answer, and it can
 be wrong. In the build tests, models said fields were `null` when they
 weren't, and that clippy was clean after it had printed three warnings. So

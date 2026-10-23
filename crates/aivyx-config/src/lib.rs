@@ -136,6 +136,11 @@ pub struct AutonomousSettings {
     /// Wall-clock ceiling, in seconds, for the whole autonomous run. A turn
     /// still running when it passes is stopped.
     pub max_duration_secs: u64,
+    /// Before the run stops with its goal reached, send the model one more
+    /// turn asking it to check the code against the task's spec, field by
+    /// field. Off by default: an experiment (in the build tests, final
+    /// answers claimed fields were `null` that the code left out).
+    pub final_review: bool,
 }
 
 impl Default for AutonomousSettings {
@@ -143,6 +148,7 @@ impl Default for AutonomousSettings {
         Self {
             max_iterations: 20,
             max_duration_secs: 3600,
+            final_review: false,
         }
     }
 }
@@ -1475,6 +1481,13 @@ mod tests {
         assert_eq!(resolved[2], PathBuf::from("*.csv"));
         assert!(resolved[3].is_absolute() && resolved[3].ends_with("specs"), "{resolved:?}");
         assert!(PermissionSettings::default().read_only_paths.is_empty());
+    }
+
+    #[test]
+    fn final_review_is_off_by_default_and_parses() {
+        assert!(!AutonomousSettings::default().final_review);
+        let settings: Settings = toml::from_str("[autonomous]\nfinal_review = true").unwrap();
+        assert!(settings.autonomous.final_review);
     }
 
     #[test]

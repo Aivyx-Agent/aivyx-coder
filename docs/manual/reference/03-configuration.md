@@ -200,6 +200,7 @@ Limits for `--auto` runs. See [Autonomous and advanced modes](../guide/10-autono
 |---|---|---|---|
 | `max_iterations` | integer |  | Total "continue" round-trips for the whole autonomous run. |
 | `max_duration_secs` | integer |  | Wall-clock ceiling, in seconds, for the whole autonomous run. A turn still running when it passes is stopped. |
+| `final_review` | bool |  | Before the run stops with its goal reached, send the model one more turn asking it to check the code against the task's spec, field by field. Off by default: an experiment (in the build tests, final answers claimed fields were `null` that the code left out). |
 
 ### `[architect]`
 

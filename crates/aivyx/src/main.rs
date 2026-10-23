@@ -917,6 +917,7 @@ async fn main() -> anyhow::Result<()> {
         final_checks: settings.verification.final_checks.clone(),
         read_only_paths: settings.permissions.resolved_read_only_paths(&built.cwd),
         report: cli.report.clone(),
+        final_review: settings.autonomous.final_review,
     });
     // Only the TUI can redraw its transcript from `AgentEvent::SessionSwitched`
     // (`handle_agent_event` rebuilds it from the resumed history) -- ACP and

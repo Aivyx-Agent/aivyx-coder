@@ -237,6 +237,25 @@ fn plan_approval_message(
 /// model decides the goal is achieved (its tasks are all done), not the
 /// tests, so a run can end that way with verification still failing --
 /// which the notice then says rather than reading as plain success.
+/// The one extra turn `[autonomous] final_review` sends when the goal is
+/// first reached. In the build tests the 27B twice left out fields the
+/// brief says are `null` while its final answer said they were `null`.
+const FINAL_REVIEW_MESSAGE: &str = "Before this run ends, check your work against the task's \
+spec. For each request and response the spec describes, read the code that handles it (don't \
+rely on memory) and compare field by field: names, types, status codes, and whether a missing \
+value is `null` or left out. Fix any mismatch, with a test. If everything matches, say so and \
+change nothing.";
+
+/// What the driver sends when the goal is reached: the review message the
+/// first time, when `final_review` is on; otherwise `None` (stop).
+fn after_goal(final_review: bool, reviewed: &mut bool) -> Option<String> {
+    if final_review && !*reviewed {
+        *reviewed = true;
+        return Some(FINAL_REVIEW_MESSAGE.to_string());
+    }
+    None
+}
+
 /// The stop notice with the facts aivyx-coder checked itself indented
 /// under it, one per line (`RunFacts::notice_lines`).
 fn notice_with_facts(notice: &str, facts: &aivyx_core::run_facts::RunFacts) -> String {
@@ -422,6 +441,9 @@ pub struct AutonomousRun {
     pub read_only_paths: Vec<PathBuf>,
     /// `--report`: where to write the run's facts as JSON when it stops.
     pub report: Option<PathBuf>,
+    /// `[autonomous] final_review`: one review turn against the spec before
+    /// the run stops with its goal reached.
+    pub final_review: bool,
 }
 
 /// A brief startup banner, printed to plain stdout before the TUI takes
@@ -550,6 +572,7 @@ pub async fn run(
             // Why the run stopped (`RunReport::outcome`) and its notice;
             // posted once, with the facts, after the loop.
             let mut stop: Option<(&str, String)> = None;
+            let mut reviewed = false;
             let mut iterations_used = 0u32;
             let mut failed_in_a_row = 0u32;
             let mut next_message = Some(autonomous.goal.clone());
@@ -625,6 +648,11 @@ pub async fn run(
                     mission_plan_snapshot.as_ref(),
                     &open_specialist_sessions,
                 );
+                // Not on the last allowed iteration: the review would end
+                // the run as "budget exhausted" with the goal reached.
+                if next_message.is_none() && iterations_used < autonomous.max_iterations {
+                    next_message = after_goal(autonomous.final_review, &mut reviewed);
+                }
                 if next_message.is_none() {
                     let notice =
                         goal_achieved_notice(iterations_used, agent.last_verification_passed());
@@ -3616,6 +3644,16 @@ mod tests {
             .collect();
         assert!(rendered.contains("stopped"));
         assert!(!rendered.contains('!'));
+    }
+
+    #[test]
+    fn a_final_review_runs_once_when_the_goal_is_first_reached() {
+        let mut reviewed = false;
+        assert_eq!(after_goal(false, &mut reviewed), None);
+        assert!(!reviewed);
+        assert_eq!(after_goal(true, &mut reviewed).as_deref(), Some(FINAL_REVIEW_MESSAGE));
+        assert!(reviewed);
+        assert_eq!(after_goal(true, &mut reviewed), None, "only once");
     }
 
     #[test]
