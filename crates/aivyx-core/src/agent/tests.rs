@@ -7391,6 +7391,7 @@ async fn clear_conversation_closes_all_open_specialist_sessions_when_a_pool_is_s
         enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients {
             prompter: Arc::new(AlwaysAllowPrompter),
             base_deny_paths: vec![],
+            read_only_paths: vec![],
             pre_approved_commands: vec![],
             plan_mode: PlanMode::new(),
             autonomous_mode: AutonomousMode::new(),

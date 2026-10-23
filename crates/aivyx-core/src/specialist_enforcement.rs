@@ -27,6 +27,9 @@ pub struct SpecialistEnforcementIngredients {
     /// specialist's own `extra_deny_paths` at call time, never mutated
     /// here.
     pub base_deny_paths: Vec<PathBuf>,
+    /// The lead's resolved `read_only_paths`: a specialist may not change
+    /// the task's fixed inputs either.
+    pub read_only_paths: Vec<PathBuf>,
     pub pre_approved_commands: Vec<(String, Vec<String>)>,
     pub plan_mode: PlanMode,
     pub autonomous_mode: AutonomousMode,
@@ -69,7 +72,8 @@ pub fn scoped_gate_and_confiner(
             cwd.to_path_buf(),
             ingredients.editor_approval_enabled,
         )
-        .with_injection_taint(ingredients.injection_taint.clone()),
+        .with_injection_taint(ingredients.injection_taint.clone())
+        .with_read_only_paths(ingredients.read_only_paths.clone()),
     );
     let confiner = aivyx_sandbox::build_confiner(
         cwd,
@@ -166,6 +170,7 @@ mod tests {
         SpecialistEnforcementIngredients {
             prompter: Arc::new(AlwaysAllowPrompter),
             base_deny_paths,
+            read_only_paths: vec![],
             pre_approved_commands: vec![],
             plan_mode: PlanMode::new(),
             autonomous_mode: AutonomousMode::new(),
@@ -208,6 +213,25 @@ mod tests {
         assert!(!strict_ok, "AF_UNIX must stay blocked for a specialist under the strict policy");
         let opted_out = strict.allow_unix_sockets(true);
         assert_eq!(specialist_can_open_a_unix_socket(opted_out).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_specialist_gate_keeps_the_leads_read_only_paths() {
+        let mut ing = ingredients(vec![]);
+        ing.read_only_paths = vec![PathBuf::from("/tmp/app/data")];
+        let (gate, _confiner) =
+            scoped_gate_and_confiner(&ing, &member("implementer", &[]), Path::new("/tmp/app"));
+        let decision = gate
+            .check(&PermissionRequest {
+                tool_name: "write_file".to_string(),
+                action: aivyx_sandbox::ActionKind::Write,
+                target: PermissionTarget::Path(PathBuf::from("/tmp/app/data/airports.csv")),
+                arguments_preview: serde_json::json!({}),
+                preview: None,
+                diff: None,
+            })
+            .await;
+        assert!(matches!(decision, PermissionDecision::Deny(_)), "{decision:?}");
     }
 
     #[tokio::test]

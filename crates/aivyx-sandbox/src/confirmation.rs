@@ -74,6 +74,14 @@ const GIT_METADATA_WRITE_DENIAL: &str = "Writing inside .git (or the global git 
     blocked: git runs programs named there (hooks, filters, fsmonitor). Ask the user to change \
     git settings themselves.";
 
+/// Why a write to a `read_only_paths` entry is refused, worded for the
+/// model: in the build tests a model edited a brief's data, and another a
+/// test's expected value taken from the brief, to make its own wrong tests
+/// pass.
+const READ_ONLY_DENIAL: &str = "This file is a fixed input of the task (read_only_paths): it \
+    can be read but not changed. If a test disagrees with it, the test or the code is wrong; \
+    fix that instead.";
+
 /// Identifies a "class" of requests for the Always-Allow cache. Scoped to
 /// the exact target (and action), not the whole tool — approving one write
 /// must not silently bless every future write anywhere.
@@ -131,6 +139,9 @@ impl PermissionKey {
 pub struct ConfirmationGate {
     prompter: Arc<dyn PermissionPrompter>,
     deny_paths: Vec<PathBuf>,
+    /// Readable, never written, deleted or moved: the task's fixed inputs.
+    /// Same matching as `deny_paths` (a prefix, or a bare file-name glob).
+    read_only_paths: Vec<PathBuf>,
     plan_mode: PlanMode,
     autonomous_mode: AutonomousMode,
     cwd: PathBuf,
@@ -182,6 +193,7 @@ impl ConfirmationGate {
         Self {
             prompter,
             deny_paths,
+            read_only_paths: Vec::new(),
             plan_mode,
             autonomous_mode,
             cwd,
@@ -202,6 +214,31 @@ impl ConfirmationGate {
     pub fn with_injection_taint(mut self, injection_taint: InjectionTaint) -> Self {
         self.injection_taint = injection_taint;
         self
+    }
+
+    /// Sets the task's fixed inputs: paths the model may read but not
+    /// change (`[permissions] read_only_paths`, already resolved). Without
+    /// a call to this, nothing is read-only.
+    pub fn with_read_only_paths(mut self, read_only_paths: Vec<PathBuf>) -> Self {
+        self.read_only_paths = read_only_paths;
+        self
+    }
+
+    /// True if this request would write, delete or move a read-only path
+    /// (either end, for a `Move`).
+    fn changes_read_only(&self, request: &PermissionRequest) -> bool {
+        if !matches!(
+            request.action,
+            ActionKind::Write | ActionKind::Delete | ActionKind::Move
+        ) {
+            return false;
+        }
+        let hit = |path: &Path| path_is_denied(path, &self.read_only_paths);
+        match &request.target {
+            PermissionTarget::Path(path) => hit(path),
+            PermissionTarget::Move { from, to } => hit(from) || hit(to),
+            PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
+        }
     }
 
     fn is_denied(&self, request: &PermissionRequest) -> bool {
@@ -330,6 +367,16 @@ impl PermissionGate for ConfirmationGate {
                 "permission denied: target touches .git metadata"
             );
             return PermissionDecision::Deny(Some(GIT_METADATA_WRITE_DENIAL.to_string()));
+        }
+
+        if self.changes_read_only(request) {
+            tracing::warn!(
+                tool = %request.tool_name,
+                action = ?request.action,
+                target = ?request.target,
+                "permission denied: target is a read-only fixed input"
+            );
+            return PermissionDecision::Deny(Some(READ_ONLY_DENIAL.to_string()));
         }
 
         if matches!(request.action, ActionKind::Read | ActionKind::Internal) {
@@ -649,6 +696,72 @@ mod tests {
             preview: None,
             diff: None,
         }
+    }
+
+    fn read_only_gate(prompter: Arc<FakePrompter>) -> (ConfirmationGate, PlanMode, AutonomousMode) {
+        let (plan, auto) = (PlanMode::new(), AutonomousMode::new());
+        let gate = ConfirmationGate::new(
+            prompter,
+            vec![],
+            vec![],
+            plan.clone(),
+            auto.clone(),
+            PathBuf::from("/work/app"),
+            false,
+        )
+        .with_read_only_paths(vec![
+            PathBuf::from("/work/app/BRIEF.md"),
+            PathBuf::from("/work/app/data"),
+            PathBuf::from("*.lock"),
+        ]);
+        (gate, plan, auto)
+    }
+
+    #[tokio::test]
+    async fn read_only_paths_refuse_every_change_in_every_mode_without_asking() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let (gate, plan, auto) = read_only_gate(prompter.clone());
+        let delete = PermissionRequest {
+            action: ActionKind::Delete,
+            ..write_request("/work/app/BRIEF.md")
+        };
+        let requests = [
+            write_request("/work/app/data/airports.csv"),
+            write_request("/work/app/Cargo.lock"),
+            delete,
+            move_request("/work/app/data/a.csv", "/work/app/b.csv"),
+            move_request("/work/app/notes.md", "/work/app/BRIEF.md"),
+        ];
+        for (planning, autonomous) in [(false, false), (false, true), (true, false)] {
+            plan.set_active(planning);
+            auto.set_active(autonomous);
+            for request in &requests {
+                let PermissionDecision::Deny(Some(reason)) = gate.check(request).await else {
+                    panic!("{:?} was not denied", request.target);
+                };
+                assert!(reason.contains("fixed input"), "{reason}");
+            }
+        }
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn read_only_paths_still_allow_reads_and_other_files() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let (gate, _, _) = read_only_gate(prompter.clone());
+        let read = gate.check(&read_request("/work/app/data/airports.csv")).await;
+        assert!(matches!(read, PermissionDecision::Allow));
+        let other = gate.check(&write_request("/work/app/src/main.rs")).await;
+        assert!(matches!(other, PermissionDecision::Allow));
+        // `data` is a directory prefix, not a name prefix.
+        let near = gate.check(&write_request("/work/app/database.rs")).await;
+        assert!(matches!(near, PermissionDecision::Allow));
     }
 
     #[tokio::test]

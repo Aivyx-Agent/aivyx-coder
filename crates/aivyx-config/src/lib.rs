@@ -1021,6 +1021,13 @@ pub struct PermissionSettings {
     /// silently losing the defaults entirely.
     #[serde(default = "default_deny_paths", deserialize_with = "merge_deny_paths")]
     pub deny_paths: Vec<String>,
+    /// The task's fixed inputs — a brief, its data — which the model may
+    /// read but never write, delete or move (`ConfirmationGate`). A
+    /// relative entry is resolved against the project root (`data` covers
+    /// everything under it); an entry with a glob character (`*`, `?`,
+    /// `[`) matches any file of that name. Commands are not covered: an
+    /// approved command can still write these files.
+    pub read_only_paths: Vec<String>,
     pub max_tool_iterations_per_turn: u32,
     /// Fixed set of commands the `run_command` tool may execute — the model
     /// selects one by `name`, it never supplies a program or arbitrary args.
@@ -1106,6 +1113,7 @@ impl Default for PermissionSettings {
         Self {
             mode: PermissionMode::Confirm,
             deny_paths: default_deny_paths(),
+            read_only_paths: Vec::new(),
             max_tool_iterations_per_turn: 25,
             allowed_commands: Vec::new(),
         }
@@ -1157,6 +1165,24 @@ impl PermissionSettings {
         let mut resolved = resolve_tilde_paths(&path_like);
         resolved.extend(bare.into_iter().map(PathBuf::from));
         resolved
+    }
+
+    /// `read_only_paths` resolved for a project rooted at `root`: `~`
+    /// expanded, other relative entries joined to `root`, glob entries
+    /// left bare (a file-name pattern, as in `deny_paths`).
+    pub fn resolved_read_only_paths(&self, root: &Path) -> Vec<PathBuf> {
+        self.read_only_paths
+            .iter()
+            .flat_map(|raw| {
+                if raw.starts_with('~') {
+                    resolve_tilde_paths(std::slice::from_ref(raw))
+                } else if raw.contains(['*', '?', '[']) {
+                    vec![PathBuf::from(raw)]
+                } else {
+                    vec![root.join(raw)]
+                }
+            })
+            .collect()
     }
 }
 
@@ -1428,6 +1454,22 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_paths_resolve_against_the_project_root() {
+        let settings: Settings = toml::from_str(
+            "[permissions]\nread_only_paths = [\"BRIEF.md\", \"data\", \"*.csv\", \"~/specs\"]",
+        )
+        .unwrap();
+        let root = Path::new("/work/app");
+        let resolved = settings.permissions.resolved_read_only_paths(root);
+        assert_eq!(resolved[0], root.join("BRIEF.md"));
+        assert_eq!(resolved[1], root.join("data"));
+        // A glob stays bare: it matches any file of that name.
+        assert_eq!(resolved[2], PathBuf::from("*.csv"));
+        assert!(resolved[3].is_absolute() && resolved[3].ends_with("specs"), "{resolved:?}");
+        assert!(PermissionSettings::default().read_only_paths.is_empty());
+    }
 
     #[test]
     fn git_ignore_defaults_to_common_generated_files_and_can_be_emptied() {

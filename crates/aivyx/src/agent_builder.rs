@@ -655,6 +655,7 @@ pub(crate) async fn build_agent(
     // scoped gate (see `specialist_enforcement_ingredients` further down),
     // which needs its own copy of the same config-level trust list.
     let specialist_pre_approved_commands = pre_approved_commands.clone();
+    let read_only_paths = settings.permissions.resolved_read_only_paths(&cwd);
     let gate: Arc<dyn PermissionGate> = Arc::new(
         ConfirmationGate::new(
             Arc::clone(&prompter),
@@ -665,7 +666,8 @@ pub(crate) async fn build_agent(
             cwd.clone(),
             settings.editor_approval.enabled,
         )
-        .with_injection_taint(injection_taint.clone()),
+        .with_injection_taint(injection_taint.clone())
+        .with_read_only_paths(read_only_paths.clone()),
     );
     let confine_options = confine_options(&settings.sandbox);
     let confiner = aivyx_sandbox::build_confiner(
@@ -684,6 +686,7 @@ pub(crate) async fn build_agent(
         aivyx_core::specialist_enforcement::SpecialistEnforcementIngredients {
             prompter: Arc::clone(&prompter),
             base_deny_paths: deny_paths.clone(),
+            read_only_paths,
             pre_approved_commands: specialist_pre_approved_commands,
             plan_mode: plan_mode.clone(),
             autonomous_mode: autonomous_mode.clone(),

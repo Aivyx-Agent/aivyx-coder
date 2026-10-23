@@ -1244,6 +1244,7 @@ mod specialist_session_tests {
             enforcement: crate::specialist_enforcement::SpecialistEnforcementIngredients {
                 prompter: Arc::new(AlwaysAllowPrompter),
                 base_deny_paths: vec![],
+                read_only_paths: vec![],
                 pre_approved_commands: vec![],
                 plan_mode: PlanMode::new(),
                 autonomous_mode: AutonomousMode::new(),
