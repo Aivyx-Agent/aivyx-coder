@@ -535,6 +535,9 @@ pub struct Agent {
     /// model calls the goal achieved while the tests still fail. Reset
     /// with `last_test_passed`.
     last_verification_passed: Option<bool>,
+    /// The worktree snapshot taken when an autonomous run started
+    /// (`mark_run_start`), for `changed_since_run_start`.
+    run_start_oid: Option<String>,
     /// `[git] ignore`: `.gitignore`-syntax patterns for generated files.
     /// An untracked path matching one is left out of the change summary,
     /// `/diff`, the `/undo`/`/redo` previews and their result lists, and
@@ -638,6 +641,7 @@ impl Agent {
             test_timeout: test_command::TEST_TIMEOUT,
             last_test_passed: None,
             last_verification_passed: None,
+            run_start_oid: None,
             generated_ignore: aivyx_tools::default_generated_patterns(),
             events_tx,
         }
@@ -843,6 +847,86 @@ impl Agent {
     /// `last_test_passed` field's doc comment.
     pub fn last_test_passed(&self) -> Option<bool> {
         self.last_test_passed
+    }
+
+    /// The `[verification] command` name, when verification is on.
+    pub fn verification_command(&self) -> Option<&str> {
+        self.verification.as_ref().map(|v| v.command_name.as_str())
+    }
+
+    /// Snapshots the worktree as an autonomous run starts, for
+    /// `changed_since_run_start`. Without a checkpointer (not a git
+    /// repository) there is nothing to snapshot.
+    pub async fn mark_run_start(&mut self) {
+        self.run_start_oid = self
+            .undo_snapshot("autonomous run start")
+            .await
+            .map(|(_, oid)| oid);
+    }
+
+    /// The files that differ between `mark_run_start`'s snapshot and the
+    /// worktree now, generated files left out, each marked when it matches
+    /// `read_only_paths`. `None` without a starting snapshot or when git
+    /// fails.
+    pub async fn changed_since_run_start(
+        &self,
+        read_only_paths: &[PathBuf],
+    ) -> Option<Vec<crate::run_facts::ChangedFile>> {
+        use crate::changes::ChangeStatus;
+        let before = self.run_start_oid.as_deref()?;
+        let root = self.executor.checkpoint_cwd()?.to_path_buf();
+        let (_, after) = self.undo_snapshot("autonomous run end").await?;
+        let changes = self.changes_between(&root, before, &after).await?;
+        Some(
+            changes
+                .into_iter()
+                .map(|c| crate::run_facts::ChangedFile {
+                    read_only: aivyx_sandbox::path_is_denied(&root.join(&c.path), read_only_paths),
+                    status: match c.status {
+                        ChangeStatus::Added => "added",
+                        ChangeStatus::Modified => "modified",
+                        ChangeStatus::Removed => "removed",
+                    },
+                    added: c.added,
+                    removed: c.removed,
+                    path: c.path,
+                })
+                .collect(),
+        )
+    }
+
+    /// Runs each `[verification] final_checks` command once an autonomous
+    /// run reached its goal, through `run_command` like auto-verification
+    /// (so confined and pre-approved), shown as aivyx-coder's own calls.
+    /// Not added to the conversation: the run is over.
+    pub async fn run_final_checks(
+        &mut self,
+        names: &[String],
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Vec<crate::run_facts::FinalCheck> {
+        let mut checks = Vec::new();
+        for name in names {
+            self.synthetic_seq += 1;
+            let call = ToolCall {
+                id: ToolCallId(format!("final-check-{}", self.synthetic_seq)),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({ "command": name }),
+                source: ToolCallSource::AutoVerification,
+            };
+            self.emit(AgentEvent::ToolCallDetected(call.clone()));
+            let result = self.executor.dispatch(call, cwd, cancellation.clone()).await;
+            let (passed, warnings) = match &result.output {
+                ToolOutput::Ok(text) => (
+                    command_reported_success(text),
+                    crate::run_facts::warnings_in(text),
+                ),
+                ToolOutput::Error(_) | ToolOutput::Denied(_) => (false, 0),
+            };
+            self.emit(AgentEvent::ToolResult(result));
+            checks.push(crate::run_facts::FinalCheck { name: name.clone(), passed, warnings });
+        }
+        checks
     }
 
     /// The outcome of the most recent automatic verification attempt --
@@ -2575,6 +2659,22 @@ impl Agent {
     /// between two snapshot commits, leaving out untracked generated
     /// files; nothing when git fails or nothing visible changed.
     async fn emit_change_summary(&self, cwd: &Path, before_oid: &str, after_oid: &str) {
+        let Some(changes) = self.changes_between(cwd, before_oid, after_oid).await else {
+            return;
+        };
+        if let Some(line) = crate::changes::summary_line(&changes) {
+            self.info(line);
+        }
+    }
+
+    /// The files that differ between two snapshot commits, leaving out
+    /// untracked generated files; `None` when git fails.
+    async fn changes_between(
+        &self,
+        cwd: &Path,
+        before_oid: &str,
+        after_oid: &str,
+    ) -> Option<Vec<crate::changes::FileChange>> {
         let diff = |format: &'static str| {
             let args = [
                 "-c",
@@ -2592,15 +2692,13 @@ impl Agent {
         let numstat = diff("--numstat").await;
         let names = diff("--name-status").await;
         let (Ok(n), Ok(s)) = (numstat, names) else {
-            return;
+            return None;
         };
         let mut changes = crate::changes::parse_numstat(&n, &s);
         if let Some(filter) = self.generated_filter(cwd).await {
             changes.retain(|c| !filter.hides(&c.path));
         }
-        if let Some(line) = crate::changes::summary_line(&changes) {
-            self.info(line);
-        }
+        Some(changes)
     }
 
     /// Runs `/council`: convenes the configured council on `subject_arg`

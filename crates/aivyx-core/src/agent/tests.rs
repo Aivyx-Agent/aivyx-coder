@@ -10663,3 +10663,78 @@ fn plan_mode_system_prompt_replaces_the_base_and_is_counted() {
     agent.autonomous_mode.set_active(true);
     assert!(agent.system_prompt_text().starts_with(&agent.system_prompt));
 }
+
+#[tokio::test]
+async fn changed_since_run_start_lists_the_runs_files_and_marks_read_only_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![]).await;
+    agent.mark_run_start().await;
+    std::fs::write(cwd.join("tracked.txt"), "v2\nmore\n").unwrap();
+    std::fs::create_dir_all(cwd.join("data")).unwrap();
+    std::fs::write(cwd.join("data/airports.csv"), "icao\n").unwrap();
+    std::fs::create_dir_all(cwd.join("target/debug")).unwrap();
+    std::fs::write(cwd.join("target/debug/app"), "binary").unwrap();
+
+    let changed = agent.changed_since_run_start(&[cwd.join("data")]).await.unwrap();
+    let file = |path: &str, status, added, removed, read_only| crate::run_facts::ChangedFile {
+        path: path.to_string(),
+        status,
+        added: Some(added),
+        removed: Some(removed),
+        read_only,
+    };
+    assert_eq!(
+        changed,
+        [
+            file("data/airports.csv", "added", 1, 0, true),
+            file("tracked.txt", "modified", 2, 1, false),
+        ],
+        "target/ is generated output and left out"
+    );
+}
+
+#[tokio::test]
+async fn changed_since_run_start_is_none_without_a_starting_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let agent = undo_agent(&cwd, vec![]).await;
+    assert!(agent.changed_since_run_start(&[]).await.is_none());
+}
+
+#[tokio::test]
+async fn final_checks_report_passes_failures_and_warnings_outside_the_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let warn = CommandSpec {
+        name: "clippy".to_string(),
+        program: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            "echo 'warning: unused variable' >&2; echo 'warning: dead code' >&2".to_string(),
+        ],
+        timeout: Duration::from_secs(5),
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(RunCommandTool::new(vec![warn, verify_command_spec("fmt", false)])));
+    let mut agent = undo_agent_with(&cwd, registry, vec![]).await;
+    let before = agent.history.len();
+    let checks = agent
+        .run_final_checks(
+            &["clippy".to_string(), "fmt".to_string()],
+            &cwd,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        checks,
+        [
+            crate::run_facts::FinalCheck { name: "clippy".into(), passed: true, warnings: 2 },
+            crate::run_facts::FinalCheck { name: "fmt".into(), passed: false, warnings: 0 },
+        ]
+    );
+    assert_eq!(agent.history.len(), before, "final checks are not part of the conversation");
+}

@@ -10,6 +10,7 @@ pub mod editor_context;
 mod failing_tests;
 pub mod mission_tools;
 pub mod routing_commands;
+pub mod run_facts;
 pub mod sandbox_failures;
 pub mod session;
 pub mod session_list;
