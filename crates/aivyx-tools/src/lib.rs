@@ -1315,6 +1315,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_now_works_when_the_gitignore_already_covers_generated_output() {
+        // 2026-10-23, ckl build test: a project whose .gitignore lists
+        // node_modules/ failed every checkpoint (87 in one run), because
+        // the generated-files exclusion named the already-ignored path in
+        // `git add`, which git refuses.
+        use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
+
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let mut executor =
+            ToolExecutor::new(ToolRegistry::new(), Arc::new(AlwaysDenyGate), Arc::new(NoopConfiner));
+        let cwd = dir.path().canonicalize().unwrap();
+        let checkpointer = GitCheckpointer::detect(&cwd, vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(default_generated_patterns());
+        executor.set_checkpointer_at(cwd.clone(), vec![], Arc::new(checkpointer));
+        std::fs::write(cwd.join(".gitignore"), "node_modules/\ndist/\n").unwrap();
+        std::fs::create_dir_all(cwd.join("node_modules/react")).unwrap();
+        std::fs::write(cwd.join("node_modules/react/index.js"), "x\n").unwrap();
+        std::fs::write(cwd.join("app.ts"), "export {};\n").unwrap();
+
+        let snapshot = executor.checkpoint_now("turn", &CancellationToken::new()).await;
+        let snapshot = snapshot.expect("the checkpoint must succeed");
+        let tree = run_git(&cwd, &["ls-tree", "-r", "--name-only", &snapshot], &[])
+            .await
+            .unwrap();
+        assert!(tree.contains("app.ts") && tree.contains(".gitignore"), "{tree}");
+        assert!(!tree.contains("node_modules"), "{tree}");
+    }
+
+    #[tokio::test]
     async fn checkpoint_now_snapshots_the_current_worktree() {
         use aivyx_sandbox::{AlwaysDenyGate, NoopConfiner};
 
