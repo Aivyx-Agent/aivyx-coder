@@ -31,6 +31,41 @@ pub fn resolve(cwd: &Path, raw: &str) -> PathBuf {
     resolve_symlinks(&lexical)
 }
 
+/// The reason to refuse `raw` when it is the project's own absolute path
+/// without its leading `/` (`k/runs/app/src/x.rs` for a project at
+/// `/k/runs/app`): resolved against the project, it would make a copy of
+/// that folder chain inside it, as a model running in a container did
+/// (fltplan build test, 2026-10-22). `None` otherwise — for a project path
+/// of one component (too short to tell a slip from a real folder), and when
+/// a folder of that name really exists.
+pub fn missing_leading_slash(cwd: &Path, raw: &str) -> Option<String> {
+    if raw.starts_with('/') || raw.starts_with('~') {
+        return None;
+    }
+    let project: Vec<Component> =
+        cwd.components().filter(|c| matches!(c, Component::Normal(_))).collect();
+    let given: Vec<Component> =
+        Path::new(raw).components().filter(|c| !matches!(c, Component::CurDir)).collect();
+    if project.len() < 2
+        || given.len() < project.len()
+        || given[..project.len()] != project[..]
+        || cwd.join(given[0]).exists()
+    {
+        return None;
+    }
+    let rest: PathBuf = given[project.len()..].iter().collect();
+    let rest = if rest.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        rest.display().to_string()
+    };
+    Some(format!(
+        "`{raw}` looks like this project's own path `{}` without its leading `/`. Paths are \
+         relative to the project: use `{rest}`.",
+        cwd.display()
+    ))
+}
+
 fn resolve_lexical(cwd: &Path, raw: &str) -> PathBuf {
     let expanded: PathBuf = if let Some(rest) = raw.strip_prefix("~/") {
         home_dir()
@@ -138,6 +173,37 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_path_missing_its_leading_slash_is_caught_with_the_right_path() {
+        let cwd = Path::new("/k/runs/9b/app");
+        let msg = missing_leading_slash(cwd, "k/runs/9b/app/src/main.rs").unwrap();
+        assert!(msg.contains("`/k/runs/9b/app`") && msg.contains("`src/main.rs`"), "{msg}");
+        let msg = missing_leading_slash(cwd, "./k/runs/9b/app").unwrap();
+        assert!(msg.contains("`.`"), "{msg}");
+    }
+
+    #[test]
+    fn ordinary_and_absolute_paths_pass() {
+        let cwd = Path::new("/k/runs/9b/app");
+        for raw in ["src/main.rs", "/k/runs/9b/app/src/main.rs", "~/notes.md", "k/other.rs", "k"] {
+            assert_eq!(missing_leading_slash(cwd, raw), None, "{raw}");
+        }
+        // One component is too short to tell a slip from a real folder.
+        assert_eq!(missing_leading_slash(Path::new("/app"), "app/x.rs"), None);
+    }
+
+    #[test]
+    fn a_real_folder_with_that_name_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let rel = cwd.strip_prefix("/").unwrap().to_path_buf();
+        let raw = rel.join("x.rs").to_string_lossy().into_owned();
+        assert!(missing_leading_slash(&cwd, &raw).is_some(), "{raw}");
+        let first = rel.components().next().unwrap();
+        std::fs::create_dir(cwd.join(first)).unwrap();
+        assert_eq!(missing_leading_slash(&cwd, &raw), None);
+    }
 
     #[cfg(unix)]
     #[test]

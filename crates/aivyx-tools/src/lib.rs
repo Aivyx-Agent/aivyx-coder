@@ -51,7 +51,7 @@ pub fn deny_aware_pathspecs(dir: &Path, deny: &[PathBuf]) -> Vec<String> {
 }
 pub use lsp::LspClient;
 pub use mcp::{McpClient, ToolInfo};
-pub use path_resolve::resolve;
+pub use path_resolve::{missing_leading_slash, resolve};
 pub use process::{
     CommandSpec, ProcessGroup, SANDBOX_DENIAL_NOTE, SANDBOX_FAILURE_NOTE, kill_all_process_groups,
     kill_process_group, mentions_permission_error, output_in_group, run, run_noting_sandbox,

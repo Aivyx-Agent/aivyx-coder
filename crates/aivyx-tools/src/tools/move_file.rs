@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::bounded_read;
-use crate::path_resolve::resolve;
+use crate::path_resolve::{missing_leading_slash, resolve};
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -77,6 +77,11 @@ impl Tool for MoveFileTool {
     ) -> Result<(ActionKind, PermissionTarget), ToolError> {
         let args: MoveFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        for path in [&args.from, &args.to] {
+            if let Some(hint) = missing_leading_slash(cwd, path) {
+                return Err(ToolError::InvalidArguments(hint));
+            }
+        }
         Ok((
             ActionKind::Move,
             PermissionTarget::Move {
@@ -248,6 +253,23 @@ fn directory_listing(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_refuses_a_slipped_project_path_at_either_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let slipped = format!("{}/b.rs", cwd.display().to_string().trim_start_matches('/'));
+        for (from, to) in [("a.rs", slipped.as_str()), (slipped.as_str(), "a.rs")] {
+            let args = serde_json::json!({ "from": from, "to": to });
+            assert!(
+                matches!(
+                    MoveFileTool::new(vec![]).permission_target(&args, &cwd),
+                    Err(ToolError::InvalidArguments(_))
+                ),
+                "{from} -> {to}"
+            );
+        }
+    }
 
     fn ctx(dir: &Path) -> ToolExecutionContext {
         ToolExecutionContext {

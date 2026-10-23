@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::diff::unified_diff;
 use crate::bounded_read;
-use crate::path_resolve::resolve;
+use crate::path_resolve::{missing_leading_slash, resolve};
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -45,6 +45,9 @@ impl Tool for WriteFileTool {
     ) -> Result<PermissionRequest, ToolError> {
         let args: WriteFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        if let Some(hint) = missing_leading_slash(cwd, &args.path) {
+            return Err(ToolError::InvalidArguments(hint));
+        }
         let resolved = resolve(cwd, &args.path);
 
         let (preview, diff) = match bounded_read::read_whole(&resolved) {
@@ -107,6 +110,19 @@ impl Tool for WriteFileTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_path_missing_its_leading_slash_is_refused_with_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let slipped = format!("{}/src/main.rs", cwd.display().to_string().trim_start_matches('/'));
+        let args = serde_json::json!({ "path": slipped, "content": "x" });
+        let Err(ToolError::InvalidArguments(msg)) = WriteFileTool.permission_request(&args, &cwd)
+        else {
+            panic!("a slipped path must be refused");
+        };
+        assert!(msg.contains("use `src/main.rs`"), "{msg}");
+    }
 
     #[test]
     fn new_file_preview_shows_additions_only() {

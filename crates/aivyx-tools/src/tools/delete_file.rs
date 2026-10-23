@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::bounded_read;
-use crate::path_resolve::resolve;
+use crate::path_resolve::{missing_leading_slash, resolve};
 use crate::{Tool, ToolError, ToolExecutionContext};
 
 #[derive(Deserialize, JsonSchema)]
@@ -58,6 +58,9 @@ impl Tool for DeleteFileTool {
     ) -> Result<(ActionKind, PermissionTarget), ToolError> {
         let args: DeleteFileArgs = serde_json::from_value(arguments.clone())
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        if let Some(hint) = missing_leading_slash(cwd, &args.path) {
+            return Err(ToolError::InvalidArguments(hint));
+        }
         Ok((ActionKind::Delete, PermissionTarget::Path(resolve(cwd, &args.path))))
     }
 
