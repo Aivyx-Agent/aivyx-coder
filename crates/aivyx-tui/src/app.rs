@@ -237,6 +237,77 @@ fn plan_approval_message(
 /// model decides the goal is achieved (its tasks are all done), not the
 /// tests, so a run can end that way with verification still failing --
 /// which the notice then says rather than reading as plain success.
+/// The stop notice with the facts aivyx-coder checked itself indented
+/// under it, one per line (`RunFacts::notice_lines`).
+fn notice_with_facts(notice: &str, facts: &aivyx_core::run_facts::RunFacts) -> String {
+    let mut text = notice.to_string();
+    for line in facts.notice_lines() {
+        text.push_str("\n  ");
+        text.push_str(&line);
+    }
+    text
+}
+
+/// Writes the `--report` JSON, private to the user (mode 600), replacing
+/// any earlier report at `path`.
+fn write_report(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(json.as_bytes())
+}
+
+/// Ends an `--auto` run: runs the final checks (only when the goal was
+/// reached), collects the facts, writes `--report`, and posts the stop
+/// notice with the facts under it.
+#[allow(clippy::too_many_arguments)]
+async fn finish_autonomous_run(
+    agent: &mut Agent,
+    run: &AutonomousRun,
+    cwd: &std::path::Path,
+    outcome: &str,
+    notice: String,
+    iterations: u32,
+    started: Instant,
+    active_cancellation: &Mutex<Option<CancellationToken>>,
+) {
+    let mut facts = aivyx_core::run_facts::RunFacts {
+        verification: agent
+            .verification_command()
+            .map(|name| (name.to_string(), agent.last_verification_passed())),
+        ..Default::default()
+    };
+    if outcome == "goal_achieved" && !run.final_checks.is_empty() {
+        let cancellation = CancellationToken::new();
+        *active_cancellation.lock().unwrap() = Some(cancellation.clone());
+        facts.final_checks = agent.run_final_checks(&run.final_checks, cwd, &cancellation).await;
+        *active_cancellation.lock().unwrap() = None;
+    }
+    facts.changed = agent.changed_since_run_start(&run.read_only_paths).await;
+    let notice = notice_with_facts(&notice, &facts);
+    if let Some(path) = &run.report {
+        let report = aivyx_core::run_facts::RunReport {
+            goal: &run.goal,
+            outcome,
+            notice: &notice,
+            iterations,
+            duration_secs: started.elapsed().as_secs(),
+            last_verification_passed: agent.last_verification_passed(),
+            final_checks: &facts.final_checks,
+            changed_files: facts.changed.as_deref().unwrap_or_default(),
+        };
+        if let Err(err) = write_report(path, &report.to_json()) {
+            agent.notify(format!("couldn't write the --report file {}: {err}", path.display()));
+        }
+    }
+    agent.notify(notice);
+}
+
 fn goal_achieved_notice(iterations_used: u32, last_verification_passed: Option<bool>) -> String {
     let notice =
         format!("autonomous run stopped: goal achieved after {iterations_used} iteration(s)");
@@ -344,6 +415,13 @@ pub struct AutonomousRun {
     /// `None` when `[team] enabled = false` (see `agent_builder.rs`'s
     /// `BuiltAgent.specialist_session_pool`, threaded from directly).
     pub specialist_session_pool: Option<aivyx_core::SpecialistSessionPool>,
+    /// `[verification] final_checks`: run by aivyx-coder when the goal is
+    /// reached, reported in the stop notice.
+    pub final_checks: Vec<String>,
+    /// Resolved `[permissions] read_only_paths`, to mark changed files.
+    pub read_only_paths: Vec<PathBuf>,
+    /// `--report`: where to write the run's facts as JSON when it stops.
+    pub report: Option<PathBuf>,
 }
 
 /// A brief startup banner, printed to plain stdout before the TUI takes
@@ -466,7 +544,12 @@ pub async fn run(
             // beyond appearing in the transcript locally; Ctrl+C is the
             // only supported intervention, matching the design doc's
             // scope).
-            let deadline = Instant::now() + autonomous.max_duration;
+            let started = Instant::now();
+            let deadline = started + autonomous.max_duration;
+            agent.mark_run_start().await;
+            // Why the run stopped (`RunReport::outcome`) and its notice;
+            // posted once, with the facts, after the loop.
+            let mut stop: Option<(&str, String)> = None;
             let mut iterations_used = 0u32;
             let mut failed_in_a_row = 0u32;
             let mut next_message = Some(autonomous.goal.clone());
@@ -476,7 +559,8 @@ pub async fn run(
             while let Some(message) = next_message.take() {
                 if iterations_used >= autonomous.max_iterations || Instant::now() >= deadline {
                     let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
-                    agent.notify(budget_exhausted_notice(iterations_used, &tasks_snapshot));
+                    let notice = budget_exhausted_notice(iterations_used, &tasks_snapshot);
+                    stop = Some(("budget_exhausted", notice));
                     break;
                 }
                 iterations_used += 1;
@@ -489,13 +573,14 @@ pub async fn run(
 
                 if deadline_hit.load(Ordering::SeqCst) {
                     let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
-                    agent.notify(budget_exhausted_notice(iterations_used, &tasks_snapshot));
+                    let notice = budget_exhausted_notice(iterations_used, &tasks_snapshot);
+                    stop = Some(("budget_exhausted", notice));
                     break;
                 }
                 if cancellation.is_cancelled() {
                     // The user hit Ctrl+C wanting this to stop — do not
                     // send another message.
-                    agent.notify(cancelled_notice(iterations_used));
+                    stop = Some(("cancelled", cancelled_notice(iterations_used)));
                     break;
                 }
                 match &outcome {
@@ -505,7 +590,7 @@ pub async fn run(
                         if let Some(notice) =
                             failed_turns_notice(failed_in_a_row, iterations_used, error)
                         {
-                            agent.notify(notice);
+                            stop = Some(("failed", notice));
                             break;
                         }
                     }
@@ -520,7 +605,8 @@ pub async fn run(
                 // — `.take()`, not `.current()`, since consuming the taint
                 // here is exactly what decides that outcome.
                 if let Some(finding) = autonomous.injection_taint.take() {
-                    agent.notify(injection_detected_notice(iterations_used, &finding));
+                    let notice = injection_detected_notice(iterations_used, &finding);
+                    stop = Some(("injection_detected", notice));
                     break;
                 }
                 let tasks_snapshot = autonomous.tasks.lock().unwrap().clone();
@@ -540,11 +626,23 @@ pub async fn run(
                     &open_specialist_sessions,
                 );
                 if next_message.is_none() {
-                    agent.notify(goal_achieved_notice(
-                        iterations_used,
-                        agent.last_verification_passed(),
-                    ));
+                    let notice =
+                        goal_achieved_notice(iterations_used, agent.last_verification_passed());
+                    stop = Some(("goal_achieved", notice));
                 }
+            }
+            if let Some((outcome, notice)) = stop {
+                finish_autonomous_run(
+                    &mut agent,
+                    &autonomous,
+                    &cwd,
+                    outcome,
+                    notice,
+                    iterations_used,
+                    started,
+                    &background_cancellation,
+                )
+                .await;
             }
         } else {
             while let Some(input) = input_rx.recv().await {
@@ -3518,6 +3616,36 @@ mod tests {
             .collect();
         assert!(rendered.contains("stopped"));
         assert!(!rendered.contains('!'));
+    }
+
+    #[test]
+    fn the_stop_notice_carries_the_facts_indented_under_it() {
+        let facts = aivyx_core::run_facts::RunFacts {
+            verification: Some(("test".into(), Some(true))),
+            changed: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            notice_with_facts("autonomous run stopped: goal achieved after 2 iteration(s)", &facts),
+            "autonomous run stopped: goal achieved after 2 iteration(s)\n  \
+             verification: `test` passed\n  changed: no files"
+        );
+        let none = aivyx_core::run_facts::RunFacts::default();
+        assert_eq!(notice_with_facts("stopped", &none), "stopped");
+    }
+
+    #[test]
+    fn the_report_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.json");
+        write_report(&path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // A second run overwrites it.
+        write_report(&path, "{\"n\": 2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"n\": 2}");
     }
 
     #[test]

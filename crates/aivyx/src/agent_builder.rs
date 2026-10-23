@@ -125,6 +125,23 @@ pub(crate) fn confine_options(sandbox: &aivyx_config::SandboxSettings) -> Confin
 /// mismatches, and `agent.tests()`'s own announcement (built from the
 /// same `tests` this function was given) always describes the same
 /// command that ends up enabled.
+/// `[verification] final_checks` must each name an allowed command, like
+/// `[verification] command`: a typo would otherwise drop a check silently.
+pub(crate) fn check_final_checks(
+    final_checks: &[String],
+    allowed_command_names: &[String],
+) -> anyhow::Result<()> {
+    for name in final_checks {
+        if !allowed_command_names.iter().any(|n| n == name) {
+            anyhow::bail!(
+                "--auto: [verification] final_checks names \"{name}\", which doesn't match any \
+                 [[permissions.allowed_commands]] entry name."
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn auto_verification(
     configured_name: Option<&str>,
     allowed_command_names: &[String],
@@ -594,6 +611,7 @@ pub(crate) async fn build_agent(
         .map(|c| c.name.clone())
         .collect();
     let auto = if cli.auto.is_some() {
+        check_final_checks(&settings.verification.final_checks, &allowed_command_names)?;
         Some(auto_verification(
             settings.verification.command.as_deref(),
             &allowed_command_names,
@@ -1759,6 +1777,15 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_checks_must_name_allowed_commands() {
+        let allowed = vec!["test".to_string(), "clippy".to_string()];
+        assert!(check_final_checks(&["clippy".to_string()], &allowed).is_ok());
+        assert!(check_final_checks(&[], &allowed).is_ok());
+        let err = check_final_checks(&["lint".to_string()], &allowed).unwrap_err().to_string();
+        assert!(err.contains("final_checks") && err.contains("\"lint\""), "{err}");
+    }
 
     #[cfg(feature = "sandbox-backend")]
     #[test]

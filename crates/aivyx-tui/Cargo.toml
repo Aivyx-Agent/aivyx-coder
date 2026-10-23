@@ -39,3 +39,6 @@ unicode-width = "0.2.0"
 default = ["sandbox-backend"]
 sandbox-backend = ["aivyx-sandbox/sandbox-backend", "aivyx-core/sandbox-backend"]
 
+
+[dev-dependencies]
+tempfile = "3.27.0"

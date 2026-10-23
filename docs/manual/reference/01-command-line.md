@@ -80,6 +80,22 @@ check its work — a `[verification] command`, or a test command it can
 detect in the project — and refuses to start without one. Not with `--plan`
 or `--resume`. See [Autonomous and advanced modes](../guide/10-autonomous-and-advanced-modes.md).
 
+### `--report`
+
+```
+aivyx-coder --auto "build the app in BRIEF.md" --report run.json
+```
+
+With `--auto` only. When the run stops, for any reason, write what
+aivyx-coder checked itself to this file as JSON:
+- the outcome and the stop notice;
+- iterations and duration;
+- the last verification result;
+- the `[verification] final_checks` results with their warning counts;
+- every file the run changed, marking any in `read_only_paths`.
+
+The file is private to you (mode 600).
+
 ### `--acp`
 
 Run as an Agent Client Protocol server over standard input and output, so

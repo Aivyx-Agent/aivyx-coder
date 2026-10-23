@@ -103,6 +103,11 @@ pub struct VerificationSettings {
     /// (`global::*`). Works for cargo, pytest and `go test` output; ignored
     /// when commands don't run sandboxed.
     pub sandbox_failures: Vec<String>,
+    /// Commands (`[[permissions.allowed_commands]]` names) aivyx-coder
+    /// runs itself when an autonomous run reaches its goal — a linter,
+    /// say. Their results, with warning counts, go into the stop notice
+    /// and `--report`, so the run's end doesn't rest on the model's claims.
+    pub final_checks: Vec<String>,
 }
 
 impl Default for VerificationSettings {
@@ -112,6 +117,7 @@ impl Default for VerificationSettings {
             max_auto_verify_retries: 3,
             scoped_command: None,
             sandbox_failures: Vec::new(),
+            final_checks: Vec::new(),
         }
     }
 }
@@ -1469,6 +1475,14 @@ mod tests {
         assert_eq!(resolved[2], PathBuf::from("*.csv"));
         assert!(resolved[3].is_absolute() && resolved[3].ends_with("specs"), "{resolved:?}");
         assert!(PermissionSettings::default().read_only_paths.is_empty());
+    }
+
+    #[test]
+    fn final_checks_default_to_none_and_parse() {
+        assert!(VerificationSettings::default().final_checks.is_empty());
+        let settings: Settings =
+            toml::from_str("[verification]\nfinal_checks = [\"clippy\"]").unwrap();
+        assert_eq!(settings.verification.final_checks, ["clippy"]);
     }
 
     #[test]

@@ -98,6 +98,14 @@ mod tests {
     }
 
     #[test]
+    fn report_needs_auto() {
+        assert!(Cli::try_parse_from(["aivyx-coder", "--report", "r.json"]).is_err());
+        let cli =
+            Cli::try_parse_from(["aivyx-coder", "--auto", "go", "--report", "r.json"]).unwrap();
+        assert_eq!(cli.report, Some(std::path::PathBuf::from("r.json")));
+    }
+
+    #[test]
     fn resume_flag_forms() {
         assert_eq!(Cli::try_parse_from(["aivyx-coder"]).unwrap().resume, None);
         assert_eq!(
@@ -485,6 +493,12 @@ struct Cli {
     /// detected in the project.
     #[arg(long)]
     auto: Option<String>,
+
+    /// With --auto: when the run stops, write what aivyx-coder checked
+    /// itself (outcome, iterations, verification, final checks, changed
+    /// files) to this file as JSON.
+    #[arg(long, value_name = "PATH", requires = "auto")]
+    report: Option<std::path::PathBuf>,
 
     /// Override config.toml's backend edit_format ("native" or "prompted")
     /// for this session — mainly for comparing the two on a given model.
@@ -900,6 +914,9 @@ async fn main() -> anyhow::Result<()> {
         injection_taint: built.injection_taint.clone(),
         mission_plan: built.mission_plan.clone(),
         specialist_session_pool: built.specialist_session_pool.clone(),
+        final_checks: settings.verification.final_checks.clone(),
+        read_only_paths: settings.permissions.resolved_read_only_paths(&built.cwd),
+        report: cli.report.clone(),
     });
     // Only the TUI can redraw its transcript from `AgentEvent::SessionSwitched`
     // (`handle_agent_event` rebuilds it from the resumed history) -- ACP and
