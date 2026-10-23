@@ -414,11 +414,36 @@ fn format_output(status: ExitStatus, stdout: (Vec<u8>, usize), stderr: (Vec<u8>,
         .code()
         .map(|c| c.to_string())
         .unwrap_or_else(|| "signal".to_string());
+    let stdout = format_stream(stdout.0, stdout.1);
+    let stderr = format_stream(stderr.0, stderr.1);
+    // A clean exit with warnings read as plain success, and a model then
+    // reported clippy as clean after three warnings (vaops build test,
+    // 2026-10-23). `(success)` stays as it was: success checks match it.
+    let warnings = match count_warnings(&stdout) + count_warnings(&stderr) {
+        n if !status.success() || n == 0 => String::new(),
+        1 => ", 1 warning".to_string(),
+        n => format!(", {n} warnings"),
+    };
     format!(
-        "exit status: {code} ({verdict})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        format_stream(stdout.0, stdout.1),
-        format_stream(stderr.0, stderr.1),
+        "exit status: {code} ({verdict}){warnings}\n--- stdout ---\n{stdout}\n\
+         --- stderr ---\n{stderr}"
     )
+}
+
+/// Compiler and linter warnings in `text`: lines starting `warning:`
+/// (rustc, cargo, clippy) or containing `: warning:` (gcc, clang, and
+/// other `file:line: warning:` tools), but not cargo's per-target
+/// `warning: \`name\` (lib) generated N warnings` summaries.
+fn count_warnings(text: &str) -> usize {
+    text.lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            let summary = line.starts_with("warning: `")
+                && line.contains("` (")
+                && line.contains(") generated ");
+            (line.starts_with("warning:") || line.contains(": warning:")) && !summary
+        })
+        .count()
 }
 
 /// Renders one already-capped stream, prefixing a truncation notice if the
@@ -442,6 +467,41 @@ fn format_stream(data: Vec<u8>, total_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn formatted(raw_status: i32, stdout: &str, stderr: &str) -> String {
+        let stream = |s: &str| (s.as_bytes().to_vec(), s.len());
+        format_output(ExitStatus::from_raw(raw_status), stream(stdout), stream(stderr))
+    }
+
+    const CLIPPY_WARNINGS: &str = "warning: `format!` in `format!` args\n   --> src/api.rs:610:23\n\
+warning: this function has too many arguments (10/7)\n   --> src/db.rs:749:1\n\
+warning: this function has too many arguments (9/7)\n    --> tests/api.rs:1230:1\n\
+warning: `vaops` (lib) generated 2 warnings \
+(run `cargo clippy --fix --lib -p vaops` to apply 1 suggestion)\n\
+warning: `vaops` (test \"api\") generated 1 warning\n";
+
+    #[test]
+    fn a_successful_run_with_warnings_says_how_many() {
+        let text = formatted(0, "", CLIPPY_WARNINGS);
+        assert!(text.starts_with("exit status: 0 (success), 3 warnings\n"), "{text}");
+        // Every existing success check looks for this exact text.
+        assert!(text.contains("(success)"), "{text}");
+    }
+
+    #[test]
+    fn compiler_warnings_with_a_location_prefix_count_too() {
+        let gcc = "a.c:12:5: warning: unused variable 'x' [-Wunused-variable]\n";
+        let text = formatted(0, gcc, "");
+        assert!(text.starts_with("exit status: 0 (success), 1 warning\n"), "{text}");
+    }
+
+    #[test]
+    fn no_warnings_or_a_failure_leaves_the_status_line_alone() {
+        assert!(formatted(0, "ok", "").starts_with("exit status: 0 (success)\n"));
+        let failed = formatted(101 << 8, "", CLIPPY_WARNINGS);
+        assert!(failed.starts_with("exit status: 101 (failed)\n"), "{failed}");
+    }
 
     #[test]
     fn format_stream_marks_truncation_using_the_true_total() {
