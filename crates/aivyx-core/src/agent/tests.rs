@@ -10769,3 +10769,48 @@ async fn after_truncation_the_prompt_names_the_files_this_session_wrote() {
     let fresh = agent.system_prompt_text();
     assert!(!fresh.contains("server/quiz.ts"), "a new conversation starts afresh: {fresh}");
 }
+
+#[tokio::test]
+async fn a_failed_checkpoint_is_shown_as_a_warning_once() {
+    // 2026-10-23, ckl build test: every checkpoint of a run failed and
+    // only the log said so. The user sees the first failure, mid-turn,
+    // as a warning — not an `Error`, which a frontend takes as the end
+    // of the turn — and the turn carries on.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mock = Arc::new(MockBackend::new(vec![
+        write_call("c1", "a.txt", "a\n"),
+        write_call("c2", "b.txt", "b\n"),
+        text_response("done"),
+    ]));
+    let (mut agent, mut rx) = undo_agent_over(&cwd, mock).await;
+    let private = cwd.join(".git").join("aivyx");
+    let _ = std::fs::remove_dir_all(&private);
+    std::fs::write(&private, "not a directory").unwrap();
+
+    agent.run_turn("write two files".into(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "b\n");
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::Warning(text) => warnings.push(text),
+            AgentEvent::Error(text) => errors.push(text),
+            _ => {}
+        }
+    }
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].starts_with("Checkpoint failed"), "{}", warnings[0]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn the_checkpoint_failure_notice_keeps_git_errors_short() {
+    let long = (1..=10).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+    let notice = checkpoint_failure_notice(&long);
+    assert!(notice.ends_with("line 1\nline 2\nline 3…"), "{notice}");
+    let notice = checkpoint_failure_notice(&"x".repeat(1000));
+    assert!(notice.ends_with(&format!("{}…", "x".repeat(300))), "{notice}");
+}

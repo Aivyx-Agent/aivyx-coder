@@ -12,6 +12,12 @@ snapshots the whole worktree into a hidden git ref
 files, respects `.gitignore`, skips identical states, and keeps the newest
 50. Turn it off with `checkpoints = false` under `[git]`.
 
+If a snapshot fails (git refuses it, say), the change still goes ahead and a
+notice in the transcript says so, with git's message: `/undo` and an
+`--auto` rewind can't go back to before that change. Later failures in a row
+only go to the log; the next failure after a snapshot that worked gets a
+notice again.
+
 ## See what changed
 
 After every turn that changed files, a dim line sums it up:

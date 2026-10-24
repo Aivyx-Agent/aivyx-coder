@@ -173,7 +173,9 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
         // styles it differently from the model's reply, and here it must
         // not read as the model's own words or run into them (live test,
         // 2026-10-19: the compaction notice did both).
-        AgentEvent::Error(text) => SessionUpdate::AgentMessageChunk(text_chunk(notice_paragraph(text))),
+        AgentEvent::Error(text) | AgentEvent::Warning(text) => {
+            SessionUpdate::AgentMessageChunk(text_chunk(notice_paragraph(text)))
+        }
         AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) => {
             SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
         }
@@ -371,6 +373,19 @@ mod tests {
                     ))
                 );
             }
+            other => panic!("expected AgentMessageChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_warning_is_a_notice_paragraph() {
+        let update =
+            translate_event(&sid(), &AgentEvent::Warning("Checkpoint failed".to_string())).unwrap();
+        match update {
+            SessionUpdate::AgentMessageChunk(chunk) => assert_eq!(
+                chunk.content,
+                ContentBlock::Text(TextContent::new("\n\n> ⚠ Checkpoint failed\n\n"))
+            ),
             other => panic!("expected AgentMessageChunk, got {other:?}"),
         }
     }

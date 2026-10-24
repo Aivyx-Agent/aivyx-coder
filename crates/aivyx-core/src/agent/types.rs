@@ -97,6 +97,10 @@ pub enum AgentEvent {
     /// after a turn that changed files. Frontends render it dim/unprefixed,
     /// unlike `Error`'s red notice.
     Info(String),
+    /// Something the user should know about mid-turn that doesn't stop it,
+    /// e.g. a failed checkpoint. Shown like `Error`'s notice, but unlike
+    /// `Error` a frontend must not treat it as the end of the turn.
+    Warning(String),
     /// A diff to show the user (`/diff`): `title` is a one-line heading
     /// (e.g. `Uncommitted changes`), `text` the unified diff itself,
     /// already truncated for display. Frontends show it in a pager (TUI)

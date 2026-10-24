@@ -1353,6 +1353,10 @@ impl App {
             AgentEvent::Info(text) => {
                 self.transcript.push(ChatLine::Info(text));
             }
+            // A notice, but the turn goes on: `streaming_active` stays.
+            AgentEvent::Warning(text) => {
+                self.transcript.push(ChatLine::Notice(text));
+            }
             // Never opened over a permission modal; the title still lands
             // in the transcript so the request isn't silently lost.
             AgentEvent::ShowDiff { title, text } => {
@@ -1728,9 +1732,10 @@ fn sub_agent_event_text(event: &AgentEvent) -> String {
         AgentEvent::TextDelta(text) | AgentEvent::ReasoningDelta(text) => text.clone(),
         AgentEvent::ToolCallDetected(call) => format!("{}({})", call.name, call.arguments),
         AgentEvent::ToolResult(result) => tool_output_text(&result.output),
-        AgentEvent::Error(text) | AgentEvent::TurnPaused(text) | AgentEvent::Info(text) => {
-            text.clone()
-        }
+        AgentEvent::Error(text)
+        | AgentEvent::TurnPaused(text)
+        | AgentEvent::Info(text)
+        | AgentEvent::Warning(text) => text.clone(),
         AgentEvent::ShowDiff { title, .. } => title.clone(),
         AgentEvent::TestOutput(line) => line.clone(),
         AgentEvent::TestFinished { summary, .. } => summary.clone(),
@@ -3596,6 +3601,17 @@ mod tests {
             assert!(matches!(app.transcript.last(), Some(ChatLine::Info(t)) if t == "x"));
             assert_eq!(app.streaming_active, streaming);
         }
+    }
+
+    #[test]
+    fn a_warning_is_a_notice_that_leaves_the_turn_running() {
+        // A failed checkpoint mid-turn: shown like an error, but the turn
+        // goes on, so the status line must keep saying so.
+        let mut app = App::new(None, PlanMode::new());
+        app.streaming_active = true;
+        app.handle_agent_event(AgentEvent::Warning("Checkpoint failed".to_string()));
+        assert!(matches!(app.transcript.last(), Some(ChatLine::Notice(t)) if t == "Checkpoint failed"));
+        assert!(app.streaming_active);
     }
 
     #[test]

@@ -923,6 +923,7 @@ impl Agent {
             };
             self.emit(AgentEvent::ToolCallDetected(call.clone()));
             let result = self.executor.dispatch(call, cwd, cancellation.clone()).await;
+            self.report_checkpoint_failure();
             let (passed, warnings) = match &result.output {
                 ToolOutput::Ok(text) => (
                     command_reported_success(text),
@@ -2247,6 +2248,15 @@ impl Agent {
         let _ = self.events_tx.send(event);
     }
 
+    /// Tells the user when the checkpoint before a tool call failed (once
+    /// per run of failures — see `ToolExecutor::take_checkpoint_failure`).
+    /// Called after every dispatch.
+    fn report_checkpoint_failure(&self) {
+        if let Some(err) = self.executor.take_checkpoint_failure() {
+            self.emit(AgentEvent::Warning(checkpoint_failure_notice(&err)));
+        }
+    }
+
     /// Records a synthetic tool result for a call that was never dispatched
     /// — either cancellation fired first, or the response exceeded
     /// `MAX_TOOL_CALLS_PER_RESPONSE`. The assistant message already pushed
@@ -2351,6 +2361,7 @@ impl Agent {
             .executor
             .dispatch(call, cwd, cancellation.clone())
             .await;
+        self.report_checkpoint_failure();
         let vacuous = matches!(&result.output, ToolOutput::Ok(text)
             if command_reported_success(text) && ran_no_tests(text));
         let mut passed = !vacuous
@@ -3664,6 +3675,7 @@ impl Agent {
                     .executor
                     .dispatch(call, cwd, cancellation.clone())
                     .await;
+                self.report_checkpoint_failure();
                 if runs_command {
                     self.note_known_failures(&mut result.output);
                 }
@@ -4182,6 +4194,24 @@ fn sanitize_for_display(raw: &str) -> String {
             .collect();
         format!("{truncated}...")
     }
+}
+
+/// The notice for a failed checkpoint: `err` is git's message, cut to a
+/// few lines.
+fn checkpoint_failure_notice(err: &str) -> String {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 300;
+    let lines: Vec<&str> = err.trim().lines().collect();
+    let mut detail = lines[..lines.len().min(MAX_LINES)].join("\n");
+    if detail.chars().count() > MAX_CHARS {
+        detail = detail.chars().take(MAX_CHARS).collect::<String>() + "…";
+    } else if lines.len() > MAX_LINES {
+        detail.push('…');
+    }
+    format!(
+        "Checkpoint failed, so /undo and rollbacks can't go back to before this change. \
+         Work continues; further failures are only logged until a checkpoint succeeds.\n{detail}"
+    )
 }
 
 /// Parses `run_command`'s formatted output (see

@@ -251,6 +251,19 @@ pub struct ToolExecutor {
     /// The deny paths `checkpointer` excludes from its snapshots, for
     /// `worktree_tree_over`'s own staging. Set with `checkpoint_cwd`.
     checkpoint_deny_paths: Vec<PathBuf>,
+    /// Whether tool-call checkpoints are failing, so the user hears about
+    /// it (`take_checkpoint_failure`) instead of only the log: a failing
+    /// checkpoint leaves nothing for `/undo` or a rollback to return to.
+    checkpoint_health: std::sync::Mutex<CheckpointHealth>,
+}
+
+/// See `ToolExecutor::checkpoint_health`.
+#[derive(Default)]
+struct CheckpointHealth {
+    /// Whether the most recent tool-call checkpoint failed.
+    failing: bool,
+    /// The error that started the current run of failures, until taken.
+    unreported: Option<String>,
 }
 
 impl ToolExecutor {
@@ -266,6 +279,7 @@ impl ToolExecutor {
             checkpointer: None,
             checkpoint_cwd: None,
             checkpoint_deny_paths: Vec::new(),
+            checkpoint_health: std::sync::Mutex::default(),
         }
     }
 
@@ -435,6 +449,18 @@ impl ToolExecutor {
         Some(tree?.trim().to_string()).filter(|t| !t.is_empty())
     }
 
+    /// The error from the first tool-call checkpoint that failed since
+    /// the last one that succeeded, once: further failures in a row stay
+    /// in the log (one broken repository failed 87 in a row), and a
+    /// success followed by a new failure reports again.
+    pub fn take_checkpoint_failure(&self) -> Option<String> {
+        self.checkpoint_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unreported
+            .take()
+    }
+
     /// Whether `dispatch` checkpoints a call to `tool_name` before running
     /// it once the gate allows it: the tool exists, its `needs_checkpoint()`
     /// is true, and a checkpointer is configured. Lets `Agent` decide per
@@ -583,7 +609,8 @@ impl ToolExecutor {
         // Snapshot the worktree before anything that can actually mutate
         // it — after the gate (denied calls change nothing worth
         // checkpointing), before the effect. Best-effort: a failed
-        // checkpoint logs and the call proceeds. Deliberately
+        // checkpoint logs, is kept for `take_checkpoint_failure`, and the
+        // call proceeds. Deliberately
         // `needs_checkpoint()`, not `mutates_outside_session()`: the latter
         // also drives plan-mode filtering and must stay `true` for
         // `web_fetch`/`web_search` (network is not session-local), but
@@ -594,7 +621,23 @@ impl ToolExecutor {
         if tool.needs_checkpoint()
             && let Some(checkpointer) = &self.checkpointer
         {
-            checkpointer.checkpoint(&call.name, &cancellation).await;
+            let outcome = checkpointer.try_checkpoint(&call.name, &cancellation).await;
+            let mut health = self
+                .checkpoint_health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match outcome {
+                Ok(()) => health.failing = false,
+                // A cancelled snapshot isn't a broken one.
+                Err(_) if cancellation.is_cancelled() => {}
+                Err(err) => {
+                    tracing::warn!(tool = %call.name, error = %err, "checkpoint failed (tool call proceeds)");
+                    if !health.failing {
+                        health.failing = true;
+                        health.unreported = Some(err);
+                    }
+                }
+            }
         }
 
         let ctx = ToolExecutionContext {
@@ -1524,6 +1567,67 @@ mod tests {
         assert_ne!(again.as_deref(), Some("refs/aivyx/checkpoints/9999999999999-0000"));
         let again = again.expect("the real, matching snapshot is still found");
         assert_eq!(tree_of_ref(&cwd, &again).await, tree_of_ref(&cwd, &real).await);
+    }
+
+    #[tokio::test]
+    async fn a_failing_checkpoint_is_reported_once_per_run_of_failures() {
+        // 2026-10-23, ckl build test: 87 checkpoints failed in one run and
+        // only the log said so. The first failure is kept for the agent to
+        // show; the rest of that run of failures isn't; after a success, a
+        // new failure is reported again.
+        use aivyx_checkpoint::test_support::init_repo;
+        use aivyx_sandbox::{NoopConfiner, PermissionDecision};
+        use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+        struct AllowAll;
+        #[async_trait]
+        impl PermissionGate for AllowAll {
+            async fn check(&self, _r: &PermissionRequest) -> PermissionDecision {
+                PermissionDecision::Allow
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WriteFileTool));
+        let mut executor = ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner));
+        executor.set_checkpointer_at(
+            cwd.clone(),
+            vec![],
+            Arc::new(GitCheckpointer::detect(&cwd, vec![]).await.unwrap()),
+        );
+        let write = |n: u32| ToolCall {
+            id: ToolCallId(format!("c{n}")),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": "tracked.txt", "content": format!("{n}\n") }),
+            source: ToolCallSource::Native,
+        };
+        let broken = cwd.join(".git").join("aivyx");
+        let break_checkpoints = || {
+            let _ = std::fs::remove_dir_all(&broken);
+            std::fs::write(&broken, "not a directory").unwrap();
+        };
+        let cancel = CancellationToken::new;
+
+        executor.dispatch(write(1), &cwd, cancel()).await;
+        assert_eq!(executor.take_checkpoint_failure(), None, "a working checkpoint");
+
+        break_checkpoints();
+        let result = executor.dispatch(write(2), &cwd, cancel()).await;
+        assert!(matches!(result.output, ToolOutput::Ok(_)), "the call still proceeds");
+        assert!(executor.take_checkpoint_failure().is_some(), "the first failure is reported");
+        assert_eq!(executor.take_checkpoint_failure(), None, "and taken only once");
+        executor.dispatch(write(3), &cwd, cancel()).await;
+        assert_eq!(executor.take_checkpoint_failure(), None, "the same run of failures");
+
+        std::fs::remove_file(&broken).unwrap();
+        executor.dispatch(write(4), &cwd, cancel()).await;
+        assert_eq!(executor.take_checkpoint_failure(), None, "working again");
+        break_checkpoints();
+        executor.dispatch(write(5), &cwd, cancel()).await;
+        assert!(executor.take_checkpoint_failure().is_some(), "a new failure after a success");
     }
 
     #[tokio::test]
