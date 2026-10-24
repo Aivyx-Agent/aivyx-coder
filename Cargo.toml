@@ -34,7 +34,7 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
 aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "6e465755c827189e195499b981c13ba235953b30", default-features = false }
-aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "d014b8daec7f4de42cb9dd2ddbdef41e2cbec9c1" }
+aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "b8072e7dce1a84f526cd4ecf99ab02f4ea50d0b1" }
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "a6e7ed96094f13f4fb63c8026cd5d2b9f75df3a9" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "df5938c91d2457af4e0a3db32dcf9013c9642cd8" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a9ece398f65ad56a756786cecc713bc5be836680" }

@@ -262,6 +262,9 @@ pub struct ToolExecutor {
 struct CheckpointHealth {
     /// Whether the most recent tool-call checkpoint failed.
     failing: bool,
+    /// Whether the most recent attempt made its snapshot (a cancelled one
+    /// didn't, but isn't `failing`).
+    last_ok: bool,
     /// The error that started the current run of failures, until taken.
     unreported: Option<String>,
 }
@@ -461,6 +464,17 @@ impl ToolExecutor {
             .take()
     }
 
+    /// Whether the checkpoint `dispatch` last took (before the most recent
+    /// call it checkpointed) worked. When it didn't, `latest_checkpoint_ref`
+    /// is an older state than "right before that call", so restoring to it
+    /// would also throw away whatever came between.
+    pub fn last_checkpoint_ok(&self) -> bool {
+        self.checkpoint_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_ok
+    }
+
     /// Whether `dispatch` checkpoints a call to `tool_name` before running
     /// it once the gate allows it: the tool exists, its `needs_checkpoint()`
     /// is true, and a checkpointer is configured. Lets `Agent` decide per
@@ -626,6 +640,7 @@ impl ToolExecutor {
                 .checkpoint_health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.last_ok = outcome.is_ok();
             match outcome {
                 Ok(()) => health.failing = false,
                 // A cancelled snapshot isn't a broken one.
@@ -1613,10 +1628,12 @@ mod tests {
 
         executor.dispatch(write(1), &cwd, cancel()).await;
         assert_eq!(executor.take_checkpoint_failure(), None, "a working checkpoint");
+        assert!(executor.last_checkpoint_ok());
 
         break_checkpoints();
         let result = executor.dispatch(write(2), &cwd, cancel()).await;
         assert!(matches!(result.output, ToolOutput::Ok(_)), "the call still proceeds");
+        assert!(!executor.last_checkpoint_ok());
         assert!(executor.take_checkpoint_failure().is_some(), "the first failure is reported");
         assert_eq!(executor.take_checkpoint_failure(), None, "and taken only once");
         executor.dispatch(write(3), &cwd, cancel()).await;
@@ -1625,6 +1642,7 @@ mod tests {
         std::fs::remove_file(&broken).unwrap();
         executor.dispatch(write(4), &cwd, cancel()).await;
         assert_eq!(executor.take_checkpoint_failure(), None, "working again");
+        assert!(executor.last_checkpoint_ok());
         break_checkpoints();
         executor.dispatch(write(5), &cwd, cancel()).await;
         assert!(executor.take_checkpoint_failure().is_some(), "a new failure after a success");

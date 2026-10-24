@@ -500,6 +500,12 @@ pub struct Agent {
     /// in flight, or once it's resolved (pass or rewind). Interactive mode
     /// never reads this field. See ROADMAP.md Phase 11c.
     pre_experiment_ref: Option<String>,
+    /// The checkpoint before the current batch's first unverified edit
+    /// failed, so `pre_experiment_ref` is `None` and the batch can't be
+    /// rewound: the newest checkpoint is older than the batch, and
+    /// restoring it would also discard work before it (possibly already
+    /// verified). Reset with `pre_experiment_ref`.
+    pre_experiment_checkpoint_failed: bool,
     /// The `/undo` model: which turns changed files, and where to rewind
     /// each one to. Persisted with the session (see `persist`/`restore`);
     /// reset by `clear_conversation`.
@@ -639,6 +645,7 @@ impl Agent {
             verification_touched_paths: Vec::new(),
             written_this_session: Vec::new(),
             pre_experiment_ref: None,
+            pre_experiment_checkpoint_failed: false,
             undo: crate::undo::UndoLedger::default(),
             command_prompter: None,
             write_sandbox: None,
@@ -3504,6 +3511,7 @@ impl Agent {
                             self.unverified_edits = false;
                             self.verify_retries = 0;
                             self.pre_experiment_ref = None;
+                            self.pre_experiment_checkpoint_failed = false;
                             self.verification_touched_paths.clear();
                             if let Some(notice) = empty_response_notice {
                                 self.emit(AgentEvent::Info(notice.to_string()));
@@ -3542,7 +3550,17 @@ impl Agent {
                              failure may predate them",
                         );
                     }
-                    if self.autonomous_mode.active()
+                    let checkpoint_failed =
+                        std::mem::take(&mut self.pre_experiment_checkpoint_failed);
+                    if self.autonomous_mode.active() && checkpoint_failed {
+                        self.unverified_edits = false;
+                        self.verification_touched_paths.clear();
+                        self.emit(AgentEvent::Error(format!(
+                            "{failing} — keeping this round of edits: the checkpoint before \
+                             it failed, so there is no snapshot of the state just before it \
+                             to rewind to, and an older one would discard earlier work too."
+                        )));
+                    } else if self.autonomous_mode.active()
                         && let Some(pre_experiment_ref) = self.pre_experiment_ref.take()
                     {
                         // Discard only edits that didn't help: a round that
@@ -3622,6 +3640,10 @@ impl Agent {
             let mut batch_start_ref: Option<String> = None;
             let mut batch_touched_paths: Vec<String> = Vec::new();
             let mut batch_rolled_back = false;
+            // The checkpoint before the batch's first checkpointed call
+            // failed: the latest ref is older than the batch, so it has
+            // no anchor and is never rolled back.
+            let mut batch_unanchored = false;
 
             for (index, call) in tool_calls.into_iter().enumerate() {
                 // Every one of these calls is already recorded as a
@@ -3696,8 +3718,16 @@ impl Agent {
                         // right before this edit" — remember it as the
                         // rewind target if this batch's verification never
                         // passes.
-                        self.pre_experiment_ref =
-                            self.executor.latest_checkpoint_ref(&cancellation).await;
+                        // Unless that checkpoint failed: then the latest
+                        // ref predates the batch (see
+                        // `pre_experiment_checkpoint_failed`).
+                        let checkpoint_ok = !checkpointed || self.executor.last_checkpoint_ok();
+                        self.pre_experiment_checkpoint_failed = !checkpoint_ok;
+                        self.pre_experiment_ref = if checkpoint_ok {
+                            self.executor.latest_checkpoint_ref(&cancellation).await
+                        } else {
+                            None
+                        };
                     }
                 }
 
@@ -3719,8 +3749,13 @@ impl Agent {
                     self.changed_since_verification = true;
                 }
                 if checkpointed && matches!(result.output, ToolOutput::Ok(_)) {
-                    if batch_start_ref.is_none() {
-                        batch_start_ref = self.executor.latest_checkpoint_ref(&cancellation).await;
+                    if batch_start_ref.is_none() && !batch_unanchored {
+                        if self.executor.last_checkpoint_ok() {
+                            batch_start_ref =
+                                self.executor.latest_checkpoint_ref(&cancellation).await;
+                        } else {
+                            batch_unanchored = true;
+                        }
                     }
                     // Cloned — call_description is still needed below when
                     // record_tool_result is called with it.
@@ -3760,6 +3795,18 @@ impl Agent {
                         }
                     }
                     batch_rolled_back = true;
+                    batch_touched_paths.clear();
+                } else if let ToolOutput::Error(original_error) = &result.output
+                    && batch_unanchored
+                    && !batch_touched_paths.is_empty()
+                {
+                    result.output = ToolOutput::Error(format!(
+                        "{original_error}\n\nThe {} earlier edit(s) in this same response were \
+                         NOT rolled back, because the checkpoint before them failed: {}. They \
+                         are still in place.",
+                        batch_touched_paths.len(),
+                        batch_touched_paths.join(", "),
+                    ));
                     batch_touched_paths.clear();
                 }
 

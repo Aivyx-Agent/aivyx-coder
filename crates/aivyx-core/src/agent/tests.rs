@@ -10814,3 +10814,118 @@ fn the_checkpoint_failure_notice_keeps_git_errors_short() {
     let notice = checkpoint_failure_notice(&"x".repeat(1000));
     assert!(notice.ends_with(&format!("{}…", "x".repeat(300))), "{notice}");
 }
+
+/// A repo whose newest checkpoint predates work now in the worktree
+/// (`tracked.txt` changed to "earlier work"), with checkpoints broken from
+/// here on: the state in which a rollback to "the latest checkpoint"
+/// would also throw away that earlier work. Broken by making the ref
+/// directory read-only, so a snapshot fails only at its last step and a
+/// restore still works — a test that broke restore too would pass on the
+/// old code without showing the loss.
+async fn repo_with_stale_checkpoint_and_broken_checkpoints(dir: &Path) {
+    init_git_repo(dir).await;
+    let out = tokio::process::Command::new("git")
+        .args(["update-ref", "refs/aivyx/checkpoints/0000000000001-0000", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    std::fs::write(dir.join("tracked.txt"), "earlier work\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let refs = dir.join(".git/refs/aivyx/checkpoints");
+    std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o555)).unwrap();
+}
+
+#[tokio::test]
+async fn an_autonomous_rewind_never_goes_past_a_failed_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    repo_with_stale_checkpoint_and_broken_checkpoints(&cwd).await;
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "exit 1".to_string()],
+        timeout: Duration::from_secs(5),
+    }])));
+    let mock = Arc::new(MockBackend::new(vec![
+        multi_call_response(vec![write_call_in("new.txt", "hi\n", "c1")]),
+        text_response("done"),
+        text_response("still trying"),
+    ]));
+    let mut executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        cwd.clone(),
+        vec![],
+        Arc::new(aivyx_tools::GitCheckpointer::detect(&cwd, vec![]).await.unwrap()),
+    );
+    let autonomous_mode = AutonomousMode::new();
+    autonomous_mode.set_active(true);
+    let (tx, mut rx) = unbounded_channel();
+    let mut agent = Agent::new(
+        mock,
+        executor,
+        "system",
+        AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::default(),
+        PlanMode::new(),
+        autonomous_mode,
+        tx,
+    );
+    agent.set_verification("verify".to_string(), 1);
+
+    agent.run_turn("go".to_string(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "earlier work\n",
+        "work from before the batch must survive"
+    );
+    assert!(cwd.join("new.txt").exists(), "the batch is kept, not rewound to an older state");
+    let mut errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::Error(text) = event {
+            errors.push(text);
+        }
+    }
+    assert!(
+        errors.iter().any(|e| e.contains("keeping this round of edits: the checkpoint before it failed")),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_rollback_never_goes_past_a_failed_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    repo_with_stale_checkpoint_and_broken_checkpoints(&cwd).await;
+    let response = multi_call_response(vec![
+        write_call_in("a.txt", "A\n", "c1"),
+        edit_call_in("a.txt", "this text does not exist", "replacement", "c2"),
+    ]);
+    let (mut agent, _rx, mock) =
+        checkpointed_agent(&cwd, vec![response, text_response("done")], false).await;
+
+    agent.run_turn("go".to_string(), &cwd, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "earlier work\n",
+        "work from before the batch must survive"
+    );
+    assert!(cwd.join("a.txt").exists(), "nothing is rolled back without an anchor");
+    let received = mock.received.lock().unwrap();
+    let last = received.last().unwrap();
+    let results: String = last
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match c {
+            ContentBlock::ToolResult(r) => Some(format!("{:?}", r.output)),
+            _ => None,
+        })
+        .collect();
+    assert!(results.contains("were NOT rolled back"), "{results}");
+}
