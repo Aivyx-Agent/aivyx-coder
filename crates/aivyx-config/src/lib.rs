@@ -100,8 +100,8 @@ pub struct VerificationSettings {
     /// leave them alone, and a test run whose only failures are these
     /// counts as passed. Each entry is a test name as the runner prints it
     /// (`search::tests::not_found`), or a prefix ending in `*`
-    /// (`global::*`). Works for cargo, pytest and `go test` output; ignored
-    /// when commands don't run sandboxed.
+    /// (`global::*`). Works for cargo, pytest, `go test`, Vitest and Jest
+    /// output; ignored when commands don't run sandboxed.
     pub sandbox_failures: Vec<String>,
     /// Commands (`[[permissions.allowed_commands]]` names) aivyx-coder
     /// runs itself when an autonomous run reaches its goal — a linter,

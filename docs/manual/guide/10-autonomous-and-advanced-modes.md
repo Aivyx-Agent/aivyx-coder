@@ -36,7 +36,7 @@ least one failing test and broke none, they stay, and the notice lists what
 they fixed and what still fails — a failure that was already there, such as
 a test that [only fails inside the sandbox](15-troubleshooting.md), says
 nothing about the edits. This needs output it can read (`cargo test`,
-pytest or `go test`); with anything else, or when part of the suite didn't
+pytest, `go test`, Vitest or Jest); with anything else, or when part of the suite didn't
 report or fewer tests ran, it rewinds as before.
 
 Tests you know fail only inside the sandbox can be listed in

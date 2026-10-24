@@ -9,7 +9,7 @@
 //! verification passes when they are the only failures.
 //!
 //! Failures are read with `FailureParser`, so the list works for libtest,
-//! pytest and `go test`. Whenever the output can't be read with confidence
+//! pytest, `go test`, Vitest and Jest. Whenever the output can't be read with confidence
 //! (another runner, a compile error, a crash, output cut short) nothing is
 //! excused.
 

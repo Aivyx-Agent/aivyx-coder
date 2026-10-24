@@ -2,8 +2,8 @@
 //! by line — enough to tell whether a round of edits fixed failing tests
 //! without breaking others (see `Agent::edits_made_progress`).
 //!
-//! Recognises cargo's libtest, pytest and `go test` output. Anything it
-//! can't account for — another runner, a build that didn't compile, a test
+//! Recognises cargo's libtest, pytest, `go test`, Vitest and Jest output.
+//! Anything it can't account for — another runner, a build that didn't compile, a test
 //! binary that crashed — gives `None`, never a guess: a missed failure
 //! would make a broken change look like progress.
 
@@ -74,6 +74,8 @@ pub(crate) struct FailureParser {
     libtest_summaries: usize,
     go_summaries: usize,
     pytest_summaries: usize,
+    /// Vitest's `Test Files` lines and Jest's `Test Suites:` lines.
+    js_summaries: usize,
     total: u64,
     counted: bool,
     /// Something the parser can't account for: a compile error, a crashed
@@ -96,6 +98,10 @@ impl FailureParser {
                 self.section = Section::Other;
             }
             Section::Other => {}
+        }
+
+        if self.feed_js(line.trim_start()) {
+            return;
         }
 
         // libtest
@@ -154,10 +160,69 @@ impl FailureParser {
         }
     }
 
+    /// Vitest and Jest lines; `true` when `line` was one of theirs.
+    fn feed_js(&mut self, line: &str) -> bool {
+        // Vitest: `FAIL  file > suite > test`, or `FAIL  file [ file ]` for a
+        // test file that failed to load. Jest's `FAIL  file` (no `>`) only
+        // names the file; its tests come on `●` lines.
+        if let Some(rest) = line.strip_prefix("FAIL  ") {
+            if let Some((file, _)) = rest.split_once(" [ ").filter(|_| rest.ends_with(" ]")) {
+                self.failing.insert(file.to_string());
+            } else if rest.contains(" > ") {
+                self.failing.insert(rest.to_string());
+            }
+            return true;
+        }
+        if line.starts_with("Test Files  ") || line.starts_with("Test Suites:") {
+            self.js_summaries += 1;
+            return true;
+        }
+        // Vitest: `Tests  3 failed | 118 passed (121)`, or `Tests  no tests`.
+        if let Some(rest) = line.strip_prefix("Tests  ") {
+            let total = rest
+                .rsplit_once('(')
+                .and_then(|(_, n)| n.strip_suffix(')'))
+                .and_then(|n| n.parse().ok());
+            if let Some(total) = total.or_else(|| rest.contains("no tests").then_some(0)) {
+                self.total += total;
+                self.counted = true;
+            }
+            return true;
+        }
+        // Jest: `Tests:       2 failed, 3 passed, 5 total`.
+        if let Some(rest) = line.strip_prefix("Tests:") {
+            if let Some(total) = rest
+                .split(',')
+                .find_map(|part| part.trim().strip_suffix(" total"))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                self.total += total;
+                self.counted = true;
+            }
+            return true;
+        }
+        if let Some(name) = line.strip_prefix("● ") {
+            if name.trim() == "Test suite failed to run" {
+                self.unaccountable = true;
+            } else {
+                self.failing.insert(name.trim().to_string());
+            }
+            return true;
+        }
+        if line.contains("Unhandled Errors") && line.contains('⎯') {
+            self.unaccountable = true;
+            return true;
+        }
+        false
+    }
+
     /// The run's failing tests, or `None` when no recognised runner
     /// reported, or something happened the parser can't account for.
     pub(crate) fn finish(self) -> Option<TestRun> {
-        let summaries = self.libtest_summaries + self.go_summaries + self.pytest_summaries;
+        let summaries = self.libtest_summaries
+            + self.go_summaries
+            + self.pytest_summaries
+            + self.js_summaries;
         if self.unaccountable || summaries == 0 {
             return None;
         }
@@ -214,6 +279,114 @@ mod tests {
 
     fn names(run: &TestRun) -> Vec<&str> {
         run.failing.iter().map(String::as_str).collect()
+    }
+
+    /// `vitest run` with failures, escape codes stripped (as aivyx-coder now
+    /// passes it on), from the ckl build test.
+    const VITEST_BEFORE: &str = "\
+ RUN  v5.0.5 /k/runs/m/app
+
+ ✓ server/format.test.ts (18 tests) 5ms
+ ❯ src/Quiz.test.tsx (7 tests | 1 failed) 128ms
+   ❯ Quiz (7)
+     × shows the first due card with aircraft, title and challenge 67ms
+     ✓ a typed answer shows the result and the next due date 14ms
+ ❯ server/quiz.test.ts (27 tests | 2 failed) 3684ms
+   ❯ PUT matching cards by challenge (3)
+     × the k-th item with a challenge matches the k-th existing card 182ms
+
+ Test Files  2 failed | 6 passed (8)
+      Tests  3 failed | 118 passed (121)
+   Start at  00:53:12
+   Duration  3.84s (tests 86%, environment 10%, import 3%, transform 1%)
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  server/quiz.test.ts > PUT matching cards by challenge > the k-th item with a challenge \
+matches the k-th existing card
+AssertionError: expected { id: 3, checklist_id: 1, …(10) } to match object \
+{ id: 1, position: 1, …(4) }
+(6 matching properties omitted from actual)
+
+ FAIL  server/quiz.test.ts > POST /api/quiz/cards/:id/review > second success: interval 6
+AssertionError: expected 13 to be 14 // Object.is equality
+
+ FAIL  src/Quiz.test.tsx > Quiz > shows the first due card with aircraft, title and challenge
+Error: Invalid Chai property: toHaveTextContent
+";
+
+    const VITEST_AFTER: &str = "\
+ Test Files  1 failed | 7 passed (8)
+      Tests  1 failed | 120 passed (121)
+
+ FAIL  server/quiz.test.ts > POST /api/quiz/cards/:id/review > second success: interval 6
+AssertionError: expected 13 to be 14 // Object.is equality
+";
+
+    #[test]
+    fn vitest_failures_and_totals() {
+        let run = parse(VITEST_BEFORE).unwrap();
+        assert_eq!(
+            names(&run),
+            [
+                "server/quiz.test.ts > POST /api/quiz/cards/:id/review > second success: \
+                 interval 6",
+                "server/quiz.test.ts > PUT matching cards by challenge > the k-th item with a \
+                 challenge matches the k-th existing card",
+                "src/Quiz.test.tsx > Quiz > shows the first due card with aircraft, title and \
+                 challenge",
+            ]
+        );
+        assert_eq!((run.summaries, run.total), (1, Some(121)));
+        let after = parse(VITEST_AFTER).unwrap();
+        let progress = progress(&run, &after).unwrap();
+        assert_eq!(progress.fixed.len(), 2);
+        assert_eq!(progress.still_failing.len(), 1);
+    }
+
+    #[test]
+    fn vitest_passing_runs_and_files_that_fail_to_load() {
+        let run = parse(" Test Files  6 passed (6)\n      Tests  87 passed (87)\n").unwrap();
+        assert!(run.failing.is_empty());
+        assert_eq!(run.total, Some(87));
+        let broken = " FAIL  src/Quiz.test.tsx [ src/Quiz.test.tsx ]\nError: Failed to load url\n\
+                      \n Test Files  1 failed | 5 passed (6)\n      Tests  80 passed (80)\n";
+        assert_eq!(names(&parse(broken).unwrap()), ["src/Quiz.test.tsx"]);
+        let unhandled = " Test Files  6 passed (6)\n      Tests  87 passed (87)\n\
+                         ⎯⎯⎯⎯ Unhandled Errors ⎯⎯⎯⎯\nError: boom\n";
+        assert_eq!(parse(unhandled), None, "an unhandled error isn't accounted for");
+    }
+
+    const JEST: &str = "\
+ PASS  src/a.test.js
+ FAIL  src/sum.test.js
+  ● math › adds
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 4
+    Received: 5
+
+      at Object.<anonymous> (src/sum.test.js:3:17)
+
+  ● math › subtracts
+
+    boom
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       2 failed, 3 passed, 5 total
+Snapshots:   0 total
+Time:        0.5 s
+";
+
+    #[test]
+    fn jest_failures_and_totals() {
+        let run = parse(JEST).unwrap();
+        assert_eq!(names(&run), ["math › adds", "math › subtracts"]);
+        assert_eq!((run.summaries, run.total), (1, Some(5)));
+        let crashed = " FAIL  src/x.test.js\n  ● Test suite failed to run\n\n    SyntaxError\n\n\
+                       Test Suites: 1 failed, 1 total\nTests:       0 total\n";
+        assert_eq!(parse(crashed), None, "a suite that didn't run isn't accounted for");
     }
 
     /// `cargo test -q` with two binaries, as just's suite prints it.
