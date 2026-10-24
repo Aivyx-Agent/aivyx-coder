@@ -489,6 +489,11 @@ pub struct Agent {
     /// turn to keep trying. A `Vec` with dedup-on-insert (not a `HashSet`)
     /// so args built from it are in a deterministic, testable order.
     verification_touched_paths: Vec<PathBuf>,
+    /// Files this conversation's edit calls wrote, relative to the project,
+    /// in the order first written. Named in the history-truncated note: in
+    /// the ckl build test the model, its history cut, no longer knew it had
+    /// written its own test and debated whether it could change it.
+    written_this_session: Vec<String>,
     /// The checkpoint ref taken right before the first unverified edit of
     /// the current batch — the rewind target if verification exhausts its
     /// retries in autonomous mode. `None` when there's no unverified batch
@@ -632,6 +637,7 @@ impl Agent {
             last_full_verification_output: None,
             last_scoped_verification_output: None,
             verification_touched_paths: Vec::new(),
+            written_this_session: Vec::new(),
             pre_experiment_ref: None,
             undo: crate::undo::UndoLedger::default(),
             command_prompter: None,
@@ -799,6 +805,7 @@ impl Agent {
         self.last_verification_passed = None;
         self.emit(AgentEvent::ConversationCleared);
         self.history_truncated = false;
+        self.written_this_session.clear();
         self.dropped_requests.clear();
         if targets_store {
             if let Some(SessionTarget::Store {
@@ -967,6 +974,24 @@ impl Agent {
         if let Some(verification) = &mut self.verification {
             verification.scoped = Some(ScopedVerificationConfig { spec, confiner });
         }
+    }
+
+    /// For the history-truncated note: the files this conversation wrote,
+    /// at most `WRITTEN_FILES_NOTE_CAP` by name. Empty when there are none.
+    fn written_files_note(&self) -> String {
+        const WRITTEN_FILES_NOTE_CAP: usize = 30;
+        if self.written_this_session.is_empty() {
+            return String::new();
+        }
+        let shown = &self.written_this_session
+            [..self.written_this_session.len().min(WRITTEN_FILES_NOTE_CAP)];
+        let more = self.written_this_session.len() - shown.len();
+        let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+        format!(
+            "\n\n(Files you wrote or edited earlier in this session: {}{more}. They are your \
+             own work, so you may change them — unlike the task's spec and its data.)",
+            shown.join(", ")
+        )
     }
 
     /// Adds `path` to `verification_touched_paths` unless it's already
@@ -1779,6 +1804,7 @@ impl Agent {
         let specialist_sessions = state.specialist_sessions.clone();
         let plan_mode_active = state.plan_mode_active;
         self.history_truncated = false;
+        self.written_this_session.clear();
         self.dropped_requests.clear();
         self.restore_session(state);
         self.plan_mode.set_active(plan_mode_active);
@@ -1942,6 +1968,7 @@ impl Agent {
             system.push_str(&section);
         }
         if self.history_truncated {
+            system.push_str(&self.written_files_note());
             match &self.autonomous_goal {
                 Some(goal) if self.autonomous_mode.active() => {
                     system.push_str(
@@ -3643,6 +3670,11 @@ impl Agent {
                 if is_edit_call && matches!(result.output, ToolOutput::Ok(_)) {
                     self.unverified_edits = true;
                     if let Some(path) = touched_path {
+                        let relative = path.strip_prefix(cwd).unwrap_or(&path);
+                        let relative = relative.to_string_lossy().into_owned();
+                        if !self.written_this_session.contains(&relative) {
+                            self.written_this_session.push(relative);
+                        }
                         self.record_touched_path(path);
                     }
                     if self.autonomous_mode.active() && !was_already_unverified {

@@ -10738,3 +10738,34 @@ async fn final_checks_report_passes_failures_and_warnings_outside_the_conversati
     );
     assert_eq!(agent.history.len(), before, "final checks are not part of the conversation");
 }
+
+#[tokio::test]
+async fn after_truncation_the_prompt_names_the_files_this_session_wrote() {
+    // ckl build test: after the history was cut to fit the window the model
+    // no longer knew it had written its own test file, and debated whether
+    // it was a fixed input it mustn't change.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut agent = undo_agent(&cwd, vec![
+        write_call("c1", "server/quiz.test.ts", "test\n"),
+        write_call("c2", "server/quiz.ts", "code\n"),
+        write_call("c3", "server/quiz.test.ts", "test 2\n"), text_response("done"),
+    ]).await;
+    agent.run_turn("build the quiz".into(), &cwd, CancellationToken::new()).await.unwrap();
+    assert!(!agent.system_prompt_text().contains("server/quiz.ts"), "no note before truncation");
+
+    agent.history_truncated = true;
+    let prompt = agent.system_prompt_text();
+    assert!(
+        prompt.contains(
+            "Files you wrote or edited earlier in this session: server/quiz.test.ts, server/quiz.ts"
+        ),
+        "{prompt}"
+    );
+
+    agent.clear_conversation();
+    agent.history_truncated = true;
+    let fresh = agent.system_prompt_text();
+    assert!(!fresh.contains("server/quiz.ts"), "a new conversation starts afresh: {fresh}");
+}
