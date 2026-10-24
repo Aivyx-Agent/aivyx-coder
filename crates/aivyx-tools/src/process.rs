@@ -446,6 +446,51 @@ fn count_warnings(text: &str) -> usize {
         .count()
 }
 
+/// `text` without terminal escape codes: colours and cursor moves (CSI),
+/// hyperlinks and titles (OSC), charset switches. Test runners such as
+/// Vitest colour their output even into a pipe, and the model only pays for
+/// the codes: a third of one failing Vitest run was escape codes (ckl build
+/// test, 2026-10-23).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then one final byte.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: up to BEL or ESC \.
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            // A charset designation takes one more character.
+            Some('(' | ')' | '*' | '+') => {
+                chars.next();
+            }
+            // Any other two-character escape, or a lone ESC at the end.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Renders one already-capped stream, prefixing a truncation notice if the
 /// true total (`total_bytes`) exceeded what was kept — the data itself is
 /// never larger than `MAX_OUTPUT_BYTES` by the time this runs (capped
@@ -453,7 +498,7 @@ fn count_warnings(text: &str) -> usize {
 /// after-the-fact truncation this can't recompute "was it truncated" from
 /// the data's own length; the caller must pass the true total along.
 fn format_stream(data: Vec<u8>, total_bytes: usize) -> String {
-    let text = String::from_utf8_lossy(&data).into_owned();
+    let text = strip_ansi(&String::from_utf8_lossy(&data));
     if total_bytes > data.len() {
         format!(
             "[... {} bytes truncated ...]\n{text}",
@@ -501,6 +546,18 @@ warning: `vaops` (test \"api\") generated 1 warning\n";
         assert!(formatted(0, "ok", "").starts_with("exit status: 0 (success)\n"));
         let failed = formatted(101 << 8, "", CLIPPY_WARNINGS);
         assert!(failed.starts_with("exit status: 101 (failed)\n"), "{failed}");
+    }
+
+    #[test]
+    fn colour_and_cursor_codes_are_stripped_from_output() {
+        // A Vitest failure in the ckl build test: a third of the bytes the
+        // model got were escape codes.
+        let raw = "\x1b[1m\x1b[30m\x1b[46m RUN \x1b[49m\x1b[39m\x1b[22m \x1b[36mv5.0.5\x1b[39m\n\
+                   \x1b[31m×\x1b[31m fails\x1b[39m\x1b]8;;https://x\x07link\x1b]8;;\x07\x1b(B\n";
+        assert_eq!(strip_ansi(raw), " RUN  v5.0.5\n× failslink\n");
+        assert_eq!(strip_ansi("plain\ttext\n"), "plain\ttext\n");
+        let text = formatted(0, raw, "");
+        assert!(!text.contains('\x1b'), "{text:?}");
     }
 
     #[test]
