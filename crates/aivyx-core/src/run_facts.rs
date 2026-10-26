@@ -41,6 +41,26 @@ pub struct RunFacts {
     pub changed: Option<Vec<ChangedFile>>,
 }
 
+/// Token use over a run's main-loop model requests, as the server reported
+/// it. Sub-agents and specialists aren't counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub requests: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// The largest single prompt: how full the context got.
+    pub peak_prompt_tokens: u32,
+}
+
+impl UsageTotals {
+    pub fn record(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        self.requests += 1;
+        self.prompt_tokens += u64::from(prompt_tokens);
+        self.completion_tokens += u64::from(completion_tokens);
+        self.peak_prompt_tokens = self.peak_prompt_tokens.max(prompt_tokens);
+    }
+}
+
 /// The `--report` file's contents.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport<'a> {
@@ -209,5 +229,17 @@ mod tests {
         assert_eq!(json["changed_files"][0]["status"], "modified");
         assert_eq!(json["changed_files"][0]["read_only"], false);
         assert_eq!(json["last_verification_passed"], true);
+    }
+
+    #[test]
+    fn usage_totals_add_up_and_keep_the_peak() {
+        let mut usage = UsageTotals::default();
+        usage.record(100, 20);
+        usage.record(300, 5);
+        usage.record(200, 10);
+        assert_eq!(
+            usage,
+            UsageTotals { requests: 3, prompt_tokens: 600, completion_tokens: 35, peak_prompt_tokens: 300 }
+        );
     }
 }

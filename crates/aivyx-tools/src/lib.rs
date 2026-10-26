@@ -267,6 +267,10 @@ struct CheckpointHealth {
     last_ok: bool,
     /// The error that started the current run of failures, until taken.
     unreported: Option<String>,
+    /// Checkpoint attempts that weren't cancelled, and how many of those
+    /// failed, for the run report.
+    attempts: u32,
+    failures: u32,
 }
 
 impl ToolExecutor {
@@ -475,6 +479,16 @@ impl ToolExecutor {
             .last_ok
     }
 
+    /// Tool-call checkpoint attempts so far and how many failed; cancelled
+    /// attempts count as neither.
+    pub fn checkpoint_counts(&self) -> (u32, u32) {
+        let health = self
+            .checkpoint_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (health.attempts, health.failures)
+    }
+
     /// Whether `dispatch` checkpoints a call to `tool_name` before running
     /// it once the gate allows it: the tool exists, its `needs_checkpoint()`
     /// is true, and a checkpointer is configured. Lets `Agent` decide per
@@ -642,10 +656,15 @@ impl ToolExecutor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             health.last_ok = outcome.is_ok();
             match outcome {
-                Ok(()) => health.failing = false,
+                Ok(()) => {
+                    health.failing = false;
+                    health.attempts += 1;
+                }
                 // A cancelled snapshot isn't a broken one.
                 Err(_) if cancellation.is_cancelled() => {}
                 Err(err) => {
+                    health.attempts += 1;
+                    health.failures += 1;
                     tracing::warn!(tool = %call.name, error = %err, "checkpoint failed (tool call proceeds)");
                     if !health.failing {
                         health.failing = true;
@@ -1646,6 +1665,8 @@ mod tests {
         break_checkpoints();
         executor.dispatch(write(5), &cwd, cancel()).await;
         assert!(executor.take_checkpoint_failure().is_some(), "a new failure after a success");
+        // Five checkpointed calls; those for writes 2, 3 and 5 failed.
+        assert_eq!(executor.checkpoint_counts(), (5, 3));
     }
 
     #[tokio::test]

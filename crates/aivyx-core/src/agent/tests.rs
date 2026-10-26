@@ -10929,3 +10929,30 @@ async fn a_batch_rollback_never_goes_past_a_failed_checkpoint() {
         .collect();
     assert!(results.contains("were NOT rolled back"), "{results}");
 }
+
+#[tokio::test]
+async fn usage_is_totalled_per_run_and_reset_when_a_run_starts() {
+    let reply = || {
+        vec![
+            StreamEvent::TextDelta("ok".to_string()),
+            StreamEvent::Done { finish_reason: FinishReason::Stop },
+            StreamEvent::Usage { prompt_tokens: 100, completion_tokens: 20 },
+        ]
+    };
+    let (mut agent, _rx, _) = build_agent(vec![reply(), reply()], ToolRegistry::new(), 10);
+    for message in ["one", "two"] {
+        agent.run_turn(message.to_string(), Path::new("."), CancellationToken::new()).await.unwrap();
+    }
+    assert_eq!(
+        agent.usage_totals(),
+        crate::run_facts::UsageTotals {
+            requests: 2,
+            prompt_tokens: 200,
+            completion_tokens: 40,
+            peak_prompt_tokens: 100,
+        }
+    );
+    assert_eq!(agent.checkpoints_since_run_start(), (0, 0));
+    agent.mark_run_start().await;
+    assert_eq!(agent.usage_totals(), crate::run_facts::UsageTotals::default());
+}

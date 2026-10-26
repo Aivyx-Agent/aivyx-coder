@@ -549,6 +549,10 @@ pub struct Agent {
     /// The worktree snapshot taken when an autonomous run started
     /// (`mark_run_start`), for `changed_since_run_start`.
     run_start_oid: Option<String>,
+    /// Token use since the run started (`mark_run_start`), for `--report`.
+    usage: crate::run_facts::UsageTotals,
+    /// `ToolExecutor::checkpoint_counts` when the run started.
+    run_start_checkpoints: (u32, u32),
     /// `[git] ignore`: `.gitignore`-syntax patterns for generated files.
     /// An untracked path matching one is left out of the change summary,
     /// `/diff`, the `/undo`/`/redo` previews and their result lists, and
@@ -655,6 +659,8 @@ impl Agent {
             last_test_passed: None,
             last_verification_passed: None,
             run_start_oid: None,
+            usage: crate::run_facts::UsageTotals::default(),
+            run_start_checkpoints: (0, 0),
             generated_ignore: aivyx_tools::default_generated_patterns(),
             events_tx,
         }
@@ -872,10 +878,26 @@ impl Agent {
     /// `changed_since_run_start`. Without a checkpointer (not a git
     /// repository) there is nothing to snapshot.
     pub async fn mark_run_start(&mut self) {
+        self.usage = crate::run_facts::UsageTotals::default();
+        self.run_start_checkpoints = self.executor.checkpoint_counts();
         self.run_start_oid = self
             .undo_snapshot("autonomous run start")
             .await
             .map(|(_, oid)| oid);
+    }
+
+    /// Token use over the main loop's model requests since the run started.
+    pub fn usage_totals(&self) -> crate::run_facts::UsageTotals {
+        self.usage
+    }
+
+    /// Tool-call checkpoints since the run started, and how many failed.
+    pub fn checkpoints_since_run_start(&self) -> (u32, u32) {
+        let (attempts, failures) = self.executor.checkpoint_counts();
+        (
+            attempts.saturating_sub(self.run_start_checkpoints.0),
+            failures.saturating_sub(self.run_start_checkpoints.1),
+        )
     }
 
     /// The files that differ between `mark_run_start`'s snapshot and the
@@ -3267,7 +3289,8 @@ impl Agent {
                         self.emit(AgentEvent::ToolCallDetected(call.clone()));
                         tool_calls.push(call);
                     }
-                    Ok(StreamEvent::Usage { prompt_tokens, .. }) => {
+                    Ok(StreamEvent::Usage { prompt_tokens, completion_tokens }) => {
+                        self.usage.record(prompt_tokens, completion_tokens);
                         // Calibrate the estimator to this model: how many
                         // chars actually mapped to one prompt token this time.
                         if let Some(chars) = self.last_request_chars
