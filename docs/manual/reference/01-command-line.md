@@ -94,7 +94,7 @@ aivyx-coder checked itself to this file as JSON:
 - the `[verification] final_checks` results with their warning counts;
 - every file the run changed, marking any in `read_only_paths`, and
   `read_only_touched`, the read-only files that changed anyway;
-- the `[backend]` model, address and `reasoning_effort`;
+- the `[backend]` model, address (any `user:password@` part removed) and `reasoning_effort`;
 - `model_requests`, `prompt_tokens`, `completion_tokens` and
   `peak_context_tokens` over the main loop's model requests (as the server
   reported them; sub-agents aren't counted);

@@ -6,6 +6,7 @@
 //! after three warnings.
 
 use serde::Serialize;
+use std::borrow::Cow;
 
 /// One `[verification] final_checks` command, run by aivyx-coder when the
 /// goal was reached.
@@ -105,7 +106,7 @@ struct ReportJson<'a> {
     final_checks: &'a [FinalCheck],
     changed_files: &'a [ChangedFile],
     model: &'a str,
-    base_url: &'a str,
+    base_url: Cow<'a, str>,
     reasoning_effort: Option<&'a str>,
     model_requests: u32,
     prompt_tokens: u64,
@@ -130,6 +131,20 @@ pub fn warnings_in(output: &str) -> usize {
         .and_then(|(_, rest)| rest.split_whitespace().next())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0)
+}
+
+/// `url` without any `user:password@` in its authority (the part between
+/// `://` and the first `/`, `?` or `#`). Anything else comes back as is.
+fn without_userinfo(url: &str) -> Cow<'_, str> {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return Cow::Borrowed(url);
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => Cow::Owned(format!("{}{}", &url[..scheme_end], &rest[at + 1..])),
+        None => Cow::Borrowed(url),
+    }
 }
 
 impl RunFacts {
@@ -195,7 +210,7 @@ impl RunReport<'_> {
             final_checks: self.final_checks,
             changed_files: self.changed_files,
             model: self.model,
-            base_url: self.base_url,
+            base_url: without_userinfo(self.base_url),
             reasoning_effort: self.reasoning_effort,
             model_requests: self.usage.requests,
             prompt_tokens: self.usage.prompt_tokens,
@@ -309,6 +324,10 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(json["report_version"], 1);
+        let with_userinfo = RunReport { base_url: "http://user:secret@llama:8080/v1", ..report };
+        let json_userinfo: serde_json::Value =
+            serde_json::from_str(&with_userinfo.to_json()).unwrap();
+        assert_eq!(json_userinfo["base_url"], "http://llama:8080/v1");
         assert_eq!(json["coder_version"], "0.6.3");
         assert_eq!(json["outcome"], "goal_achieved");
         assert_eq!(json["iterations"], 5);
@@ -326,6 +345,18 @@ mod tests {
         assert_eq!(json["checkpoints"], 30);
         assert_eq!(json["checkpoint_failures"], 1);
         assert_eq!(json["read_only_touched"], serde_json::json!(["BRIEF.md"]));
+    }
+
+    #[test]
+    fn userinfo_is_stripped_from_a_base_url() {
+        assert_eq!(without_userinfo("http://user:pass@llama:8080/v1"), "http://llama:8080/v1");
+        assert_eq!(
+            without_userinfo("https://token@api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(without_userinfo("http://llama:8080/v1"), "http://llama:8080/v1");
+        assert_eq!(without_userinfo("http://llama:8080/v1/path@x"), "http://llama:8080/v1/path@x");
+        assert_eq!(without_userinfo(""), "");
     }
 
     #[test]
