@@ -906,7 +906,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
-    let autonomous_run = cli.auto.map(|goal| aivyx_tui::AutonomousRun {
+    let autonomous_run = cli.auto.map(|goal| aivyx_core::autonomous::AutonomousRun {
         goal,
         max_iterations: settings.autonomous.max_iterations,
         max_duration: Duration::from_secs(settings.autonomous.max_duration_secs),
