@@ -8,6 +8,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod agent_builder;
+mod headless;
 mod packs;
 mod routing;
 mod setup_wizard;
