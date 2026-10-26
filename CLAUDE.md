@@ -60,6 +60,34 @@ Tests fail if a CLI flag or slash command has no section in
 - `AIVYX_DEBUG_LOG` (env var) captures raw wire traffic in plaintext,
   append-only, no rotation — treat as sensitive, delete when done debugging.
 
+## Releasing
+
+1. **Run the fast-tier bench on the release candidate before tagging.** The
+   bench lives in the private repo `~/Projects/Rust/aivyx-coder-bench`; it
+   takes about 3 h on the 27B.
+   - Commit the candidate, then switch the local stack to the 27B:
+     `docker compose -f compose.yml -f compose.qwen38.yml up -d llama` in
+     `~/Projects/Rust/docker`.
+   - `target/release/coder-bench run --profile models/qwen38-27b.toml --coder-ref <rc commit>`.
+     The result set is labelled `<version>-<sha7>`.
+   - `target/release/coder-bench compare <label> --against <last release> --profile models/qwen38-27b.toml`.
+     A FAIL blocks the release until it is understood. Put the summary
+     table in the release notes; the bench repo is private, so don't link
+     to it.
+2. Bump the version in `Cargo.toml` and every `crates/*/Cargo.toml` that
+   names it, run `cargo check --workspace` so `Cargo.lock` follows, commit
+   `Release vX.Y.Z`, tag `vX.Y.Z`, push both.
+3. Watch the Release, Docker Publish and CI workflows to green. Check the
+   darwin-aarch64 and x86_64-linux-musl archives against their `.sha256`
+   files, and run the Linux binary's `--version`.
+4. Update `docs/registry-submission/aivyx-coder/agent.json` (version, URLs,
+   sha256s, `cmd` paths), commit `registry: aivyx-coder vX.Y.Z`, and update
+   the registry fork's `aivyx-coder/agent.json` on branch `add-aivyx-coder`
+   (PR 620).
+5. After the release ships, record its bench results as the new baseline:
+   `coder-bench baseline set <label> --as X.Y.Z --profile models/qwen38-27b.toml`,
+   then commit the results and `baselines.json` in the bench repo.
+
 ## Architecture
 
 Workspace crates (`crates/*`), roughly bottom-up:
