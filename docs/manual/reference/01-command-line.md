@@ -126,7 +126,7 @@ redirecting the output is enough.
   | 0 | goal achieved, and the last verification passed (or never ran) |
   | 1 | goal achieved, but the last verification or a final check failed |
   | 2 | the `[autonomous]` budget ran out |
-  | 3 | turns kept failing (for example, the model server is down) |
+  | 3 | turns kept failing (for example, the model server is down), or an error stopped the run from starting (for example, a config error) |
   | 4 | possible prompt injection detected |
   | 130 | stopped by `SIGINT` or `SIGTERM` |
 

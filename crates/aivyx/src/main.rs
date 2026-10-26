@@ -749,6 +749,7 @@ fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
                 && let Some(stop) = run_stop.as_ref().filter(|stop| !stop.is_cancelled())
             {
                 stop.cancel();
+                eprintln!("stopping (send the signal again to exit now)");
                 continue;
             }
             aivyx_tools::kill_all_process_groups();
@@ -760,16 +761,29 @@ fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Headless: --auto without a terminal on stdout, or asked for.
+    let headless = cli.auto.is_some()
+        && (cli.headless || !std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    match run_main(cli, headless).await {
+        // Exit status 1 is reserved for "goal achieved, a check failed", so a
+        // headless error (config, setup, ...) prints the way anyhow would and
+        // exits 3 -- "an error".
+        Err(err) if headless => {
+            eprintln!("Error: {err:?}");
+            aivyx_tools::kill_all_process_groups();
+            std::process::exit(3);
+        }
+        result => result,
+    }
+}
 
+async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
     // `pack …` works on files only: no agent, no setup wizard, and it
     // never writes config.toml.
     if let Some(Command::Pack { action }) = cli.command {
         return run_pack(action);
     }
 
-    // Headless: --auto without a terminal on stdout, or asked for.
-    let headless = cli.auto.is_some()
-        && (cli.headless || !std::io::IsTerminal::is_terminal(&std::io::stdout()));
     let run_stop = headless.then(CancellationToken::new);
     spawn_exit_signal_handler(run_stop.clone());
 
