@@ -106,6 +106,12 @@ fn sanitize(text: &str) -> String {
     text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
 }
 
+/// Writes the stop notice to `out`, sanitized like the progress lines: its
+/// changed file names and model text must not reach the terminal raw.
+fn write_notice(out: &mut impl Write, notice: &str) {
+    let _ = writeln!(out, "{}", sanitize(notice));
+}
+
 /// Writes progress lines with the time since `started` in front:
 /// `[0:12:31] tool run_command test`. With `verbose`, the model's streamed
 /// text goes out as it arrives, and the next progress line starts on a new line.
@@ -191,7 +197,7 @@ pub async fn run(
         tracing::warn!("headless: progress printer didn't finish draining");
     }
     let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{}", end.notice);
+    write_notice(&mut stdout, &end.notice);
     let _ = stdout.flush();
     exit_code(&end)
 }
@@ -285,6 +291,16 @@ mod tests {
         assert!(!text.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{text:?}");
         assert!(text.starts_with("[0:00:00] [2Jboom"), "{text:?}");
         assert!(text.contains("next\ttab"), "{text:?}");
+    }
+
+    #[test]
+    fn the_stop_notice_is_sanitized() {
+        let mut out = Vec::new();
+        write_notice(&mut out, "goal achieved\n  changed: src/\x1b[2Jevil\r.rs\x07");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{text:?}");
+        assert!(text.contains("goal achieved"), "{text:?}");
+        assert!(text.contains("src/[2Jevil.rs"), "{text:?}");
     }
 
     #[test]
