@@ -1,4 +1,3 @@
-#![allow(dead_code)] // wired up in the next commit
 //! `--auto` without the TUI: for scripts, CI and the benchmark. Progress
 //! goes to stderr, one line per event, prefixed with the time since the run
 //! started; the stop notice goes to stdout; the exit code says how the run

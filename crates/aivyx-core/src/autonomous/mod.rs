@@ -237,6 +237,7 @@ fn injection_detected_notice(iterations_used: u32, finding: &InjectionFinding) -
 /// between the `set_tasks` tool and the `Agent` — the driver reads it
 /// directly rather than waiting on an `AgentEvent::TasksUpdated` event, so
 /// its goal-achieved check always sees the current state.
+#[derive(Clone)]
 pub struct AutonomousRun {
     pub goal: String,
     pub max_iterations: u32,

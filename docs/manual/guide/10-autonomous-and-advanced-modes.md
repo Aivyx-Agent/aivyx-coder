@@ -104,6 +104,13 @@ autonomous run stopped: goal achieved after 5 iteration(s)
 - **`--report run.json`:** writes all of this as JSON when the run stops,
   for scripts and for looking back.
 
+**Running without the TUI.** When stdout isn't a terminal, or with
+`--headless`, `--auto` runs without the TUI: progress goes to stderr, the
+stop notice to stdout, and the exit code says how the run ended (see
+[`--headless`](../reference/01-command-line.md#--headless)). `SIGINT` or
+`SIGTERM` stops it cleanly, with the report written. This is how the
+benchmark and CI scripts run aivyx-coder.
+
 A command that succeeds but prints compiler or linter warnings shows them in
 its result too (`exit status: 0 (success), 3 warnings`), so the model sees
 them.

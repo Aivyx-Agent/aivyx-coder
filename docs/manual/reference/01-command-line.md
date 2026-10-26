@@ -104,6 +104,47 @@ aivyx-coder checked itself to this file as JSON:
 
 The file is private to you (mode 600).
 
+### `--headless`
+
+```
+aivyx-coder --auto "build the app in BRIEF.md" --headless --report run.json
+```
+
+With `--auto` only. Run without the terminal UI: for scripts, CI and
+benchmarks. It's the default when stdout isn't a terminal, so piping or
+redirecting the output is enough.
+
+- **Progress** goes to stderr, one line per step, with the time since the
+  run started: `[0:04:12] tool run_command test`, then
+  `[0:04:31]   exit status: 101 (failed)`. Warnings and notices are printed
+  in full; the model's own text only with `--verbose`.
+- **The stop notice** and its facts go to stdout when the run ends.
+- **The exit code** says how it ended:
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | goal achieved, and the last verification passed (or never ran) |
+  | 1 | goal achieved, but the last verification or a final check failed |
+  | 2 | the `[autonomous]` budget ran out |
+  | 3 | turns kept failing (for example, the model server is down) |
+  | 4 | possible prompt injection detected |
+  | 130 | stopped by `SIGINT` or `SIGTERM` |
+
+- **Stopping it:** `SIGINT` or `SIGTERM` ends the run the way Ctrl+C does in
+  the TUI: running commands are killed and `--report` is still written. A
+  second signal exits at once.
+- **Permissions:** nothing can be asked without a terminal, so anything that
+  would need a person is refused. `--auto`'s gate already works this way.
+
+### `--verbose`
+
+```
+aivyx-coder --auto "fix the failing test" --headless --verbose
+```
+
+With `--auto` in headless mode: also print the model's text to stderr as it
+streams. `-v` for short.
+
 ### `--acp`
 
 Run as an Agent Client Protocol server over standard input and output, so

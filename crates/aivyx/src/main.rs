@@ -5,6 +5,7 @@ use aivyx_config::Settings;
 use aivyx_core::EditFormat;
 use aivyx_sandbox::PermissionPrompter;
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod agent_builder;
@@ -96,6 +97,14 @@ mod tests {
     #[test]
     fn validate_mcp_server_session_limits_accepts_real_defaults() {
         assert!(validate_mcp_server_session_limits(1800, 8).is_ok());
+    }
+
+    #[test]
+    fn headless_and_verbose_need_auto() {
+        let cli = Cli::try_parse_from(["aivyx-coder", "--auto", "go", "--headless", "-v"]).unwrap();
+        assert!(cli.headless && cli.verbose);
+        assert!(Cli::try_parse_from(["aivyx-coder", "--headless"]).is_err());
+        assert!(Cli::try_parse_from(["aivyx-coder", "--verbose"]).is_err());
     }
 
     #[test]
@@ -501,6 +510,19 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "auto")]
     report: Option<std::path::PathBuf>,
 
+    /// With --auto: run without the terminal UI. Progress goes to stderr,
+    /// the stop notice to stdout, and the exit code says how the run ended
+    /// (0 goal achieved, 1 achieved but a check failed, 2 budget used up,
+    /// 3 failed, 4 injection detected, 130 stopped by a signal). The
+    /// default when stdout isn't a terminal.
+    #[arg(long, requires = "auto")]
+    headless: bool,
+
+    /// With --auto in headless mode: also print the model's text as it
+    /// streams.
+    #[arg(long, short = 'v', requires = "auto")]
+    verbose: bool,
+
     /// Override config.toml's backend edit_format ("native" or "prompted")
     /// for this session — mainly for comparing the two on a given model.
     #[arg(long, value_parser = ["native", "prompted"])]
@@ -689,21 +711,49 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
 /// test binary stuck in a loop — outlived aivyx-coder indefinitely
 /// (live-test finding, 2026-10-20). `SIGKILL` can't be caught; it still
 /// orphans whatever was running.
-fn spawn_exit_signal_handler() {
+///
+/// In headless `--auto` (`run_stop` set) the first `SIGINT` or `SIGTERM`
+/// cancels the run instead, as Ctrl+C does in the TUI, so the report is
+/// still written; a second one exits at once. `SIGINT` is only caught then:
+/// in the TUI, Ctrl+C is a key, not a signal.
+fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
     use tokio::signal::unix::{SignalKind, signal};
     let (Ok(mut terminate), Ok(mut hangup)) =
         (signal(SignalKind::terminate()), signal(SignalKind::hangup()))
     else {
         return;
     };
+    let mut interrupt = match run_stop {
+        Some(_) => match signal(SignalKind::interrupt()) {
+            Ok(interrupt) => Some(interrupt),
+            Err(_) => return,
+        },
+        None => None,
+    };
     tokio::spawn(async move {
-        // The shell's convention for "ended by signal N": 128 + N.
-        let code = tokio::select! {
-            _ = terminate.recv() => 128 + 15,
-            _ = hangup.recv() => 128 + 1,
-        };
-        aivyx_tools::kill_all_process_groups();
-        std::process::exit(code);
+        loop {
+            // The shell's convention for "ended by signal N": 128 + N.
+            let code = tokio::select! {
+                _ = terminate.recv() => 128 + 15,
+                _ = hangup.recv() => 128 + 1,
+                _ = async {
+                    match interrupt.as_mut() {
+                        Some(interrupt) => {
+                            interrupt.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => 128 + 2,
+            };
+            if code != 128 + 1
+                && let Some(stop) = run_stop.as_ref().filter(|stop| !stop.is_cancelled())
+            {
+                stop.cancel();
+                continue;
+            }
+            aivyx_tools::kill_all_process_groups();
+            std::process::exit(code);
+        }
     });
 }
 
@@ -717,7 +767,11 @@ async fn main() -> anyhow::Result<()> {
         return run_pack(action);
     }
 
-    spawn_exit_signal_handler();
+    // Headless: --auto without a terminal on stdout, or asked for.
+    let headless = cli.auto.is_some()
+        && (cli.headless || !std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    let run_stop = headless.then(CancellationToken::new);
+    spawn_exit_signal_handler(run_stop.clone());
 
     // Must run before Settings::load()'s own first-run-writes-defaults
     // behavior could otherwise fire silently -- the wizard is specifically
@@ -848,7 +902,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (tui_prompter, tui_permission_rx) = aivyx_tui::permission_channel();
-    let prompter: Arc<dyn PermissionPrompter> = Arc::new(tui_prompter);
+    let prompter: Arc<dyn PermissionPrompter> = if headless {
+        Arc::new(crate::headless::NoHumanPrompter)
+    } else {
+        Arc::new(tui_prompter)
+    };
     let mut built =
         crate::agent_builder::build_agent(&cli, &settings, prompter, pack.as_ref()).await?;
 
@@ -925,6 +983,21 @@ async fn main() -> anyhow::Result<()> {
             reasoning_effort: settings.backend.reasoning_effort.clone(),
         },
     });
+    if let (Some(run), Some(stop)) = (autonomous_run.as_ref().filter(|_| headless), run_stop) {
+        let run = run.clone();
+        let code = crate::headless::run(
+            built.agent,
+            built.events_rx,
+            built.cwd,
+            run,
+            stop,
+            cli.verbose,
+        )
+        .await;
+        aivyx_tools::kill_all_process_groups();
+        drop(_tracing_guard);
+        std::process::exit(code);
+    }
     // Only the TUI can redraw its transcript from `AgentEvent::SessionSwitched`
     // (`handle_agent_event` rebuilds it from the resumed history) -- ACP and
     // `--mcp-server` never reach this line (ACP returns earlier above;
