@@ -123,16 +123,19 @@ redirecting the output is enough.
 
   | Code | Meaning |
   |---|---|
-  | 0 | goal achieved, and the last verification passed (or never ran) |
+  | 0 | goal achieved, the last verification passed (or never ran), and every final check passed |
   | 1 | goal achieved, but the last verification or a final check failed |
   | 2 | the `[autonomous]` budget ran out |
   | 3 | turns kept failing (for example, the model server is down), or an error stopped the run from starting (for example, a config error) |
   | 4 | possible prompt injection detected |
-  | 130 | stopped by `SIGINT` or `SIGTERM` |
+  | 130 | stopped by `SIGINT` or `SIGTERM`, including during the final checks |
 
 - **Stopping it:** `SIGINT` or `SIGTERM` ends the run the way Ctrl+C does in
   the TUI: running commands are killed and `--report` is still written. A
-  second signal exits at once.
+  signal during the final checks counts as cancelled (130). A second signal
+  exits at once with 128 plus the signal (130 for `SIGINT`, 143 for
+  `SIGTERM`) and writes no report. `SIGHUP` exits at once with 129 and
+  writes no report.
 - **Permissions:** nothing can be asked without a terminal, so anything that
   would need a person is refused. `--auto`'s gate already works this way.
 

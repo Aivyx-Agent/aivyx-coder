@@ -190,11 +190,12 @@ pub async fn run(
     let end =
         aivyx_core::autonomous::drive(&mut agent, &run, &cwd, &stop, &active, &mut on_iteration)
             .await;
-    // Dropping the agent closes the event channel unless a tool kept a
-    // sender; give the printer a moment to drain either way.
+    // Dropping the agent drops its event sender, but clones can outlive it
+    // (team-mode specialist sessions hold some), so the channel may stay
+    // open: give the printer a moment to drain, then move on.
     drop(agent);
     if tokio::time::timeout(Duration::from_secs(2), printing).await.is_err() {
-        tracing::warn!("headless: progress printer didn't finish draining");
+        tracing::debug!("headless: progress printer didn't finish draining");
     }
     let mut stdout = std::io::stdout().lock();
     write_notice(&mut stdout, &end.notice);

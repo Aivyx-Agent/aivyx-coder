@@ -96,11 +96,10 @@ fn next_autonomous_message(
     Some("continue working toward the goal".to_string())
 }
 
-/// The three driver stop reasons each get their own message-building
-/// function (rather than inlining `format!` at each `agent.notify(...)`
-/// call site) purely so the message *content* is unit-testable — the
-/// driver loop itself lives inside a spawned task in `run()` and isn't a
-/// pure function, so it can't be exercised directly in a unit test.
+/// The driver stop reasons each get their own message-building function
+/// (rather than inlining `format!` at each `agent.notify(...)` call site)
+/// so the message *content* can be unit-tested on its own; the loop that
+/// uses them, `drive()`, is also tested directly (see `tests.rs`).
 fn budget_exhausted_notice(iterations_used: u32, tasks: &[Task]) -> String {
     let done_count = tasks
         .iter()
@@ -222,7 +221,6 @@ fn goal_achieved_notice(iterations_used: u32, last_verification_passed: Option<b
         notice
     }
 }
-
 
 fn injection_detected_notice(iterations_used: u32, finding: &InjectionFinding) -> String {
     format!(
@@ -404,8 +402,8 @@ async fn finish(
     agent: &mut Agent,
     run: &AutonomousRun,
     cwd: &Path,
-    outcome: Outcome,
-    notice: String,
+    mut outcome: Outcome,
+    mut notice: String,
     iterations: u32,
     started: Instant,
     stop: &CancellationToken,
@@ -422,6 +420,16 @@ async fn finish(
         *active_cancellation.lock().unwrap() = Some(cancellation.clone());
         facts.final_checks = agent.run_final_checks(&run.final_checks, cwd, &cancellation).await;
         *active_cancellation.lock().unwrap() = None;
+        // A signal during the checks cancelled them (they count as failed);
+        // report the run as cancelled, not as a goal reached with failing
+        // checks.
+        if stop.is_cancelled() {
+            outcome = Outcome::Cancelled;
+            notice = format!(
+                "{} (goal reached; cancelled during the final checks)",
+                cancelled_notice(iterations)
+            );
+        }
     }
     facts.changed = agent.changed_since_run_start(&run.read_only_paths).await;
     let notice = notice_with_facts(&notice, &facts);
@@ -429,6 +437,8 @@ async fn finish(
         let (checkpoints, checkpoint_failures) = agent.checkpoints_since_run_start();
         let report = RunReport {
             report_version: crate::run_facts::REPORT_VERSION,
+            // Every crate inherits the workspace version, so this is the
+            // coder's version.
             coder_version: env!("CARGO_PKG_VERSION"),
             goal: &run.goal,
             outcome: outcome.as_str(),

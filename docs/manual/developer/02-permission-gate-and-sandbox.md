@@ -71,6 +71,7 @@ Linux-only, behind the default-on `sandbox-backend` feature;
   `.output()` on a confined command. Live groups are also recorded in a
   process-wide registry; the binary's `SIGTERM`/`SIGHUP` handler kills them
   all with `kill_all_process_groups` before exiting, since nothing unwinds.
+  In headless `--auto` the first `SIGINT`/`SIGTERM` cancels the run instead.
 - **`require_enforcement`** is checked twice, fail-closed when true: the
   parent failing to build the ruleset, and the child seeing
   `RulesetStatus::NotEnforced`. `PartiallyEnforced` (an older kernel ABI) is

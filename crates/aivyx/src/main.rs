@@ -723,13 +723,9 @@ fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
     else {
         return;
     };
-    let mut interrupt = match run_stop {
-        Some(_) => match signal(SignalKind::interrupt()) {
-            Ok(interrupt) => Some(interrupt),
-            Err(_) => return,
-        },
-        None => None,
-    };
+    // Without a SIGINT handler Ctrl+C keeps its default (ends the process);
+    // the SIGTERM and SIGHUP handling still applies.
+    let mut interrupt = run_stop.as_ref().and_then(|_| signal(SignalKind::interrupt()).ok());
     tokio::spawn(async move {
         loop {
             // The shell's convention for "ended by signal N": 128 + N.

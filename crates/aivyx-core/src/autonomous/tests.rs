@@ -320,7 +320,6 @@ fn injection_detected_notice_reports_iterations_source_and_pattern() {
     assert!(message.contains("ignore previous instructions"));
 }
 
-
 /// Streams one scripted response per request; an exhausted queue streams
 /// nothing, which ends the turn.
 struct ScriptedBackend {
@@ -368,6 +367,55 @@ impl PermissionGate for AllowAll {
     }
 }
 
+/// A `run_command` that never finishes on its own: it returns an error
+/// once its call is cancelled, as the real one does when killed.
+struct HangingRunCommand;
+
+#[async_trait::async_trait]
+impl aivyx_tools::Tool for HangingRunCommand {
+    fn name(&self) -> &str {
+        "run_command"
+    }
+
+    fn definition(&self) -> aivyx_types::ToolDefinition {
+        aivyx_types::ToolDefinition {
+            name: "run_command".to_string(),
+            description: "hangs".to_string(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, aivyx_tools::ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: aivyx_sandbox::ActionKind::Internal,
+            target: aivyx_sandbox::PermissionTarget::Other("hang".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        ctx: &aivyx_tools::ToolExecutionContext,
+    ) -> Result<aivyx_types::ToolOutput, aivyx_tools::ToolError> {
+        tokio::select! {
+            _ = ctx.cancellation.cancelled() => {
+                Ok(aivyx_types::ToolOutput::Error("cancelled".to_string()))
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                Ok(aivyx_types::ToolOutput::Ok("exit code 0".to_string()))
+            }
+        }
+    }
+}
+
 fn text(reply: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(reply.to_string()),
@@ -399,8 +447,17 @@ fn run_with(tasks: Vec<Task>, max_iterations: u32) -> AutonomousRun {
 /// Drives `run` against `llm` and returns how it ended plus the iteration
 /// numbers `on_iteration` saw.
 async fn drive_with(llm: Arc<dyn LlmBackend>, run: &AutonomousRun, stop: &CancellationToken) -> (RunEnd, Vec<u32>) {
+    drive_with_tools(llm, ToolRegistry::new(), run, stop).await
+}
+
+async fn drive_with_tools(
+    llm: Arc<dyn LlmBackend>,
+    registry: ToolRegistry,
+    run: &AutonomousRun,
+    stop: &CancellationToken,
+) -> (RunEnd, Vec<u32>) {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let executor = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAll), Arc::new(NoopConfiner));
+    let executor = ToolExecutor::new(registry, Arc::new(AllowAll), Arc::new(NoopConfiner));
     let mut agent = Agent::new(
         llm,
         executor,
@@ -468,6 +525,30 @@ async fn drive_stops_when_flagged_content_was_ingested() {
     let (end, _) = drive_with(scripted(&["ok"]), &run, &CancellationToken::new()).await;
     assert_eq!(end.outcome, Outcome::InjectionDetected);
     assert_eq!(end.iterations, 1);
+}
+
+#[tokio::test]
+async fn a_signal_during_the_final_checks_ends_the_run_as_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.final_checks = vec!["sleep 5".to_string()];
+    run.report = Some(dir.path().join("run.json"));
+    let stop = CancellationToken::new();
+    let canceller = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        canceller.cancel();
+    });
+    let started = Instant::now();
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(HangingRunCommand));
+    let (end, _) = drive_with_tools(scripted(&["Done."]), registry, &run, &stop).await;
+    assert!(started.elapsed() < Duration::from_secs(4), "the check wasn't interrupted");
+    assert_eq!(end.outcome, Outcome::Cancelled, "{}", end.notice);
+    assert!(end.notice.contains("cancelled during the final checks"), "{}", end.notice);
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("run.json")).unwrap()).unwrap();
+    assert_eq!(report["outcome"], "cancelled");
 }
 
 #[tokio::test]
