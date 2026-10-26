@@ -392,6 +392,7 @@ fn run_with(tasks: Vec<Task>, max_iterations: u32) -> AutonomousRun {
         read_only_paths: Vec::new(),
         report: None,
         final_review: false,
+        model: RunModel::default(),
     }
 }
 
@@ -479,6 +480,10 @@ async fn drive_writes_the_report_with_the_outcome() {
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("run.json")).unwrap()).unwrap();
     assert_eq!(report["outcome"], "goal_achieved");
     assert_eq!(report["iterations"], 1);
+    assert_eq!(report["report_version"], 1);
+    // The scripted reply carries no usage event, and only those are counted.
+    assert_eq!(report["model_requests"], 0);
+    assert_eq!(report["checkpoints"], 0);
 }
 
 #[test]

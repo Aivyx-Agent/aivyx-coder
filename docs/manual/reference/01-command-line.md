@@ -92,7 +92,15 @@ aivyx-coder checked itself to this file as JSON:
 - iterations and duration;
 - the last verification result;
 - the `[verification] final_checks` results with their warning counts;
-- every file the run changed, marking any in `read_only_paths`.
+- every file the run changed, marking any in `read_only_paths`, and
+  `read_only_touched`, the read-only files that changed anyway;
+- the `[backend]` model, address and `reasoning_effort`;
+- `model_requests`, `prompt_tokens`, `completion_tokens` and
+  `peak_context_tokens` over the main loop's model requests (as the server
+  reported them; sub-agents aren't counted);
+- `checkpoints` and `checkpoint_failures` during the run;
+- `report_version` (1) and `coder_version`. The version goes up only when a
+  field changes meaning or is removed, not when one is added.
 
 The file is private to you (mode 600).
 

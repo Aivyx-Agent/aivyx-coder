@@ -61,9 +61,15 @@ impl UsageTotals {
     }
 }
 
+/// The `--report` format's version: bumped when a field changes meaning
+/// or goes away, not when one is added.
+pub const REPORT_VERSION: u32 = 1;
+
 /// The `--report` file's contents.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct RunReport<'a> {
+    pub report_version: u32,
+    pub coder_version: &'a str,
     pub goal: &'a str,
     /// `goal_achieved`, `budget_exhausted`, `cancelled`, `failed` or
     /// `injection_detected`.
@@ -74,6 +80,42 @@ pub struct RunReport<'a> {
     pub last_verification_passed: Option<bool>,
     pub final_checks: &'a [FinalCheck],
     pub changed_files: &'a [ChangedFile],
+    /// `[backend]` model and address, and `reasoning_effort` if set.
+    pub model: &'a str,
+    pub base_url: &'a str,
+    pub reasoning_effort: Option<&'a str>,
+    pub usage: UsageTotals,
+    /// Tool-call checkpoints during the run, and how many failed.
+    pub checkpoints: u32,
+    pub checkpoint_failures: u32,
+}
+
+/// The JSON shape: `RunReport` flattened, with the read-only files that
+/// changed listed on their own.
+#[derive(Serialize)]
+struct ReportJson<'a> {
+    report_version: u32,
+    coder_version: &'a str,
+    goal: &'a str,
+    outcome: &'a str,
+    notice: &'a str,
+    iterations: u32,
+    duration_secs: u64,
+    last_verification_passed: Option<bool>,
+    final_checks: &'a [FinalCheck],
+    changed_files: &'a [ChangedFile],
+    model: &'a str,
+    base_url: &'a str,
+    reasoning_effort: Option<&'a str>,
+    model_requests: u32,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    peak_context_tokens: u32,
+    checkpoints: u32,
+    checkpoint_failures: u32,
+    /// Files in `read_only_paths` that changed anyway (a command can change
+    /// what the file tools may not).
+    read_only_touched: Vec<&'a str>,
 }
 
 /// How many changed files the notice names before "and N more".
@@ -141,7 +183,34 @@ impl RunFacts {
 impl RunReport<'_> {
     /// Pretty-printed JSON, as written to the `--report` file.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("a RunReport always serializes")
+        let json = ReportJson {
+            report_version: self.report_version,
+            coder_version: self.coder_version,
+            goal: self.goal,
+            outcome: self.outcome,
+            notice: self.notice,
+            iterations: self.iterations,
+            duration_secs: self.duration_secs,
+            last_verification_passed: self.last_verification_passed,
+            final_checks: self.final_checks,
+            changed_files: self.changed_files,
+            model: self.model,
+            base_url: self.base_url,
+            reasoning_effort: self.reasoning_effort,
+            model_requests: self.usage.requests,
+            prompt_tokens: self.usage.prompt_tokens,
+            completion_tokens: self.usage.completion_tokens,
+            peak_context_tokens: self.usage.peak_prompt_tokens,
+            checkpoints: self.checkpoints,
+            checkpoint_failures: self.checkpoint_failures,
+            read_only_touched: self
+                .changed_files
+                .iter()
+                .filter(|f| f.read_only)
+                .map(|f| f.path.as_str())
+                .collect(),
+        };
+        serde_json::to_string_pretty(&json).expect("a RunReport always serializes")
     }
 }
 
@@ -211,8 +280,13 @@ mod tests {
     #[test]
     fn the_report_serializes_every_field() {
         let checks = [FinalCheck { name: "clippy".into(), passed: true, warnings: 3 }];
-        let files = [file("src/main.rs", "modified", 10, 2, false)];
+        let files = [
+            file("src/main.rs", "modified", 10, 2, false),
+            file("BRIEF.md", "modified", 1, 1, true),
+        ];
         let report = RunReport {
+            report_version: REPORT_VERSION,
+            coder_version: "0.6.3",
             goal: "Build it.",
             outcome: "goal_achieved",
             notice: "autonomous run stopped: goal achieved after 5 iteration(s)",
@@ -221,14 +295,37 @@ mod tests {
             last_verification_passed: Some(true),
             final_checks: &checks,
             changed_files: &files,
+            model: "Qwen3.8-27B",
+            base_url: "http://llama:8080/v1",
+            reasoning_effort: Some("medium"),
+            usage: UsageTotals {
+                requests: 9,
+                prompt_tokens: 90_000,
+                completion_tokens: 12_000,
+                peak_prompt_tokens: 41_000,
+            },
+            checkpoints: 30,
+            checkpoint_failures: 1,
         };
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(json["report_version"], 1);
+        assert_eq!(json["coder_version"], "0.6.3");
         assert_eq!(json["outcome"], "goal_achieved");
         assert_eq!(json["iterations"], 5);
         assert_eq!(json["final_checks"][0]["warnings"], 3);
         assert_eq!(json["changed_files"][0]["status"], "modified");
         assert_eq!(json["changed_files"][0]["read_only"], false);
         assert_eq!(json["last_verification_passed"], true);
+        assert_eq!(json["model"], "Qwen3.8-27B");
+        assert_eq!(json["base_url"], "http://llama:8080/v1");
+        assert_eq!(json["reasoning_effort"], "medium");
+        assert_eq!(json["model_requests"], 9);
+        assert_eq!(json["prompt_tokens"], 90_000);
+        assert_eq!(json["completion_tokens"], 12_000);
+        assert_eq!(json["peak_context_tokens"], 41_000);
+        assert_eq!(json["checkpoints"], 30);
+        assert_eq!(json["checkpoint_failures"], 1);
+        assert_eq!(json["read_only_touched"], serde_json::json!(["BRIEF.md"]));
     }
 
     #[test]

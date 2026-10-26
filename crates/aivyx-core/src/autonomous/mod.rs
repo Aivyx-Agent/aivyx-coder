@@ -259,6 +259,8 @@ pub struct AutonomousRun {
     /// `[autonomous] final_review`: one review turn against the spec before
     /// the run stops with its goal reached.
     pub final_review: bool,
+    /// `[backend]` model, address and reasoning effort, for `--report`.
+    pub model: RunModel,
 }
 
 /// Why an autonomous run stopped.
@@ -295,6 +297,14 @@ pub struct RunEnd {
     /// Whether every `[verification] final_checks` command passed (`true`
     /// when none ran).
     pub final_checks_passed: bool,
+}
+
+/// The model a run talks to, as configured, for `--report`.
+#[derive(Debug, Clone, Default)]
+pub struct RunModel {
+    pub model: String,
+    pub base_url: String,
+    pub reasoning_effort: Option<String>,
 }
 
 /// Runs an `--auto` session to its end. `stop` ends the run the way Ctrl+C
@@ -415,7 +425,10 @@ async fn finish(
     facts.changed = agent.changed_since_run_start(&run.read_only_paths).await;
     let notice = notice_with_facts(&notice, &facts);
     if let Some(path) = &run.report {
+        let (checkpoints, checkpoint_failures) = agent.checkpoints_since_run_start();
         let report = RunReport {
+            report_version: crate::run_facts::REPORT_VERSION,
+            coder_version: env!("CARGO_PKG_VERSION"),
             goal: &run.goal,
             outcome: outcome.as_str(),
             notice: &notice,
@@ -424,6 +437,12 @@ async fn finish(
             last_verification_passed: agent.last_verification_passed(),
             final_checks: &facts.final_checks,
             changed_files: facts.changed.as_deref().unwrap_or_default(),
+            model: &run.model.model,
+            base_url: &run.model.base_url,
+            reasoning_effort: run.model.reasoning_effort.as_deref(),
+            usage: agent.usage_totals(),
+            checkpoints,
+            checkpoint_failures,
         };
         if let Err(err) = write_report(path, &report.to_json()) {
             agent.notify(format!("couldn't write the --report file {}: {err}", path.display()));

@@ -918,6 +918,11 @@ async fn main() -> anyhow::Result<()> {
         read_only_paths: settings.permissions.resolved_read_only_paths(&built.cwd),
         report: cli.report.clone(),
         final_review: settings.autonomous.final_review,
+        model: aivyx_core::autonomous::RunModel {
+            model: settings.backend.model.clone(),
+            base_url: settings.backend.base_url.clone(),
+            reasoning_effort: settings.backend.reasoning_effort.clone(),
+        },
     });
     // Only the TUI can redraw its transcript from `AgentEvent::SessionSwitched`
     // (`handle_agent_event` rebuilds it from the resumed history) -- ACP and
