@@ -101,6 +101,12 @@ fn progress_line(event: &AgentEvent) -> Option<String> {
     }
 }
 
+/// Drops every control character except newline and tab, so text from the
+/// model, tools or files can't move the cursor or rewrite earlier output.
+fn sanitize(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
+}
+
 /// Writes progress lines with the time since `started` in front:
 /// `[0:12:31] tool run_command test`. With `verbose`, the model's streamed
 /// text goes out as it arrives, and the next progress line starts on a new line.
@@ -126,6 +132,7 @@ impl Printer {
             self.mid_text = false;
         }
         let stamp = self.stamp();
+        let text = sanitize(text);
         for (i, part) in text.lines().enumerate() {
             let _ = if i == 0 {
                 writeln!(out, "{stamp} {part}")
@@ -139,7 +146,7 @@ impl Printer {
         if let AgentEvent::TextDelta(text) = event
             && self.verbose
         {
-            let _ = write!(out, "{text}");
+            let _ = write!(out, "{}", sanitize(text));
             self.mid_text = true;
             return;
         }
@@ -265,6 +272,20 @@ mod tests {
         printer.line("error: one\ntwo", &mut out);
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text, "thinking\n[0:00:00] iteration 2\n[0:00:00] error: one\n          two\n");
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_output() {
+        let evil = "\x1b[2Jboom\rX\x07\nnext\ttab";
+        let mut out = Vec::new();
+        let mut printer = Printer::new(true);
+        printer.line(evil, &mut out);
+        printer.event(&AgentEvent::TextDelta(evil.into()), &mut out);
+        printer.line(evil, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{text:?}");
+        assert!(text.starts_with("[0:00:00] [2Jboom"), "{text:?}");
+        assert!(text.contains("next\ttab"), "{text:?}");
     }
 
     #[test]
