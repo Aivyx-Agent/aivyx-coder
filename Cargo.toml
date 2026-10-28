@@ -34,10 +34,10 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
 aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "7de5380de0b861e47d51d56342b521b75f194c34", default-features = false }
-aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "6cea5fc590c1d4a1255cd1e878829d78edcfcd9d" }
+aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "5ecd5e26b442b5568bab8730fd4608d7e379e369" }
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "4ec85e4d887a6f0de2318baf1fa4d7e9023a1ffc" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "f883339ee9655871673c75343b1773b7836f465b" }
-aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "81e1f36dbbf35987a38c3b936867eacb5ab8d8c8" }
+aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a506c9c961b82715806bdec67e53704f1a11ed8d" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffaff98acf1bd32955e6abdb659444215218416e" }
 aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "1ab893732e07daca13d37ea2a1695b229c058a20" }
 # The signed pack format shared with aivyx-pa (config packs). Not on

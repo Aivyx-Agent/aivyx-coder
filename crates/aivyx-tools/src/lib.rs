@@ -342,44 +342,35 @@ impl ToolExecutor {
     /// can't be confirmed.
     ///
     /// Verification matters because `GitCheckpointer::checkpoint` swallows
-    /// its own errors (a git failure, the 10 s timeout) and
-    /// `refs/aivyx/checkpoints/` is shared by every aivyx process using the
-    /// repository: "the newest ref" may be stale or another process's. So
-    /// this recomputes the worktree's tree the way the checkpointer does (a
-    /// private index plus `write-tree`, with the same deny-path excludes)
-    /// and returns the newest of the last few refs whose tree matches.
-    /// When the tree is unchanged since the last checkpoint (deduplicated),
-    /// that earlier ref is the match.
+    /// its own errors (a git failure, the 10 s timeout): "the newest
+    /// checkpoint" may be stale. So this recomputes the worktree's tree the
+    /// way the checkpointer does (a private index plus `write-tree`, with
+    /// the same deny-path excludes) and returns the newest of the last few
+    /// checkpoints *this checkpointer took* whose recorded tree matches —
+    /// never a ref read back from `refs/aivyx/checkpoints/`, which other
+    /// processes, or a confined command, can write. When the tree is
+    /// unchanged since the last checkpoint (deduplicated), that earlier
+    /// checkpoint is the match.
     pub async fn checkpoint_now(
         &self,
         label: &str,
         cancellation: &CancellationToken,
     ) -> Option<String> {
-        /// How many of the newest refs to search for the matching tree.
-        const SCAN: &str = "--count=8";
+        /// How many of the newest checkpoints to search for the matching tree.
+        const SCAN: usize = 8;
         let checkpointer = self.checkpointer.as_ref()?;
         let cwd = self.checkpoint_cwd.as_deref()?;
         checkpointer.checkpoint(label, cancellation).await;
         let tree = self
             .current_worktree_tree(cwd, checkpointer, cancellation)
             .await?;
-        let refs = run_git(
-            cwd,
-            &[
-                "for-each-ref",
-                "--sort=-refname",
-                SCAN,
-                "--format=%(refname) %(tree)",
-                "refs/aivyx/checkpoints/",
-            ],
-            &[],
-        )
-        .await
-        .ok()?;
-        refs.lines().find_map(|line| {
-            let (name, ref_tree) = line.split_once(' ')?;
-            (ref_tree.trim() == tree).then(|| name.to_string())
-        })
+        checkpointer
+            .checkpoints()
+            .into_iter()
+            .rev()
+            .take(SCAN)
+            .find(|taken| taken.tree == tree)
+            .map(|taken| taken.ref_name)
     }
 
     /// The tree oid of the worktree as the checkpointer would snapshot it
@@ -412,7 +403,9 @@ impl ToolExecutor {
         // the whole worktree on every message.
         let _ = std::fs::remove_file(&index);
         let checkpointer_index = git_dir.join("aivyx").join("index");
-        if checkpointer_index.exists() {
+        // Only a regular file: `.git` is writable by confined commands, and
+        // a symlink here would copy whatever it points at into `.git`.
+        if std::fs::symlink_metadata(&checkpointer_index).is_ok_and(|m| m.is_file()) {
             let _ = std::fs::copy(&checkpointer_index, &index);
         }
         let tree = checkpointer.tree_in_index(&index, cancellation).await.ok();
@@ -1601,6 +1594,33 @@ mod tests {
         assert_ne!(again.as_deref(), Some("refs/aivyx/checkpoints/9999999999999-0000"));
         let again = again.expect("the real, matching snapshot is still found");
         assert_eq!(tree_of_ref(&cwd, &again).await, tree_of_ref(&cwd, &real).await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_now_and_restore_use_only_this_checkpointers_own_checkpoints() {
+        // A ref planted under refs/aivyx/checkpoints/ (any process sharing
+        // the repository, or a confined command, can write one) is neither
+        // returned by checkpoint_now nor accepted for a restore.
+        let dir = tempfile::tempdir().unwrap();
+        aivyx_checkpoint::test_support::init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let executor = undo_executor(&cwd, vec![]).await;
+        std::fs::write(cwd.join("tracked.txt"), "before\n").unwrap();
+        let before = executor.checkpoint_now("undo", &CancellationToken::new()).await.unwrap();
+        let planted = "refs/aivyx/checkpoints/9999999999999-0000000-0000";
+        run_git(&cwd, &["update-ref", planted, "HEAD"], &[]).await.unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "after\n").unwrap();
+        std::fs::write(cwd.join("new.txt"), "new\n").unwrap();
+        let after = executor.checkpoint_now("undo", &CancellationToken::new()).await.unwrap();
+        assert_ne!(after, planted);
+        assert!(executor.restore_to_checkpoint(planted, &CancellationToken::new()).await.is_err());
+
+        executor.restore_to_checkpoint(&before, &CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "before\n");
+        assert!(!cwd.join("new.txt").exists());
+        executor.restore_to_checkpoint(&after, &CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(cwd.join("new.txt")).unwrap(), "new\n");
     }
 
     #[tokio::test]

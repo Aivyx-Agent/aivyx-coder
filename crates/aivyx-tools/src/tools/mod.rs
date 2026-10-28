@@ -68,14 +68,19 @@ pub use write_file::WriteFileTool;
 /// A bounded, *unconfined* git read for a permission preview or a branch
 /// lookup — run before the user approves anything, so it must never run a
 /// program the repository's own config names (a confined command can write
-/// `.git/config`): fsmonitor, hooks and the repository's filter drivers are
-/// switched off. Diffs should still add `--no-ext-diff --no-textconv`.
-/// `None` on any failure.
+/// `.git/config`): `aivyx_checkpoint::unconfined_git_args_blocking` checks
+/// the repository's config against its allow-list (no git runs at all when
+/// it refuses) and switches off fsmonitor, hooks, signing, transport and
+/// the repository's filter drivers. Diffs should still add
+/// `--no-ext-diff --no-textconv`. `None` on any failure.
 pub(crate) fn unconfined_git_capture(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let guard = aivyx_checkpoint::unconfined_git_args_blocking(cwd).ok()?;
     let output = std::process::Command::new("git")
-        .args(aivyx_checkpoint::unconfined_git_args_blocking(cwd))
+        .args(guard)
         .args(args)
         .current_dir(cwd)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
