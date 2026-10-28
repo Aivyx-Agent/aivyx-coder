@@ -160,7 +160,7 @@ dependencies = [
 [[package]]
 name = "aivyx-checkpoint"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-checkpoint?rev=b8072e7dce1a84f526cd4ecf99ab02f4ea50d0b1#b8072e7dce1a84f526cd4ecf99ab02f4ea50d0b1"
+source = "git+https://github.com/Aivyx-Agent/aivyx-checkpoint?rev=6cea5fc590c1d4a1255cd1e878829d78edcfcd9d#6cea5fc590c1d4a1255cd1e878829d78edcfcd9d"
 dependencies = [
  "tokio",
  "tokio-util",
@@ -184,7 +184,7 @@ dependencies = [
 [[package]]
 name = "aivyx-confine"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-confine?rev=6e465755c827189e195499b981c13ba235953b30#6e465755c827189e195499b981c13ba235953b30"
+source = "git+https://github.com/Aivyx-Agent/aivyx-confine?rev=7de5380de0b861e47d51d56342b521b75f194c34#7de5380de0b861e47d51d56342b521b75f194c34"
 dependencies = [
  "globset",
  "landlock",
@@ -227,12 +227,12 @@ dependencies = [
 [[package]]
 name = "aivyx-injection-guard"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-injection-guard?rev=a9ece398f65ad56a756786cecc713bc5be836680#a9ece398f65ad56a756786cecc713bc5be836680"
+source = "git+https://github.com/Aivyx-Agent/aivyx-injection-guard?rev=81e1f36dbbf35987a38c3b936867eacb5ab8d8c8#81e1f36dbbf35987a38c3b936867eacb5ab8d8c8"
 
 [[package]]
 name = "aivyx-kvcache"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-kvcache?rev=a6e7ed96094f13f4fb63c8026cd5d2b9f75df3a9#a6e7ed96094f13f4fb63c8026cd5d2b9f75df3a9"
+source = "git+https://github.com/Aivyx-Agent/aivyx-kvcache?rev=4ec85e4d887a6f0de2318baf1fa4d7e9023a1ffc#4ec85e4d887a6f0de2318baf1fa4d7e9023a1ffc"
 dependencies = [
  "async-trait",
  "clap",
@@ -294,7 +294,7 @@ dependencies = [
 [[package]]
 name = "aivyx-pack"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-pack?rev=5295ad2314c500d664d0a1117ba172eae3c1cb50#5295ad2314c500d664d0a1117ba172eae3c1cb50"
+source = "git+https://github.com/Aivyx-Agent/aivyx-pack?rev=eedbf350820c0483c6a1649de4c83bb1a45844ad#eedbf350820c0483c6a1649de4c83bb1a45844ad"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "aivyx-recall"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-recall?rev=df5938c91d2457af4e0a3db32dcf9013c9642cd8#df5938c91d2457af4e0a3db32dcf9013c9642cd8"
+source = "git+https://github.com/Aivyx-Agent/aivyx-recall?rev=f883339ee9655871673c75343b1773b7836f465b#f883339ee9655871673c75343b1773b7836f465b"
 dependencies = [
  "async-trait",
  "fd-lock",
@@ -337,7 +337,7 @@ dependencies = [
 [[package]]
 name = "aivyx-route"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=d387a52bbcc3925064cab17c4e6b1964d044a66f#d387a52bbcc3925064cab17c4e6b1964d044a66f"
+source = "git+https://github.com/Aivyx-Agent/aivyx-route?rev=1ab893732e07daca13d37ea2a1695b229c058a20#1ab893732e07daca13d37ea2a1695b229c058a20"
 dependencies = [
  "futures-util",
  "reqwest 0.13.4",
@@ -366,7 +366,7 @@ dependencies = [
 [[package]]
 name = "aivyx-skills"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-skills?rev=4ee706e7b378f8da1792d320908f557fea270747#4ee706e7b378f8da1792d320908f557fea270747"
+source = "git+https://github.com/Aivyx-Agent/aivyx-skills?rev=ffaff98acf1bd32955e6abdb659444215218416e#ffaff98acf1bd32955e6abdb659444215218416e"
 dependencies = [
  "libc",
  "rust-embed",
@@ -446,7 +446,7 @@ dependencies = [
 [[package]]
 name = "aivyx-vision-core"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=531aa7d6e61f095aa8132ea9c7696bff15c3e131#531aa7d6e61f095aa8132ea9c7696bff15c3e131"
+source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=226663984b64fe2832afb58158b6ad9be1414c9e#226663984b64fe2832afb58158b6ad9be1414c9e"
 dependencies = [
  "async-trait",
  "thiserror 2.0.18",
@@ -455,7 +455,7 @@ dependencies = [
 [[package]]
 name = "aivyx-vision-mold"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=531aa7d6e61f095aa8132ea9c7696bff15c3e131#531aa7d6e61f095aa8132ea9c7696bff15c3e131"
+source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=226663984b64fe2832afb58158b6ad9be1414c9e#226663984b64fe2832afb58158b6ad9be1414c9e"
 dependencies = [
  "aivyx-vision-core",
  "async-trait",
@@ -472,7 +472,7 @@ dependencies = [
 [[package]]
 name = "aivyx-vision-svg"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=531aa7d6e61f095aa8132ea9c7696bff15c3e131#531aa7d6e61f095aa8132ea9c7696bff15c3e131"
+source = "git+https://github.com/Aivyx-Agent/aivyx-vision?rev=226663984b64fe2832afb58158b6ad9be1414c9e#226663984b64fe2832afb58158b6ad9be1414c9e"
 dependencies = [
  "async-trait",
  "svg-hush",
@@ -3288,7 +3288,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -5816,7 +5816,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -6126,9 +6126,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -7483,9 +7483,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -8390,9 +8390,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.8"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8403,14 +8403,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
