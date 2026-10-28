@@ -28,7 +28,7 @@ mod tools;
 pub mod web;
 pub mod wiki;
 
-pub use aivyx_checkpoint::{GitCheckpointer, exclude_pathspecs, run_git};
+pub use aivyx_checkpoint::{DetectOutcome, GitCheckpointer, exclude_pathspecs, run_git};
 pub use generated::{
     DEFAULT_GENERATED_PATTERNS, GeneratedFiles, default_generated_patterns, tracked_paths,
 };

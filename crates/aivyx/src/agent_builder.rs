@@ -24,9 +24,9 @@ use aivyx_sandbox::{
     AutonomousMode, ConfineOptions, ConfirmationGate, InjectionTaint, PermissionGate, PermissionPrompter, PlanMode,
 };
 use aivyx_tools::{
-    CoderTextCompleter, CommandSpec, DeleteFileTool, EditFileTool, FindReferencesTool,
-    GenerateImageTool, GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool, GitBranchTool,
-    GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
+    CoderTextCompleter, CommandSpec, DeleteFileTool, DetectOutcome, EditFileTool,
+    FindReferencesTool, GenerateImageTool, GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool,
+    GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LoadSkillTool,
     LspClient, McpClient, McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool,
     MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool, RememberPreferenceTool,
@@ -726,14 +726,26 @@ pub(crate) async fn build_agent(
     );
 
     let mut checkpointer: Option<Arc<GitCheckpointer>> = None;
-    if settings.git.checkpoints
-        && let Some(detected) = GitCheckpointer::detect(&cwd, deny_paths.clone()).await
-    {
-        // Untracked build output stays out of every snapshot: a fresh
-        // project without a .gitignore otherwise copies target/ in at each
-        // checkpoint (305 MB in one 33-minute --auto run, 2026-10-22).
-        let detected = detected.with_generated_ignore(settings.git.ignore.clone());
-        checkpointer = Some(Arc::new(detected));
+    // Set when cwd is a git repository whose checkpoints aivyx-checkpoint
+    // refuses (its config or layout could steer the unsandboxed checkpoint
+    // git): told to the user once, below, instead of looking like a folder
+    // that simply isn't a repository.
+    let mut checkpoints_refused: Option<String> = None;
+    if settings.git.checkpoints {
+        match GitCheckpointer::detect_outcome(&cwd, deny_paths.clone()).await {
+            DetectOutcome::Ready(detected) => {
+                // Untracked build output stays out of every snapshot: a fresh
+                // project without a .gitignore otherwise copies target/ in at each
+                // checkpoint (305 MB in one 33-minute --auto run, 2026-10-22).
+                let detected = detected.with_generated_ignore(settings.git.ignore.clone());
+                checkpointer = Some(Arc::new(detected));
+            }
+            DetectOutcome::Refused(reason) => {
+                tracing::warn!(%reason, "checkpoints refused for this repository");
+                checkpoints_refused = Some(reason);
+            }
+            DetectOutcome::NotARepo(_) => {}
+        }
     }
     let has_checkpointer = checkpointer.is_some();
     // The discard/rewind safety net on exhausted verification (the entire
@@ -742,6 +754,11 @@ pub(crate) async fn build_agent(
     // silently to "leave the broken edits in place and keep going," which
     // is not a safe default for an unattended run. Refuse to start rather
     // than run degraded, same as the verification-command check above.
+    if cli.auto.is_some()
+        && let Some(reason) = &checkpoints_refused
+    {
+        anyhow::bail!("--auto needs checkpoints, and {}", refused_checkpoints_notice(reason));
+    }
     if cli.auto.is_some() && !has_checkpointer {
         anyhow::bail!(
             "--auto requires a git worktree with checkpoints enabled ([git] checkpoints = true, \
@@ -762,6 +779,9 @@ pub(crate) async fn build_agent(
         });
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    if let Some(reason) = &checkpoints_refused {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Warning(refused_checkpoints_notice(reason)));
+    }
 
     // Best-effort probe of the *served* context window (llama-server
     // /props, Ollama /api/show). A smaller-than-configured window means
@@ -1774,9 +1794,37 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// The session-start notice for a git repository whose checkpoints
+/// aivyx-checkpoint refuses. `reason` names the setting or path, never a
+/// config value; it is cut short so a long list stays one readable notice.
+fn refused_checkpoints_notice(reason: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let mut detail: String = reason.trim().chars().take(MAX_CHARS).collect();
+    if reason.trim().chars().count() > MAX_CHARS {
+        detail.push('…');
+    }
+    format!(
+        "checkpoints are off for this repository, so /undo, /redo and automatic rollback \
+         won't work: {detail}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refused_checkpoints_notice_names_the_reason_and_what_is_off() {
+        let notice = refused_checkpoints_notice(
+            "the repository's git config sets core.sshcommand, which git run outside the \
+             sandbox must not honour; remove it to re-enable checkpoints",
+        );
+        assert!(notice.contains("/undo"), "{notice}");
+        assert!(notice.contains("rollback"), "{notice}");
+        assert!(notice.contains("core.sshcommand"), "{notice}");
+        let long = refused_checkpoints_notice(&"x".repeat(1000));
+        assert!(long.chars().count() < 450 && long.ends_with('…'), "{long}");
+    }
 
     #[test]
     fn final_checks_must_name_allowed_commands() {
