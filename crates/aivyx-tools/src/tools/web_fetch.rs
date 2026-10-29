@@ -16,6 +16,16 @@ use crate::{Tool, ToolError, ToolExecutionContext};
 /// convention rather than `run_command`/`run_shell`'s tail-truncation.
 const MAX_FETCH_OUTPUT_BYTES: usize = 50 * 1024;
 
+/// How much of a response body is read at all. The model sees 50 KiB of the
+/// converted text, so a few MiB of markup is plenty; the rest of a larger
+/// body is never pulled into memory.
+const MAX_FETCH_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// The longest run of non-whitespace characters handed to the HTML
+/// converter. `html2text` is quadratic in an unbreakable run (a base64
+/// blob, a minified bundle), so longer runs are broken up first.
+const MAX_UNBROKEN_RUN: usize = 4096;
+
 #[derive(Deserialize, JsonSchema)]
 struct WebFetchArgs {
     /// The URL to fetch, including scheme (e.g. "https://example.com/page").
@@ -161,21 +171,51 @@ impl Tool for WebFetchTool {
                     response.status()
                 )));
             }
-            let body = response.text().await.map_err(|err| {
+            // Read chunk by chunk and stop at the cap: dropping the response
+            // closes the connection, so a huge body is not pulled in.
+            let mut response = response;
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut cut = false;
+            while let Some(chunk) = response.chunk().await.map_err(|err| {
                 ToolError::ExecutionFailed(format!("failed to read response body: {err}"))
-            })?;
-            Ok(body)
+            })? {
+                let room = MAX_FETCH_BODY_BYTES - bytes.len();
+                if chunk.len() >= room {
+                    bytes.extend_from_slice(&chunk[..room]);
+                    cut = true;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), cut))
         };
 
-        let body = tokio::select! {
+        let (body, cut) = tokio::select! {
             result = fetch => result?,
             _ = ctx.cancellation.cancelled() => {
                 return Err(ToolError::ExecutionFailed("fetch was cancelled".to_string()));
             }
         };
 
-        let text = html_to_text(&body);
-        Ok(ToolOutput::Ok(head_truncate(&text)))
+        // The conversion is CPU work: off the async worker, and abandoned
+        // (not waited for) when the call is cancelled.
+        let convert = tokio::task::spawn_blocking(move || html_to_text(&body));
+        let text = tokio::select! {
+            result = convert => result.map_err(|err| {
+                ToolError::ExecutionFailed(format!("could not convert the page: {err}"))
+            })?,
+            _ = ctx.cancellation.cancelled() => {
+                return Err(ToolError::ExecutionFailed("fetch was cancelled".to_string()));
+            }
+        };
+        let mut out = head_truncate(&text);
+        if cut {
+            out.push_str(&format!(
+                "\n\n[... the page is larger than {} MiB; the rest was not read ...]",
+                MAX_FETCH_BODY_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(ToolOutput::Ok(out))
     }
 }
 
@@ -184,7 +224,41 @@ fn html_to_text(html: &str) -> String {
     // `Result<String, _>` as the task brief's starting draft assumed —
     // see task-3-report.md for the verified signature), so there's no
     // fallible path here to `unwrap_or_else` against.
-    html2text::from_read(html.as_bytes(), 100)
+    html2text::from_read(break_long_runs(html).as_bytes(), 100)
+}
+
+/// Inserts a space into any run of non-whitespace longer than
+/// `MAX_UNBROKEN_RUN` characters, so the converter's cost stays linear in
+/// the page size.
+fn break_long_runs(html: &str) -> std::borrow::Cow<'_, str> {
+    let mut run = 0usize;
+    let mut longest = 0usize;
+    for c in html.chars() {
+        if c.is_whitespace() {
+            run = 0;
+        } else {
+            run += 1;
+            longest = longest.max(run);
+        }
+    }
+    if longest <= MAX_UNBROKEN_RUN {
+        return std::borrow::Cow::Borrowed(html);
+    }
+    let mut out = String::with_capacity(html.len() + html.len() / MAX_UNBROKEN_RUN);
+    run = 0;
+    for c in html.chars() {
+        if c.is_whitespace() {
+            run = 0;
+        } else {
+            if run == MAX_UNBROKEN_RUN {
+                out.push(' ');
+                run = 0;
+            }
+            run += 1;
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn head_truncate(text: &str) -> String {
@@ -351,5 +425,66 @@ mod tests {
             request.target,
             PermissionTarget::Other("https://example.com".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_probes {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// C4: the body is read whole (`response.text()`) before the output is
+    /// truncated, so a page of any size is held in memory. A well-behaved
+    /// reader stops after a bounded prefix; this server counts what it got to
+    /// write before the client let go.
+    #[tokio::test]
+    async fn audit_c4_web_fetch_stops_reading_an_enormous_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sent_in_server = sent.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
+                .await;
+            let chunk = "word ".repeat((1 << 20) / 5).into_bytes();
+            for _ in 0..24 {
+                if stream.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                sent_in_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = stream.shutdown().await;
+        });
+        let tool = WebFetchTool::new(30, true);
+        let ctx = ToolExecutionContext {
+            cwd: std::env::temp_dir(),
+            confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let _ = tool
+            .execute(serde_json::json!({ "url": format!("http://{addr}/") }), &ctx)
+            .await;
+        let mib = sent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(mib < 8, "web_fetch pulled {mib} MiB of a 24 MiB body into memory");
+    }
+}
+
+#[cfg(test)]
+mod audit_probes_cpu {
+    /// C4b: `html_to_text` is quadratic in the length of an unbreakable run
+    /// (a base64 blob, minified JSON): 64 KiB takes 0.2 s, 512 KiB 12 s (debug
+    /// build). It runs inline in the async `execute`, so neither the fetch
+    /// timeout nor Ctrl+C can interrupt it.
+    #[test]
+    fn audit_c4b_html_to_text_is_not_quadratic_on_a_long_unbroken_run() {
+        let page = "a".repeat(256 << 10);
+        let start = std::time::Instant::now();
+        let _ = super::html_to_text(&page);
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "256 KiB took {took:?}");
     }
 }
