@@ -522,8 +522,12 @@ impl PermissionGate for ConfirmationGate {
         // fast path) and, if autonomous mode is active, the taint/cwd
         // checks in the block above. Auto-allow with no prompt from here —
         // same UX as before this ActionKind existed, for the case that
-        // actually matters (untainted, non-plan-mode use).
-        if request.action == ActionKind::Network {
+        // actually matters (untainted, non-plan-mode use). Once the session
+        // is flagged for prompt injection the same reasoning as autonomous
+        // mode applies: a fetch URL can carry anything the session has read
+        // out of the machine, so a flagged interactive session asks first
+        // (falls through to the prompt below, like a write or a command).
+        if request.action == ActionKind::Network && self.injection_taint.current().is_none() {
             return PermissionDecision::Allow;
         }
 
@@ -2797,6 +2801,35 @@ mod tests {
             0,
             "Network must be auto-allowed with no prompt in plain interactive use"
         );
+    }
+
+    #[tokio::test]
+    async fn a_flagged_interactive_session_asks_before_a_network_action() {
+        let prompter = Arc::new(FakePrompter {
+            response: UserResponse::Allow,
+            calls: AtomicUsize::new(0),
+        });
+        let taint = InjectionTaint::new();
+        taint.flag(InjectionFinding {
+            source: "web_fetch: page".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(taint);
+
+        let decision = gate.check(&network_request("https://example.com")).await;
+
+        assert_eq!(decision, PermissionDecision::Allow);
+        assert_eq!(prompter.calls.load(Ordering::SeqCst), 1, "a flagged session must be asked");
     }
 
     // --- .git metadata hard-deny (audit finding A1) ---
