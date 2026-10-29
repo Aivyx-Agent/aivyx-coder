@@ -10956,3 +10956,122 @@ async fn usage_is_totalled_per_run_and_reset_when_a_run_starts() {
     agent.mark_run_start().await;
     assert_eq!(agent.usage_totals(), crate::run_facts::UsageTotals::default());
 }
+
+// ---- audit 2026-10-28 ----
+
+/// C1: `AGENTS.md` in the project is checked against `deny_paths` by its own
+/// (lexical) name, then read by following symlinks. A repository that ships
+/// `AGENTS.md` as a symlink to a denied file puts that file's content into
+/// the system prompt.
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_c1_agents_md_symlink_to_a_denied_file_is_not_read() {
+    let secrets = tempfile::tempdir().unwrap();
+    let secrets_dir = secrets.path().canonicalize().unwrap();
+    std::fs::write(secrets_dir.join("id_ed25519"), "SECRET_KEY_MATERIAL_12345").unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(secrets_dir.join("id_ed25519"), project.path().join("AGENTS.md"))
+        .unwrap();
+
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done { finish_reason: FinishReason::Stop }]],
+        ToolRegistry::new(),
+        10,
+    );
+    // `deny_paths` as the config resolves them: canonical absolute entries.
+    agent.set_agents_file(None, 1024, vec![secrets_dir.clone()]);
+    agent
+        .run_turn("hi".to_string(), project.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let received = mock.received.lock().unwrap();
+    let system = received[0].messages[0].text_content();
+    assert!(
+        !system.contains("SECRET_KEY_MATERIAL_12345"),
+        "a denied file reached the system prompt through an AGENTS.md symlink"
+    );
+}
+
+/// First system message the agent sends for one turn in `cwd`.
+#[cfg(unix)]
+async fn system_prompt_with_agents_files(
+    cwd: &Path,
+    global: Option<PathBuf>,
+    pack: Option<(String, PathBuf)>,
+    deny: Vec<PathBuf>,
+) -> String {
+    let (mut agent, _rx, mock) = build_agent(
+        vec![vec![StreamEvent::Done { finish_reason: FinishReason::Stop }]],
+        ToolRegistry::new(),
+        10,
+    );
+    agent.set_agents_file(global, 1024, deny);
+    if let Some((name, path)) = pack {
+        agent.set_pack_instructions(name, path);
+    }
+    agent.run_turn("hi".to_string(), cwd, CancellationToken::new()).await.unwrap();
+    let received = mock.received.lock().unwrap();
+    received[0].messages[0].text_content()
+}
+
+/// C1: a link that stays inside the project is fine; one that leaves it is
+/// refused even when the target is not on the deny list.
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_c1_project_agents_md_link_must_stay_inside_the_project() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("notes.md"), "OUTSIDE_NOTES").unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path().join("notes.md"), project.path().join("AGENTS.md"))
+        .unwrap();
+    let system = system_prompt_with_agents_files(project.path(), None, None, vec![]).await;
+    assert!(!system.contains("OUTSIDE_NOTES"), "{system}");
+
+    let inside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(inside.path().join("docs")).unwrap();
+    std::fs::write(inside.path().join("docs/rules.md"), "INSIDE_RULES").unwrap();
+    std::os::unix::fs::symlink("docs/rules.md", inside.path().join("AGENTS.md")).unwrap();
+    let system = system_prompt_with_agents_files(inside.path(), None, None, vec![]).await;
+    assert!(system.contains("INSIDE_RULES"), "{system}");
+}
+
+/// C21: the user-level and pack instruction files live under the config
+/// directory the built-in `deny_paths` always list; they must still load.
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_c21_user_and_pack_instructions_load_from_a_denied_config_dir() {
+    let cfg = tempfile::tempdir().unwrap();
+    let cfg_dir = cfg.path().canonicalize().unwrap();
+    let global = cfg_dir.join("AGENTS.md");
+    std::fs::write(&global, "GLOBAL_MARKER_77").unwrap();
+    let pack_dir = cfg_dir.join("packs/p/1.0.0/coder");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    let pack = pack_dir.join("AGENTS.md");
+    std::fs::write(&pack, "PACK_MARKER_88").unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let system = system_prompt_with_agents_files(
+        project.path(),
+        Some(global.clone()),
+        Some(("p".to_string(), pack)),
+        vec![cfg_dir.clone()],
+    )
+    .await;
+    assert!(system.contains("GLOBAL_MARKER_77"), "{system}");
+    assert!(system.contains("PACK_MARKER_88"), "{system}");
+
+    // A user-level link that leads somewhere denied is still refused.
+    let secrets = tempfile::tempdir().unwrap();
+    let secrets_dir = secrets.path().canonicalize().unwrap();
+    std::fs::write(secrets_dir.join("key"), "SECRET_KEY_MATERIAL").unwrap();
+    std::fs::remove_file(&global).unwrap();
+    std::os::unix::fs::symlink(secrets_dir.join("key"), &global).unwrap();
+    let system = system_prompt_with_agents_files(
+        project.path(),
+        Some(global),
+        None,
+        vec![cfg_dir, secrets_dir],
+    )
+    .await;
+    assert!(!system.contains("SECRET_KEY_MATERIAL"), "{system}");
+}

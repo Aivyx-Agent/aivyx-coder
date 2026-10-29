@@ -1513,8 +1513,8 @@ impl Agent {
         let mut over_budget_labels: Vec<String> = Vec::new();
 
         if let Some(path) = &global_path
-            && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
-            && let Some(content) = read_instructions(path).await
+            && let Some(content) =
+                read_instructions(path, &config.deny_paths, InstructionsScope::Trusted).await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -1532,8 +1532,8 @@ impl Agent {
 
         let mut has_pack = false;
         if let Some((name, path)) = &pack
-            && !aivyx_sandbox::path_is_denied(path, &config.deny_paths)
-            && let Some(content) = read_instructions(path).await
+            && let Some(content) =
+                read_instructions(path, &config.deny_paths, InstructionsScope::Trusted).await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -1549,8 +1549,12 @@ impl Agent {
             }
         }
 
-        if !aivyx_sandbox::path_is_denied(&project_path, &config.deny_paths)
-            && let Some(content) = read_instructions(&project_path).await
+        if let Some(content) = read_instructions(
+            &project_path,
+            &config.deny_paths,
+            InstructionsScope::Project(cwd),
+        )
+        .await
         {
             let content = content.trim();
             if !content.is_empty() {
@@ -4412,13 +4416,77 @@ fn new_lines_note(previous: &str, current: &str) -> Option<String> {
 /// `READ_FILE_LIMIT`: the project's `AGENTS.md` is repo content, and a
 /// FIFO or a link to `/dev/zero` there must not stall every turn. `None`
 /// for anything unreadable, which callers treat as no file.
-async fn read_instructions(path: &Path) -> Option<String> {
+/// Where an instructions file is allowed to resolve to.
+#[derive(Clone, Copy)]
+enum InstructionsScope<'a> {
+    /// The project's `AGENTS.md`: it must resolve inside this directory.
+    Project(&'a Path),
+    /// The user-level file or a pack's: the user's own, kept under the
+    /// config directory the built-in `deny_paths` cover, so a deny entry
+    /// that contains the file itself does not apply to it. A link that
+    /// leads out of that entry is checked against every entry.
+    Trusted,
+}
+
+/// Decides whether `path` (and where it really points) may be read into the
+/// system prompt, and returns the path to read. The deny check applies to
+/// the link and to its target; a project file must resolve inside the
+/// project. Returns `None` for anything that fails, silently, like a
+/// missing file.
+fn instructions_path_to_read(
+    path: &Path,
+    deny_paths: &[PathBuf],
+    scope: InstructionsScope<'_>,
+) -> Option<PathBuf> {
+    let resolved = path.canonicalize().ok()?;
+    let denied = |p: &Path, exempt_own_dirs: bool| {
+        deny_paths.iter().any(|entry| {
+            if exempt_own_dirs
+                && !entry.as_os_str().is_empty()
+                && entry.is_absolute()
+                && entry != path
+                && path.starts_with(entry)
+                && resolved.starts_with(entry)
+            {
+                return false;
+            }
+            aivyx_sandbox::path_is_denied(p, std::slice::from_ref(entry))
+        })
+    };
+    let trusted = matches!(scope, InstructionsScope::Trusted);
+    if denied(path, trusted) || denied(&resolved, trusted) {
+        return None;
+    }
+    if let InstructionsScope::Project(root) = scope {
+        let root = root.canonicalize().ok()?;
+        if !resolved.starts_with(&root) {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+async fn read_instructions(
+    path: &Path,
+    deny_paths: &[PathBuf],
+    scope: InstructionsScope<'_>,
+) -> Option<String> {
     let path = path.to_path_buf();
+    let deny_paths = deny_paths.to_vec();
+    let root = match scope {
+        InstructionsScope::Project(root) => Some(root.to_path_buf()),
+        InstructionsScope::Trusted => None,
+    };
     tokio::task::spawn_blocking(move || {
-        aivyx_tools::bounded_read::read_capped(&path, aivyx_tools::bounded_read::READ_FILE_LIMIT)
+        let scope = match &root {
+            Some(root) => InstructionsScope::Project(root),
+            None => InstructionsScope::Trusted,
+        };
+        let resolved = instructions_path_to_read(&path, &deny_paths, scope)?;
+        aivyx_tools::bounded_read::read_capped(&resolved, aivyx_tools::bounded_read::READ_FILE_LIMIT)
+            .ok()
+            .map(|capped| capped.text)
     })
     .await
     .ok()?
-    .ok()
-    .map(|capped| capped.text)
 }
