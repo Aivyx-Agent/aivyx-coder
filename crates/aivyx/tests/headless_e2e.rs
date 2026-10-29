@@ -262,3 +262,27 @@ fn headless_setup_error_exits_3() {
     assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
     assert!(stderr.contains("Error:"), "stderr: {stderr}");
 }
+
+// ---- audit 2026-10-28 ----
+
+/// C7: headless `--auto` ends in `process::exit`, which skips destructors.
+/// The confiner's private temp directory ("lives until aivyx-coder exits
+/// normally") is therefore left behind after every run.
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_c7_a_finished_headless_run_leaves_no_temp_dir_behind() {
+    let done = serde_json::json!({"tasks": [{"text": "do the task", "status": "done"}]});
+    let server = model_server(tool_reply("set_tasks", done), text_reply("Done.")).await;
+    let (home, project) = setup(&server, 5);
+    let report = home.path().join("run.json");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cmd = coder(home.path(), project.path(), &report, &["--headless"]);
+    cmd.env("TMPDIR", tmp.path());
+    let output = run_bounded(&mut cmd);
+    assert_eq!(output.status.code(), Some(0));
+    let left: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind in TMPDIR: {left:?}");
+}

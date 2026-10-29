@@ -749,17 +749,64 @@ fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
                 continue;
             }
             aivyx_tools::kill_all_process_groups();
+            remove_headless_temp_dir();
             std::process::exit(code);
         }
     });
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The private directory a headless run keeps its temp files in (the
+/// confiner's per-run `$TMPDIR` is created inside it). A headless run ends
+/// in `process::exit`, which skips destructors, so nothing would remove that
+/// directory; this one is removed explicitly on every way out.
+static HEADLESS_TMP: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Points this process's temp directory at a fresh private one, recorded in
+/// `HEADLESS_TMP`. Called from the single-threaded start of `main`, before
+/// the async runtime exists. Best effort: on failure the run just uses the
+/// system temp directory as before.
+fn use_private_temp_dir() {
+    use std::os::unix::fs::DirBuilderExt;
+    let base = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..8u32 {
+        let dir = base.join(format!("aivyx-coder-run-{}-{nanos:x}-{attempt}", std::process::id()));
+        if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
+            // SAFETY: called before any other thread exists (`main` builds the
+            // runtime afterwards), so nothing reads the environment concurrently.
+            unsafe { std::env::set_var("TMPDIR", &dir) };
+            let _ = HEADLESS_TMP.set(dir);
+            return;
+        }
+    }
+}
+
+/// Removes the headless run's private temp directory. Call it after the
+/// process groups are killed, right before `process::exit`.
+pub(crate) fn remove_headless_temp_dir() {
+    if let Some(dir) = HEADLESS_TMP.get() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // Headless: --auto without a terminal on stdout, or asked for.
     let headless = cli.auto.is_some()
         && (cli.headless || !std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    if headless {
+        use_private_temp_dir();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(main_async(cli, headless))
+}
+
+async fn main_async(cli: Cli, headless: bool) -> anyhow::Result<()> {
     match run_main(cli, headless).await {
         // Exit status 1 is reserved for "goal achieved, a check failed", so a
         // headless error (config, setup, ...) prints the way anyhow would and
@@ -767,6 +814,7 @@ async fn main() -> anyhow::Result<()> {
         Err(err) if headless => {
             eprintln!("Error: {err:?}");
             aivyx_tools::kill_all_process_groups();
+            remove_headless_temp_dir();
             std::process::exit(3);
         }
         result => result,
@@ -1005,6 +1053,7 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
         )
         .await;
         aivyx_tools::kill_all_process_groups();
+        remove_headless_temp_dir();
         drop(_tracing_guard);
         std::process::exit(code);
     }
