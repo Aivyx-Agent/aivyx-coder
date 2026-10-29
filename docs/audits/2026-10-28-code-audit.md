@@ -446,3 +446,43 @@ Not individually proven (they are small, or by design); each names the code.
 - Team-mode peer messaging and session persistence were re-read at the gate
   and attenuation level only, not re-tested.
 - A full manual pass over the TUI beyond the approval modal; the setup wizard.
+
+## Revision 1
+
+Review follow-ups; no rank changed.
+
+- **C2, what is written:** the report is a pretty-printed JSON object, one
+  key per line, every string escaped (the goal comes from the user; the notice
+  and file names are model-influenced but JSON-escaped). It cannot form an
+  `authorized_keys` line, a shell command or a unit file, so the damage is data
+  loss (truncation and replacement of the target), not code execution. The
+  precondition is that the model can run a command to plant the link: the
+  `--auto` test command or an approved shell.
+- **C1, how the link appears:** the model can create the link itself during a
+  session (test command or approved shell) and `AGENTS.md` is re-read at the
+  start of the next turn. The other path is an untrusted clone that ships it.
+- **C9, documented intent:** `05-security-model.md` calls `read_only_paths` "a
+  guard against the model's mistakes, not a security boundary", and the stop
+  notice and `--report` list changed read-only files after the fact
+  (`read_only_touched`). So C9 defeats the guard in the case it was built for
+  (a model restructuring directories) but is not a boundary break, and the
+  after-the-fact listing would only catch it if the moved file is reported as
+  changed (a move shows as removed and added; the path match is the same
+  `starts_with` on the entry, so a relocated file may not be marked).
+- **Explicit verdicts:**
+  - *ACP cancellation:* not checked in this audit (only read that
+    `session/prompt` runs the turn in a spawned task). Audits 4 to 6 fixed it;
+    left for the live session (Task 12).
+  - *MCP cancellation:* not checked in this audit; the 2026-09-21 fix is
+    taken as is. Left for Task 12.
+  - *Format-2 config packs:* checked by reading, clean apart from C6. Install
+    verifies the signature and trusted publisher, stages in a scratch folder,
+    runs `check_coder_part`, then renames; `aivyx-pack` rejects unsafe names,
+    versions, relative paths and archive entries; approved MCP servers are
+    compared on command, arguments and env. Not exercised with a live pack.
+  - *`read_only_paths` in `edit_file` and `patch_file`:* `patch_file` read:
+    its target is a resolved `Write` path, so `changes_read_only` applies. I
+    did not read `edit_file` line by line; it is covered on the same basis
+    (the check is in the gate on the action and path, not in the tool) and the
+    gate's own tests cover `Write` paths, but I did not run a test through
+    `edit_file`. The only hole found is C9 (moves).
