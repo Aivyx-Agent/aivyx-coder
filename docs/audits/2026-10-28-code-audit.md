@@ -491,7 +491,7 @@ Review follow-ups; no rank changed.
 
 A live run of v0.6.4 (`main` at `7e5c1ae`, built with its own target dir) on
 the local stack, on 2026-10-29. It records defects only; Task 13 fixes them.
-New IDs continue from C10: **one Medium (C11) and three Low (C12 to C14)**,
+New IDs continue from the Lows (C20): **one Medium (C21) and four Low (C22 to C25)**,
 no Critical or High. Five audit findings (C1, C2, C6, C7, C9) were
 reproduced live, and the two explicit "not checked" verdicts (ACP and MCP
 cancellation) are now checked and clean.
@@ -518,7 +518,7 @@ cancellation) are now checked and clean.
 
 ### Defects
 
-#### C11 (Medium) The user-level `AGENTS.md` and a pack's instructions are silently dropped on a default install
+#### C21 (Medium) The user-level `AGENTS.md` and a pack's instructions are silently dropped on a default install
 
 - **Where:** `crates/aivyx-core/src/agent/mod.rs:1503` to `:1545`
   (`refresh_agents_files`): both the global file and the pack file go through
@@ -549,7 +549,7 @@ cancellation) are now checked and clean.
   trusted), or compare against deny entries other than the config directory.
   Add a test whose files sit inside the config directory.
 
-#### C12 (Low) An ACP permission request does not observe `session/cancel`
+#### C22 (Low) An ACP permission request does not observe `session/cancel`
 
 - **Where:** `crates/aivyx-acp/src/prompter.rs` (the wait for the client's
   `session/request_permission` response).
@@ -565,7 +565,7 @@ cancellation) are now checked and clean.
 - **Fix direction:** race the permission wait against the turn's cancel token
   and treat cancel as `Deny`.
 
-#### C13 (Low) A start-up MCP notice is glued to the first reply, and the first prompt waits ~30 s
+#### C23 (Low) A start-up MCP notice is glued to the first reply, and the first prompt waits ~30 s
 
 - **Where:** the ACP session's start-up notices (`crates/aivyx-acp/src/session.rs`)
   and MCP server start-up (`aivyx-core` MCP client).
@@ -578,7 +578,7 @@ cancellation) are now checked and clean.
 - **Fix direction:** end the notice with a blank line; start MCP servers
   without holding up the first prompt or cap the start-up wait lower.
 
-#### C14 (Low) With a custom roster whose lead lacks `run_command`, `[verification]` fails noisily after every turn
+#### C24 (Low) With a custom roster whose lead lacks `run_command`, `[verification]` fails noisily after every turn
 
 - **Where:** auto-verify after a team turn (`crates/aivyx-core`, verification
   runner) with `[team] roster_path`.
@@ -594,6 +594,21 @@ cancellation) are now checked and clean.
   path whatever the lead's allowlist (it is the user's configured command), or
   say at start-up that verification is disabled by the roster.
 
+#### C25 (Low) A headless `--auto` stop notice says `verification: test never ran` after the model ran the test itself
+
+- **Judgement:** the exit code is correct (the goal was reached and no check
+  failed). The wording is the defect: the line refers to the automatic
+  verification, which only runs after edits, but reads as if the tests were
+  never run, and the notice and `--report` give no sign of the model's own
+  passing `run_command test`.
+- **Reproduction:** a project whose test only plants a symlink (no source
+  edits); `aivyx-coder --auto "Run the test command once with run_command, then
+  record and complete a one-task list" --headless --report run.json`. The model's
+  `run_command test` exits 0, the run ends `goal achieved`, exit code 0, with
+  `verification: \`test\` never ran`.
+- **Fix direction:** say `no edits, so the automatic check did not run`, or
+  count a passing run of the verification command made by the model.
+
 ### Audit findings reproduced live
 
 | ID | Result |
@@ -606,7 +621,7 @@ cancellation) are now checked and clean.
 
 ### The brief's "not checked" items
 
-- **ACP cancellation: clean** apart from C12. `session/cancel` mid-stream
+- **ACP cancellation: clean** apart from C22. `session/cancel` mid-stream
   returned `stopReason: cancelled` in the same second and the next prompt on
   the session worked; mid-`run_shell` (`sleep 301`) and mid-`run_command`
   (`sleep 302`) both ended the tool as `failed: command was cancelled` with no
@@ -623,16 +638,13 @@ cancellation) are now checked and clean.
   `data/brief.md`); only C9's move gets through.
 - **Format-2 pack:** install, `pack list`, `use` with consent on a pty (and
   "left off, no terminal" without one), `off`; the TUI start-up notice names the
-  pack. Found C6 (reproduced), C11 and C13.
+  pack. Found C6 (reproduced), C21 and C23.
 - **Team mode with a custom roster:** the lead delegated to a `docs-writer`
   whose `extra_deny_paths = ["src/"]`: the docs file was written and every
-  read, grep and edit of `src/` by the specialist was hard-blocked. Found C14.
+  read, grep and edit of `src/` by the specialist was hard-blocked. Found C24.
 - **Prompt injection:** a file with an obvious phrase and a fetched page
   (`web_fetch`, `[web] allow_private_targets` set for the test) were flagged with
   the "likely prompt injection" note and nothing ran. A paraphrased instruction
   in a file (no listed phrase) was not flagged and, with approvals denied, the
   9B did not act on it. By default `web_fetch` refuses a loopback address.
-- **Observation, not ranked:** a headless `--auto` run that only ran the
-  `test` command by hand (no edits) ends `goal achieved` with exit 0 and the line
-  `verification: test never ran`; the line refers to the automatic check and
-  reads like a failure to run the tests.
+- The unranked observation became C25 above.
