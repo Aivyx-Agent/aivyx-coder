@@ -486,3 +486,153 @@ Review follow-ups; no rank changed.
     (the check is in the gate on the action and path, not in the tool) and the
     gate's own tests cover `Write` paths, but I did not run a test through
     `edit_file`. The only hole found is C9 (moves).
+
+## Live session
+
+A live run of v0.6.4 (`main` at `7e5c1ae`, built with its own target dir) on
+the local stack, on 2026-10-29. It records defects only; Task 13 fixes them.
+New IDs continue from C10: **one Medium (C11) and three Low (C12 to C14)**,
+no Critical or High. Five audit findings (C1, C2, C6, C7, C9) were
+reproduced live, and the two explicit "not checked" verdicts (ACP and MCP
+cancellation) are now checked and clean.
+
+### How it was run
+
+- A throwaway `HOME` with its own `config.toml`, a scratch git project and
+  scratch victim files under `/tmp/claude-1000/coder-live/` (never the bench
+  repo, never the real config). The 9B (`Qwen3.5-9B`) served the TUI, ACP, MCP
+  and the pack and team runs; the 27B served the `--auto` run with `--report`
+  (7 requests, goal achieved in 56 s). The stack is back on the 9B.
+- **TUI:** driven through a pty by a throwaway Python driver (keystrokes in,
+  ANSI-stripped output out), not a screen emulator, so layout was read from
+  the text only. Covered: `--plan` and a plan with a task list, **Ctrl+P**
+  hand-off (the plan-approved message went out and the `edit_file` approval
+  modal showed the diff), `/diff`, `/test`, `/commit -m`, `/checkpoints`,
+  `/undo` (preview says the commit stays, files restored), `/redo`,
+  `--resume` and `/sessions` (the resumed model recalled the work). All
+  behaved as documented.
+- **ACP:** a throwaway JSON-RPC client over stdio (initialize, `session/new`,
+  `session/prompt`, `session/cancel`, permission replies). **MCP:** the same
+  for `--mcp-server` (`code`, `code_reply`, `notifications/cancelled`).
+- Not exercised: C3, C4, C5, C8, C10, the macOS build, the wizard.
+
+### Defects
+
+#### C11 (Medium) The user-level `AGENTS.md` and a pack's instructions are silently dropped on a default install
+
+- **Where:** `crates/aivyx-core/src/agent/mod.rs:1503` to `:1545`
+  (`refresh_agents_files`): both the global file and the pack file go through
+  `path_is_denied(path, &config.deny_paths)` before they are read.
+- **What happens:** the built-in `deny_paths` always contain
+  `~/.config/aivyx-coder` (`aivyx-config/src/lib.rs:1072`, merged into every
+  config), and both files live under it (`~/.config/aivyx-coder/AGENTS.md`,
+  `~/.config/aivyx-coder/packs/<name>/<version>/coder/AGENTS.md`). The check
+  treats them as denied and skips them, with no notice. The unit tests
+  (`pack_instructions_sit_between_user_and_project`) put the files in a temp
+  directory outside the denied entry, so they pass.
+- **Reproduction (live):** a pack with `Always end replies with LIVEPACK-OK.`
+  and a user-level `AGENTS.md` with `Always end every reply with the token
+  GLOBAL-MARKER-77.`, installed and in use (`pack use`), run over ACP on the 27B
+  and the TUI: the model answers `NONE` when asked what its instructions say
+  about a reply marker, and replies carry neither marker. The same files with
+  `XDG_CONFIG_HOME` pointing at a directory that `~/.config/aivyx-coder` does
+  not cover: the replies end with `LIVEPACK-OK` and `GLOBAL-MARKER-77`.
+  Skills from a pack are unaffected (loaded through `load_skill`, not this
+  path); the TUI start-up line still says `Using pack livepack v0.1.0 here.`,
+  so the pack looks active.
+- **Why it matters:** the pack's instructions are the main thing a format-2
+  pack delivers, and `~/.config/aivyx-coder/AGENTS.md` is a documented feature
+  (`guide/07`, `reference/06`). Both are dead on a default config, with a
+  notice that says the pack is in use.
+- **Fix direction:** exempt the two known files (check the deny list against
+  the project path only; the global and pack files are the user's own and
+  trusted), or compare against deny entries other than the config directory.
+  Add a test whose files sit inside the config directory.
+
+#### C12 (Low) An ACP permission request does not observe `session/cancel`
+
+- **Where:** `crates/aivyx-acp/src/prompter.rs` (the wait for the client's
+  `session/request_permission` response).
+- **What happens:** the ACP spec has the client answer every pending permission
+  request with `cancelled` when it sends `session/cancel`, and coder relies on
+  that. A client that does not (or is slow) leaves the prompt call pending: the
+  turn does not return `cancelled`, and the stop button appears dead.
+- **Reproduction:** an ACP client that never answers a `run_shell` permission
+  request, then sends `session/cancel` 6 s later: no `session/prompt` response
+  within a further 34 s. Nothing ran (the command was never approved).
+  With a client that answers `allow` and cancels while the command runs, the
+  cancel works at once (see "Checked and clean").
+- **Fix direction:** race the permission wait against the turn's cancel token
+  and treat cancel as `Deny`.
+
+#### C13 (Low) A start-up MCP notice is glued to the first reply, and the first prompt waits ~30 s
+
+- **Where:** the ACP session's start-up notices (`crates/aivyx-acp/src/session.rs`)
+  and MCP server start-up (`aivyx-core` MCP client).
+- **What happens:** with a pack MCP server that does not speak MCP (a stand-in
+  `/bin/echo`), the first prompt of the session took 31 s to start, and the
+  agent message began `MCP server "dis​play" timed out during startup —
+  its tools are unavailable this sessionHello! ...`: the notice has no trailing
+  newline, so it runs into the model's text. The server name also reaches the
+  notice with its zero-width character (C6's class).
+- **Fix direction:** end the notice with a blank line; start MCP servers
+  without holding up the first prompt or cap the start-up wait lower.
+
+#### C14 (Low) With a custom roster whose lead lacks `run_command`, `[verification]` fails noisily after every turn
+
+- **Where:** auto-verify after a team turn (`crates/aivyx-core`, verification
+  runner) with `[team] roster_path`.
+- **What happens:** the roster in the manual's example gives the lead only
+  `set_tasks`. After a turn that delegated and changed a file, the transcript
+  shows `auto-verify-1` as a failed `run_command`: `no tool registered with
+  name: run_command`. Verification can never run in that setup, and it looks
+  like the project's tests failed to start.
+- **Reproduction:** roster with `lead` allowlist `["set_tasks"]` and
+  `[verification] command = "test"`; `delegate_to_specialist` for a docs file;
+  the turn ends with the failed `auto-verify-1` tool call.
+- **Fix direction:** run the verification command through the same internal
+  path whatever the lead's allowlist (it is the user's configured command), or
+  say at start-up that verification is disabled by the roster.
+
+### Audit findings reproduced live
+
+| ID | Result |
+|---|---|
+| C1 | **Reproduced.** `AGENTS.md` as a symlink to a file in a configured `deny_paths` directory: the model quoted the canary text (`CANARY-C1-7f3a9`) verbatim from its system prompt; a direct `read_file` of the same file was refused. |
+| C2 | **Reproduced.** `--auto ... --headless --report run.json` in a project whose test (the pre-approved `test` command) replaces `run.json` with a symlink to a scratch victim file: after the run the victim held the report JSON (`{"report_version": 1, ...}`), its original text gone. |
+| C6 | **Reproduced.** A signed format-2 pack (built with `aivyx-pack`, trusted via `[pack]`) with U+200B in an MCP server name and an env value and U+202E in an argument: `pack inspect` and the `pack use` consent prompt (on a pty) print the raw bytes `E2 80 8B` and `E2 80 AE`. An untrusted publisher is refused as designed. |
+| C7 | **Reproduced for headless `--auto`.** With `TMPDIR` pointed at an empty directory, one run leaves `aivyx-confine-XXXXXX` behind; an ACP run that executed a command left none. (`/tmp` here held 167 older `aivyx-confine-*` directories.) |
+| C9 | **Reproduced.** With `read_only_paths = ["data/brief.md"]`, `move_file data data_old` was approved and moved the read-only file; the same move with `data` itself listed is refused. |
+
+### The brief's "not checked" items
+
+- **ACP cancellation: clean** apart from C12. `session/cancel` mid-stream
+  returned `stopReason: cancelled` in the same second and the next prompt on
+  the session worked; mid-`run_shell` (`sleep 301`) and mid-`run_command`
+  (`sleep 302`) both ended the tool as `failed: command was cancelled` with no
+  orphan process afterwards; `/test` with a 97 s test ended with `Tests
+  cancelled` and no orphan test binary; a cancel during a pending approval
+  with a compliant client cancelled the tool.
+- **MCP cancellation: clean.** A cancelled `code` call (nine-file task,
+  cancelled after 8 s) stopped after the first file with no further writes and
+  no response, as the MCP spec says; the control without a cancel wrote all
+  nine. A cancelled `code_reply` wrote no more files in the following 10 s
+  and the session answered the next `code_reply` normally.
+- **`read_only_paths` through `edit_file`, `patch_file`, `write_file`:**
+  all three refused with the "fixed input" message (BRIEF.md and
+  `data/brief.md`); only C9's move gets through.
+- **Format-2 pack:** install, `pack list`, `use` with consent on a pty (and
+  "left off, no terminal" without one), `off`; the TUI start-up notice names the
+  pack. Found C6 (reproduced), C11 and C13.
+- **Team mode with a custom roster:** the lead delegated to a `docs-writer`
+  whose `extra_deny_paths = ["src/"]`: the docs file was written and every
+  read, grep and edit of `src/` by the specialist was hard-blocked. Found C14.
+- **Prompt injection:** a file with an obvious phrase and a fetched page
+  (`web_fetch`, `[web] allow_private_targets` set for the test) were flagged with
+  the "likely prompt injection" note and nothing ran. A paraphrased instruction
+  in a file (no listed phrase) was not flagged and, with approvals denied, the
+  9B did not act on it. By default `web_fetch` refuses a loopback address.
+- **Observation, not ranked:** a headless `--auto` run that only ran the
+  `test` command by hand (no edits) ends `goal achieved` with exit 0 and the line
+  `verification: test never ran`; the line refers to the automatic check and
+  reads like a failure to run the tests.
