@@ -101,9 +101,13 @@ fn progress_line(event: &AgentEvent) -> Option<String> {
 }
 
 /// Drops every control character except newline and tab, so text from the
-/// model, tools or files can't move the cursor or rewrite earlier output.
+/// model, tools or files can't move the cursor or rewrite earlier output,
+/// and shows invisible format characters (bidi overrides, zero-width) as
+/// escapes so a log line can't be reordered.
 fn sanitize(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
+    let kept: String =
+        text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+    aivyx_sandbox::escape_invisible(&kept)
 }
 
 /// Writes the stop notice to `out`, sanitized like the progress lines: its
@@ -207,6 +211,11 @@ pub async fn run(
 mod tests {
     use super::*;
     use aivyx_types::{ToolCallId, ToolCallSource, ToolResult};
+
+    #[test]
+    fn sanitize_drops_controls_and_shows_bidi_overrides_as_escapes() {
+        assert_eq!(sanitize("a\x1b[2Kb\nc\u{202E}d"), "a[2Kb\nc\\u{202e}d");
+    }
 
     fn end(outcome: Outcome, verified: Option<bool>, checks: bool) -> RunEnd {
         RunEnd {

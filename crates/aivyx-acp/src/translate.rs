@@ -57,7 +57,13 @@ pub(crate) fn text_chunk(text: String) -> ContentChunk {
 /// here, never free-form model text.
 fn strip_control_chars_for_display(raw: &str) -> String {
     raw.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if c.is_control() || aivyx_sandbox::is_invisible_format(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 

