@@ -37,11 +37,21 @@ pub struct MoveFileTool {
     /// `GrepTool`/`GlobTool` already document for needing `deny_paths`
     /// beyond `permission_request`'s single-target check.
     deny_paths: Vec<PathBuf>,
+    /// `[permissions] read_only_paths`: the gate refuses a move that names a
+    /// read-only path or one of its parent directories; this list lets a
+    /// directory move also refuse when a pattern entry (`*.csv`) matches a
+    /// file nested inside the tree.
+    read_only_paths: Vec<PathBuf>,
 }
 
 impl MoveFileTool {
     pub fn new(deny_paths: Vec<PathBuf>) -> Self {
-        Self { deny_paths }
+        Self { deny_paths, read_only_paths: Vec::new() }
+    }
+
+    pub fn with_read_only_paths(mut self, read_only_paths: Vec<PathBuf>) -> Self {
+        self.read_only_paths = read_only_paths;
+        self
     }
 }
 
@@ -120,6 +130,13 @@ impl Tool for MoveFileTool {
                     "{} is under a configured deny_paths entry — refusing to move a directory \
                      that contains it (moving would relocate it outside deny_paths' protection)",
                     denied.display()
+                )));
+            }
+            if let Some(fixed) = find_denied_descendant(from, &self.read_only_paths) {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "{} is a fixed input (read_only_paths) — refusing to move a directory that \
+                     contains it",
+                    fixed.display()
                 )));
             }
             format!(
@@ -277,6 +294,22 @@ mod tests {
             confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[test]
+    fn a_directory_move_is_refused_when_a_read_only_pattern_matches_a_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("data/rows.csv"), "a,b\n").unwrap();
+        let tool = MoveFileTool::new(vec![]).with_read_only_paths(vec![PathBuf::from("*.csv")]);
+        let err = tool
+            .permission_request(&json!({ "from": "data", "to": "data_old" }), dir.path())
+            .unwrap_err();
+        assert!(err.to_string().contains("fixed input"), "{err}");
+        let free = MoveFileTool::new(vec![]);
+        assert!(
+            free.permission_request(&json!({ "from": "data", "to": "data_old" }), dir.path()).is_ok()
+        );
     }
 
     /// Task 8 review Finding 1 (security audit, 2026-09-16): after a

@@ -236,7 +236,18 @@ impl ConfirmationGate {
         let hit = |path: &Path| path_is_denied(path, &self.read_only_paths);
         match &request.target {
             PermissionTarget::Path(path) => hit(path),
-            PermissionTarget::Move { from, to } => hit(from) || hit(to),
+            // Moving a directory that contains a read-only path relocates it
+            // too: `from` is also checked as an ancestor of each entry.
+            // (Single-component pattern entries are matched against the
+            // directory's contents by `move_file` itself.)
+            PermissionTarget::Move { from, to } => {
+                hit(from)
+                    || hit(to)
+                    || self
+                        .read_only_paths
+                        .iter()
+                        .any(|entry| !aivyx_confine::is_bare_pattern(entry) && entry.starts_with(from))
+            }
             PermissionTarget::Command { .. } | PermissionTarget::Other(_) => false,
         }
     }

@@ -82,7 +82,8 @@ way to *remove* a built-in default through config. This covers:
 change**: the task's own inputs, such as a brief and its data.
 
 - **What's refused:** a write, delete or move (either end) of a matching
-  path, at the same tier as `deny_paths`, in every mode, without a prompt.
+  path, or a move of a directory that contains one, at the same tier as
+  `deny_paths`, in every mode, without a prompt.
   The denial tells the model to fix its test or code instead.
 - **How entries match:**
   - a relative entry is resolved against the project root, and covers

@@ -1789,3 +1789,59 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit_probes {
+    use super::*;
+    use aivyx_sandbox::{
+        AutonomousMode, ConfirmationGate, NoopConfiner, PermissionPrompter, PermissionRequest,
+        PlanMode, UserResponse,
+    };
+    use aivyx_types::{ToolCall, ToolCallId, ToolCallSource};
+
+    struct YesPrompter;
+    #[async_trait]
+    impl PermissionPrompter for YesPrompter {
+        async fn prompt(&self, _r: &PermissionRequest) -> UserResponse {
+            UserResponse::Allow
+        }
+    }
+
+    /// C9: `read_only_paths` is matched against the two endpoints of a move
+    /// only (`starts_with` the entry). Moving a directory that CONTAINS a
+    /// read-only file relocates the file without the gate seeing it; the
+    /// model can then recreate the "fixed input" with content of its choice.
+    #[tokio::test]
+    async fn audit_c9_moving_a_parent_directory_cannot_relocate_a_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("data")).unwrap();
+        std::fs::write(cwd.join("data/brief.md"), "the fixed brief\n").unwrap();
+
+        let gate = ConfirmationGate::new(
+            Arc::new(YesPrompter),
+            vec![],
+            vec![],
+            PlanMode::new(),
+            AutonomousMode::new(),
+            cwd.clone(),
+            false,
+        )
+        .with_read_only_paths(vec![cwd.join("data/brief.md")]);
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(MoveFileTool::new(vec![])));
+        let executor = ToolExecutor::new(registry, Arc::new(gate), Arc::new(NoopConfiner));
+        let call = ToolCall {
+            id: ToolCallId("c".into()),
+            name: "move_file".into(),
+            arguments: serde_json::json!({"from": "data", "to": "data_old"}),
+            source: ToolCallSource::Native,
+        };
+        let _ = executor.dispatch(call, &cwd, CancellationToken::new()).await;
+
+        assert!(
+            cwd.join("data/brief.md").exists(),
+            "the read-only brief was moved away with its parent directory"
+        );
+    }
+}

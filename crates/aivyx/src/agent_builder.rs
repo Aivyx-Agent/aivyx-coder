@@ -674,6 +674,7 @@ pub(crate) async fn build_agent(
     // which needs its own copy of the same config-level trust list.
     let specialist_pre_approved_commands = pre_approved_commands.clone();
     let read_only_paths = settings.permissions.resolved_read_only_paths(&cwd);
+    let move_read_only_paths = read_only_paths.clone();
     let gate: Arc<dyn PermissionGate> = Arc::new(
         ConfirmationGate::new(
             Arc::clone(&prompter),
@@ -827,7 +828,9 @@ pub(crate) async fn build_agent(
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
     registry.register(Arc::new(DeleteFileTool));
-    registry.register(Arc::new(MoveFileTool::new(deny_paths.clone())));
+    registry.register(Arc::new(
+        MoveFileTool::new(deny_paths.clone()).with_read_only_paths(move_read_only_paths),
+    ));
     registry.register(Arc::new(PatchFileTool));
     registry.register(Arc::new(GrepTool::new(deny_paths.clone())));
     registry.register(Arc::new(GlobTool::new(deny_paths.clone())));
