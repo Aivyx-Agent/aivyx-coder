@@ -51,6 +51,42 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     Ok((file, meta.len()))
 }
 
+/// Replaces the contents of the regular file at `path` (creating it with
+/// `mode` when missing) without following a symlink at the final component
+/// and without touching anything that is not a regular file. The check is
+/// made on the opened file, so a link swapped in afterwards cannot redirect
+/// the write. For files coder writes itself, unconfined, inside a project
+/// directory a confined command can also write to (the `--report` file, wiki
+/// pages).
+#[cfg(unix)]
+pub fn write_no_follow(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    // No truncation at open: the type is checked first. O_NONBLOCK keeps a
+    // FIFO from waiting for a reader.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is a symlink; refusing to write through it", path.display()),
+                )
+            } else {
+                err
+            }
+        })?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    file.set_len(0)?;
+    file.write_all(bytes)
+}
+
 /// The first `limit` bytes of `path` as text. `InvalidData` if it isn't
 /// UTF-8 (a character cut by the limit doesn't count).
 pub fn read_capped(path: &Path, limit: u64) -> io::Result<Capped> {

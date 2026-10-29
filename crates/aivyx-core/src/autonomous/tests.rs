@@ -575,3 +575,27 @@ fn every_outcome_has_its_report_name() {
     assert_eq!(Outcome::Failed.as_str(), "failed");
     assert_eq!(Outcome::InjectionDetected.as_str(), "injection_detected");
 }
+
+// ---- audit 2026-10-28 ----
+
+/// C2: `--report` is written with `create + truncate` and no `O_NOFOLLOW`,
+/// by the unconfined aivyx-coder process. A symlink the confined run left at
+/// the report path makes it overwrite whatever the link points at.
+#[cfg(unix)]
+#[test]
+fn audit_c2_report_through_a_planted_symlink_does_not_clobber_the_target() {
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("authorized_keys");
+    std::fs::write(&victim, "ssh-ed25519 AAAA-ORIGINAL user@host\n").unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let report = project.path().join("run.json");
+    std::os::unix::fs::symlink(&victim, &report).unwrap();
+
+    let _ = write_report(&report, "{\"report_version\": 1}");
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "ssh-ed25519 AAAA-ORIGINAL user@host\n",
+        "the report overwrote the file the symlink pointed at"
+    );
+}

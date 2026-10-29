@@ -194,15 +194,9 @@ fn notice_with_facts(notice: &str, facts: &RunFacts) -> String {
 /// Writes the `--report` JSON, private to the user (mode 600), replacing
 /// any earlier report at `path`.
 fn write_report(path: &std::path::Path, json: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(json.as_bytes())
+    // A symlink at the report path (a confined command can plant one in the
+    // project) is refused rather than followed.
+    aivyx_tools::bounded_read::write_no_follow(path, json.as_bytes(), 0o600)
 }
 
 /// `last_verification_passed` is `Agent::last_verification_passed`: the
