@@ -271,6 +271,17 @@ pub async fn stamp_page(
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
     let path = page_path(wiki_dir, name);
+    // A page that is a symlink (or not a regular file) is never read or
+    // rewritten: the stamp must not land in whatever the link points at.
+    let is_plain_file = std::fs::symlink_metadata(&path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false);
+    if !is_plain_file {
+        return Err(format!(
+            "could not stamp {}: not a regular file (a symlink or other special file)",
+            path.display()
+        ));
+    }
     let content = std::fs::read_to_string(&path)
         .map_err(|err| format!("could not read {}: {err}", path.display()))?;
     let (fm, body) = parse_frontmatter(&content);
@@ -287,7 +298,8 @@ pub async fn stamp_page(
     let mut out = render_frontmatter(&head, covers, &summary);
     out.push('\n');
     out.push_str(body);
-    std::fs::write(&path, out).map_err(|err| format!("could not write {}: {err}", path.display()))
+    crate::bounded_read::write_no_follow(&path, out.as_bytes(), 0o644)
+        .map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
 #[cfg(test)]
@@ -618,5 +630,42 @@ mod git_tests {
         .await;
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit_probes {
+    use super::*;
+
+    /// C3: `stamp_page` reads then `fs::write`s `docs/wiki/<page>.md`
+    /// following symlinks, unconfined. A planted link rewrites its target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_c3_stamp_page_through_a_planted_symlink_does_not_rewrite_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        for argv in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t.invalid"],
+            vec!["commit", "-q", "--allow-empty", "-m", "i"],
+        ] {
+            run_git(&cwd, &argv, &[]).await.unwrap();
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("bashrc");
+        std::fs::write(&victim, "export PATH=$PATH:/usr/local/bin\n").unwrap();
+        let wiki = cwd.join("docs/wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::os::unix::fs::symlink(&victim, wiki.join("core.md")).unwrap();
+
+        let _ = stamp_page(&wiki, &cwd, "core", &["src".to_string()], &CancellationToken::new())
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "export PATH=$PATH:/usr/local/bin\n",
+            "stamp_page rewrote the file a wiki-page symlink pointed at"
+        );
     }
 }
