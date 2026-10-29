@@ -33,24 +33,24 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # exactly one place to bump: aivyx-kvcache and aivyx-recall previously
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
-aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "7de5380de0b861e47d51d56342b521b75f194c34", default-features = false }
-aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "a41da4090a99813c95d69361f94504f07bca52cb" }
+aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8", default-features = false }
+aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "55f4c93ee87c593f58b5e0ca206263cead98f20d" }
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "4ec85e4d887a6f0de2318baf1fa4d7e9023a1ffc" }
-aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "f883339ee9655871673c75343b1773b7836f465b" }
-aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a506c9c961b82715806bdec67e53704f1a11ed8d" }
+aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "c16530ecc58201e81c0e907fc1ffce150f63960d" }
+aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a3eb989ea86b4784a3bd118d21530c5731ae21f6" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffaff98acf1bd32955e6abdb659444215218416e" }
 aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "1ab893732e07daca13d37ea2a1695b229c058a20" }
 # The signed pack format shared with aivyx-pa (config packs). Not on
 # crates.io -- pinned by commit SHA like the others; MUST stay public.
-aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "eedbf350820c0483c6a1649de4c83bb1a45844ad" }
+aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "aec62513f35e20ffc59bbc45e299bc8f3a7127f1" }
 # Not on crates.io -- pinned by commit SHA, same as aivyx-checkpoint/
 # aivyx-confine/aivyx-injection-guard above. No platform-specific
 # backend, so no target-gating needed. All three pinned to the same rev
 # (Milestone 2 Pass A's merge commit in that repo) so they never drift
 # out of lockstep with each other.
-aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "226663984b64fe2832afb58158b6ad9be1414c9e" }
-aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "226663984b64fe2832afb58158b6ad9be1414c9e" }
-aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "226663984b64fe2832afb58158b6ad9be1414c9e" }
+aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
+aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
+aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
 
 [profile.release]
 strip = true

@@ -79,8 +79,8 @@ ignore = [
 
     # paste — RUSTSEC-2024-0436 (unmaintained proc-macro). Pulled via
     #   paste → gemm → candle-core → mistralrs → aivyx-llm
-    # (aivyx-pa reaches it through frankenstein instead; the root is
-    # different here but the disposition is the same).
+    # (aivyx-pa reaches it through both frankenstein and this same
+    # gemm → candle-core path; the disposition is the same).
     { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro, not vulnerable; transitive under gemm/candle-core (mistralrs → aivyx-llm); awaiting upstream" },
 
     # zip — RUSTSEC-2026-0367/0368/0369. zip 7.2.0 via
