@@ -218,11 +218,21 @@ pub struct AcpPrompter {
     connection: ConnectionTo<Client>,
     /// The session's project folder, for the "outside the project" note.
     project: Option<std::path::PathBuf>,
+    /// Woken by `session/cancel`: a permission request still unanswered then
+    /// is denied instead of waiting for a client that never replies.
+    cancel_signal: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl AcpPrompter {
     pub fn new(session_id: SessionId, connection: ConnectionTo<Client>) -> Self {
-        Self { session_id, connection, project: None }
+        Self { session_id, connection, project: None, cancel_signal: None }
+    }
+
+    /// Makes an unanswered permission request end (as a denial) when
+    /// `session/cancel` arrives.
+    pub fn with_cancel_signal(mut self, signal: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        self.cancel_signal = Some(signal);
+        self
     }
 
     /// Notes approvals for changes outside `project`.
@@ -242,7 +252,17 @@ impl PermissionPrompter for AcpPrompter {
             &call_id,
             self.project.as_deref(),
         );
-        match self.connection.send_request(acp_request).block_task().await {
+        let cancelled = async {
+            match &self.cancel_signal {
+                Some(signal) => signal.notified().await,
+                None => std::future::pending().await,
+            }
+        };
+        let answer = tokio::select! {
+            answer = self.connection.send_request(acp_request).block_task() => answer,
+            _ = cancelled => return UserResponse::Deny,
+        };
+        match answer {
             Ok(response) => acp_response_to_user_response(response),
             // Connection gone / request failed — fail closed, matching
             // `TuiPrompter`'s "render loop is gone" fallback.

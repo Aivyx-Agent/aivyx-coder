@@ -194,7 +194,12 @@ impl Session {
 /// arriving while the first still runs), and `session/cancel` must stop
 /// all of them, while a turn that finishes only ever drops its own token.
 #[derive(Clone, Default)]
-struct TurnCancellation(Arc<std::sync::Mutex<TurnSlot>>);
+struct TurnCancellation(
+    Arc<std::sync::Mutex<TurnSlot>>,
+    /// Woken by `cancel`, so a permission request the client has not answered
+    /// (a client that does not reply `cancelled` itself) stops waiting.
+    Arc<tokio::sync::Notify>,
+);
 
 #[derive(Default)]
 struct TurnSlot {
@@ -233,7 +238,13 @@ impl TurnCancellation {
         for token in slot.running.values() {
             token.cancel();
         }
+        self.1.notify_waiters();
         !slot.running.is_empty()
+    }
+
+    /// The signal `cancel` wakes, for the permission prompter.
+    fn cancel_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.1)
     }
 }
 
@@ -565,6 +576,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
     // `TurnCancellation`'s doc comment.
     let turn_cancellation = TurnCancellation::default();
     let cancel_turn = turn_cancellation.clone();
+    let prompter_cancel_signal = turn_cancellation.cancel_signal();
 
     AcpAgentBuilder
         .builder()
@@ -640,7 +652,8 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     .prompter_installer
                     .install(
                         AcpPrompter::new(session_id.clone(), connection.clone())
-                            .with_project(built.cwd.clone()),
+                            .with_project(built.cwd.clone())
+                            .with_cancel_signal(prompter_cancel_signal.clone()),
                     );
                 *guard = Some(Session {
                     agent: built.agent,
@@ -824,6 +837,20 @@ mod tests {
         assert!(token.is_cancelled());
         slot.finish(generation);
         assert!(!slot.cancel(), "nothing is running once the turn finished");
+    }
+
+    #[tokio::test]
+    async fn cancel_wakes_a_permission_wait_through_the_signal() {
+        let slot = TurnCancellation::default();
+        let signal = slot.cancel_signal();
+        let waiter = tokio::spawn(async move { signal.notified().await });
+        tokio::task::yield_now().await;
+        let _ = slot.begin();
+        slot.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiting permission request was not woken")
+            .unwrap();
     }
 
     #[test]
