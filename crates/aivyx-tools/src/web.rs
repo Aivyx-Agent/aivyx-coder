@@ -43,6 +43,10 @@ fn is_ipv4_private_or_local(v4: Ipv4Addr) -> bool {
         || (a == 100 && (b & 0xc0) == 64)
         || v4.is_broadcast()
         || v4.is_multicast()
+        // 198.18.0.0/15: benchmarking networks; 192.0.0.0/24: IETF protocol
+        // assignments.
+        || (a == 198 && (b & 0xfe) == 18)
+        || v4.octets()[..3] == [192, 0, 0]
 }
 
 fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
@@ -67,6 +71,10 @@ fn is_ipv6_private_or_local(v6: Ipv6Addr) -> bool {
     }
     if (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]) || segments[..3] == [0x64, 0xff9b, 1] {
         return is_ipv4_private_or_local(v4(segments[6], segments[7]));
+    }
+    // 2001:0::/32: Teredo tunnelling.
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        return true;
     }
     if segments[0] == 0x2002 {
         return is_ipv4_private_or_local(v4(segments[1], segments[2]));
@@ -178,6 +186,13 @@ mod tests {
         assert!(is_private_or_local("0.1.2.3".parse().unwrap()));
         assert!(is_private_or_local("255.255.255.255".parse().unwrap()));
         assert!(is_private_or_local("224.0.0.1".parse().unwrap()));
+        // Benchmarking, IETF protocol assignments and Teredo.
+        assert!(is_private_or_local("198.18.0.1".parse().unwrap()));
+        assert!(is_private_or_local("198.19.255.254".parse().unwrap()));
+        assert!(!is_private_or_local("198.20.0.1".parse().unwrap()));
+        assert!(is_private_or_local("192.0.0.8".parse().unwrap()));
+        assert!(!is_private_or_local("192.0.2.1".parse().unwrap()));
+        assert!(is_private_or_local("2001:0:4136:e378::1".parse().unwrap()));
     }
 
     #[test]

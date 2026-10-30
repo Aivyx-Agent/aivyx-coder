@@ -142,6 +142,14 @@ impl RepoMap {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .filter(|e| !is_denied(&e.path(), &self.deny_paths))
+            // A page that is a link must lead to a file inside the project
+            // that is not denied either.
+            .filter(|e| match (e.path().canonicalize(), self.root.canonicalize()) {
+                (Ok(target), Ok(root)) => {
+                    target.starts_with(root) && !is_denied(&target, &self.deny_paths)
+                }
+                _ => false,
+            })
             // Followed through symlinks, so a page linked to /dev/zero or a
             // FIFO is dropped before anything opens it.
             .filter(|e| {
@@ -668,6 +676,28 @@ fn caller() {
         assert!(
             !rendered.contains("secret.md"),
             "denied wiki page leaked:\n{rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wiki_page_linked_to_a_file_outside_the_project_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("notes.md"), "summary: OUTSIDE_SUMMARY\n").unwrap();
+        write(dir.path(), "visible.rs", "pub fn visible_fn() {}\n");
+        write(dir.path(), "docs/wiki/real.md", "summary: inside page\n");
+        std::os::unix::fs::symlink(
+            outside.path().join("notes.md"),
+            dir.path().join("docs/wiki/linked.md"),
+        )
+        .unwrap();
+        let map = RepoMap::new(dir.path().to_path_buf(), vec![]);
+        let rendered = map.render(10_000).unwrap();
+        assert!(rendered.contains("real.md"), "{rendered}");
+        assert!(
+            !rendered.contains("OUTSIDE_SUMMARY") && !rendered.contains("linked.md"),
+            "{rendered}"
         );
     }
 

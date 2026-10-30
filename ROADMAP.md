@@ -1119,3 +1119,29 @@ deferred, not overlooked:
   complete content of any small file (under `MAX_MATCHES = 200` lines)
   inside its own `extra_deny_paths`. See the design spec's "What this
   spec does not decide" section for the corrected severity writeup.
+
+## Backlog from the 2026-10-28 code audit (`docs/audits/2026-10-28-code-audit.md`)
+
+Left open on purpose; every Medium and High finding is fixed.
+
+- **L1 `memory_read` returns recalled text unfenced.** Same as every other
+  tool result and scanned by the per-result injection scan; a labelled fence
+  is cheap hardening but changes the tool's output format, so it needs its own
+  pass over the prompts that mention it.
+- **L2 `memory_write` Always Allow is keyed by topic.** Consistent with the
+  path-keyed `write_file`; wants a sentence in the approval text, not a code
+  change.
+- **L4 `-v/--verbose` is ignored with the TUI `--auto`.** Harmless; fold into
+  the next CLI pass.
+- **L5 `has_commit_hook` runs plain `git rev-parse` unconfined.** It cannot use
+  `run_git` (that sets `core.hooksPath=/dev/null`, hiding the hooks it looks
+  for); probed not exploitable today. Needs a guarded helper that keeps the
+  hooks path.
+- **L6 A goal-achieved run exits 0 when the verification command never ran.**
+  Pinned by existing tests and documented; changing the exit table is a
+  decision for the next headless revision.
+- **L7 `generate_image` reads any non-denied `reference_image`.** The backend is
+  the user's own and normally local; revisit with the vision toolset.
+- **C23 (second half) the first ACP prompt waits ~30 s for an MCP server that
+  does not speak MCP.** The notice is fixed; shortening or backgrounding the
+  start-up wait changes MCP start-up semantics.

@@ -134,10 +134,15 @@ pub fn warnings_in(output: &str) -> usize {
 }
 
 /// `url` without any `user:password@` in its authority (the part between
-/// `://` and the first `/`, `?` or `#`). Anything else comes back as is.
+/// `://` and the first `/`, `?` or `#`), and without a query string or
+/// fragment (a key can sit there). Anything else comes back as is.
 fn without_userinfo(url: &str) -> Cow<'_, str> {
     let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
         return Cow::Borrowed(url);
+    };
+    let url = match url.find(['?', '#']) {
+        Some(cut) => &url[..cut],
+        None => url,
     };
     let rest = &url[scheme_end..];
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -357,6 +362,7 @@ mod tests {
         assert_eq!(without_userinfo("http://llama:8080/v1"), "http://llama:8080/v1");
         assert_eq!(without_userinfo("http://llama:8080/v1/path@x"), "http://llama:8080/v1/path@x");
         assert_eq!(without_userinfo(""), "");
+        assert_eq!(without_userinfo("http://llama:8080/v1?key=SECRET#frag"), "http://llama:8080/v1");
     }
 
     #[test]
