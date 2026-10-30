@@ -145,12 +145,16 @@ pub(crate) fn build_pending_request(
     request: &PermissionRequest,
     request_id: String,
 ) -> Option<PendingApprovalRequest> {
-    let target = match &request.target {
+    // Invisible format characters (bidi overrides, zero-width) are shown as
+    // escapes in everything the approver reads; file contents (the diffs)
+    // stay as they are.
+    let shown = |text: &str| crate::escape_invisible(text);
+    let target = shown(&match &request.target {
         PermissionTarget::Path(path) => path.display().to_string(),
         PermissionTarget::Command { program, args } => format!("{program} {}", args.join(" ")),
         PermissionTarget::Other(description) => description.clone(),
         PermissionTarget::Move { from, to } => format!("{} -> {}", from.display(), to.display()),
-    };
+    });
 
     let content = match request.action {
         ActionKind::Write => {
@@ -172,21 +176,21 @@ pub(crate) fn build_pending_request(
                 return None;
             };
             ApprovalContent::Execute {
-                command: program.clone(),
-                args: args.clone(),
+                command: shown(program),
+                args: args.iter().map(|arg| shown(arg)).collect(),
             }
         }
         ActionKind::McpTool => ApprovalContent::McpTool {
-            description: request.preview.clone().unwrap_or_else(|| target.clone()),
+            description: request.preview.as_deref().map(shown).unwrap_or_else(|| target.clone()),
         },
         ActionKind::Move => {
             let PermissionTarget::Move { from, to } = &request.target else {
                 return None;
             };
             ApprovalContent::Move {
-                from: from.display().to_string(),
-                to: to.display().to_string(),
-                preview: request.preview.clone(),
+                from: shown(&from.display().to_string()),
+                to: shown(&to.display().to_string()),
+                preview: request.preview.as_deref().map(shown),
             }
         }
         // `Memory`, `PersistentMemory`, `Interact`, and `Network` fall back

@@ -1630,17 +1630,33 @@ impl ModalView {
     }
 }
 
-/// Breaks `line` into rows of at most `width` characters, keeping its style.
+/// Breaks `line` into rows no wider than `width` terminal columns (double-
+/// width characters count as two), keeping its style, so no row is ever
+/// clipped by the widget that draws it.
 fn wrap_modal_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar as _;
     let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
-    if width == 0 || text.chars().count() <= width {
+    if width == 0 {
         return vec![line];
     }
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(width)
-        .map(|chunk| Line::from(chunk.iter().collect::<String>()).style(line.style))
-        .collect()
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        // A character wider than the whole row gets a row of its own.
+        if used + w > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(c);
+        used += w;
+    }
+    rows.push(row);
+    if rows.len() == 1 {
+        return vec![line];
+    }
+    rows.into_iter().map(|row| Line::from(row).style(line.style)).collect()
 }
 
 /// The modal, with the "outside the project" note when `project` is known.
@@ -1680,6 +1696,8 @@ fn render_permission_modal_in(
 
     match request.preview.as_deref() {
         Some(preview) if !preview.is_empty() => lines.extend(preview.lines().map(|l| {
+            let escaped = aivyx_sandbox::escape_invisible(l);
+            let l = escaped.as_str();
             // The diff's file headers name the file relative to the project.
             match l.strip_prefix("--- ").or_else(|| l.strip_prefix("+++ ")) {
                 Some(path) => diff_line(&format!(
@@ -1694,7 +1712,10 @@ fn render_permission_modal_in(
         // already appears on the "Command: " line above) is pure noise --
         // omit the line entirely rather than showing "Args: {}".
         _ if request.arguments_preview != serde_json::json!({}) => {
-            lines.push(Line::from(format!("Args: {}", request.arguments_preview)));
+            lines.push(Line::from(aivyx_sandbox::escape_invisible(&format!(
+                "Args: {}",
+                request.arguments_preview
+            ))));
         }
         _ => {}
     }
@@ -1772,7 +1793,9 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
     // label ("Command: ", "Target: ") whose width the continuation lines
     // are indented to, matching the transcript's `prefixed_lines`.
     let (label, body) = match target {
-        PermissionTarget::Path(path) => ("Target: ", display_path(path)),
+        PermissionTarget::Path(path) => {
+            ("Target: ", aivyx_sandbox::escape_invisible(&display_path(path)))
+        }
         PermissionTarget::Command { program, args } => {
             // U2: quote any word that needs it (e.g. a `run_shell` script
             // body, which is itself one `sh -c` argument but often
@@ -1781,10 +1804,13 @@ fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
             // separate arguments to `sh`.
             ("Command: ", aivyx_sandbox::display_command(program, args))
         }
-        PermissionTarget::Other(description) => ("Target: ", description.clone()),
-        PermissionTarget::Move { from, to } => {
-            ("Move: ", format!("{} -> {}", from.display(), to.display()))
+        PermissionTarget::Other(description) => {
+            ("Target: ", aivyx_sandbox::escape_invisible(description))
         }
+        PermissionTarget::Move { from, to } => (
+            "Move: ",
+            aivyx_sandbox::escape_invisible(&format!("{} -> {}", from.display(), to.display())),
+        ),
     };
 
     if body.is_empty() {
@@ -4089,6 +4115,38 @@ mod tests {
         assert!(!text.contains("more line(s)"), "{text}");
         assert!(view.seen_all());
         assert!(text.contains("[a] Always Allow"), "{text}");
+    }
+
+    #[test]
+    fn invisible_characters_in_a_url_or_path_target_are_shown_escaped() {
+        for target in [
+            PermissionTarget::Other("https://good.example/\u{202E}moc.live".to_string()),
+            PermissionTarget::Path(std::path::PathBuf::from("/tmp/a\u{200B}b")),
+        ] {
+            let mut request = long_script_request();
+            request.target = target;
+            let text = draw_modal(&request, &ModalView::default());
+            assert!(!text.contains('\u{202E}') && !text.contains('\u{200B}'), "{text}");
+            assert!(text.contains("\\u{"), "{text}");
+        }
+    }
+
+    #[test]
+    fn full_width_text_cannot_push_a_payload_out_of_sight() {
+        let mut request = long_script_request();
+        request.target = PermissionTarget::Command {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), format!("{}Q", "全".repeat(400))],
+        };
+        let view = ModalView::default();
+        let top = draw_modal(&request, &view);
+        assert!(
+            top.contains("Q") || (!view.seen_all() && top.contains("more line(s)")),
+            "payload neither shown nor flagged:\n{top}"
+        );
+        view.scroll_by(isize::MAX / 2);
+        let end = draw_modal(&request, &view);
+        assert!(end.contains("Q"), "{end}");
     }
 
     #[test]

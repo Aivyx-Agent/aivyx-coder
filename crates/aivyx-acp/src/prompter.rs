@@ -62,10 +62,14 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
 
 fn target_string(target: &PermissionTarget) -> String {
     match target {
-        PermissionTarget::Path(path) => path.display().to_string(),
+        PermissionTarget::Path(path) => aivyx_sandbox::escape_invisible(&path.display().to_string()),
         PermissionTarget::Command { program, args } => aivyx_sandbox::display_command(program, args),
-        PermissionTarget::Other(description) => description.clone(),
-        PermissionTarget::Move { from, to } => format!("{} -> {}", from.display(), to.display()),
+        PermissionTarget::Other(description) => aivyx_sandbox::escape_invisible(description),
+        PermissionTarget::Move { from, to } => aivyx_sandbox::escape_invisible(&format!(
+            "{} -> {}",
+            from.display(),
+            to.display()
+        )),
     }
 }
 
@@ -123,7 +127,7 @@ fn pending_tool_call(
                 // Routes through `ToolCallContent`'s blanket
                 // `From<T: Into<ContentBlock>>` impl — `Content` itself has
                 // no `From<String>`, so this must target the enum level.
-                let content: ToolCallContent = preview.clone().into();
+                let content: ToolCallContent = aivyx_sandbox::escape_invisible(preview).into();
                 vec![content]
             }
             None => Vec::new(),
