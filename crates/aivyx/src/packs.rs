@@ -535,6 +535,15 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
     };
     let coder = installed.manifest.coder.as_ref()?;
     let mut notices = vec![format!("Using pack {} v{} here.", installed.name, installed.version)];
+    let agents_file = installed.dir.join(&coder.agents_file);
+    if !agents_file.is_file() {
+        notices.push(format!(
+            "Pack {}'s instructions file ({}) is missing, so its instructions aren't loaded — \
+             install the pack again.",
+            installed.name,
+            coder.agents_file
+        ));
+    }
     let mut mcp_servers = Vec::new();
     for server in pack_mcp_servers(&installed.dir, &installed.manifest) {
         match used.mcp.iter().find(|a| a.name == server.name) {
@@ -550,7 +559,7 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
     Some(PackLayer {
         name: installed.name.clone(),
         version: installed.version.clone(),
-        agents_file: installed.dir.join(&coder.agents_file),
+        agents_file,
         skills_dir: coder.skills.as_ref().map(|r| installed.dir.join(r)),
         roster: coder.roster.as_ref().map(|r| installed.dir.join(r)),
         mcp_servers,
@@ -563,6 +572,12 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
 /// slot (project, then user); approved MCP servers unless the user already
 /// has one of that name. Anything not applied gets a notice.
 pub fn apply_to_settings(layer: &mut PackLayer, settings: &mut Settings) {
+    if !settings.agents_file.enabled && layer.agents_file.is_file() {
+        layer.notices.push(format!(
+            "Pack {}'s instructions aren't loaded: [agents_file] enabled is false.",
+            layer.name
+        ));
+    }
     if let Some(roster) = &layer.roster {
         if settings.team.roster_path.is_none() {
             settings.team.roster_path = Some(roster.display().to_string());
@@ -913,6 +928,23 @@ mcp = "coder/mcp.toml"
         use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
         remove(&packs, "business-manager").unwrap();
         assert!(ActiveState::load(&packs).uses.is_empty());
+    }
+
+    #[test]
+    fn the_pack_line_says_when_its_instructions_cannot_load() {
+        let packs = installed_packs("layer-noinstr");
+        let project = tmp("layer-noinstr-project");
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        let mut layer = resolve_layer(&packs, &project).unwrap();
+        let mut settings = Settings::default();
+        settings.agents_file.enabled = false;
+        apply_to_settings(&mut layer, &mut settings);
+        assert!(layer.notices.iter().any(|n| n.contains("instructions aren't loaded")), "{:?}", layer.notices);
+
+        let installed = packs.find("business-manager").unwrap();
+        std::fs::remove_file(installed.dir.join(&installed.manifest.coder.as_ref().unwrap().agents_file)).unwrap();
+        let layer = resolve_layer(&packs, &project).unwrap();
+        assert!(layer.notices.iter().any(|n| n.contains("is missing")), "{:?}", layer.notices);
     }
 
     #[test]
