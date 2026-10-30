@@ -156,7 +156,7 @@ impl RunFacts {
             let verdict = match passed {
                 Some(true) => "passed",
                 Some(false) => "failed",
-                None => "never ran",
+                None => "was not run by automatic verification (it runs after edits; a run the model made itself is not counted)",
             };
             lines.push(format!("verification: `{name}` {verdict}"));
         }
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(
             facts.notice_lines(),
             [
-                "verification: `test` never ran",
+                "verification: `test` was not run by automatic verification (it runs after edits; a run the model made itself is not counted)",
                 "changed: 8 files (+8 −0) — f0.rs, f1.rs, f2.rs, f3.rs, f4.rs and 3 more",
             ]
         );
