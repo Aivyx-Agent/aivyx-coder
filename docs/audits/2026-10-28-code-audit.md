@@ -648,3 +648,26 @@ cancellation) are now checked and clean.
   in a file (no listed phrase) was not flagged and, with approvals denied, the
   9B did not act on it. By default `web_fetch` refuses a loopback address.
 - The unranked observation became C25 above.
+
+## Fixes (Task 13)
+
+All Medium and High findings and the live-session defects are fixed on `main`
+(pushed; CI run 41139515807 green).
+
+| ID | Fix |
+|---|---|
+| C1 | `c5b5bf7`..`9d05789`: instruction files are canonicalised and checked as link and target; project file must resolve inside the project |
+| C2 | `c5b5bf7`: `--report` written with `O_NOFOLLOW`, regular files only |
+| C3 | `55abbd4` |
+| C4 | `8ac5408` |
+| C5, C6 | `21b535d` (also covers L3, the headless and ACP display filters) |
+| C7 | `cb445a5` |
+| C8 | `e88d797` |
+| C9 | `ab646f7` |
+| C10 | `368b0c5` |
+| C21 | `9d05789` |
+| C22 | `07dc073` |
+| C23, C24 | `c1a81da` (the slow first prompt behind an unresponsive MCP server stays open) |
+| C25 | `36eb989` |
+| L3, L8, L9, L10 | `21b535d`, `0c57679` |
+| L1, L2, L4, L5, L6, L7 | open, with reasons, in `ROADMAP.md` |
