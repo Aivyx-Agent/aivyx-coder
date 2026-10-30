@@ -367,7 +367,9 @@ fn respond_then_advertise(
     for warning in startup_warnings {
         let _ = connection.send_notification(SessionNotification::new(
             session_id.clone(),
-            SessionUpdate::AgentMessageChunk(crate::translate::text_chunk(warning)),
+            SessionUpdate::AgentMessageChunk(crate::translate::text_chunk(
+                startup_warning_text(&warning),
+            )),
         ));
     }
     responded
@@ -378,6 +380,12 @@ fn respond_then_advertise(
 /// are shown as soon as the session opens; information ("using the
 /// server's 32768-token context window") is dropped — drained during the
 /// first prompt, it used to land inside the model's reply.
+/// A start-up warning as an agent message: ended by a blank line so the
+/// model's first reply does not run on from it.
+fn startup_warning_text(warning: &str) -> String {
+    format!("{warning}\n\n")
+}
+
 fn startup_warnings(events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
     let mut warnings = Vec::new();
     while let Ok(event) = events_rx.try_recv() {
@@ -743,6 +751,11 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_startup_warning_ends_with_a_blank_line() {
+        assert_eq!(startup_warning_text("MCP server x timed out"), "MCP server x timed out\n\n");
+    }
 
     #[test]
     fn startup_warnings_keep_warnings_and_drop_information() {

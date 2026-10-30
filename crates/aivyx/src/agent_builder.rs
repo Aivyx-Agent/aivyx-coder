@@ -319,6 +319,22 @@ fn resolve_team_config(
     Ok(team)
 }
 
+/// A start-up warning when the roster's lead cannot call `run_command`,
+/// which the automatic `[verification]` check needs: it would otherwise
+/// fail after every turn looking like the project's tests did not start.
+fn roster_without_run_command_notice(team: &aivyx_team::TeamConfig) -> Option<String> {
+    let lead = team.members.iter().find(|m| m.name == team.lead)?;
+    if lead.tool_allowlist.iter().any(|tool| tool == "run_command") {
+        return None;
+    }
+    Some(format!(
+        "[verification] is configured, but the team roster's lead \"{}\" has no run_command in \
+         its tool_allowlist, so verification cannot run — add run_command to the lead's \
+         tool_allowlist, or remove [verification] command.",
+        lead.name
+    ))
+}
+
 /// Renders the skill-discovery listing appended to the system prompt via
 /// `Agent::set_skills`. Scans each overlay-sourced (`User`/`Project`)
 /// entry's composed name+description entry for injection markers before
@@ -1061,23 +1077,25 @@ pub(crate) async fn build_agent(
                 mcp_clients.push(client);
             }
             Ok(Err(err)) => {
+                let shown_name = aivyx_sandbox::escape_invisible(&server_name);
                 tracing::warn!(
                     server = %server_name,
                     error = %err,
                     "MCP server failed to connect/discover tools — skipping for this session"
                 );
                 let _ = events_tx.send(aivyx_core::AgentEvent::Error(format!(
-                    "MCP server \"{server_name}\" failed to connect: {err} — its tools are \
+                    "MCP server \"{shown_name}\" failed to connect: {err} — its tools are \
                      unavailable this session"
                 )));
             }
             Err(_) => {
+                let shown_name = aivyx_sandbox::escape_invisible(&server_name);
                 tracing::warn!(
                     server = %server_name,
                     "MCP server startup timed out — skipping for this session"
                 );
                 let _ = events_tx.send(aivyx_core::AgentEvent::Error(format!(
-                    "MCP server \"{server_name}\" timed out during startup — its tools are \
+                    "MCP server \"{shown_name}\" timed out during startup — its tools are \
                      unavailable this session"
                 )));
             }
@@ -1274,6 +1292,11 @@ pub(crate) async fn build_agent(
             "close_specialist",
         ]);
         let team = resolve_team_config(settings, &available_tools)?;
+        if verification_command.is_some()
+            && let Some(notice) = roster_without_run_command_notice(&team)
+        {
+            let _ = events_tx.send(aivyx_core::AgentEvent::Warning(notice));
+        }
         registry.register(Arc::new(aivyx_core::DelegateToSpecialistTool::new(
             aivyx_core::DelegateToSpecialistConfig {
                 llm: Arc::clone(&llm),
@@ -2127,6 +2150,25 @@ mod tests {
             err.to_string().contains("provider-mistral-rs"),
             "error should name the missing feature, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_lead_without_run_command_is_called_out_when_verification_is_configured() {
+        let mut team = aivyx_team::default_coding_roster();
+        let lead = team.lead.clone();
+        for member in &mut team.members {
+            if member.name == lead {
+                member.tool_allowlist = vec!["set_tasks".to_string()];
+            }
+        }
+        let notice = roster_without_run_command_notice(&team).unwrap();
+        assert!(notice.contains("run_command"), "{notice}");
+        for member in &mut team.members {
+            if member.name == lead {
+                member.tool_allowlist.push("run_command".to_string());
+            }
+        }
+        assert!(roster_without_run_command_notice(&team).is_none());
     }
 
     #[test]
