@@ -91,6 +91,40 @@ pub fn write_no_follow(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// UTF-8 (a character cut by the limit doesn't count).
 pub fn read_capped(path: &Path, limit: u64) -> io::Result<Capped> {
     let (file, size) = open_regular(path)?;
+    read_capped_file(file, size, limit)
+}
+
+/// Like `read_capped`, but for a path that must pass `accept` once resolved:
+/// the file is opened once, the path is then resolved, and the resolved
+/// path must be the very file that was opened (same device and inode) before
+/// `accept` sees it, so a link swapped in between the check and the read
+/// cannot make the read return something `accept` never saw (the resolved
+/// path is compared with `lstat`, so a link put there afterwards does not match). Refused (an
+/// error) when the two differ or `accept` says no. Unix only.
+#[cfg(unix)]
+pub fn read_capped_verified(
+    path: &Path,
+    limit: u64,
+    accept: impl FnOnce(&Path) -> bool,
+) -> io::Result<Capped> {
+    use std::os::unix::fs::MetadataExt;
+    let (file, size) = open_regular(path)?;
+    let opened = file.metadata()?;
+    let resolved = path.canonicalize()?;
+    let current = std::fs::symlink_metadata(&resolved)?;
+    if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the file changed while it was being checked",
+        ));
+    }
+    if !accept(&resolved) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path not accepted"));
+    }
+    read_capped_file(file, size, limit)
+}
+
+fn read_capped_file(file: std::fs::File, size: u64, limit: u64) -> io::Result<Capped> {
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;
     let truncated = size > limit;

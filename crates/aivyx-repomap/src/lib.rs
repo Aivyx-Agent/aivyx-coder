@@ -142,26 +142,13 @@ impl RepoMap {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .filter(|e| !is_denied(&e.path(), &self.deny_paths))
-            // A page that is a link must lead to a file inside the project
-            // that is not denied either.
-            .filter(|e| match (e.path().canonicalize(), self.root.canonicalize()) {
-                (Ok(target), Ok(root)) => {
-                    target.starts_with(root) && !is_denied(&target, &self.deny_paths)
-                }
-                _ => false,
-            })
-            // Followed through symlinks, so a page linked to /dev/zero or a
-            // FIFO is dropped before anything opens it.
-            .filter(|e| {
-                std::fs::metadata(e.path()).is_ok_and(|m| m.is_file() && m.len() <= MAX_FILE_BYTES)
-            })
-            .map(|e| {
+            // A page that cannot be read safely (a device, a pipe, a link out
+            // of the project, a denied target) is left out entirely.
+            .filter_map(|e| {
                 let path = e.path();
                 let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
-                let summary = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|content| wiki_summary(&content));
-                (relative.display().to_string(), summary)
+                let content = self.read_wiki_page(&path)?;
+                Some((relative.display().to_string(), wiki_summary(&content)))
             })
             .collect();
         pages.sort();
@@ -175,6 +162,37 @@ impl RepoMap {
             None => format!("  {path}\n"),
         }));
         lines
+    }
+
+    /// The text of a wiki page, or `None` when it must not be read: opened
+    /// once (without blocking), then the path is resolved and must be that
+    /// same file, inside the project and not denied, so a link swapped in
+    /// after the check cannot redirect the read.
+    fn read_wiki_page(&self, path: &Path) -> Option<String> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let opened = file.metadata().ok()?;
+        if !opened.is_file() || opened.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        let resolved = path.canonicalize().ok()?;
+        let current = std::fs::symlink_metadata(&resolved).ok()?;
+        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+            return None;
+        }
+        if !resolved.starts_with(self.root.canonicalize().ok()?)
+            || is_denied(&resolved, &self.deny_paths)
+        {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(MAX_FILE_BYTES).read_to_string(&mut text).ok()?;
+        Some(text)
     }
 
     /// Walks the repo and returns tags for every parseable file, re-parsing
@@ -699,6 +717,42 @@ fn caller() {
             !rendered.contains("OUTSIDE_SUMMARY") && !rendered.contains("linked.md"),
             "{rendered}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wiki_page_swapped_for_a_link_out_never_leaks_its_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.md");
+        std::fs::write(&target, "summary: OUTSIDE_SUMMARY\n").unwrap();
+        write(&root, "docs/wiki/page.md", "summary: inside\n");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let (stop, root, target) = (stop.clone(), root.clone(), target.clone());
+            std::thread::spawn(move || {
+                let mut flip = false;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let tmp = root.join("docs/wiki/.swap");
+                    let _ = std::fs::remove_file(&tmp);
+                    if flip {
+                        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+                    } else {
+                        std::fs::write(&tmp, "summary: inside\n").unwrap();
+                    }
+                    let _ = std::fs::rename(&tmp, root.join("docs/wiki/page.md"));
+                    flip = !flip;
+                }
+            })
+        };
+        let map = RepoMap::new(root.clone(), vec![]);
+        for _ in 0..2000 {
+            let lines = map.wiki_pointer_lines().join("");
+            assert!(!lines.contains("OUTSIDE_SUMMARY"), "{lines}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().unwrap();
     }
 
     #[test]

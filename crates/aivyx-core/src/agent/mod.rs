@@ -4428,42 +4428,50 @@ enum InstructionsScope<'a> {
     Trusted,
 }
 
-/// Decides whether `path` (and where it really points) may be read into the
-/// system prompt, and returns the path to read. The deny check applies to
-/// the link and to its target; a project file must resolve inside the
-/// project. Returns `None` for anything that fails, silently, like a
-/// missing file.
-fn instructions_path_to_read(
+/// Whether the resolved instructions file `resolved` (reached through
+/// `path`) may be read into the system prompt: the deny check applies to the
+/// link and to its target; a project file must resolve inside the project.
+fn instructions_path_accepted(
     path: &Path,
+    resolved: &Path,
     deny_paths: &[PathBuf],
     scope: InstructionsScope<'_>,
-) -> Option<PathBuf> {
-    let resolved = path.canonicalize().ok()?;
-    let denied = |p: &Path, exempt_own_dirs: bool| {
+) -> bool {
+    let trusted = matches!(scope, InstructionsScope::Trusted);
+    // The user's own instructions file sitting in place (not a link leading
+    // elsewhere) in a directory the built-in `deny_paths` cover (the config
+    // directory): exactly that file is exempt from the entry containing it.
+    let in_place = trusted
+        && resolved.file_name().is_some_and(|name| name == "AGENTS.md")
+        && path.file_name() == resolved.file_name()
+        && path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .is_some_and(|parent| resolved.parent() == Some(parent.as_path()));
+    let denied = |p: &Path| {
         deny_paths.iter().any(|entry| {
-            if exempt_own_dirs
-                && !entry.as_os_str().is_empty()
-                && entry.is_absolute()
-                && entry != path
-                && path.starts_with(entry)
-                && resolved.starts_with(entry)
+            if in_place
+                && entry
+                    .canonicalize()
+                    .is_ok_and(|entry| entry != resolved && resolved.starts_with(entry))
             {
                 return false;
             }
             aivyx_sandbox::path_is_denied(p, std::slice::from_ref(entry))
         })
     };
-    let trusted = matches!(scope, InstructionsScope::Trusted);
-    if denied(path, trusted) || denied(&resolved, trusted) {
-        return None;
+    if denied(path) || denied(resolved) {
+        return false;
     }
     if let InstructionsScope::Project(root) = scope {
-        let root = root.canonicalize().ok()?;
+        let Ok(root) = root.canonicalize() else {
+            return false;
+        };
         if !resolved.starts_with(&root) {
-            return None;
+            return false;
         }
     }
-    Some(resolved)
+    true
 }
 
 async fn read_instructions(
@@ -4482,10 +4490,15 @@ async fn read_instructions(
             Some(root) => InstructionsScope::Project(root),
             None => InstructionsScope::Trusted,
         };
-        let resolved = instructions_path_to_read(&path, &deny_paths, scope)?;
-        aivyx_tools::bounded_read::read_capped(&resolved, aivyx_tools::bounded_read::READ_FILE_LIMIT)
-            .ok()
-            .map(|capped| capped.text)
+        // Opened once and checked against what was opened, not re-opened by
+        // name after the check.
+        aivyx_tools::bounded_read::read_capped_verified(
+            &path,
+            aivyx_tools::bounded_read::READ_FILE_LIMIT,
+            |resolved| instructions_path_accepted(&path, resolved, &deny_paths, scope),
+        )
+        .ok()
+        .map(|capped| capped.text)
     })
     .await
     .ok()?

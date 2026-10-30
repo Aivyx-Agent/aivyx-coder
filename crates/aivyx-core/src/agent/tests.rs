@@ -11075,3 +11075,46 @@ async fn audit_c21_user_and_pack_instructions_load_from_a_denied_config_dir() {
     .await;
     assert!(!system.contains("SECRET_KEY_MATERIAL"), "{system}");
 }
+
+/// C1 (race): a process swapping `AGENTS.md` between a regular file and a
+/// link to a denied key while the file is read must never make the read
+/// return the key.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_c1_a_swapped_agents_md_never_returns_the_denied_file() {
+    let secrets = tempfile::tempdir().unwrap();
+    let secrets_dir = secrets.path().canonicalize().unwrap();
+    std::fs::write(secrets_dir.join("key"), "SECRET_KEY_MATERIAL").unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    std::fs::write(root.join("AGENTS.md"), "PROJECT_OK").unwrap();
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (stop, root, key) = (stop.clone(), root.clone(), secrets_dir.join("key"));
+        std::thread::spawn(move || {
+            let mut flip = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let tmp = root.join(".swap");
+                let _ = std::fs::remove_file(&tmp);
+                if flip {
+                    std::os::unix::fs::symlink(&key, &tmp).unwrap();
+                } else {
+                    std::fs::write(&tmp, "PROJECT_OK").unwrap();
+                }
+                let _ = std::fs::rename(&tmp, root.join("AGENTS.md"));
+                flip = !flip;
+            }
+        })
+    };
+    let deny = vec![secrets_dir.clone()];
+    for _ in 0..3000 {
+        if let Some(text) =
+            read_instructions(&root.join("AGENTS.md"), &deny, InstructionsScope::Project(&root)).await
+        {
+            assert!(!text.contains("SECRET_KEY_MATERIAL"), "the denied file was read");
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+}

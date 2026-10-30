@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 globset = "0.4.18"
 ignore = "0.4.28"
+libc = "0.2.186"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.26.10"
 tree-sitter-rust = "0.24.2"
