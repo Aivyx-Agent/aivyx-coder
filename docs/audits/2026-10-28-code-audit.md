@@ -656,7 +656,7 @@ All Medium and High findings and the live-session defects are fixed on `main`
 
 | ID | Fix |
 |---|---|
-| C1 | `c5b5bf7`..`9d05789`: instruction files are canonicalised and checked as link and target; project file must resolve inside the project |
+| C1 | `9d05789` (race-free open-once check in the fix-round-1 commit): instruction files are checked as link and target; project file must resolve inside the project |
 | C2 | `c5b5bf7`: `--report` written with `O_NOFOLLOW`, regular files only |
 | C3 | `55abbd4` |
 | C4 | `8ac5408` |
@@ -669,5 +669,5 @@ All Medium and High findings and the live-session defects are fixed on `main`
 | C22 | `07dc073` |
 | C23, C24 | `c1a81da` (the slow first prompt behind an unresponsive MCP server stays open) |
 | C25 | `36eb989` |
-| L3, L8, L9, L10 | `21b535d`, `0c57679` |
+| L3, L8, L9, L10 | `21b535d`, `0c57679` (that commit's message labels L8 to L10 as C16/C18/C19; the right IDs are C18, C19, C20) |
 | L1, L2, L4, L5, L6, L7 | open, with reasons, in `ROADMAP.md` |
