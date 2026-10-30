@@ -26,6 +26,12 @@ const MAX_FETCH_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// blob, a minified bundle), so longer runs are broken up first.
 const MAX_UNBROKEN_RUN: usize = 4096;
 
+/// Deepest element nesting handed to the HTML converter. `html2text` recurses
+/// per level (a few thousand `<ul><li>` overflow a thread's stack) and slows
+/// down on deep trees; a page nested deeper than this is reduced to its text
+/// with the tags stripped instead.
+const MAX_NESTING_DEPTH: usize = 200;
+
 #[derive(Deserialize, JsonSchema)]
 struct WebFetchArgs {
     /// The URL to fetch, including scheme (e.g. "https://example.com/page").
@@ -180,7 +186,7 @@ impl Tool for WebFetchTool {
                 ToolError::ExecutionFailed(format!("failed to read response body: {err}"))
             })? {
                 let room = MAX_FETCH_BODY_BYTES - bytes.len();
-                if chunk.len() >= room {
+                if chunk.len() > room {
                     bytes.extend_from_slice(&chunk[..room]);
                     cut = true;
                     break;
@@ -224,7 +230,69 @@ fn html_to_text(html: &str) -> String {
     // `Result<String, _>` as the task brief's starting draft assumed —
     // see task-3-report.md for the verified signature), so there's no
     // fallible path here to `unwrap_or_else` against.
-    html2text::from_read(break_long_runs(html).as_bytes(), 100)
+    let html = break_long_runs(html);
+    if nesting_depth(&html) > MAX_NESTING_DEPTH {
+        return strip_tags(&html);
+    }
+    html2text::from_read(html.as_bytes(), 100)
+}
+
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
+    "track", "wbr",
+];
+
+/// Calls `f(tag_text)` for each `<...>` tag in `html`, in order.
+fn for_each_tag(html: &str, mut f: impl FnMut(&str)) {
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('>') else { break };
+        f(&after[..end]);
+        rest = &after[end + 1..];
+    }
+}
+
+/// The deepest element nesting in `html`, counted from its tags (a cheap
+/// estimate: void and self-closing elements and comments do not nest).
+fn nesting_depth(html: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    for_each_tag(html, |tag| {
+        if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
+            return;
+        }
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+            return;
+        }
+        let name = tag.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        if VOID_ELEMENTS.iter().any(|v| name.eq_ignore_ascii_case(v)) {
+            return;
+        }
+        depth += 1;
+        deepest = deepest.max(depth);
+    });
+    deepest
+}
+
+/// `html` with every tag removed and runs of blank space folded.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        let after = &rest[start + 1..];
+        match after.find('>') {
+            Some(end) => rest = &after[end + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Inserts a space into any run of non-whitespace longer than
@@ -433,6 +501,36 @@ mod audit_probes {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A body of exactly the cap is complete: no "rest was not read" note.
+    #[tokio::test]
+    async fn a_body_of_exactly_the_cap_is_not_marked_as_cut() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n")
+                .await;
+            let body = "word ".repeat(MAX_FETCH_BODY_BYTES / 5 + 1).into_bytes();
+            let _ = stream.write_all(&body[..MAX_FETCH_BODY_BYTES]).await;
+            let _ = stream.shutdown().await;
+        });
+        let tool = WebFetchTool::new(30, true);
+        let ctx = ToolExecutionContext {
+            cwd: std::env::temp_dir(),
+            confiner: std::sync::Arc::new(aivyx_sandbox::NoopConfiner),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let out = tool
+            .execute(serde_json::json!({ "url": format!("http://{addr}/") }), &ctx)
+            .await
+            .unwrap();
+        let aivyx_types::ToolOutput::Ok(text) = out else { panic!("not ok") };
+        assert!(!text.contains("the rest was not read"), "{}", &text[text.len().saturating_sub(200)..]);
+    }
+
     /// C4: the body is read whole (`response.text()`) before the output is
     /// truncated, so a page of any size is held in memory. A well-behaved
     /// reader stops after a bounded prefix; this server counts what it got to
@@ -451,7 +549,7 @@ mod audit_probes {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
                 .await;
             let chunk = "word ".repeat((1 << 20) / 5).into_bytes();
-            for _ in 0..24 {
+            for _ in 0..64 {
                 if stream.write_all(&chunk).await.is_err() {
                     break;
                 }
@@ -469,7 +567,9 @@ mod audit_probes {
             .execute(serde_json::json!({ "url": format!("http://{addr}/") }), &ctx)
             .await;
         let mib = sent.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(mib < 8, "web_fetch pulled {mib} MiB of a 24 MiB body into memory");
+        // Loopback socket buffers let the server write a few MiB past what the
+        // client has read, so the bound is generous: far below the 64 MiB body.
+        assert!(mib < 16, "web_fetch pulled {mib} MiB of a 64 MiB body into memory");
     }
 }
 
@@ -479,6 +579,20 @@ mod audit_probes_cpu {
     /// (a base64 blob, minified JSON): 64 KiB takes 0.2 s, 512 KiB 12 s (debug
     /// build). It runs inline in the async `execute`, so neither the fetch
     /// timeout nor Ctrl+C can interrupt it.
+    #[test]
+    fn audit_c4c_deeply_nested_markup_is_flattened_not_recursed() {
+        for unit in ["<div>", "<ul><li>"] {
+            let page = format!("{}deep text", unit.repeat(3000));
+            let start = std::time::Instant::now();
+            let text = super::html_to_text(&page);
+            assert!(text.contains("deep text"), "{text:?}");
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        }
+        // Ordinary nesting still goes through the converter.
+        let text = super::html_to_text("<ul><li>one</li><li>two</li></ul>");
+        assert!(text.contains("one") && text.contains("two"));
+    }
+
     #[test]
     fn audit_c4b_html_to_text_is_not_quadratic_on_a_long_unbroken_run() {
         let page = "a".repeat(256 << 10);
