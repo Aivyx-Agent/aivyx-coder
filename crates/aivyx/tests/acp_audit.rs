@@ -395,7 +395,6 @@ async fn audit_a4_initialize_answers_a_supported_protocol_version() {
 /// A5: requests naming a session this process never created are served
 /// against the real session; an unknown mode id is accepted.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "A5 not fixed yet"]
 async fn audit_a5_unknown_session_and_mode_ids_are_rejected() {
     let server = model_server(vec![text_reply("ok")]).await;
     let (home, project) = setup(&server);

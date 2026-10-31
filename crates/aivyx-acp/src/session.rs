@@ -413,6 +413,18 @@ fn initialize_response(_req: &InitializeRequest) -> InitializeResponse {
         .agent_info(Implementation::new("aivyx-coder", env!("CARGO_PKG_VERSION")))
 }
 
+/// True when `asked` is the id of the session this process hosts.
+fn is_this_session(slot: &std::sync::Mutex<Option<SessionId>>, asked: &SessionId) -> bool {
+    slot.lock().unwrap().as_ref().is_some_and(|id| id == asked)
+}
+
+fn unknown_session(asked: &SessionId) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(
+        -32602,
+        format!("unknown session: {}", aivyx_sandbox::escape_invisible(asked.0.as_ref())),
+    )
+}
+
 fn session_modes() -> SessionModeState {
     SessionModeState::new(
         SessionModeId::new(MODE_CODE),
@@ -648,6 +660,12 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
     let plan_mode_slot: Arc<std::sync::Mutex<Option<PlanMode>>> = Arc::default();
     let new_session_plan_mode = Arc::clone(&plan_mode_slot);
     let session_exists = Arc::new(AtomicBool::new(false));
+    // The one session's id, for rejecting requests that name another.
+    let session_id_slot: Arc<std::sync::Mutex<Option<SessionId>>> = Arc::default();
+    let new_session_id_slot = Arc::clone(&session_id_slot);
+    let mode_session_id = Arc::clone(&session_id_slot);
+    let prompt_session_id = Arc::clone(&session_id_slot);
+    let cancel_session_id = Arc::clone(&session_id_slot);
 
     let state: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
     let mut init_config = Some(config);
@@ -746,6 +764,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     open_specialist_sessions: Vec::new(),
                 });
                 drop(guard);
+                *new_session_id_slot.lock().unwrap() = Some(session_id.clone());
                 new_session_exists.store(true, Ordering::Release);
                 respond_then_advertise(responder, &connection, session_id, warnings)
             },
@@ -757,15 +776,28 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                     return responder
                         .respond_with_error(agent_client_protocol::util::internal_error("no session"));
                 }
+                if !is_this_session(&mode_session_id, &req.session_id) {
+                    return responder.respond_with_error(unknown_session(&req.session_id));
+                }
+                let mode = req.mode_id.0.as_ref();
+                if mode != MODE_CODE && mode != MODE_PLAN {
+                    return responder.respond_with_error(agent_client_protocol::Error::new(
+                        -32602,
+                        format!("unknown mode: {}", aivyx_sandbox::escape_invisible(mode)),
+                    ));
+                }
                 if let Some(plan_mode) = plan_mode_slot.lock().unwrap().clone() {
-                    plan_mode.set_active(req.mode_id.0.as_ref() == MODE_PLAN);
+                    plan_mode.set_active(mode == MODE_PLAN);
                 }
                 responder.respond(SetSessionModeResponse::new())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_notification(
-            async move |_notification: CancelNotification, _connection| {
+            async move |notification: CancelNotification, _connection| {
+                if !is_this_session(&cancel_session_id, &notification.session_id) {
+                    return Ok(());
+                }
                 // This process hosts exactly one session (see the module
                 // doc comment), so there's only ever one prompt this can
                 // be about. Pending `session/request_permission` calls
@@ -787,6 +819,9 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 // (via `AcpPrompter::prompt`'s `block_task()`), and to keep
                 // accepting other requests (e.g. `session/set_mode`) while
                 // this turn runs.
+                if !is_this_session(&prompt_session_id, &req.session_id) {
+                    return responder.respond_with_error(unknown_session(&req.session_id));
+                }
                 let prompt_state = Arc::clone(&prompt_state);
                 let spawn_connection = connection.clone();
                 // Started here, in the dispatch loop, rather than inside the
@@ -1056,6 +1091,15 @@ mod tests {
     #[test]
     fn empty_prompt_yields_empty_text() {
         assert_eq!(extract_prompt_text(&[]), "");
+    }
+
+    #[test]
+    fn only_the_hosted_session_id_matches() {
+        let slot = std::sync::Mutex::new(None);
+        assert!(!is_this_session(&slot, &SessionId::new("a")), "no session yet");
+        *slot.lock().unwrap() = Some(SessionId::new("a"));
+        assert!(is_this_session(&slot, &SessionId::new("a")));
+        assert!(!is_this_session(&slot, &SessionId::new("b")));
     }
 
     #[test]
