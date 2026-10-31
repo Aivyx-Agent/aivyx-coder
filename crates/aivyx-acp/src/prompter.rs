@@ -37,8 +37,9 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
         "Allow",
         PermissionOptionKind::AllowOnce,
     )];
-    let one_off = aivyx_sandbox::is_one_off_command(request);
-    if !one_off && aivyx_sandbox::runs_code_later_for_request(request).is_none() {
+    if !aivyx_sandbox::is_one_off_command(request)
+        && aivyx_sandbox::runs_code_later_for_request(request).is_none()
+    {
         options.push(PermissionOption::new(
             ALLOW_ALWAYS,
             "Always Allow",
@@ -50,13 +51,8 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
         "Deny",
         PermissionOptionKind::RejectOnce,
     ));
-    if !one_off {
-        options.push(PermissionOption::new(
-            REJECT_ALWAYS,
-            "Always Deny",
-            PermissionOptionKind::RejectAlways,
-        ));
-    }
+    // No "Always Deny": the gate never remembers a refusal, so offering it
+    // would promise something that does not happen.
     options
 }
 
@@ -401,7 +397,7 @@ mod tests {
             new_content: "new\n".to_string(),
         }));
         let acp = permission_request_to_acp(sid(), &request, "call-1");
-        assert_eq!(acp.options.len(), 4);
+        assert_eq!(acp.options.len(), 3);
         assert_eq!(acp.tool_call.tool_call_id.0.as_ref(), "call-1");
         let ToolCallContent::Diff(diff) = &acp.tool_call.fields.content.as_ref().unwrap()[0] else {
             panic!("expected a Diff content block");
@@ -499,8 +495,8 @@ mod tests {
             "Always Allow must not be offered for a file that runs code later: {:?}",
             acp.options
         );
-        // Allow-once and both deny options are still offered.
-        assert_eq!(acp.options.len(), 3);
+        // Allow-once and deny are still offered.
+        assert_eq!(acp.options.len(), 2);
     }
 
     #[test]
@@ -508,7 +504,7 @@ mod tests {
         let request = write_request(None);
         let acp = permission_request_to_acp(sid(), &request, "call-1");
         assert!(acp.options.iter().any(|o| o.option_id.0.as_ref() == ALLOW_ALWAYS));
-        assert_eq!(acp.options.len(), 4);
+        assert_eq!(acp.options.len(), 3);
     }
 
     #[test]
@@ -536,6 +532,21 @@ mod tests {
             SelectedPermissionOutcome::new(ALLOW_ALWAYS),
         ));
         assert_eq!(acp_response_to_user_response(response), UserResponse::AllowAlways);
+    }
+
+    #[test]
+    fn always_deny_is_not_offered() {
+        let request = PermissionRequest {
+            tool_name: "run_shell".to_string(),
+            action: aivyx_sandbox::ActionKind::Execute,
+            target: PermissionTarget::Command { program: "ls".to_string(), args: vec![] },
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        };
+        let kinds: Vec<PermissionOptionKind> =
+            options_for(&request).into_iter().map(|o| o.kind).collect();
+        assert!(!kinds.contains(&PermissionOptionKind::RejectAlways), "{kinds:?}");
     }
 
     #[test]
