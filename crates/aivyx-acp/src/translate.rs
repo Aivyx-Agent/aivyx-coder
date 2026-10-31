@@ -162,12 +162,37 @@ fn notice_paragraph(text: &str) -> String {
 fn display_text(text: &str) -> String {
     let kept: String =
         text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
-    aivyx_sandbox::escape_invisible(&kept)
+    escape_invisible_keeping_emoji(&kept)
+}
+
+/// A character that can sit next to an emoji joiner or variation selector.
+fn emoji_like(c: char) -> bool {
+    c as u32 >= 0x2190 && !c.is_control() && !aivyx_sandbox::is_invisible_format(c)
+}
+
+/// `aivyx_sandbox::escape_invisible`, except that the zero-width joiner and
+/// the emoji variation selector stay when they sit inside an emoji sequence
+/// (family, flag-with-text and heart-on-fire emoji would otherwise break up).
+fn escape_invisible_keeping_emoji(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let after_emoji = i > 0 && (emoji_like(chars[i - 1]) || chars[i - 1] == '\u{FE0F}');
+        let before_emoji = chars.get(i + 1).is_some_and(|&n| emoji_like(n));
+        let joiner = c == '\u{200D}' && after_emoji && before_emoji;
+        let selector = c == '\u{FE0F}' && i > 0 && emoji_like(chars[i - 1]);
+        if joiner || selector {
+            out.push(c);
+        } else {
+            out.push_str(&aivyx_sandbox::escape_invisible(&c.to_string()));
+        }
+    }
+    out
 }
 
 /// One-line label (a tool-call title): no control characters at all.
 fn display_title(text: &str) -> String {
-    aivyx_sandbox::escape_invisible(&text.chars().filter(|c| !c.is_control()).collect::<String>())
+    escape_invisible_keeping_emoji(&text.chars().filter(|c| !c.is_control()).collect::<String>())
 }
 
 /// The longest run of consecutive backticks in `text`.
@@ -386,6 +411,14 @@ mod tests {
         };
         let ContentBlock::Text(text) = chunk.content else { panic!("text") };
         assert!(!text.text.contains('\u{202E}') && !text.text.contains('\u{1b}'), "{:?}", text.text);
+    }
+
+    #[test]
+    fn emoji_sequences_keep_their_joiners_but_bare_ones_are_escaped() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(display_text(family), family);
+        assert_eq!(display_text("\u{2764}\u{FE0F}"), "\u{2764}\u{FE0F}");
+        assert_eq!(display_text("a\u{200D}b"), "a\\u{200d}b");
     }
 
     #[test]
