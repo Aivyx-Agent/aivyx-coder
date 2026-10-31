@@ -152,7 +152,22 @@ fn build_merged_plan(
 /// `text` as a markdown blockquote paragraph marked ⚠, separated from
 /// whatever message text comes before or after it.
 fn notice_paragraph(text: &str) -> String {
-    format!("\n\n> ⚠ {}\n\n", text.trim().replace('\n', "\n> "))
+    format!("\n\n> ⚠ {}\n\n", display_text(text).trim().replace('\n', "\n> "))
+}
+
+/// Text from the model, a tool or a file as the editor should show it:
+/// control characters other than newline and tab dropped, bidi and
+/// zero-width characters shown as escapes (the same neutralising the
+/// approval prompts get).
+fn display_text(text: &str) -> String {
+    let kept: String =
+        text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+    aivyx_sandbox::escape_invisible(&kept)
+}
+
+/// One-line label (a tool-call title): no control characters at all.
+fn display_title(text: &str) -> String {
+    aivyx_sandbox::escape_invisible(&text.chars().filter(|c| !c.is_control()).collect::<String>())
 }
 
 /// The longest run of consecutive backticks in `text`.
@@ -183,14 +198,14 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
             SessionUpdate::AgentMessageChunk(text_chunk(notice_paragraph(text)))
         }
         AgentEvent::CouncilNote(text) | AgentEvent::ArchitectNote(text) => {
-            SessionUpdate::AgentMessageChunk(text_chunk(text.clone()))
+            SessionUpdate::AgentMessageChunk(text_chunk(display_text(text)))
         }
         // Its own paragraph: an Info (e.g. the change summary) arrives right
         // after the model's reply and must not run into its last sentence —
         // nor into what follows, as a specialist's summary did with the
         // lead's next words ("(+2 −0)Done.", audit 6).
         AgentEvent::Info(text) => {
-            SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{text}\n\n")))
+            SessionUpdate::AgentMessageChunk(text_chunk(format!("\n\n{}\n\n", display_text(text))))
         }
         // No pager over ACP: the diff goes to the client as a fenced block
         // its own markdown renderer can highlight — fenced with more
@@ -216,7 +231,7 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
             }
         }
         AgentEvent::ToolCallDetected(call) => SessionUpdate::ToolCall(
-            AcpToolCall::new(call.id.0.clone(), call.name.clone())
+            AcpToolCall::new(call.id.0.clone(), display_title(&call.name))
                 .kind(tool_kind(&call.name))
                 .status(ToolCallStatus::InProgress)
                 .raw_input(call.arguments.clone()),
@@ -233,7 +248,7 @@ pub(crate) fn translate_event(session_id: &SessionId, event: &AgentEvent) -> Opt
             // explicit `ToolCallContent::Content(...)` call would instead ask
             // `.into()` to produce the inner (non-public-constructible) `Content`
             // struct, which has no `From<String>` impl.
-            let content: ToolCallContent = text.clone().into();
+            let content: ToolCallContent = display_text(&text).into();
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 result.call_id.0.clone(),
                 ToolCallUpdateFields::new()
@@ -340,6 +355,37 @@ mod tests {
 
     fn sid() -> SessionId {
         SessionId::new("sess-1")
+    }
+
+    #[test]
+    fn a_tool_call_title_and_notices_are_neutralised() {
+        let call = ToolCall {
+            id: ToolCallId("call_1".to_string()),
+            name: "read_file\u{202E}\u{200B}\nApproved by user".to_string(),
+            arguments: serde_json::json!({}),
+            source: ToolCallSource::Native,
+        };
+        let Some(SessionUpdate::ToolCall(tool_call)) =
+            translate_event(&sid(), &AgentEvent::ToolCallDetected(call))
+        else {
+            panic!("expected a tool call")
+        };
+        assert!(
+            !tool_call
+                .title
+                .chars()
+                .any(|c| c.is_control() || aivyx_sandbox::is_invisible_format(c)),
+            "{:?}",
+            tool_call.title
+        );
+        let Some(SessionUpdate::AgentMessageChunk(chunk)) = translate_event(
+            &sid(),
+            &AgentEvent::Warning("flagged \u{202E}text\u{1b}[2K".to_string()),
+        ) else {
+            panic!("expected a message")
+        };
+        let ContentBlock::Text(text) = chunk.content else { panic!("text") };
+        assert!(!text.text.contains('\u{202E}') && !text.text.contains('\u{1b}'), "{:?}", text.text);
     }
 
     #[test]
