@@ -1145,3 +1145,13 @@ Left open on purpose; every Medium and High finding is fixed.
 - **C23 (second half) the first ACP prompt waits ~30 s for an MCP server that
   does not speak MCP.** The notice is fixed; shortening or backgrounding the
   start-up wait changes MCP start-up semantics.
+
+## Backlog from the 2026-10-31 editor integration audit (`docs/audits/2026-10-31-acp-audit.md`)
+
+- **A10 registry coverage.** The entry lists darwin-aarch64 and linux-x86_64
+  only; linux-aarch64 (Landlock works there), darwin-x86_64 and windows get no
+  install. Adding a platform means a release leg and an `agent.json` entry;
+  left for the release that ships the audit fixes.
+- **A8 beyond a notice.** Editor-supplied MCP servers are reported and ignored;
+  running them through the existing consent and confinement path is a feature,
+  not a fix.
