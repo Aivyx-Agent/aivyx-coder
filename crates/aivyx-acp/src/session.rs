@@ -82,12 +82,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, EmbeddedResourceResource, InitializeRequest,
-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResourceLink, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason,
+    AgentCapabilities, CancelNotification, ContentBlock, EmbeddedResourceResource, Implementation,
+    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, ResourceLink, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
 use agent_client_protocol::{
     Agent as AcpAgentBuilder, Client, ConnectionTo, Responder, Result, Stdio,
@@ -402,6 +402,17 @@ fn terminal_auth_method() -> agent_client_protocol::schema::v1::AuthMethod {
 }
 
 /// The `code`/`plan` modes `session/new` offers.
+/// The `initialize` answer. aivyx-coder speaks protocol version 1 only, so
+/// that is the version it answers with whatever the client asked for (a
+/// client that does not speak it disconnects, as the spec says), and it
+/// says which build this is.
+fn initialize_response(_req: &InitializeRequest) -> InitializeResponse {
+    InitializeResponse::new(ProtocolVersion::V1)
+        .agent_capabilities(AgentCapabilities::new())
+        .auth_methods(vec![terminal_auth_method()])
+        .agent_info(Implementation::new("aivyx-coder", env!("CARGO_PKG_VERSION")))
+}
+
 fn session_modes() -> SessionModeState {
     SessionModeState::new(
         SessionModeId::new(MODE_CODE),
@@ -479,11 +490,7 @@ pub async fn run_unconfigured() -> Result<()> {
         .name("aivyx-coder")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
-                responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new())
-                        .auth_methods(vec![terminal_auth_method()]),
-                )
+                responder.respond(initialize_response(&req))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -660,11 +667,7 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
         .name("aivyx-coder")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _connection| {
-                responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new())
-                        .auth_methods(vec![terminal_auth_method()]),
-                )
+                responder.respond(initialize_response(&req))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1053,6 +1056,18 @@ mod tests {
     #[test]
     fn empty_prompt_yields_empty_text() {
         assert_eq!(extract_prompt_text(&[]), "");
+    }
+
+    #[test]
+    fn initialize_answers_version_1_and_names_the_build() {
+        for asked in [0u16, 1, 7] {
+            let req = InitializeRequest::new(ProtocolVersion::from(asked));
+            let resp = initialize_response(&req);
+            assert_eq!(resp.protocol_version, ProtocolVersion::V1);
+            let info = resp.agent_info.expect("agent info");
+            assert_eq!(info.name, "aivyx-coder");
+            assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     #[test]

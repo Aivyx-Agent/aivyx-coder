@@ -383,7 +383,6 @@ async fn audit_a6_permission_request_names_the_reported_tool_call() {
 /// client's if supported, else the agent's latest). Coder echoes whatever
 /// the client sent.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "A4 not fixed yet"]
 async fn audit_a4_initialize_answers_a_supported_protocol_version() {
     let server = model_server(vec![text_reply("ok")]).await;
     let (home, project) = setup(&server);
