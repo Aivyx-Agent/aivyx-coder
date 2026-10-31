@@ -755,7 +755,7 @@ fn spawn_exit_signal_handler(run_stop: Option<CancellationToken>) {
     });
 }
 
-/// The private directory a headless run keeps its temp files in (the
+/// The private directory a headless or ACP run keeps its temp files in (the
 /// confiner's per-run `$TMPDIR` is created inside it). A headless run ends
 /// in `process::exit`, which skips destructors, so nothing would remove that
 /// directory; this one is removed explicitly on every way out.
@@ -797,7 +797,7 @@ fn main() -> anyhow::Result<()> {
     // Headless: --auto without a terminal on stdout, or asked for.
     let headless = cli.auto.is_some()
         && (cli.headless || !std::io::IsTerminal::is_terminal(&std::io::stdout()));
-    if headless {
+    if headless || cli.acp {
         use_private_temp_dir();
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -917,9 +917,14 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
                 })
             })
         });
-        return aivyx_acp::run(aivyx_acp::AcpSessionConfig { build })
+        let result = aivyx_acp::run(aivyx_acp::AcpSessionConfig { build })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()));
+        // The editor closed the connection: whatever a command left running
+        // goes with it, and the run's private temp directory is removed.
+        aivyx_tools::kill_all_process_groups();
+        remove_headless_temp_dir();
+        return result;
     }
 
     // A first plain launch at a terminal runs the setup wizard instead of

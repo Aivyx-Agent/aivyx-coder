@@ -39,6 +39,35 @@ enum RunOutcome {
     Cancelled,
 }
 
+/// Makes `command`'s child die when aivyx-coder does, even when coder is
+/// killed outright (`SIGKILL` of its process group, as an editor stops an
+/// agent server): `PR_SET_PDEATHSIG` set in the child before `exec`, after
+/// the confiner's own pre-exec steps, with a check that the parent has not
+/// already gone. Each command leads a process group of its own, so the
+/// group kill that reaches coder never reaches it. Linux only; elsewhere a
+/// no-op. Note the signal follows the parent *thread*: spawn from a runtime
+/// worker, not a short-lived blocking-pool thread.
+pub fn die_with_parent(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: only async-signal-safe calls (prctl, getppid) and no
+        // allocation inside the forked child.
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0
+                    || libc::getppid() != parent
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EOWNERDEAD));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
+
 /// Runs an already-built (and already-confined, if applicable) command,
 /// returning formatted output. A non-zero exit is normal `Ok` output — a
 /// failing test/build run is expected, informative verification-loop
@@ -60,6 +89,7 @@ pub async fn run(
     // already does; `NoopConfiner` doesn't), so the group can be killed
     // as a whole instead of only the direct child.
     command.process_group(0);
+    die_with_parent(&mut command);
 
     let mut child = command
         .spawn()
@@ -223,6 +253,7 @@ pub async fn output_in_group(
     mut command: tokio::process::Command,
 ) -> std::io::Result<std::process::Output> {
     command.process_group(0);
+    die_with_parent(&mut command);
     let mut child = command.spawn()?;
     let mut group = ProcessGroup::of(&child);
     let stdout = child.stdout.take();

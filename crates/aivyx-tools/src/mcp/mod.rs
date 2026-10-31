@@ -99,6 +99,7 @@ impl McpClient {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .process_group(0);
+        crate::process::die_with_parent(&mut command);
 
         let mut child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(format!(

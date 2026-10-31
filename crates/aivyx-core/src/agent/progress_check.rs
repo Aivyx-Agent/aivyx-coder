@@ -101,6 +101,7 @@ impl Agent {
             .kill_on_drop(true);
         let mut command = self.executor.confiner().confine(command);
         command.process_group(0);
+        aivyx_tools::die_with_parent(&mut command);
         let mut child = command.spawn().ok()?;
         // Killed on every way out of this function (see `ProcessGroup`).
         let mut group = aivyx_tools::ProcessGroup::of(&child);
