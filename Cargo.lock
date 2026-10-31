@@ -402,6 +402,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "html2text 0.6.0",
+ "html5ever 0.26.0",
  "ignore",
  "libc",
  "reqwest 0.13.4",

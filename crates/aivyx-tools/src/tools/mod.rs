@@ -2,6 +2,7 @@ mod delete_file;
 mod edit_file;
 mod find_references;
 mod generate_svg;
+mod html_text;
 mod generate_svg_completer;
 mod generation_tools;
 mod git_branch;

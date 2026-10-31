@@ -26,12 +26,6 @@ const MAX_FETCH_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// blob, a minified bundle), so longer runs are broken up first.
 const MAX_UNBROKEN_RUN: usize = 4096;
 
-/// Deepest element nesting handed to the HTML converter. `html2text` recurses
-/// per level (a few thousand `<ul><li>` overflow a thread's stack) and slows
-/// down on deep trees; a page nested deeper than this is reduced to its text
-/// with the tags stripped instead.
-const MAX_NESTING_DEPTH: usize = 200;
-
 #[derive(Deserialize, JsonSchema)]
 struct WebFetchArgs {
     /// The URL to fetch, including scheme (e.g. "https://example.com/page").
@@ -222,68 +216,16 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// Readable text for a page. The parsing is bounded and iterative (see
+/// `html_text`); only a page shallow enough goes to `html2text`.
 fn html_to_text(html: &str) -> String {
-    // html2text 0.6.0's `from_read` returns `String` directly (not
-    // `Result<String, _>` as the task brief's starting draft assumed —
-    // see task-3-report.md for the verified signature), so there's no
-    // fallible path here to `unwrap_or_else` against.
-    let html = break_long_runs(html);
-    if nesting_depth(&html) > MAX_NESTING_DEPTH {
-        return strip_tags(&html);
-    }
-    html2text::from_read(html.as_bytes(), 100)
+    super::html_text::page_text(html, |html| {
+        html2text::from_read(break_long_runs(html).as_bytes(), 100)
+    })
 }
 
-const VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
-    "track", "wbr",
-];
-
-/// Calls `f(tag_text)` for each `<...>` tag in `html`, in order.
-fn for_each_tag(html: &str, mut f: impl FnMut(&str)) {
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('>') else { break };
-        f(&after[..end]);
-        rest = &after[end + 1..];
-    }
-}
-
-/// The deepest element nesting in `html`, counted from its tags with a
-/// stack of open element names: an end tag closes the nearest open element of
-/// that name (and what is inside it), and an end tag that matches nothing
-/// closes nothing, as the parser ignores it. Void and self-closing elements
-/// and comments do not nest. It may overestimate, never underestimate.
-fn nesting_depth(html: &str) -> usize {
-    let mut open: Vec<String> = Vec::new();
-    let mut deepest = 0usize;
-    for_each_tag(html, |tag| {
-        if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
-            return;
-        }
-        if let Some(closing) = tag.strip_prefix('/') {
-            let name = closing.trim().to_ascii_lowercase();
-            if let Some(at) = open.iter().rposition(|open| *open == name) {
-                open.truncate(at);
-            }
-            return;
-        }
-        let name = tag
-            .split(|c: char| c.is_whitespace())
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if VOID_ELEMENTS.contains(&name.as_str()) {
-            return;
-        }
-        open.push(name);
-        deepest = deepest.max(open.len());
-    });
-    deepest
-}
-
-/// How long the HTML conversion may run before the plain-text fallback is
+/// Last resort only: the parsing above is bounded by itself and never relies
+/// on this. How long a conversion may run before the plain-text fallback is
 /// used instead.
 const CONVERT_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -311,29 +253,9 @@ async fn convert_html(body: String) -> String {
         None => format!(
             "[the page could not be converted to readable text; showing its text with the \
              tags stripped]\n\n{}",
-            strip_tags(&fallback_source)
+            super::html_text::strip_tags(&fallback_source)
         ),
     }
-}
-
-/// `html` with every tag removed and runs of blank space folded.
-fn strip_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        out.push(' ');
-        let after = &rest[start + 1..];
-        match after.find('>') {
-            Some(end) => rest = &after[end + 1..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Inserts a space into any run of non-whitespace longer than
@@ -620,18 +542,50 @@ mod audit_probes_cpu {
     /// (a base64 blob, minified JSON): 64 KiB takes 0.2 s, 512 KiB 12 s (debug
     /// build). It runs inline in the async `execute`, so neither the fetch
     /// timeout nor Ctrl+C can interrupt it.
+    /// Hostile nesting shapes at the sizes a 4 MiB body allows: the
+    /// conversion function itself must return quickly (no thread to wait
+    /// for), with the page's trailing text still in the result.
     #[test]
-    fn audit_c4c_deeply_nested_markup_is_flattened_not_recursed() {
-        for unit in ["<div>", "<ul><li>", "<ul><li></b></b>", "<div></x>"] {
-            let page = format!("{}deep text", unit.repeat(3000));
+    fn audit_c4c_hostile_nesting_returns_quickly_in_every_shape() {
+        const MIB4: usize = 4 * 1024 * 1024;
+        let fill = |unit: &str, tail: &str| {
+            let mut page = unit.repeat(MIB4 / unit.len());
+            page.push_str(tail);
+            page
+        };
+        let shapes: Vec<(&str, String)> = vec![
+            ("nested div", format!("{}deep text", "<div>".repeat(190_000))),
+            ("ul li", fill("<ul><li>", "deep text")),
+            ("stray end tags", fill("<ul><li></b></b>", "deep text")),
+            ("stray div ends", fill("<div></x>", "deep text")),
+            ("tags in comments", fill("<div><!-- > </div> -->", "deep text")),
+            ("tags in attributes", fill("<div title=\"></div>\">", "deep text")),
+        ];
+        for (name, page) in shapes {
             let start = std::time::Instant::now();
             let text = super::html_to_text(&page);
-            assert!(text.contains("deep text"), "{text:?}");
-            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            let took = start.elapsed();
+            assert!(took < std::time::Duration::from_secs(2), "{name}: {took:?}");
+            assert!(text.len() < 5 * 1024 * 1024, "{name}: {} bytes", text.len());
+            assert!(!text.is_empty(), "{name}");
         }
-        // Ordinary nesting still goes through the converter.
-        let text = super::html_to_text("<ul><li>one</li><li>two</li></ul>");
-        assert!(text.contains("one") && text.contains("two"));
+        // The tail of a page cut at the 2 MiB input cap is reported, not hidden.
+        let text = super::html_to_text(&fill("<p>word</p>", ""));
+        assert!(text.contains("larger than 2 MiB"), "{}", &text[text.len().saturating_sub(200)..]);
+    }
+
+    #[test]
+    fn a_deep_but_honest_page_keeps_its_text_in_order() {
+        let page = format!(
+            "<html><body>{}<p>first</p><p>second</p>{}</body></html>",
+            "<div>".repeat(400),
+            "</div>".repeat(400)
+        );
+        let text = super::html_to_text(&page);
+        let first = text.find("first").expect("first");
+        assert!(first < text.find("second").expect("second"), "{text}");
+        let plain = super::html_to_text("<ul><li>one</li><li>two</li></ul>");
+        assert!(plain.contains("one") && plain.contains("two"));
     }
 
     #[test]
