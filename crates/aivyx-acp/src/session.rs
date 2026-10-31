@@ -83,8 +83,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode,
+    AgentCapabilities, CancelNotification, ContentBlock, EmbeddedResourceResource, InitializeRequest,
+    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResourceLink, SessionId, SessionMode,
     SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
     SetSessionModeResponse, StopReason,
 };
@@ -265,22 +266,90 @@ fn final_stop_reason(cancelled: bool, observed: Option<StopReason>, paused: bool
     })
 }
 
+/// The most embedded-resource text forwarded to the model in one block.
+const MAX_EMBEDDED_CHARS: usize = 100_000;
+
+/// Editor-supplied text shown to the model and the user without control or
+/// invisible format characters.
+fn tidy(text: &str) -> String {
+    aivyx_sandbox::escape_invisible(&text.chars().filter(|c| !c.is_control()).collect::<String>())
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A resource link as a reference the model can follow: a `file://` link
+/// names the path (and the line range an editor puts in the fragment), and
+/// the model opens it with `read_file`, so `deny_paths`, `read_only_paths`
+/// and the outside-project note apply as for any read. The file is not read
+/// here, outside the permission gate.
+fn resource_link_text(link: &ResourceLink) -> String {
+    let name = tidy(&link.name);
+    match link.uri.strip_prefix("file://") {
+        Some(rest) => {
+            let (path, fragment) = match rest.split_once('#') {
+                Some((path, fragment)) => (path, Some(fragment)),
+                None => (rest, None),
+            };
+            let path = tidy(&percent_decode(path));
+            let lines = fragment
+                .map(|f| format!(", {}", tidy(f)))
+                .unwrap_or_default();
+            format!(
+                "[attached file: {name} ({path}{lines}) -- open it with read_file if you need its content]"
+            )
+        }
+        None => format!("[attached link: {name} ({})]", tidy(&link.uri)),
+    }
+}
+
 /// Turns `req.prompt`'s content blocks into the plain text `Agent::run_turn`
-/// expects. Only `ContentBlock::Text` is forwarded — see the Global
-/// Constraints note on v1's text-only scope.
+/// expects. Text goes through as is; a resource link becomes a reference to
+/// the file or URL; embedded text is included (capped) under its URI;
+/// images, audio and binary resources are not forwarded, and a note says so.
 fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
-    let mut text = String::new();
+    let mut parts: Vec<String> = Vec::new();
     let mut dropped_any = false;
     for block in blocks {
         match block {
-            ContentBlock::Text(t) => {
-                if !text.is_empty() {
-                    text.push('\n');
+            ContentBlock::Text(t) => parts.push(t.text.clone()),
+            ContentBlock::ResourceLink(link) => parts.push(resource_link_text(link)),
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(text) => {
+                    let body: String = text.text.chars().take(MAX_EMBEDDED_CHARS).collect();
+                    parts.push(format!(
+                        "[contents of {} attached by the editor]\n{body}\n[end of attached contents]",
+                        tidy(&text.uri)
+                    ));
                 }
-                text.push_str(&t.text);
-            }
+                _ => dropped_any = true,
+            },
             _ => dropped_any = true,
         }
+    }
+    let mut text = String::new();
+    for part in parts {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&part);
     }
     if dropped_any {
         if !text.is_empty() {
@@ -987,10 +1056,10 @@ mod tests {
     }
 
     #[test]
-    fn non_text_block_is_dropped_with_a_trailing_note() {
+    fn an_unsupported_block_is_dropped_with_a_trailing_note() {
         let blocks = vec![
             ContentBlock::Text(TextContent::new("keep me")),
-            ContentBlock::ResourceLink(ResourceLink::new("file.rs", "file:///a/file.rs")),
+            ContentBlock::Image(agent_client_protocol::schema::v1::ImageContent::new("AAAA", "image/png")),
         ];
         assert_eq!(
             extract_prompt_text(&blocks),
@@ -999,15 +1068,28 @@ mod tests {
     }
 
     #[test]
-    fn only_non_text_blocks_yields_just_the_note() {
+    fn a_file_link_becomes_a_reference_with_its_line_range() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("Explain")),
+            ContentBlock::ResourceLink(ResourceLink::new(
+                "main.rs",
+                "file:///a/my%20dir/main.rs#L3:9",
+            )),
+        ];
+        let text = extract_prompt_text(&blocks);
+        assert!(text.starts_with("Explain\n[attached file: main.rs (/a/my dir/main.rs, L3:9)"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        assert!(!text.contains("not forwarded"), "{text}");
+    }
+
+    #[test]
+    fn other_links_and_invisible_characters_are_shown_safely() {
         let blocks = vec![ContentBlock::ResourceLink(ResourceLink::new(
-            "file.rs",
-            "file:///a/file.rs",
+            "doc\u{202E}x",
+            "https://example.com/a\nb",
         ))];
-        assert_eq!(
-            extract_prompt_text(&blocks),
-            "(non-text content in this message was not forwarded)"
-        );
+        let text = extract_prompt_text(&blocks);
+        assert_eq!(text, "[attached link: doc\\u{202e}x (https://example.com/ab)]");
     }
 
     #[test]

@@ -319,7 +319,6 @@ async fn audit_a1_sigterm_kills_the_command_and_cleans_tmp() {
 /// advertise `embeddedContext` (coder doesn't). The model must at least get
 /// the link's URI.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "A2 not fixed yet"]
 async fn audit_a2_a_resource_link_reaches_the_model() {
     let server = model_server(vec![text_reply("ok")]).await;
     let (home, project) = setup(&server);
