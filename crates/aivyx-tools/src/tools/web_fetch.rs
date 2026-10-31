@@ -205,11 +205,8 @@ impl Tool for WebFetchTool {
 
         // The conversion is CPU work: off the async worker, and abandoned
         // (not waited for) when the call is cancelled.
-        let convert = tokio::task::spawn_blocking(move || html_to_text(&body));
         let text = tokio::select! {
-            result = convert => result.map_err(|err| {
-                ToolError::ExecutionFailed(format!("could not convert the page: {err}"))
-            })?,
+            text = convert_html(body) => text,
             _ = ctx.cancellation.cancelled() => {
                 return Err(ToolError::ExecutionFailed("fetch was cancelled".to_string()));
             }
@@ -253,26 +250,70 @@ fn for_each_tag(html: &str, mut f: impl FnMut(&str)) {
     }
 }
 
-/// The deepest element nesting in `html`, counted from its tags (a cheap
-/// estimate: void and self-closing elements and comments do not nest).
+/// The deepest element nesting in `html`, counted from its tags with a
+/// stack of open element names: an end tag closes the nearest open element of
+/// that name (and what is inside it), and an end tag that matches nothing
+/// closes nothing, as the parser ignores it. Void and self-closing elements
+/// and comments do not nest. It may overestimate, never underestimate.
 fn nesting_depth(html: &str) -> usize {
-    let (mut depth, mut deepest) = (0usize, 0usize);
+    let mut open: Vec<String> = Vec::new();
+    let mut deepest = 0usize;
     for_each_tag(html, |tag| {
         if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
             return;
         }
-        if tag.starts_with('/') {
-            depth = depth.saturating_sub(1);
+        if let Some(closing) = tag.strip_prefix('/') {
+            let name = closing.trim().to_ascii_lowercase();
+            if let Some(at) = open.iter().rposition(|open| *open == name) {
+                open.truncate(at);
+            }
             return;
         }
-        let name = tag.split(|c: char| c.is_whitespace()).next().unwrap_or("");
-        if VOID_ELEMENTS.iter().any(|v| name.eq_ignore_ascii_case(v)) {
+        let name = tag
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if VOID_ELEMENTS.contains(&name.as_str()) {
             return;
         }
-        depth += 1;
-        deepest = deepest.max(depth);
+        open.push(name);
+        deepest = deepest.max(open.len());
     });
     deepest
+}
+
+/// How long the HTML conversion may run before the plain-text fallback is
+/// used instead.
+const CONVERT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Stack for the conversion thread: html2text recurses per nesting level.
+const CONVERT_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// `html_to_text` on a thread of its own with a large stack and a deadline.
+/// A panic, a failure to start the thread or a conversion that runs past the
+/// deadline gives the page's text with the tags stripped, plus a note.
+async fn convert_html(body: String) -> String {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let fallback_source = body.clone();
+    let spawned = std::thread::Builder::new()
+        .name("web-fetch-html".to_string())
+        .stack_size(CONVERT_STACK_BYTES)
+        .spawn(move || {
+            let _ = tx.send(html_to_text(&body));
+        });
+    let converted = match spawned {
+        Ok(_) => tokio::time::timeout(CONVERT_DEADLINE, rx).await.ok().and_then(Result::ok),
+        Err(_) => None,
+    };
+    match converted {
+        Some(text) => text,
+        None => format!(
+            "[the page could not be converted to readable text; showing its text with the \
+             tags stripped]\n\n{}",
+            strip_tags(&fallback_source)
+        ),
+    }
 }
 
 /// `html` with every tag removed and runs of blank space folded.
@@ -581,7 +622,7 @@ mod audit_probes_cpu {
     /// timeout nor Ctrl+C can interrupt it.
     #[test]
     fn audit_c4c_deeply_nested_markup_is_flattened_not_recursed() {
-        for unit in ["<div>", "<ul><li>"] {
+        for unit in ["<div>", "<ul><li>", "<ul><li></b></b>", "<div></x>"] {
             let page = format!("{}deep text", unit.repeat(3000));
             let start = std::time::Instant::now();
             let text = super::html_to_text(&page);
