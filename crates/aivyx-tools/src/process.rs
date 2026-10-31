@@ -65,7 +65,11 @@ pub struct ParentDeathGuard {
 /// command running when only the shell is killed. The watcher blocks reading
 /// a pipe whose write end only coder holds (the returned guard): coder dying
 /// closes it, with no polling and no pid to get reused, and it works under
-/// the sandbox, which stops confined processes from signalling coder. The
+/// the sandbox, which stops confined processes from signalling coder.
+/// (The watcher is forked after the confiner's own pre-exec steps, which the
+/// callers have already registered, so it sits in the command's sandbox and
+/// group: a command that deliberately kills it only defeats this cleanup for
+/// the one case of coder being killed outright.) The
 /// watcher closes every other descriptor (the command's pipes and the
 /// spawn's status pipe must not stay open), and it ends with the group when
 /// the command is done. The death signal follows the parent *thread*: spawn
@@ -95,15 +99,24 @@ pub fn die_with_parent(
                     match libc::fork() {
                         -1 => return Err(std::io::Error::last_os_error()),
                         0 => {
-                            for fd in 0..4096 {
-                                if fd != read_fd {
+                            // Keep only the read end, as descriptor 3 (the
+                            // command's pipes and the spawn's status pipe must
+                            // not stay open here); everything else goes.
+                            if read_fd != 3 {
+                                libc::dup2(read_fd, 3);
+                            }
+                            libc::close(0);
+                            libc::close(1);
+                            libc::close(2);
+                            if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
+                                for fd in 4..4096 {
                                     libc::close(fd);
                                 }
                             }
                             let mut byte = 0u8;
                             // Returns 0 (end of file) once coder, the only
                             // holder of the write end, is gone.
-                            while libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) > 0 {}
+                            while libc::read(3, (&mut byte as *mut u8).cast(), 1) > 0 {}
                             libc::killpg(libc::getpgrp(), libc::SIGKILL);
                             libc::_exit(0);
                         }

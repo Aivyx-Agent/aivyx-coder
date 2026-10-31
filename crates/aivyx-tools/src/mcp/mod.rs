@@ -19,6 +19,8 @@ struct Started {
     /// (respawn) or dropped, so helpers the server started go with it.
     /// `None` for a test-wired session with no process behind it.
     _group: Option<crate::process::ProcessGroup>,
+    /// Ends the group's parent-death watcher when this session is dropped.
+    _watch: Option<crate::process::ParentDeathGuard>,
 }
 
 /// Owns one configured MCP server's spawned child process (or, in tests, an
@@ -58,6 +60,7 @@ impl McpClient {
             connection: Arc::new(McpConnection::new(reader, writer)),
             child: None,
             _group: None,
+            _watch: None,
         });
     }
 
@@ -99,7 +102,7 @@ impl McpClient {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .process_group(0);
-        crate::process::die_with_parent(&mut command, false);
+        let watch = crate::process::die_with_parent(&mut command, true);
 
         let mut child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(format!(
@@ -118,6 +121,7 @@ impl McpClient {
             connection: Arc::new(connection),
             child: Some(child),
             _group: Some(group),
+            _watch: watch,
         });
         Ok(())
     }

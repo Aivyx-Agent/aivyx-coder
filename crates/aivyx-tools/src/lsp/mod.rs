@@ -19,6 +19,8 @@ struct Started {
     /// (respawn) or dropped, so helpers the server started go with it.
     /// `None` for a test-wired session with no process behind it.
     _group: Option<crate::process::ProcessGroup>,
+    /// Ends the group's parent-death watcher when this session is dropped.
+    _watch: Option<crate::process::ParentDeathGuard>,
     opened_uris: HashSet<String>,
     next_doc_version: i32,
 }
@@ -78,6 +80,7 @@ impl LspClient {
             connection: Arc::new(Connection::new(reader, writer)),
             child: None,
             _group: None,
+            _watch: None,
             opened_uris: HashSet::new(),
             next_doc_version: 1,
         });
@@ -160,7 +163,7 @@ impl LspClient {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .process_group(0);
-        crate::process::die_with_parent(&mut command, false);
+        let watch = crate::process::die_with_parent(&mut command, true);
 
         let mut child = command.spawn().map_err(|err| {
             ToolError::ExecutionFailed(if err.kind() == std::io::ErrorKind::NotFound {
@@ -210,6 +213,7 @@ impl LspClient {
             connection: Arc::new(connection),
             child: Some(child),
             _group: Some(group),
+            _watch: watch,
             opened_uris: HashSet::new(),
             next_doc_version: 1,
         });
