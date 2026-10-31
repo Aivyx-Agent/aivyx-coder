@@ -472,6 +472,32 @@ fn respond_then_advertise(
 /// are shown as soon as the session opens; information ("using the
 /// server's 32768-token context window") is dropped — drained during the
 /// first prompt, it used to land inside the model's reply.
+/// The start-up notice for MCP servers the editor sent in `session/new`.
+/// They are not started: a server an editor names would run without the
+/// consent and confinement `config.toml` servers get, so the user is told
+/// where to add one instead.
+fn ignored_mcp_servers_notice(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = servers
+        .iter()
+        .map(|server| {
+            let name = serde_json::to_value(server)
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str().map(str::to_string)))
+                .unwrap_or_else(|| "(unnamed)".to_string());
+            tidy(&name)
+        })
+        .collect();
+    Some(format!(
+        "MCP servers sent by the editor were not started ({}): aivyx-coder runs MCP servers only \
+         from its own config.toml, where they are confined and approved -- add them under \
+         [[mcp.servers]] there.",
+        names.join(", ")
+    ))
+}
+
 /// A start-up warning as an agent message: ended by a blank line so the
 /// model's first reply does not run on from it.
 fn startup_warning_text(warning: &str) -> String {
@@ -739,7 +765,10 @@ pub async fn run(config: AcpSessionConfig) -> Result<()> {
                 };
                 *new_session_plan_mode.lock().unwrap() = Some(built.plan_mode.clone());
                 let mut events_rx = built.events_rx;
-                let warnings = startup_warnings(&mut events_rx);
+                let mut warnings = startup_warnings(&mut events_rx);
+                if let Some(notice) = ignored_mcp_servers_notice(&req.mcp_servers) {
+                    warnings.push(notice);
+                }
                 let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
                 // Installs the real prompter behind the `DeferredPrompter`
                 // `ConfirmationGate` has been holding since `build_agent`
@@ -1091,6 +1120,15 @@ mod tests {
     #[test]
     fn empty_prompt_yields_empty_text() {
         assert_eq!(extract_prompt_text(&[]), "");
+    }
+
+    #[test]
+    fn editor_mcp_servers_are_reported_as_ignored() {
+        use agent_client_protocol::schema::v1::{McpServer, McpServerStdio};
+        assert!(ignored_mcp_servers_notice(&[]).is_none());
+        let servers = vec![McpServer::Stdio(McpServerStdio::new("docs\u{200B}", "/bin/true"))];
+        let notice = ignored_mcp_servers_notice(&servers).unwrap();
+        assert!(notice.contains("docs\\u{200b}") && notice.contains("config.toml"), "{notice}");
     }
 
     #[test]
