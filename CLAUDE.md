@@ -81,9 +81,16 @@ Tests fail if a CLI flag or slash command has no section in
    darwin-aarch64 and x86_64-linux-musl archives against their `.sha256`
    files, and run the Linux binary's `--version`.
 4. Update `docs/registry-submission/aivyx-coder/agent.json` (version, URLs,
-   sha256s, `cmd` paths), commit `registry: aivyx-coder vX.Y.Z`, and update
+   sha256s), commit `registry: aivyx-coder vX.Y.Z`, and update
    the registry fork's `aivyx-coder/agent.json` on branch `add-aivyx-coder`
-   (PR 620).
+   (PR 620). The `cmd` paths are version-free
+   (`./aivyx-coder-<target>/aivyx-coder`: the release workflow names the
+   folder inside each archive without the version, only the archive file
+   carries it), so they stay as they are: the registry's hourly
+   auto-updater rewrites only `version`, the archive URLs and the sha256s,
+   and a versioned `cmd` would break the Zed install on the first release
+   after the entry is merged. The v0.6.4 and older archives have the old
+   layout; the first release with this workflow is the first that matches.
 5. After the release ships, record its bench results as the new baseline:
    `coder-bench baseline set <label> --as X.Y.Z --profile models/qwen38-27b.toml`,
    then commit the results and `baselines.json` in the bench repo.

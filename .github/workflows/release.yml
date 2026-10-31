@@ -52,7 +52,11 @@ jobs:
           # expression anyway so it's only ever set on the macOS leg.
           COPYFILE_DISABLE: ${{ matrix.target == 'aarch64-apple-darwin' && '1' || '' }}
         run: |
-          STAGE_NAME="aivyx-coder-${GITHUB_REF_NAME}-${{ matrix.stage_suffix }}"
+          # The archive FILE is named for the version; the folder inside it
+          # is not, so the registry entry's `cmd` (which the registry's
+          # auto-updater never rewrites) stays valid for every release.
+          ARCHIVE_NAME="aivyx-coder-${GITHUB_REF_NAME}-${{ matrix.stage_suffix }}"
+          STAGE_NAME="aivyx-coder-${{ matrix.stage_suffix }}"
           mkdir -p "dist/${STAGE_NAME}"
           cp target/${{ matrix.target }}/release/aivyx-coder "dist/${STAGE_NAME}/aivyx-coder"
           cp README.md LICENSE "dist/${STAGE_NAME}/"
@@ -60,11 +64,11 @@ jobs:
           mkdir -p "dist/${STAGE_NAME}/docs"
           cp -r docs/logos "dist/${STAGE_NAME}/docs/"
           cd dist
-          tar -czf "${STAGE_NAME}.tar.gz" "${STAGE_NAME}"
+          tar -czf "${ARCHIVE_NAME}.tar.gz" "${STAGE_NAME}"
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
+            sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
           else
-            shasum -a 256 "${STAGE_NAME}.tar.gz" > "${STAGE_NAME}.tar.gz.sha256"
+            shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
           fi
 
       - name: Upload artifact
