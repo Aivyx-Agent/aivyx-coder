@@ -249,7 +249,12 @@ impl AcpPrompter {
 #[async_trait]
 impl PermissionPrompter for AcpPrompter {
     async fn prompt(&self, request: &PermissionRequest) -> UserResponse {
-        let call_id = uuid::Uuid::new_v4().to_string();
+        // The model's own tool-call id when the executor set it (the editor
+        // already has a card for that call); a fresh one for prompts that
+        // belong to no tool call.
+        let call_id = aivyx_sandbox::CURRENT_TOOL_CALL_ID
+            .try_with(|id| id.clone())
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let acp_request = permission_request_to_acp_in(
             self.session_id.clone(),
             request,

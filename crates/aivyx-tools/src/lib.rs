@@ -615,7 +615,10 @@ impl ToolExecutor {
         let permission_request = tool.permission_request(&call.arguments, cwd)?;
 
         use aivyx_sandbox::PermissionDecision;
-        match self.gate.check(&permission_request).await {
+        let decision = aivyx_sandbox::CURRENT_TOOL_CALL_ID
+            .scope(call.id.0.clone(), self.gate.check(&permission_request))
+            .await;
+        match decision {
             PermissionDecision::Allow | PermissionDecision::AllowAlways => {}
             PermissionDecision::Deny(reason) => {
                 // The gate's reason (plan mode, deny_paths, user refusal)

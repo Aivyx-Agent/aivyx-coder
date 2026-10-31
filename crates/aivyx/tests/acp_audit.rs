@@ -346,7 +346,6 @@ async fn audit_a2_a_resource_link_reaches_the_model() {
 /// `tool_call` update the agent just sent, so the editor shows a second,
 /// orphaned tool-call entry for the approval.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "A6 not fixed yet"]
 async fn audit_a6_permission_request_names_the_reported_tool_call() {
     let server = model_server(vec![
         tool_reply("call_touch", "run_shell", json!({"command": "true"})),

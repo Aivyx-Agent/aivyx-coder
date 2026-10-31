@@ -614,6 +614,14 @@ pub fn outside_project_for_request(request: &PermissionRequest, project: &Path) 
     outside.then_some("This is outside the project — /undo and checkpoints won't cover it.")
 }
 
+tokio::task_local! {
+    /// The id of the model's tool call whose permission is being decided,
+    /// set by the tool executor around the gate check, so a frontend can
+    /// name that same call in its approval request (the ACP editor then
+    /// shows one entry per call instead of two).
+    pub static CURRENT_TOOL_CALL_ID: String;
+}
+
 /// A command line as a person should read it: each word quoted as one
 /// POSIX shell word when it needs it, so `sh -c 'python3 -m unittest'`
 /// doesn't look like several separate arguments to `sh`. Shared by every
