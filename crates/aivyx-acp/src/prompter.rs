@@ -17,6 +17,7 @@ use async_trait::async_trait;
 const ALLOW_ONCE: &str = "allow_once";
 const ALLOW_ALWAYS: &str = "allow_always";
 const REJECT_ONCE: &str = "reject_once";
+#[cfg(test)]
 const REJECT_ALWAYS: &str = "reject_always";
 
 /// Every `PermissionOption` field is set through its constructor/builder

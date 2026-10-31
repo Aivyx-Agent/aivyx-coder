@@ -101,6 +101,8 @@ struct Acp {
     /// Every line sent (`-> `) and received (`<- `), for the report.
     log: Vec<String>,
     next_id: u64,
+    /// The id `session/new` returned.
+    session_id: String,
 }
 
 impl Acp {
@@ -133,7 +135,7 @@ impl Acp {
                 }
             }
         });
-        Acp { child, stdin, rx, log: Vec::new(), next_id: 1 }
+        Acp { child, stdin, rx, log: Vec::new(), next_id: 1, session_id: String::new() }
     }
 
     fn send_raw(&mut self, line: &str) {
@@ -194,7 +196,9 @@ impl Acp {
     fn new_session(&mut self, cwd: &Path, mcp: Value) -> String {
         let id = self.request("session/new", json!({"cwd": cwd, "mcpServers": mcp}));
         let (resp, _) = self.until_response(id, None, Duration::from_secs(30));
-        resp["result"]["sessionId"].as_str().unwrap_or_else(|| panic!("{resp}")).to_string()
+        let sid = resp["result"]["sessionId"].as_str().unwrap_or_else(|| panic!("{resp}")).to_string();
+        self.session_id = sid.clone();
+        sid
     }
 
     fn kill_group(&mut self) {
@@ -456,7 +460,8 @@ async fn check_malformed_and_unknown_messages() {
 #[tokio::test(flavor = "multi_thread")]
 async fn check_cancel_mid_command() {
     let (mut acp, _server, _home, _project) = running_command("294", None).await;
-    acp.notify("session/cancel", json!({"sessionId": "any"}));
+    let sid = acp.session_id.clone();
+    acp.notify("session/cancel", json!({"sessionId": sid}));
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut stop = Value::Null;
     while let Some(msg) = acp.next(deadline.saturating_duration_since(Instant::now())) {
