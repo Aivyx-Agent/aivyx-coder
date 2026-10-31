@@ -240,7 +240,7 @@ fn kill_matching(pattern: &str) {
 /// approves it, and returns once the command is running.
 async fn running_command(secs: &str, tmpdir: Option<&Path>) -> (Acp, MockServer, tempfile::TempDir, tempfile::TempDir) {
     let server = model_server(vec![
-        tool_reply("call_sleep", "run_shell", json!({"command": format!("sleep {secs}")})),
+        tool_reply("call_sleep", "run_shell", json!({"command": format!("sleep {secs}; true")})),
         text_reply("done"),
     ])
     .await;
@@ -261,7 +261,13 @@ async fn running_command(secs: &str, tmpdir: Option<&Path>) -> (Acp, MockServer,
         assert_ne!(msg["id"], json!(id), "turn ended early: {msg}");
     }
     let pattern = format!("^sleep {secs}$");
-    assert!(!wait_for_pids(&pattern, Duration::from_secs(15)).is_empty(), "sleep never started:\n{}", acp.log.join("\n"));
+    let started = wait_for_pids(&pattern, Duration::from_secs(15));
+    if started.is_empty() {
+        // Show how the tool call ended.
+        let until = Instant::now() + Duration::from_secs(3);
+        while acp.next(until.saturating_duration_since(Instant::now())).is_some() {}
+    }
+    assert!(!started.is_empty(), "sleep never started:\n{}", acp.log.join("\n"));
     (acp, server, home, project)
 }
 

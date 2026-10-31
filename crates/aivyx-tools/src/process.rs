@@ -39,19 +39,50 @@ enum RunOutcome {
     Cancelled,
 }
 
+/// Held by the caller of [`die_with_parent`] for as long as the command's
+/// group should be watched. Dropping it (or aivyx-coder dying, which closes
+/// it) tells the group's watcher to kill the group.
+pub struct ParentDeathGuard {
+    #[cfg(target_os = "linux")]
+    _write_end: std::os::fd::OwnedFd,
+    // Kept open until the guard drops: the command's children are forked
+    // from this process after the pre-exec closure is registered.
+    #[cfg(target_os = "linux")]
+    _read_end: std::os::fd::OwnedFd,
+}
+
 /// Makes `command`'s child die when aivyx-coder does, even when coder is
 /// killed outright (`SIGKILL` of its process group, as an editor stops an
-/// agent server): `PR_SET_PDEATHSIG` set in the child before `exec`, after
-/// the confiner's own pre-exec steps, with a check that the parent has not
-/// already gone. Each command leads a process group of its own, so the
+/// agent server). Each command leads a process group of its own, so the
 /// group kill that reaches coder never reaches it. Linux only; elsewhere a
-/// no-op. Note the signal follows the parent *thread*: spawn from a runtime
-/// worker, not a short-lived blocking-pool thread.
-pub fn die_with_parent(command: &mut tokio::process::Command) {
+/// no-op.
+///
+/// In the child, before `exec` (after the confiner's own pre-exec steps):
+/// `PR_SET_PDEATHSIG` kills the command itself when coder dies (checking the
+/// parent has not already gone). With `watch_group`, a small watcher process
+/// left in the command's group also kills the whole group when coder is
+/// gone, because a shell that did not `exec` its last command leaves that
+/// command running when only the shell is killed. The watcher blocks reading
+/// a pipe whose write end only coder holds (the returned guard): coder dying
+/// closes it, with no polling and no pid to get reused, and it works under
+/// the sandbox, which stops confined processes from signalling coder. The
+/// watcher closes every other descriptor (the command's pipes and the
+/// spawn's status pipe must not stay open), and it ends with the group when
+/// the command is done. The death signal follows the parent *thread*: spawn
+/// from a runtime worker, not a short-lived blocking-pool thread.
+pub fn die_with_parent(
+    command: &mut tokio::process::Command,
+    watch_group: bool,
+) -> Option<ParentDeathGuard> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: only async-signal-safe calls (prctl, getppid) and no
-        // allocation inside the forked child.
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        let mut fds = [0 as libc::c_int; 2];
+        let watch = watch_group && unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0;
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: the closure runs in the forked child and uses only
+        // async-signal-safe calls (prctl, getppid, fork, close, read, killpg,
+        // _exit), with no allocation.
         let parent = unsafe { libc::getpid() };
         unsafe {
             command.pre_exec(move || {
@@ -60,12 +91,45 @@ pub fn die_with_parent(command: &mut tokio::process::Command) {
                 {
                     return Err(std::io::Error::from_raw_os_error(libc::EOWNERDEAD));
                 }
+                if watch {
+                    match libc::fork() {
+                        -1 => return Err(std::io::Error::last_os_error()),
+                        0 => {
+                            for fd in 0..4096 {
+                                if fd != read_fd {
+                                    libc::close(fd);
+                                }
+                            }
+                            let mut byte = 0u8;
+                            // Returns 0 (end of file) once coder, the only
+                            // holder of the write end, is gone.
+                            while libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) > 0 {}
+                            libc::killpg(libc::getpgrp(), libc::SIGKILL);
+                            libc::_exit(0);
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(())
             });
         }
+        if watch {
+            // SAFETY: both descriptors were just created by pipe2 and are
+            // owned only here.
+            return Some(unsafe {
+                ParentDeathGuard {
+                    _write_end: OwnedFd::from_raw_fd(write_fd),
+                    _read_end: OwnedFd::from_raw_fd(read_fd),
+                }
+            });
+        }
+        None
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = command;
+    {
+        let _ = (command, watch_group);
+        None
+    }
 }
 
 /// Runs an already-built (and already-confined, if applicable) command,
@@ -89,7 +153,7 @@ pub async fn run(
     // already does; `NoopConfiner` doesn't), so the group can be killed
     // as a whole instead of only the direct child.
     command.process_group(0);
-    die_with_parent(&mut command);
+    let _watch = die_with_parent(&mut command, true);
 
     let mut child = command
         .spawn()
@@ -253,7 +317,7 @@ pub async fn output_in_group(
     mut command: tokio::process::Command,
 ) -> std::io::Result<std::process::Output> {
     command.process_group(0);
-    die_with_parent(&mut command);
+    let _watch = die_with_parent(&mut command, true);
     let mut child = command.spawn()?;
     let mut group = ProcessGroup::of(&child);
     let stdout = child.stdout.take();
@@ -734,6 +798,37 @@ warning: `vaops` (test \"api\") generated 1 warning\n";
             .unwrap();
         assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_command_with_the_parent_death_watcher_starts_and_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run(sh("sleep 0.3; echo ran", dir.path()), Duration::from_secs(10), Default::default())
+            .await;
+        let text = format!("{out:?}");
+        assert!(text.contains("ran"), "{text}");
+    }
+
+    /// The guard is how aivyx-coder's own death reaches the group (its fds
+    /// close when it dies): dropping it must kill a command whose shell did
+    /// not `exec` its last program, the grandchild included.
+    #[tokio::test]
+    async fn dropping_the_guard_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = sh("sleep 297; true", dir.path());
+        command.process_group(0);
+        let guard = die_with_parent(&mut command, true).expect("a watcher on Linux");
+        let mut child = command.spawn().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(guard);
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("the shell was not killed")
+            .unwrap();
+        assert!(!status.success());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let left = std::process::Command::new("pgrep").args(["-f", "^sleep 297$"]).output().unwrap();
+        assert!(left.stdout.is_empty(), "the grandchild survived");
     }
 
     #[tokio::test]

@@ -208,7 +208,8 @@ impl Agent {
         // Own process group, so everything the test run started can be
         // killed with it (see `aivyx_tools::ProcessGroup`).
         command.process_group(0);
-        aivyx_tools::die_with_parent(&mut command);
+        // Held until this function ends: dropping it ends the group's watcher.
+        let _watch = aivyx_tools::die_with_parent(&mut command, true);
         let sandboxed = aivyx_sandbox::is_sandboxed(&command);
 
         let started = Instant::now();
