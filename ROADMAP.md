@@ -16,11 +16,9 @@ implementation plan is tracked in `docs/superpowers/specs/` and
 
 All planned phases and the capability-gap, Nonagon team, ACP, MCP-server,
 packs and routing work are shipped and live-verified; see the archived log
-for each item,. The
+for each item. The
 audits of 2026-10-28 and 2026-10-31 fixed every High and Medium finding;
 what they left open is in the last two backlog sections below.
-
-every item above.
 
 ## Backlog — capability opportunities, not yet scheduled
 
