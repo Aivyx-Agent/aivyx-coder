@@ -251,14 +251,92 @@ fn cancelled_notice_reports_iterations() {
     assert!(message.contains('2'));
 }
 
+fn review(rounds: u32) -> FinalReview {
+    FinalReview {
+        enabled: true,
+        rounds,
+        min_budget: Duration::from_secs(600),
+        fresh_context: false,
+    }
+}
+
 #[test]
 fn a_final_review_runs_once_when_the_goal_is_first_reached() {
-    let mut reviewed = false;
-    assert_eq!(after_goal(false, &mut reviewed), None);
-    assert!(!reviewed);
-    assert_eq!(after_goal(true, &mut reviewed).as_deref(), Some(FINAL_REVIEW_MESSAGE));
-    assert!(reviewed);
-    assert_eq!(after_goal(true, &mut reviewed), None, "only once");
+    let plenty = Duration::from_secs(3600);
+    let mut off = ReviewState::new(&FinalReview { enabled: false, ..review(1) });
+    assert_eq!(after_goal(&mut off, plenty), None);
+    assert_eq!(off.ran, 0);
+    assert!(!off.skipped_for_budget);
+    let mut state = ReviewState::new(&review(1));
+    assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
+    assert_eq!(state.ran, 1);
+    assert_eq!(after_goal(&mut state, plenty), None, "only once");
+}
+
+#[test]
+fn final_review_rounds_send_the_review_that_many_times() {
+    let plenty = Duration::from_secs(3600);
+    let mut state = ReviewState::new(&review(2));
+    assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
+    assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
+    assert_eq!(after_goal(&mut state, plenty), None);
+    assert_eq!(state.ran, 2);
+    assert!(!state.skipped_for_budget);
+    let mut none = ReviewState::new(&review(0));
+    assert_eq!(after_goal(&mut none, plenty), None, "zero rounds is off");
+    assert!(!none.skipped_for_budget);
+}
+
+#[test]
+fn a_review_is_skipped_when_too_little_time_is_left() {
+    let mut state = ReviewState::new(&review(2));
+    assert_eq!(after_goal(&mut state, Duration::from_secs(599)), None);
+    assert!(state.skipped_for_budget);
+    assert_eq!(state.ran, 0);
+    assert_eq!(after_goal(&mut state, Duration::from_secs(3600)), None, "a skip ends the review");
+    // Enough time for the first round, not the second.
+    let mut state = ReviewState::new(&review(2));
+    assert!(after_goal(&mut state, Duration::from_secs(600)).is_some());
+    assert_eq!(after_goal(&mut state, Duration::from_secs(10)), None);
+    assert_eq!(state.ran, 1);
+    assert!(state.skipped_for_budget);
+}
+
+#[test]
+fn the_review_message_is_a_general_checklist() {
+    for item in [
+        "field by field",
+        "malformed or missing input",
+        "boundary and impossible values",
+        "documented defaults and limits",
+        "content type",
+        "status codes",
+        "earlier parts of the task",
+        "existing tests",
+        "Fix each mismatch with a test",
+        "change nothing",
+    ] {
+        assert!(FINAL_REVIEW_MESSAGE.contains(item), "missing: {item}");
+    }
+    // General engineering practice, never anything from one benchmark case.
+    let lower = FINAL_REVIEW_MESSAGE.to_lowercase();
+    for name in ["ckl", "fltplan", "vaops", "recipe", "bughunt", "bug hunt"] {
+        assert!(!lower.contains(name), "names a benchmark case: {name}");
+    }
+}
+
+#[test]
+fn files_named_in_a_goal_are_found() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("BRIEF.md"), "x").unwrap();
+    std::fs::create_dir(dir.path().join("docs")).unwrap();
+    std::fs::write(dir.path().join("docs/api.md"), "x").unwrap();
+    let goal = "Build the app in `BRIEF.md`, following docs/api.md (see BRIEF.md). \
+                Use e.g. JSON; ignore missing.md and http://example.com/a.md.";
+    assert_eq!(
+        crate::agent::files_named_in(goal, dir.path()),
+        ["BRIEF.md", "docs/api.md"]
+    );
 }
 
 #[test]
@@ -439,7 +517,7 @@ fn run_with(tasks: Vec<Task>, max_iterations: u32) -> AutonomousRun {
         final_checks: Vec::new(),
         read_only_paths: Vec::new(),
         report: None,
-        final_review: false,
+        final_review: FinalReview::default(),
         model: RunModel::default(),
     }
 }
@@ -598,4 +676,184 @@ fn audit_c2_report_through_a_planted_symlink_does_not_clobber_the_target() {
         "ssh-ed25519 AAAA-ORIGINAL user@host\n",
         "the report overwrote the file the symlink pointed at"
     );
+}
+
+// ---- the final review over a real repository ----
+
+async fn init_git_repo(dir: &Path) {
+    for argv in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.name", "test"],
+        vec!["config", "user.email", "test@test.invalid"],
+        vec!["add", "-A"],
+        vec!["commit", "-q", "-m", "initial"],
+    ] {
+        tokio::process::Command::new("git").args(&argv).current_dir(dir).output().await.unwrap();
+    }
+}
+
+fn write_call(id: &str, path: &str, content: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCallComplete(aivyx_types::ToolCall {
+            id: aivyx_types::ToolCallId(id.to_string()),
+            name: "write_file".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": content }),
+            source: aivyx_types::ToolCallSource::Native,
+        }),
+        StreamEvent::Done { finish_reason: FinishReason::ToolCalls },
+    ]
+}
+
+/// Denies reads of any path ending in `secret.txt`, as `deny_paths` does.
+struct DenySecrets;
+
+#[async_trait::async_trait]
+impl PermissionGate for DenySecrets {
+    async fn check(&self, request: &PermissionRequest) -> PermissionDecision {
+        match &request.target {
+            aivyx_sandbox::PermissionTarget::Path(path) if path.ends_with("secret.txt") => {
+                PermissionDecision::Deny(Some("denied by deny_paths".to_string()))
+            }
+            _ => PermissionDecision::Allow,
+        }
+    }
+}
+
+/// An agent over the git repository at `dir` with read/write tools and a
+/// passing `[verification] command` that prints `VERIFY-MARKER`, driven
+/// through `run` with `responses`. Returns the agent for inspection.
+async fn drive_in_repo(dir: &Path, responses: Vec<Vec<StreamEvent>>, run: &AutonomousRun) -> (Agent, RunEnd) {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(aivyx_tools::ReadFileTool));
+    registry.register(Arc::new(aivyx_tools::WriteFileTool));
+    registry.register(Arc::new(aivyx_tools::RunCommandTool::new(vec![aivyx_tools::CommandSpec {
+        name: "verify".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "echo VERIFY-MARKER".to_string()],
+        timeout: Duration::from_secs(5),
+    }])));
+    let mut executor = ToolExecutor::new(registry, Arc::new(DenySecrets), Arc::new(NoopConfiner));
+    executor.set_checkpointer_at(
+        dir.to_path_buf(),
+        vec![],
+        Arc::new(aivyx_tools::GitCheckpointer::detect(dir, vec![]).await.unwrap()),
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut agent = Agent::new(
+        Arc::new(ScriptedBackend { responses: Mutex::new(responses.into()) }),
+        executor,
+        "system",
+        crate::AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        Arc::clone(&run.tasks),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    agent.set_verification("verify".to_string(), 1);
+    let active = Mutex::new(None);
+    let end = drive(&mut agent, run, dir, &CancellationToken::new(), &active, &mut |_| {}).await;
+    (agent, end)
+}
+
+#[tokio::test]
+async fn a_fresh_context_review_starts_from_the_goal_files_diff_and_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("BRIEF.md"), "SPEC-MARKER: the API returns JSON\n").unwrap();
+    std::fs::write(cwd.join("secret.txt"), "SECRET-MARKER\n").unwrap();
+    init_git_repo(&cwd).await;
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.goal = "Build the app in BRIEF.md; the key is in secret.txt.".to_string();
+    run.max_duration = Duration::from_secs(3600);
+    let out = tempfile::tempdir().unwrap();
+    run.report = Some(out.path().join("run.json"));
+    run.final_review = FinalReview { fresh_context: true, ..review(1) };
+    let (agent, end) = drive_in_repo(
+        &cwd,
+        vec![
+            write_call("c1", "app.rs", "DIFF-MARKER\n"),
+            text("OLD-CONVERSATION-MARKER done"),
+            text("Reviewed; everything matches."),
+        ],
+        &run,
+    )
+    .await;
+    assert_eq!(end.outcome, Outcome::GoalAchieved, "{}", end.notice);
+    assert_eq!(end.iterations, 2);
+
+    let history = agent.history_snapshot();
+    let all: String = history.iter().map(|m| m.text_content()).collect::<Vec<_>>().join("\n");
+    assert!(!all.contains("OLD-CONVERSATION-MARKER"), "the earlier conversation was kept: {all}");
+    assert_eq!(history.len(), 2, "one user message and the reply: {history:#?}");
+    assert_eq!(history[0].role, aivyx_types::Role::User);
+    let opening = history[0].text_content();
+    for marker in [
+        run.goal.as_str(),
+        "SPEC-MARKER: the API returns JSON",
+        "DIFF-MARKER",
+        "app.rs",
+        "VERIFY-MARKER",
+        FINAL_REVIEW_MESSAGE,
+    ] {
+        assert!(opening.contains(marker), "missing {marker:?} in:\n{opening}");
+    }
+    assert!(!opening.contains("SECRET-MARKER"), "a denied file was read: {opening}");
+    // Nothing else about the run was reset.
+    assert_eq!(run.tasks.lock().unwrap().len(), 1);
+
+    let report_path = run.report.as_ref().unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
+    assert_eq!(report["final_review"]["ran"], 1);
+    assert_eq!(report["final_review"]["skipped_for_budget"], false);
+    assert_eq!(report["final_review"]["changed_files"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn the_report_lists_the_files_the_review_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("README.md"), "x\n").unwrap();
+    init_git_repo(&cwd).await;
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.max_duration = Duration::from_secs(3600);
+    let out = tempfile::tempdir().unwrap();
+    run.report = Some(out.path().join("run.json"));
+    run.final_review = review(1);
+    let (agent, end) = drive_in_repo(
+        &cwd,
+        vec![
+            write_call("c1", "app.rs", "first\n"),
+            text("done"),
+            write_call("c2", "fix.rs", "fixed\n"),
+            text("fixed a mismatch"),
+        ],
+        &run,
+    )
+    .await;
+    assert_eq!(end.outcome, Outcome::GoalAchieved, "{}", end.notice);
+    assert!(
+        agent.history_snapshot().iter().any(|m| m.text_content().contains("done")),
+        "without fresh_context the conversation is kept"
+    );
+    let report_path = run.report.as_ref().unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(report_path).unwrap()).unwrap();
+    assert_eq!(report["final_review"]["ran"], 1);
+    assert_eq!(report["final_review"]["changed_files"], serde_json::json!(["fix.rs"]));
+}
+
+#[tokio::test]
+async fn a_review_with_too_little_time_left_is_skipped_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.report = Some(dir.path().join("run.json"));
+    // run_with gives the run 60 s, under the 600 s minimum.
+    run.final_review = review(1);
+    let (end, _) = drive_with(scripted(&["Done.", "never sent"]), &run, &CancellationToken::new()).await;
+    assert_eq!(end.iterations, 1);
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("run.json")).unwrap()).unwrap();
+    assert_eq!(report["final_review"]["ran"], 0);
+    assert_eq!(report["final_review"]["skipped_for_budget"], true);
 }

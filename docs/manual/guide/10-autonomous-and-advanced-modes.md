@@ -76,11 +76,35 @@ The time limit is exact: a turn still running when it passes is stopped,
 the same way Ctrl+C stops it, and the run reports the budget exhausted.
 
 **A last review (experimental).** With `final_review = true` under
-`[autonomous]`, the first time the goal is reached the model gets one more
-turn. It is asked to check the code against the task's spec field by field
-(names, types, status codes, `null` versus left out) and fix any mismatch,
-with a test. That turn counts against `max_iterations`, and it is skipped
-on the last one. It is off by default while we measure whether it helps.
+`[autonomous]`, when the goal is reached the model gets a review turn. It
+is asked to read the code and check it against the task's spec as a
+reviewer would: every request and response field by field (names, types,
+status codes, `null` versus left out); malformed or missing input getting
+the documented client error rather than a server error; boundary and
+impossible values; documented defaults and limits; response formats and
+content types; and that earlier behaviour and the existing tests still
+work. It fixes each mismatch with a test, or says everything matches and
+changes nothing. It is off by default while we measure whether it helps.
+
+```toml
+[autonomous]
+final_review = true
+final_review_rounds = 1             # review turns, one each time the goal is reached
+final_review_min_budget_secs = 600  # skip a review with less time than this left
+final_review_fresh_context = false  # start each review from a fresh conversation
+```
+
+Each review turn counts against `max_iterations`, and none is sent on the
+last iteration or with less than `final_review_min_budget_secs` of
+`max_duration_secs` left, so a review can't be cut off halfway through a
+fix; the transcript and `--report` say when one was skipped. With
+`final_review_fresh_context = true`, a review turn starts without the
+run's long history: its message holds the goal, up to four files the goal
+names (read the way `read_file` reads them, so `deny_paths` applies; each
+cut at 64 KiB), the diff since the run started, and the end of the last
+verification output. Only the conversation is replaced: the task list,
+approvals, checkpoints, plan mode and the prompt-injection guard all carry
+on as before.
 
 **What the run reports.** The model writes its own final answer, and it can
 be wrong. In the build tests, models said fields were `null` when they

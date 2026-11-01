@@ -31,6 +31,17 @@ pub struct ChangedFile {
     pub read_only: bool,
 }
 
+/// `[autonomous] final_review` in `--report`: how many review turns ran,
+/// whether one was skipped for lack of time or iterations, and the files
+/// changed from the first review turn on (relative to the repository root,
+/// generated files left out).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FinalReviewFacts {
+    pub ran: u32,
+    pub skipped_for_budget: bool,
+    pub changed_files: Vec<String>,
+}
+
 /// What the stop notice and the report say beyond the stop reason.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunFacts {
@@ -89,6 +100,7 @@ pub struct RunReport<'a> {
     /// Tool-call checkpoints during the run, and how many failed.
     pub checkpoints: u32,
     pub checkpoint_failures: u32,
+    pub final_review: &'a FinalReviewFacts,
 }
 
 /// The JSON shape: `RunReport` flattened, with the read-only files that
@@ -114,6 +126,7 @@ struct ReportJson<'a> {
     peak_context_tokens: u32,
     checkpoints: u32,
     checkpoint_failures: u32,
+    final_review: &'a FinalReviewFacts,
     /// Files in `read_only_paths` that changed anyway (a command can change
     /// what the file tools may not).
     read_only_touched: Vec<&'a str>,
@@ -223,6 +236,7 @@ impl RunReport<'_> {
             peak_context_tokens: self.usage.peak_prompt_tokens,
             checkpoints: self.checkpoints,
             checkpoint_failures: self.checkpoint_failures,
+            final_review: self.final_review,
             read_only_touched: self
                 .changed_files
                 .iter()
@@ -304,6 +318,11 @@ mod tests {
             file("src/main.rs", "modified", 10, 2, false),
             file("BRIEF.md", "modified", 1, 1, true),
         ];
+        let review = FinalReviewFacts {
+            ran: 2,
+            skipped_for_budget: false,
+            changed_files: vec!["src/main.rs".into()],
+        };
         let report = RunReport {
             report_version: REPORT_VERSION,
             coder_version: "0.6.3",
@@ -326,6 +345,7 @@ mod tests {
             },
             checkpoints: 30,
             checkpoint_failures: 1,
+            final_review: &review,
         };
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(json["report_version"], 1);
@@ -350,6 +370,14 @@ mod tests {
         assert_eq!(json["checkpoints"], 30);
         assert_eq!(json["checkpoint_failures"], 1);
         assert_eq!(json["read_only_touched"], serde_json::json!(["BRIEF.md"]));
+        assert_eq!(
+            json["final_review"],
+            serde_json::json!({
+                "ran": 2,
+                "skipped_for_budget": false,
+                "changed_files": ["src/main.rs"],
+            })
+        );
     }
 
     #[test]

@@ -1039,7 +1039,12 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
         final_checks: settings.verification.final_checks.clone(),
         read_only_paths: settings.permissions.resolved_read_only_paths(&built.cwd),
         report: cli.report.clone(),
-        final_review: settings.autonomous.final_review,
+        final_review: aivyx_core::autonomous::FinalReview {
+            enabled: settings.autonomous.final_review,
+            rounds: settings.autonomous.final_review_rounds,
+            min_budget: Duration::from_secs(settings.autonomous.final_review_min_budget_secs),
+            fresh_context: settings.autonomous.final_review_fresh_context,
+        },
         model: aivyx_core::autonomous::RunModel {
             model: settings.backend.model.clone(),
             base_url: settings.backend.base_url.clone(),

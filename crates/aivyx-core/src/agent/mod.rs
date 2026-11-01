@@ -27,6 +27,7 @@ use crate::undo::TurnMark;
 
 mod change_commands;
 mod progress_check;
+mod review;
 use progress_check::kept_edits_notice;
 mod session_commands;
 mod test_command;
@@ -36,6 +37,8 @@ mod types;
 mod undo_commands;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
+#[cfg(test)]
+pub(crate) use review::files_named_in;
 use types::{AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig};
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from

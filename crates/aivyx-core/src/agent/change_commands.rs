@@ -407,7 +407,7 @@ impl Agent {
     /// `git diff base now`, without the sections of untracked generated
     /// files. When one is hidden, the visible paths are diffed by name,
     /// in chunks so a large change set never overflows the argument list.
-    async fn visible_diff(&self, cwd: &Path, base: &str, now: &str) -> Result<String, String> {
+    pub(super) async fn visible_diff(&self, cwd: &Path, base: &str, now: &str) -> Result<String, String> {
         const DIFF: [&str; 6] = [
             "-c",
             "core.quotePath=false",

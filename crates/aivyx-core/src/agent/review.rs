@@ -1,0 +1,271 @@
+//! The agent's side of `[autonomous] final_review`: the worktree snapshots
+//! the report's review changes are measured between, and the fresh context
+//! a review turn can start from (`final_review_fresh_context`).
+
+use std::path::Path;
+
+use aivyx_types::{ToolCall, ToolCallId, ToolCallSource, ToolOutput};
+use tokio_util::sync::CancellationToken;
+
+use super::Agent;
+
+/// At most this many files named in the goal go into a fresh review context.
+const REVIEW_FILES: usize = 4;
+/// Each of those files is cut at this many bytes.
+const REVIEW_FILE_CAP: usize = 64 * 1024;
+/// The diff since the run started is cut at this many bytes.
+const REVIEW_DIFF_CAP: usize = 64 * 1024;
+/// The last verification output keeps at most its last this many bytes
+/// (a test runner's summary comes last).
+const REVIEW_VERIFICATION_CAP: usize = 16 * 1024;
+/// `read_file` calls per named file, at most (each returns up to
+/// `aivyx_tools::MAX_READ_CHARS` characters).
+const READS_PER_FILE: usize = 16;
+
+/// What a review turn started from a fresh context sees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReviewContext {
+    pub goal: String,
+    /// `(path as named in the goal, contents)`, read through `read_file`.
+    pub files: Vec<(String, String)>,
+    /// The diff since the run started; `None` without a starting snapshot
+    /// (not a git repository).
+    pub diff: Option<String>,
+    /// The last full `[verification] command` run's output, if one ran.
+    pub last_verification: Option<String>,
+}
+
+/// The files `goal` names, in order, each once: words with a `.` or `/` in
+/// them (quotes, brackets and sentence punctuation stripped) that are files
+/// under `cwd`. URLs are left out. At most [`REVIEW_FILES`].
+pub(crate) fn files_named_in(goal: &str, cwd: &Path) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in goal.split_whitespace() {
+        let word = word
+            .trim_matches(|c: char| "`'\"()[]{}<>,;:!?*".contains(c))
+            .trim_end_matches('.');
+        if word.is_empty()
+            || word.contains("://")
+            || !(word.contains('.') || word.contains('/'))
+            || found.iter().any(|f| f == word)
+        {
+            continue;
+        }
+        if aivyx_tools::resolve(cwd, word).is_file() {
+            found.push(word.to_string());
+            if found.len() == REVIEW_FILES {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// `text` cut to at most `max` bytes at a char boundary, keeping the start.
+fn head(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n… (cut at {max} bytes)", &text[..cut])
+}
+
+/// `text` cut to at most `max` bytes at a char boundary, keeping the end.
+fn tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("… (only the last {max} bytes)\n{}", &text[start..])
+}
+
+/// A `read_file` result split into its text and, when the file goes on,
+/// the `offset` its closing note says to read from next.
+fn split_read_note(output: &str) -> (&str, Option<usize>) {
+    let at = output
+        .rfind("\n[read_file: ")
+        .or_else(|| output.starts_with("[read_file: ").then_some(0));
+    let Some(at) = at else {
+        return (output, None);
+    };
+    let note = &output[at..];
+    if !note.trim_end().ends_with(']') {
+        return (output, None);
+    }
+    let next = note
+        .split_once("pass offset=")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse().ok());
+    (&output[..at], next)
+}
+
+impl Agent {
+    /// Snapshots the worktree now and returns the commit oid, or `None`
+    /// without a checkpointer (not a git repository) or when git fails.
+    pub(crate) async fn snapshot_worktree(&self, label: &str) -> Option<String> {
+        self.undo_snapshot(label).await.map(|(_, oid)| oid)
+    }
+
+    /// The files that differ between the snapshot `oid` and the worktree
+    /// now, generated files left out. `None` when git fails.
+    pub(crate) async fn changed_paths_since(&self, oid: &str) -> Option<Vec<String>> {
+        let root = self.executor.checkpoint_cwd()?.to_path_buf();
+        let now = self.snapshot_worktree("final review end").await?;
+        let changes = self.changes_between(&root, oid, &now).await?;
+        Some(changes.into_iter().map(|c| c.path).collect())
+    }
+
+    /// The diff between `mark_run_start`'s snapshot and the worktree now,
+    /// generated files left out. `None` without a starting snapshot or when
+    /// git fails.
+    pub(crate) async fn diff_since_run_start(&self) -> Option<String> {
+        let before = self.run_start_oid.as_deref()?;
+        let root = self.executor.checkpoint_cwd()?.to_path_buf();
+        let now = self.snapshot_worktree("final review diff").await?;
+        self.visible_diff(&root, before, &now).await.ok()
+    }
+
+    /// Reads `path` the way the model's own `read_file` call would — through
+    /// `ToolExecutor::dispatch`, so the permission gate (and with it
+    /// `deny_paths`) decides — page by page up to [`REVIEW_FILE_CAP`].
+    /// Each page is scanned for prompt injection like any tool output.
+    /// `None` when the read is refused or fails.
+    async fn read_for_review(&mut self, path: &str, cwd: &Path) -> Option<String> {
+        let mut text = String::new();
+        let mut offset = 1usize;
+        for _ in 0..READS_PER_FILE {
+            self.synthetic_seq += 1;
+            let call = ToolCall {
+                id: ToolCallId(format!("final-review-read-{}", self.synthetic_seq)),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": path, "offset": offset }),
+                source: ToolCallSource::AutoVerification,
+            };
+            let result = self.executor.dispatch(call, cwd, CancellationToken::new()).await;
+            let ToolOutput::Ok(output) = result.output else {
+                break;
+            };
+            if let Some(finding) =
+                aivyx_sandbox::scan_for_injection_markers(&output, &format!("read_file: {path}"))
+            {
+                self.injection_taint.flag(finding);
+            }
+            let (body, next) = split_read_note(&output);
+            text.push_str(body);
+            match next {
+                Some(n) if n > offset && text.len() < REVIEW_FILE_CAP => offset = n,
+                _ => break,
+            }
+        }
+        (!text.is_empty()).then(|| head(&text, REVIEW_FILE_CAP))
+    }
+
+    /// Gathers what a fresh-context review turn starts from: the goal, the
+    /// files it names (read through the gate, size-capped), the diff since
+    /// the run started, and the last verification output.
+    pub(crate) async fn review_context(&mut self, goal: &str, cwd: &Path) -> ReviewContext {
+        let mut files = Vec::new();
+        for path in files_named_in(goal, cwd) {
+            if let Some(text) = self.read_for_review(&path, cwd).await {
+                files.push((path, text));
+            }
+        }
+        let diff = self.diff_since_run_start().await.map(|diff| {
+            if let Some(finding) =
+                aivyx_sandbox::scan_for_injection_markers(&diff, "final review diff")
+            {
+                self.injection_taint.flag(finding);
+            }
+            head(&diff, REVIEW_DIFF_CAP)
+        });
+        ReviewContext {
+            goal: goal.to_string(),
+            files,
+            diff,
+            last_verification: self
+                .last_full_verification_output
+                .as_deref()
+                .map(|output| tail(output, REVIEW_VERIFICATION_CAP)),
+        }
+    }
+
+    /// Sets the conversation aside for a fresh-context review turn and
+    /// returns the text that opens its user message (the caller appends the
+    /// review request, so the turn is a single user message and chat
+    /// templates that require alternating roles still work).
+    ///
+    /// Only the conversation history changes. The system prompt is built
+    /// per request and is kept, and so is everything else: the task list,
+    /// the permission gate and its approvals, checkpoints and the `/undo`
+    /// ledger, the injection taint, plan mode, the autonomous goal,
+    /// verification state and usage counters. The review needs the same
+    /// rules and the same run, just without the run's long history.
+    pub(crate) fn replace_history_for_review(&mut self, context: ReviewContext) -> String {
+        self.history.clear();
+        let mut text = String::from(
+            "The conversation so far has been set aside so you can review the work with fresh \
+             eyes. Here is what you need; read any other file you want.\n\n## The goal\n\n",
+        );
+        text.push_str(&context.goal);
+        for (path, contents) in &context.files {
+            text.push_str(&format!(
+                "\n\n## {path} (named in the goal)\n\n----- begin {path} -----\n{contents}"
+            ));
+            if !contents.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!("----- end {path} -----"));
+        }
+        text.push_str("\n\n## Changes since the run started\n\n");
+        match context.diff.as_deref() {
+            None => text.push_str("(not available: no snapshot from the run's start)"),
+            Some(diff) if diff.trim().is_empty() => text.push_str("(no changes)"),
+            Some(diff) => {
+                text.push_str("----- begin diff -----\n");
+                text.push_str(diff);
+                if !diff.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str("----- end diff -----");
+            }
+        }
+        if let Some(output) = &context.last_verification {
+            text.push_str("\n\n## The last verification run\n\n----- begin output -----\n");
+            text.push_str(output);
+            if !output.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str("----- end output -----");
+        }
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_file_note_gives_the_next_offset() {
+        let page = "a\nb\n\n[read_file: lines 1-2 of 9 — pass offset=3 to read on, or grep for the part you need]";
+        assert_eq!(split_read_note(page), ("a\nb\n", Some(3)));
+        assert_eq!(split_read_note("whole file\n"), ("whole file\n", None));
+        let last = "x\n\n[read_file: lines 8-9 of 9]";
+        assert_eq!(split_read_note(last), ("x\n", None));
+        assert_eq!(split_read_note("[read_file: the file has 3 lines — nothing at line 9]"), ("", None));
+    }
+
+    #[test]
+    fn caps_keep_the_right_end_on_char_boundaries() {
+        assert_eq!(head("abc", 5), "abc");
+        assert!(head("ééé", 3).starts_with("é\n… (cut"));
+        assert!(tail("ééé", 3).ends_with("\né"));
+        assert_eq!(tail("abc", 3), "abc");
+    }
+}

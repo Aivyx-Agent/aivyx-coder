@@ -136,11 +136,25 @@ pub struct AutonomousSettings {
     /// Wall-clock ceiling, in seconds, for the whole autonomous run. A turn
     /// still running when it passes is stopped.
     pub max_duration_secs: u64,
-    /// Before the run stops with its goal reached, send the model one more
-    /// turn asking it to check the code against the task's spec, field by
-    /// field. Off by default: an experiment (in the build tests, final
-    /// answers claimed fields were `null` that the code left out).
+    /// Before the run stops with its goal reached, send the model a review
+    /// turn: check the code against the task's spec field by field, plus a
+    /// general checklist (malformed input, boundary values, defaults and
+    /// limits, formats, error codes, earlier behaviour still working). Off
+    /// by default: an experiment (in the build tests, final answers claimed
+    /// fields were `null` that the code left out).
     pub final_review: bool,
+    /// How many review turns `final_review` sends, one after another, each
+    /// time the goal is reached again. 0 sends none.
+    pub final_review_rounds: u32,
+    /// Skip a review turn when less than this many seconds of
+    /// `max_duration_secs` are left, so a review can't be cut off halfway
+    /// through a fix. The `--report` file says when one was skipped.
+    pub final_review_min_budget_secs: u64,
+    /// Start each review turn from a fresh conversation: the goal, the files
+    /// the goal names (read like `read_file`, `deny_paths` applies), the diff
+    /// since the run started, and the last verification output, instead of
+    /// the whole run's history. Tasks, permissions and checkpoints are kept.
+    pub final_review_fresh_context: bool,
 }
 
 impl Default for AutonomousSettings {
@@ -149,6 +163,9 @@ impl Default for AutonomousSettings {
             max_iterations: 20,
             max_duration_secs: 3600,
             final_review: false,
+            final_review_rounds: 1,
+            final_review_min_budget_secs: 600,
+            final_review_fresh_context: false,
         }
     }
 }
@@ -1488,6 +1505,17 @@ mod tests {
         assert!(!AutonomousSettings::default().final_review);
         let settings: Settings = toml::from_str("[autonomous]\nfinal_review = true").unwrap();
         assert!(settings.autonomous.final_review);
+        assert_eq!(settings.autonomous.final_review_rounds, 1);
+        assert_eq!(settings.autonomous.final_review_min_budget_secs, 600);
+        assert!(!settings.autonomous.final_review_fresh_context);
+        let settings: Settings = toml::from_str(
+            "[autonomous]\nfinal_review = true\nfinal_review_rounds = 2\n\
+             final_review_min_budget_secs = 120\nfinal_review_fresh_context = true",
+        )
+        .unwrap();
+        assert_eq!(settings.autonomous.final_review_rounds, 2);
+        assert_eq!(settings.autonomous.final_review_min_budget_secs, 120);
+        assert!(settings.autonomous.final_review_fresh_context);
     }
 
     #[test]
