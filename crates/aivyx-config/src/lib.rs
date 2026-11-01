@@ -147,16 +147,18 @@ pub struct AutonomousSettings {
     /// time the goal is reached again. 0 sends none.
     pub final_review_rounds: u32,
     /// Skip a review turn when less than this many seconds of
-    /// `max_duration_secs` are left (or less than a quarter of
-    /// `max_duration_secs`, if that is smaller, so a short run can still
-    /// review), so a review can't be cut off halfway through a fix. The
-    /// `--report` file says when one was skipped.
+    /// `max_duration_secs` are left, or less than a quarter of
+    /// `max_duration_secs` if that is smaller (so a short run can still
+    /// review). This makes it less likely that the time limit stops a
+    /// review partway through a fix. The `--report` file says when one was
+    /// skipped, and why.
     pub final_review_min_budget_secs: u64,
     /// Start each review turn from a fresh conversation: the goal, the files
     /// the goal names (read like `read_file`, `deny_paths` applies), the diff
     /// since the run started, and the last verification output, instead of
     /// the whole run's history, kept to a quarter of `[backend]
-    /// context_tokens`. Tasks, permissions and checkpoints are kept.
+    /// context_tokens`. Tasks, permissions and checkpoints are kept, and the
+    /// saved session keeps the whole conversation.
     pub final_review_fresh_context: bool,
 }
 

@@ -202,7 +202,7 @@ Limits for `--auto` runs. See [Autonomous and advanced modes](../guide/10-autono
 | `max_duration_secs` | integer |  | Wall-clock ceiling, in seconds, for the whole autonomous run. A turn still running when it passes is stopped. |
 | `final_review` | bool |  | Before the run stops with its goal reached, send the model a review turn: check the code against the task's spec field by field, plus a general checklist (malformed input, boundary values, defaults and limits, formats, error codes, earlier behaviour still working). |
 | `final_review_rounds` | integer |  | How many review turns `final_review` sends, one after another, each time the goal is reached again. 0 sends none. |
-| `final_review_min_budget_secs` | integer |  | Skip a review turn when less than this many seconds of `max_duration_secs` are left (or less than a quarter of `max_duration_secs`, if that is smaller, so a short run can still review), so a review can't be cut off halfway through a fix. The `--report` file says when one was skipped. |
+| `final_review_min_budget_secs` | integer |  | Skip a review turn when less than this many seconds of `max_duration_secs` are left, or less than a quarter of `max_duration_secs` if that is smaller (so a short run can still review). This makes it less likely that the time limit stops a review partway through a fix. |
 | `final_review_fresh_context` | bool |  | Start each review turn from a fresh conversation: the goal, the files the goal names (read like `read_file`, `deny_paths` applies), the diff since the run started, and the last verification output, instead of the whole run's history, kept to a quarter of `[backend] context_tokens`. |
 
 ### `[architect]`

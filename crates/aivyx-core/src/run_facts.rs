@@ -32,13 +32,18 @@ pub struct ChangedFile {
 }
 
 /// `[autonomous] final_review` in `--report`: how many review turns ran,
-/// whether one was skipped for lack of time or iterations, and the files
-/// changed from the first review turn on (relative to the repository root,
-/// generated files left out).
+/// whether and why a due one was skipped, and the files changed from the
+/// first review turn on (relative to the repository root, generated files
+/// left out).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FinalReviewFacts {
     pub ran: u32,
+    /// A due review was skipped for lack of time or iterations
+    /// (`skip_reason` `budget` or `iterations`).
     pub skipped_for_budget: bool,
+    /// `budget`, `iterations` or `verification_failed`; `null` when no due
+    /// review was skipped.
+    pub skip_reason: Option<&'static str>,
     pub changed_files: Vec<String>,
 }
 
@@ -321,6 +326,7 @@ mod tests {
         let review = FinalReviewFacts {
             ran: 2,
             skipped_for_budget: false,
+            skip_reason: None,
             changed_files: vec!["src/main.rs".into()],
         };
         let report = RunReport {
@@ -375,6 +381,7 @@ mod tests {
             serde_json::json!({
                 "ran": 2,
                 "skipped_for_budget": false,
+                "skip_reason": null,
                 "changed_files": ["src/main.rs"],
             })
         );

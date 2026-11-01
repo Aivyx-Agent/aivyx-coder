@@ -562,6 +562,10 @@ pub struct Agent {
     /// is never staged by `/commit`'s nothing-staged path. Empty turns it
     /// off. Defaults to [`aivyx_tools::DEFAULT_GENERATED_PATTERNS`].
     generated_ignore: Vec<String>,
+    /// The conversation a fresh-context final review set aside
+    /// (`replace_history_for_review`), oldest first. Not sent to the model;
+    /// saved ahead of `history` so the session file keeps the whole run.
+    history_before_review: Vec<Message>,
     events_tx: UnboundedSender<AgentEvent>,
 }
 
@@ -665,6 +669,7 @@ impl Agent {
             usage: crate::run_facts::UsageTotals::default(),
             run_start_checkpoints: (0, 0),
             generated_ignore: aivyx_tools::default_generated_patterns(),
+            history_before_review: Vec::new(),
             events_tx,
         }
     }
@@ -817,6 +822,7 @@ impl Agent {
         self.last_routed = None;
         self.undo.clear();
         self.pending_notes.clear();
+        self.history_before_review.clear();
         self.last_test_passed = None;
         self.last_verification_passed = None;
         self.emit(AgentEvent::ConversationCleared);
@@ -1682,6 +1688,7 @@ impl Agent {
     /// session saved in Act mode never clobbers an explicit `--plan` flag.
     pub fn restore(&mut self, state: SessionState) {
         self.history = state.history;
+        self.history_before_review.clear();
         *self.tasks.lock().unwrap() = state.tasks;
         if state.plan_mode_active {
             self.plan_mode.set_active(true);
@@ -1835,6 +1842,7 @@ impl Agent {
         self.last_routed = None;
         self.undo.clear();
         self.pending_notes.clear();
+        self.history_before_review.clear();
         self.last_test_passed = None;
         self.last_verification_passed = None;
 
@@ -1886,8 +1894,13 @@ impl Agent {
             .as_ref()
             .map(SpecialistSessionPool::snapshot_for_persistence)
             .unwrap_or_default();
+        let history = if self.history_before_review.is_empty() {
+            self.history.clone()
+        } else {
+            [self.history_before_review.as_slice(), self.history.as_slice()].concat()
+        };
         let mut state = SessionState::new(
-            self.history.clone(),
+            history,
             tasks,
             self.plan_mode.active(),
             specialist_sessions,

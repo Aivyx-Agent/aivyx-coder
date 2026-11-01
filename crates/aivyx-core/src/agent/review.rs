@@ -91,9 +91,10 @@ const MARKER_ROOM: usize = 32;
 
 /// `context` cut so the whole review message (`render_review` with
 /// `request`) stays within `budget` bytes. Parts are filled in priority
-/// order (goal, last verification output, diff, then the named files in
-/// order), so the lowest-priority parts are cut first, each with a visible
-/// "… N bytes cut" marker.
+/// order (the goal, the files it names in order — the spec the review checks
+/// against — the last verification output, then the diff), so the
+/// lowest-priority parts are cut first, each with a visible "… N bytes cut"
+/// marker.
 fn fit_review_context(context: ReviewContext, request: &str, budget: usize) -> ReviewContext {
     // The message with every part empty is the fixed cost.
     let skeleton = ReviewContext {
@@ -111,14 +112,64 @@ fn fit_review_context(context: ReviewContext, request: &str, budget: usize) -> R
         cut
     };
     let goal = take(&context.goal, false);
-    let last_verification = context.last_verification.as_deref().map(|v| take(v, true));
-    let diff = context.diff.as_deref().map(|d| take(d, false));
     let files = context
         .files
         .iter()
         .map(|(path, text)| (path.clone(), take(text, false)))
         .collect();
+    let last_verification = context.last_verification.as_deref().map(|v| take(v, true));
+    let diff = context.diff.as_deref().map(|d| take(d, false));
     ReviewContext { goal, files, diff, last_verification }
+}
+
+/// Lockfiles: generated, often large, and nothing to review line by line.
+/// A fresh-context review lists them in the diff summary, without a body.
+const LOCKFILES: [&str; 7] = [
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "Gemfile.lock",
+    "go.sum",
+];
+
+fn is_lockfile(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOCKFILES.contains(&name)
+}
+
+/// A `--stat`-style summary of every changed file (lockfiles marked), then
+/// `diff` without the sections of lockfiles. The summary comes first so a
+/// diff cut to fit still names every file.
+fn diff_with_summary(changes: &[crate::changes::FileChange], diff: &str) -> String {
+    use crate::changes::ChangeStatus;
+    let mut text = match changes.len() {
+        1 => "1 file changed:\n".to_string(),
+        n => format!("{n} files changed:\n"),
+    };
+    for change in changes {
+        let counts = match (&change.status, change.added, change.removed) {
+            (ChangeStatus::Removed, _, _) => "removed".to_string(),
+            (_, Some(a), Some(r)) => format!("+{a} −{r}"),
+            _ => "binary".to_string(),
+        };
+        let new = if change.status == ChangeStatus::Added { ", new" } else { "" };
+        let lock = if is_lockfile(&change.path) { " (lockfile: diff left out)" } else { "" };
+        text.push_str(&format!("  {} | {counts}{new}{lock}\n", change.path));
+    }
+    text.push('\n');
+    let mut keep = true;
+    for line in diff.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let path = rest.rsplit_once(" b/").map_or(rest, |(_, b)| b).trim_end();
+            keep = !is_lockfile(path);
+        }
+        if keep {
+            text.push_str(line);
+        }
+    }
+    text
 }
 
 /// The fresh-context review turn's user message: what the review needs,
@@ -200,14 +251,17 @@ impl Agent {
         Some(changes.into_iter().map(|c| c.path).collect())
     }
 
-    /// The diff between `mark_run_start`'s snapshot and the worktree now,
-    /// generated files left out. `None` without a starting snapshot or when
-    /// git fails.
+    /// The changes between `mark_run_start`'s snapshot and the worktree
+    /// now, generated files left out: a summary of every changed file, then
+    /// the diff without lockfile bodies (`diff_with_summary`). `None`
+    /// without a starting snapshot or when git fails.
     pub(crate) async fn diff_since_run_start(&self) -> Option<String> {
         let before = self.run_start_oid.as_deref()?;
         let root = self.executor.checkpoint_cwd()?.to_path_buf();
         let now = self.snapshot_worktree("final review diff").await?;
-        self.visible_diff(&root, before, &now).await.ok()
+        let changes = self.changes_between(&root, before, &now).await?;
+        let diff = self.visible_diff(&root, before, &now).await.ok()?;
+        Some(diff_with_summary(&changes, &diff))
     }
 
     /// Reads `path` the way the model's own `read_file` call would — through
@@ -247,7 +301,9 @@ impl Agent {
 
     /// Gathers what a fresh-context review turn starts from: the goal, the
     /// files it names (read through the gate, size-capped), the diff since
-    /// the run started, and the last verification output.
+    /// the run started, and the last verification output. The files and
+    /// the verification output are scanned for prompt injection like any
+    /// tool output; the diff is the run's own work and is not.
     pub(crate) async fn review_context(&mut self, goal: &str, cwd: &Path) -> ReviewContext {
         let mut files = Vec::new();
         for path in files_named_in(goal, cwd) {
@@ -255,23 +311,18 @@ impl Agent {
                 files.push((path, text));
             }
         }
-        let diff = self.diff_since_run_start().await.map(|diff| {
-            if let Some(finding) =
-                aivyx_sandbox::scan_for_injection_markers(&diff, "final review diff")
-            {
-                self.injection_taint.flag(finding);
-            }
-            head(&diff, REVIEW_DIFF_CAP)
-        });
-        ReviewContext {
-            goal: goal.to_string(),
-            files,
-            diff,
-            last_verification: self
-                .last_full_verification_output
-                .as_deref()
-                .map(|output| tail(output, REVIEW_VERIFICATION_CAP)),
+        let diff = self.diff_since_run_start().await.map(|diff| head(&diff, REVIEW_DIFF_CAP));
+        let last_verification = self
+            .last_full_verification_output
+            .as_deref()
+            .map(|output| tail(output, REVIEW_VERIFICATION_CAP));
+        if let Some(output) = &last_verification
+            && let Some(finding) =
+                aivyx_sandbox::scan_for_injection_markers(output, "verification output")
+        {
+            self.injection_taint.flag(finding);
         }
+        ReviewContext { goal: goal.to_string(), files, diff, last_verification }
     }
 
     /// Sets the conversation aside for a fresh-context review turn and
@@ -282,7 +333,9 @@ impl Agent {
     /// characters-per-token ratio), cutting the lowest-priority parts first
     /// (`fit_review_context`).
     ///
-    /// Only the conversation history changes. The system prompt is built
+    /// Only the live conversation history changes; the saved session still
+    /// holds the conversation set aside, followed by the review's
+    /// (`history_before_review`). The system prompt is built
     /// per request and is kept, and so is everything else: the task list,
     /// the permission gate and its approvals, checkpoints and the `/undo`
     /// ledger, the injection taint, plan mode, the autonomous goal,
@@ -293,7 +346,10 @@ impl Agent {
         context: ReviewContext,
         request: &str,
     ) -> String {
-        self.history.clear();
+        // Kept for the saved session (`snapshot_state`), so a review turn
+        // doesn't overwrite the run's conversation with its own.
+        let set_aside = std::mem::take(&mut self.history);
+        self.history_before_review.extend(set_aside);
         let budget = (f64::from(self.context_limit / 4) * self.chars_per_token) as usize;
         render_review(&fit_review_context(context, request, budget), request)
     }
@@ -335,12 +391,32 @@ mod tests {
             diff: Some("D".repeat(5000)),
             last_verification: Some("V".repeat(500)),
         };
-        let fitted = fit_review_context(context, "REQUEST", 3000);
+        let fitted = fit_review_context(context, "REQUEST", 7000);
         assert_eq!(fitted.goal, "GOAL");
+        assert_eq!(fitted.files[0].1, "F".repeat(5000), "the spec comes before the rest");
         assert_eq!(fitted.last_verification.as_deref(), Some("V".repeat(500).as_str()));
         let diff = fitted.diff.as_deref().unwrap();
-        assert!(diff.contains("bytes cut"), "{diff}");
-        assert!(fitted.files[0].1.starts_with("\n… 5000 bytes cut"), "{}", fitted.files[0].1);
-        assert!(render_review(&fitted, "REQUEST").len() <= 3000);
+        assert!(diff.contains("bytes cut"), "the diff is cut first: {diff}");
+        assert!(render_review(&fitted, "REQUEST").len() <= 7000);
+    }
+
+    #[test]
+    fn the_diff_opens_with_a_summary_and_leaves_lockfile_bodies_out() {
+        use crate::changes::{ChangeStatus, FileChange};
+        let changes = [
+            FileChange { path: "src/lib.rs".into(), added: Some(3), removed: Some(1), status: ChangeStatus::Modified },
+            FileChange { path: "Cargo.lock".into(), added: Some(90), removed: Some(2), status: ChangeStatus::Modified },
+            FileChange { path: "web/package-lock.json".into(), added: Some(5), removed: Some(0), status: ChangeStatus::Added },
+        ];
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n+SRC\n\
+                    diff --git a/Cargo.lock b/Cargo.lock\n+LOCKBODY\n\
+                    diff --git a/web/package-lock.json b/web/package-lock.json\n+LOCKBODY\n";
+        let text = diff_with_summary(&changes, diff);
+        assert!(text.starts_with("3 files changed:\n"), "{text}");
+        assert!(text.contains("src/lib.rs | +3 −1"), "{text}");
+        assert!(text.contains("Cargo.lock | +90 −2 (lockfile: diff left out)"), "{text}");
+        assert!(text.contains("web/package-lock.json"), "{text}");
+        assert!(text.contains("+SRC"), "{text}");
+        assert!(!text.contains("LOCKBODY"), "{text}");
     }
 }

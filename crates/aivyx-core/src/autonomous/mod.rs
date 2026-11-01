@@ -202,6 +202,9 @@ pub struct ReviewState {
     /// A review turn was due but too little time (or the last iteration)
     /// was left for it.
     pub skipped_for_budget: bool,
+    /// Why a due review turn was not sent: `budget` (too little time
+    /// left), `iterations` (the last iteration) or `verification_failed`.
+    pub skip_reason: Option<&'static str>,
 }
 
 impl ReviewState {
@@ -214,16 +217,20 @@ impl ReviewState {
             fresh_context: review.fresh_context,
             ran: 0,
             skipped_for_budget: false,
+            skip_reason: None,
         }
     }
 
-    /// A review turn was due but there's no budget left for it: no more
-    /// are sent.
-    fn skip_for_budget(&mut self) {
-        if self.rounds_left > 0 {
-            self.rounds_left = 0;
-            self.skipped_for_budget = true;
+    /// A review turn was due but can't be sent (`reason`, see
+    /// `skip_reason`): no more are sent. Returns whether one was due.
+    fn skip(&mut self, reason: &'static str) -> bool {
+        if self.rounds_left == 0 {
+            return false;
         }
+        self.rounds_left = 0;
+        self.skipped_for_budget = matches!(reason, "budget" | "iterations");
+        self.skip_reason = Some(reason);
+        true
     }
 }
 
@@ -236,7 +243,7 @@ fn after_goal(review: &mut ReviewState, remaining: Duration) -> Option<String> {
         return None;
     }
     if remaining < review.min_budget {
-        review.skip_for_budget();
+        review.skip("budget");
         return None;
     }
     review.rounds_left -= 1;
@@ -466,6 +473,7 @@ pub async fn drive(
     let review = crate::run_facts::FinalReviewFacts {
         ran: review.ran,
         skipped_for_budget: review.skipped_for_budget,
+        skip_reason: review.skip_reason,
         changed_files: review_changed,
     };
     finish(
@@ -483,8 +491,9 @@ pub async fn drive(
     .await
 }
 
-/// The goal is reached: the next review turn's message, if one is due and
-/// there's budget for it, else `None` (stop). With `fresh_context`, the
+/// The goal is reached: the next review turn's message, if one is due,
+/// there's budget for it and the last verification didn't fail, else `None`
+/// (stop). With `fresh_context`, the
 /// conversation is replaced first and the message opens with what the
 /// review needs (`Agent::replace_history_for_review`).
 async fn review_turn(
@@ -499,10 +508,17 @@ async fn review_turn(
     // Not on the last allowed iteration: the review would end the run as
     // "budget exhausted" with the goal reached.
     if iterations_used >= run.max_iterations {
-        if review.rounds_left > 0 {
+        if review.skip("iterations") {
             agent.info("final review skipped: no iterations left (max_iterations)");
         }
-        review.skip_for_budget();
+        return None;
+    }
+    // A review checks finished work against the spec; with the tests
+    // failing the work isn't finished, and the run says so in its notice.
+    if agent.last_verification_passed() == Some(false) {
+        if review.skip("verification_failed") {
+            agent.info("final review skipped: the last verification run failed");
+        }
         return None;
     }
     let remaining = deadline.saturating_duration_since(Instant::now());

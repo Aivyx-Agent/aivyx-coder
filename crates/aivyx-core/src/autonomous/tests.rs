@@ -294,6 +294,7 @@ fn a_review_is_skipped_when_too_little_time_is_left() {
     let mut state = ReviewState::new(&review(2), HOUR);
     assert_eq!(after_goal(&mut state, Duration::from_secs(599)), None);
     assert!(state.skipped_for_budget);
+    assert_eq!(state.skip_reason, Some("budget"));
     assert_eq!(state.ran, 0);
     assert_eq!(after_goal(&mut state, Duration::from_secs(3600)), None, "a skip ends the review");
     // Enough time for the first round, not the second.
@@ -725,13 +726,35 @@ impl PermissionGate for DenySecrets {
 /// passing `[verification] command` that prints `VERIFY-MARKER`, driven
 /// through `run` with `responses`. Returns the agent for inspection.
 async fn drive_in_repo(dir: &Path, responses: Vec<Vec<StreamEvent>>, run: &AutonomousRun) -> (Agent, RunEnd) {
+    drive_in_repo_with(dir, responses, run, RepoOptions::default()).await
+}
+
+struct RepoOptions {
+    context_tokens: u32,
+    /// The `[verification] command`'s shell script.
+    verify: &'static str,
+    session: Option<PathBuf>,
+}
+
+impl Default for RepoOptions {
+    fn default() -> Self {
+        Self { context_tokens: 8192, verify: "echo VERIFY-MARKER", session: None }
+    }
+}
+
+async fn drive_in_repo_with(
+    dir: &Path,
+    responses: Vec<Vec<StreamEvent>>,
+    run: &AutonomousRun,
+    options: RepoOptions,
+) -> (Agent, RunEnd) {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(aivyx_tools::ReadFileTool));
     registry.register(Arc::new(aivyx_tools::WriteFileTool));
     registry.register(Arc::new(aivyx_tools::RunCommandTool::new(vec![aivyx_tools::CommandSpec {
         name: "verify".to_string(),
         program: "sh".to_string(),
-        args: vec!["-c".to_string(), "echo VERIFY-MARKER".to_string()],
+        args: vec!["-c".to_string(), options.verify.to_string()],
         timeout: Duration::from_secs(5),
     }])));
     let mut executor = ToolExecutor::new(registry, Arc::new(DenySecrets), Arc::new(NoopConfiner));
@@ -745,13 +768,20 @@ async fn drive_in_repo(dir: &Path, responses: Vec<Vec<StreamEvent>>, run: &Auton
         Arc::new(ScriptedBackend { responses: Mutex::new(responses.into()) }),
         executor,
         "system",
-        crate::AgentConfig { max_tool_iterations: 10, ..Default::default() },
+        crate::AgentConfig {
+            max_tool_iterations: 10,
+            context_tokens: options.context_tokens,
+            ..Default::default()
+        },
         Arc::clone(&run.tasks),
         PlanMode::new(),
         AutonomousMode::new(),
         tx,
     );
     agent.set_verification("verify".to_string(), 1);
+    if let Some(path) = options.session {
+        agent.set_session_path(path);
+    }
     let active = Mutex::new(None);
     let end = drive(&mut agent, run, dir, &CancellationToken::new(), &active, &mut |_| {}).await;
     (agent, end)
@@ -900,4 +930,93 @@ async fn a_fresh_review_message_fits_a_quarter_of_the_context_window() {
     assert!(message.contains(FINAL_REVIEW_MESSAGE));
     assert!(message.contains("bytes cut"), "the cut is marked");
     assert!(agent.history_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn a_fresh_review_keeps_the_whole_spec_and_leaves_lockfile_bodies_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let brief: String =
+        (0..320).map(|i| format!("SPEC line {i:03}: the field is documented here.\n")).collect();
+    assert!(brief.len() > 13 * 1024);
+    std::fs::write(cwd.join("BRIEF.md"), &brief).unwrap();
+    init_git_repo(&cwd).await;
+    let lock = "LOCKBODY checksum = \"abc\"\n".repeat(20 * 1024 / 26);
+    let src = "fn generated() -> u32 { 42 } // SRC\n".repeat(60 * 1024 / 36);
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.goal = "Build the app in BRIEF.md.".to_string();
+    run.max_duration = Duration::from_secs(3600);
+    run.final_review = FinalReview { fresh_context: true, ..review(1) };
+    let (agent, end) = drive_in_repo_with(
+        &cwd,
+        vec![
+            write_call("c1", "src/lib.rs", &src),
+            write_call("c2", "Cargo.lock", &lock),
+            text("done"),
+            text("Reviewed."),
+        ],
+        &run,
+        RepoOptions { context_tokens: 65536, ..RepoOptions::default() },
+    )
+    .await;
+    assert_eq!(end.outcome, Outcome::GoalAchieved, "{}", end.notice);
+    let opening = agent.history_snapshot()[0].text_content();
+    assert!(opening.contains(&brief), "the spec was cut");
+    assert!(!opening.contains("LOCKBODY"), "a lockfile body was included");
+    assert!(opening.contains("Cargo.lock"), "the lockfile is listed in the summary");
+    assert!(opening.contains("src/lib.rs"));
+    assert!(opening.contains(FINAL_REVIEW_MESSAGE));
+    assert!(agent.estimate_tokens(&opening) <= 65536 / 4);
+}
+
+#[tokio::test]
+async fn no_review_runs_while_the_last_verification_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("README.md"), "x\n").unwrap();
+    init_git_repo(&cwd).await;
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.max_duration = Duration::from_secs(3600);
+    let out = tempfile::tempdir().unwrap();
+    run.report = Some(out.path().join("run.json"));
+    run.final_review = review(1);
+    let (_, end) = drive_in_repo_with(
+        &cwd,
+        vec![write_call("c1", "app.rs", "x\n"), text("done"), text("never")],
+        &run,
+        RepoOptions { verify: "echo failing; exit 1", ..RepoOptions::default() },
+    )
+    .await;
+    assert_eq!(end.last_verification_passed, Some(false));
+    assert_eq!(end.iterations, 1, "{}", end.notice);
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.path().join("run.json")).unwrap()).unwrap();
+    assert_eq!(report["final_review"]["ran"], 0);
+    assert_eq!(report["final_review"]["skipped_for_budget"], false);
+    assert_eq!(report["final_review"]["skip_reason"], "verification_failed");
+}
+
+#[tokio::test]
+async fn a_fresh_review_keeps_the_saved_session_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("README.md"), "x\n").unwrap();
+    init_git_repo(&cwd).await;
+    let state_dir = tempfile::tempdir().unwrap();
+    let session = state_dir.path().join("session.json");
+    let mut run = run_with(vec![done_task(1)], 5);
+    run.max_duration = Duration::from_secs(3600);
+    run.final_review = FinalReview { fresh_context: true, ..review(1) };
+    let (agent, _) = drive_in_repo_with(
+        &cwd,
+        vec![text("OLD-CONVERSATION-MARKER done"), text("REVIEW-REPLY-MARKER")],
+        &run,
+        RepoOptions { session: Some(session.clone()), ..RepoOptions::default() },
+    )
+    .await;
+    assert_eq!(agent.history_snapshot().len(), 2, "the live conversation is the review");
+    let saved = crate::session::load(&session).expect("the session was saved");
+    let all: String = saved.history.iter().map(|m| m.text_content()).collect::<Vec<_>>().join("\n");
+    assert!(all.contains("OLD-CONVERSATION-MARKER"), "the run's conversation was lost: {all}");
+    assert!(all.contains("REVIEW-REPLY-MARKER"), "the review was not saved: {all}");
 }

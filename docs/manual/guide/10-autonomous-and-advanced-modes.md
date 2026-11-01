@@ -94,22 +94,28 @@ final_review_min_budget_secs = 600  # skip a review with less time than this lef
 final_review_fresh_context = false  # start each review from a fresh conversation
 ```
 
-Each review turn counts against `max_iterations`, and none is sent on the
-last iteration or with less than `final_review_min_budget_secs` of
-`max_duration_secs` left (or a quarter of `max_duration_secs`, if that is
-less, so a short run can still review), so a review can't be cut off
-halfway through a fix; the transcript and `--report` say when one was
-skipped. With
-`final_review_fresh_context = true`, a review turn starts without the
-run's long history: its message holds the goal, up to four files the goal
-names (read the way `read_file` reads them, so `deny_paths` applies; each
-cut at 64 KiB), the diff since the run started, and the end of the last
-verification output. The whole message is kept to about a quarter of
-`[backend] context_tokens`: the goal comes first, then the verification
-output, the diff and the files, and whatever doesn't fit is cut from the
-end of that list, with a "… N bytes cut" marker where it was. Only the conversation is replaced: the task list,
-approvals, checkpoints, plan mode and the prompt-injection guard all carry
-on as before.
+Each review turn counts against `max_iterations`. None is sent on the
+last iteration, or while the last verification run failed (the work isn't
+finished then, and the stop notice says so). None is sent either with less
+than `final_review_min_budget_secs` of `max_duration_secs` left, or less
+than a quarter of `max_duration_secs` if that is smaller, so a short run
+can still review. This makes it less likely that the time limit stops a
+review turn partway through a fix; it can't rule it out. The transcript
+and `--report` say when a review was skipped, and why.
+
+With `final_review_fresh_context = true`, a review turn starts without the
+run's long history. Its message holds the goal; up to four files the goal
+names, read the way `read_file` reads them (so `deny_paths` applies) and
+each cut at 64 KiB; the end of the last verification output; and the diff
+since the run started, which opens with a summary of every changed file
+and leaves out the bodies of lockfiles (`Cargo.lock`, `package-lock.json`
+and the like). The whole message is kept to about a quarter of
+`[backend] context_tokens`, filled in that order: whatever doesn't fit is
+cut from the diff first, then the verification output, then the files,
+with a "… N bytes cut" marker where it was. Only the live conversation is
+replaced: the saved session keeps the run's conversation followed by the
+review's, and the task list, approvals, checkpoints, plan mode and the
+prompt-injection guard all carry on as before.
 
 **What the run reports.** The model writes its own final answer, and it can
 be wrong. In the build tests, models said fields were `null` when they
