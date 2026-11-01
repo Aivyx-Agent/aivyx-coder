@@ -371,3 +371,9 @@ Left open on purpose; every Medium and High finding is fixed.
 - **A8 beyond a notice.** Editor-supplied MCP servers are reported and ignored;
   running them through the existing consent and confinement path is a feature,
   not a fix.
+- **A1 watcher placement.** The watcher that kills a command's process group
+  when coder dies is forked after the confiner's pre-exec step, so it sits
+  inside the command's sandbox and the command could signal it. It only
+  matters for cleanup when coder itself is killed outright, and a surviving
+  command stays confined. Forking it first means reordering every confined
+  spawn site.
