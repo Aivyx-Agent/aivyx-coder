@@ -38,7 +38,7 @@ mod undo_commands;
 
 pub use types::{AgentConfig, AgentError, AgentEvent, EditFormat};
 #[cfg(test)]
-pub(crate) use review::files_named_in;
+pub(crate) use review::{ReviewContext, files_named_in};
 use types::{AgentsFileConfig, EditorContextConfig, ScopedVerificationConfig, VerificationConfig};
 
 /// Caps unbounded growth of a single turn's accumulated assistant text from

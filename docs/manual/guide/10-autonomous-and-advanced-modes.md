@@ -96,13 +96,18 @@ final_review_fresh_context = false  # start each review from a fresh conversatio
 
 Each review turn counts against `max_iterations`, and none is sent on the
 last iteration or with less than `final_review_min_budget_secs` of
-`max_duration_secs` left, so a review can't be cut off halfway through a
-fix; the transcript and `--report` say when one was skipped. With
+`max_duration_secs` left (or a quarter of `max_duration_secs`, if that is
+less, so a short run can still review), so a review can't be cut off
+halfway through a fix; the transcript and `--report` say when one was
+skipped. With
 `final_review_fresh_context = true`, a review turn starts without the
 run's long history: its message holds the goal, up to four files the goal
 names (read the way `read_file` reads them, so `deny_paths` applies; each
 cut at 64 KiB), the diff since the run started, and the end of the last
-verification output. Only the conversation is replaced: the task list,
+verification output. The whole message is kept to about a quarter of
+`[backend] context_tokens`: the goal comes first, then the verification
+output, the diff and the files, and whatever doesn't fit is cut from the
+end of that list, with a "… N bytes cut" marker where it was. Only the conversation is replaced: the task list,
 approvals, checkpoints, plan mode and the prompt-injection guard all carry
 on as before.
 

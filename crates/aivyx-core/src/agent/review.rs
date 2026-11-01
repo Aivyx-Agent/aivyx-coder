@@ -70,7 +70,7 @@ fn head(text: &str, max: usize) -> String {
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}\n… (cut at {max} bytes)", &text[..cut])
+    format!("{}\n… {} bytes cut", &text[..cut], text.len() - cut)
 }
 
 /// `text` cut to at most `max` bytes at a char boundary, keeping the end.
@@ -82,7 +82,86 @@ fn tail(text: &str, max: usize) -> String {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    format!("… (only the last {max} bytes)\n{}", &text[start..])
+    format!("… {start} bytes cut\n{}", &text[start..])
+}
+
+/// Room left for each cut-marker ("… N bytes cut") and the line break
+/// around it, so a part cut to fit still fits with its marker.
+const MARKER_ROOM: usize = 32;
+
+/// `context` cut so the whole review message (`render_review` with
+/// `request`) stays within `budget` bytes. Parts are filled in priority
+/// order (goal, last verification output, diff, then the named files in
+/// order), so the lowest-priority parts are cut first, each with a visible
+/// "… N bytes cut" marker.
+fn fit_review_context(context: ReviewContext, request: &str, budget: usize) -> ReviewContext {
+    // The message with every part empty is the fixed cost.
+    let skeleton = ReviewContext {
+        goal: String::new(),
+        files: context.files.iter().map(|(path, _)| (path.clone(), String::new())).collect(),
+        diff: context.diff.as_ref().map(|_| String::new()),
+        last_verification: context.last_verification.as_ref().map(|_| String::new()),
+    };
+    let parts = 3 + context.files.len();
+    let fixed = render_review(&skeleton, request).len() + parts * MARKER_ROOM;
+    let mut room = budget.saturating_sub(fixed);
+    let mut take = |text: &str, keep_end: bool| -> String {
+        let cut = if keep_end { tail(text, room) } else { head(text, room) };
+        room = room.saturating_sub(text.len().min(room));
+        cut
+    };
+    let goal = take(&context.goal, false);
+    let last_verification = context.last_verification.as_deref().map(|v| take(v, true));
+    let diff = context.diff.as_deref().map(|d| take(d, false));
+    let files = context
+        .files
+        .iter()
+        .map(|(path, text)| (path.clone(), take(text, false)))
+        .collect();
+    ReviewContext { goal, files, diff, last_verification }
+}
+
+/// The fresh-context review turn's user message: what the review needs,
+/// then `request` (the review message itself).
+fn render_review(context: &ReviewContext, request: &str) -> String {
+    let mut text = String::from(
+        "The conversation so far has been set aside so you can review the work with fresh \
+         eyes. Here is what you need; read any other file you want.\n\n## The goal\n\n",
+    );
+    text.push_str(&context.goal);
+    for (path, contents) in &context.files {
+        text.push_str(&format!(
+            "\n\n## {path} (named in the goal)\n\n----- begin {path} -----\n{contents}"
+        ));
+        if !contents.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("----- end {path} -----"));
+    }
+    text.push_str("\n\n## Changes since the run started\n\n");
+    match context.diff.as_deref() {
+        None => text.push_str("(not available: no snapshot from the run's start)"),
+        Some(diff) if diff.trim().is_empty() => text.push_str("(no changes)"),
+        Some(diff) => {
+            text.push_str("----- begin diff -----\n");
+            text.push_str(diff);
+            if !diff.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str("----- end diff -----");
+        }
+    }
+    if let Some(output) = &context.last_verification {
+        text.push_str("\n\n## The last verification run\n\n----- begin output -----\n");
+        text.push_str(output);
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("----- end output -----");
+    }
+    text.push_str("\n\n");
+    text.push_str(request);
+    text
 }
 
 /// A `read_file` result split into its text and, when the file goes on,
@@ -196,9 +275,12 @@ impl Agent {
     }
 
     /// Sets the conversation aside for a fresh-context review turn and
-    /// returns the text that opens its user message (the caller appends the
-    /// review request, so the turn is a single user message and chat
-    /// templates that require alternating roles still work).
+    /// returns its whole user message: the context, then `request` (the
+    /// review message). One user message, so chat templates that require
+    /// alternating roles still work. The message is kept to a quarter of
+    /// `[backend] context_tokens` (estimated with the agent's own
+    /// characters-per-token ratio), cutting the lowest-priority parts first
+    /// (`fit_review_context`).
     ///
     /// Only the conversation history changes. The system prompt is built
     /// per request and is kept, and so is everything else: the task list,
@@ -206,44 +288,20 @@ impl Agent {
     /// ledger, the injection taint, plan mode, the autonomous goal,
     /// verification state and usage counters. The review needs the same
     /// rules and the same run, just without the run's long history.
-    pub(crate) fn replace_history_for_review(&mut self, context: ReviewContext) -> String {
+    pub(crate) fn replace_history_for_review(
+        &mut self,
+        context: ReviewContext,
+        request: &str,
+    ) -> String {
         self.history.clear();
-        let mut text = String::from(
-            "The conversation so far has been set aside so you can review the work with fresh \
-             eyes. Here is what you need; read any other file you want.\n\n## The goal\n\n",
-        );
-        text.push_str(&context.goal);
-        for (path, contents) in &context.files {
-            text.push_str(&format!(
-                "\n\n## {path} (named in the goal)\n\n----- begin {path} -----\n{contents}"
-            ));
-            if !contents.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&format!("----- end {path} -----"));
-        }
-        text.push_str("\n\n## Changes since the run started\n\n");
-        match context.diff.as_deref() {
-            None => text.push_str("(not available: no snapshot from the run's start)"),
-            Some(diff) if diff.trim().is_empty() => text.push_str("(no changes)"),
-            Some(diff) => {
-                text.push_str("----- begin diff -----\n");
-                text.push_str(diff);
-                if !diff.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str("----- end diff -----");
-            }
-        }
-        if let Some(output) = &context.last_verification {
-            text.push_str("\n\n## The last verification run\n\n----- begin output -----\n");
-            text.push_str(output);
-            if !output.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str("----- end output -----");
-        }
-        text
+        let budget = (f64::from(self.context_limit / 4) * self.chars_per_token) as usize;
+        render_review(&fit_review_context(context, request, budget), request)
+    }
+
+    /// The token estimate for `text`, with the ratio compaction uses.
+    #[cfg(test)]
+    pub(crate) fn estimate_tokens(&self, text: &str) -> u32 {
+        (text.len() as f64 / self.chars_per_token).ceil() as u32
     }
 }
 
@@ -264,8 +322,25 @@ mod tests {
     #[test]
     fn caps_keep_the_right_end_on_char_boundaries() {
         assert_eq!(head("abc", 5), "abc");
-        assert!(head("ééé", 3).starts_with("é\n… (cut"));
-        assert!(tail("ééé", 3).ends_with("\né"));
+        assert_eq!(head("ééé", 3), "é\n… 4 bytes cut");
+        assert_eq!(tail("ééé", 3), "… 4 bytes cut\né");
         assert_eq!(tail("abc", 3), "abc");
+    }
+
+    #[test]
+    fn the_lowest_priority_parts_are_cut_first() {
+        let context = ReviewContext {
+            goal: "GOAL".to_string(),
+            files: vec![("a.md".to_string(), "F".repeat(5000))],
+            diff: Some("D".repeat(5000)),
+            last_verification: Some("V".repeat(500)),
+        };
+        let fitted = fit_review_context(context, "REQUEST", 3000);
+        assert_eq!(fitted.goal, "GOAL");
+        assert_eq!(fitted.last_verification.as_deref(), Some("V".repeat(500).as_str()));
+        let diff = fitted.diff.as_deref().unwrap();
+        assert!(diff.contains("bytes cut"), "{diff}");
+        assert!(fitted.files[0].1.starts_with("\n… 5000 bytes cut"), "{}", fitted.files[0].1);
+        assert!(render_review(&fitted, "REQUEST").len() <= 3000);
     }
 }

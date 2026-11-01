@@ -182,7 +182,8 @@ pub struct FinalReview {
     pub enabled: bool,
     /// Review turns to send, one each time the goal is reached.
     pub rounds: u32,
-    /// A review turn is skipped when less time than this is left.
+    /// A review turn is skipped when less time than this (or than a
+    /// quarter of the run's `max_duration`, if that is less) is left.
     pub min_budget: Duration,
     /// Each review turn starts from a fresh conversation
     /// (`Agent::replace_history_for_review`).
@@ -204,10 +205,12 @@ pub struct ReviewState {
 }
 
 impl ReviewState {
-    pub fn new(review: &FinalReview) -> Self {
+    /// The guard is `min_budget` or a quarter of the run's `max_duration`,
+    /// whichever is less, so a short run can still review.
+    pub fn new(review: &FinalReview, max_duration: Duration) -> Self {
         Self {
             rounds_left: if review.enabled { review.rounds } else { 0 },
-            min_budget: review.min_budget,
+            min_budget: review.min_budget.min(max_duration / 4),
             fresh_context: review.fresh_context,
             ran: 0,
             skipped_for_budget: false,
@@ -376,7 +379,7 @@ pub async fn drive(
     let started = Instant::now();
     let deadline = started + run.max_duration;
     agent.mark_run_start().await;
-    let mut review = ReviewState::new(&run.final_review);
+    let mut review = ReviewState::new(&run.final_review, run.max_duration);
     // The worktree when the first review turn started, for the files the
     // review changed (`--report`).
     let mut review_start: Option<String> = None;
@@ -522,8 +525,7 @@ async fn review_turn(
         return Some(message);
     }
     let context = agent.review_context(&run.goal, cwd).await;
-    let opening = agent.replace_history_for_review(context);
-    Some(format!("{opening}\n\n{message}"))
+    Some(agent.replace_history_for_review(context, &message))
 }
 
 /// Ends a run: runs the final checks (only when the goal was reached),

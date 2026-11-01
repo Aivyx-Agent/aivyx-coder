@@ -251,6 +251,8 @@ fn cancelled_notice_reports_iterations() {
     assert!(message.contains('2'));
 }
 
+const HOUR: Duration = Duration::from_secs(3600);
+
 fn review(rounds: u32) -> FinalReview {
     FinalReview {
         enabled: true,
@@ -263,11 +265,11 @@ fn review(rounds: u32) -> FinalReview {
 #[test]
 fn a_final_review_runs_once_when_the_goal_is_first_reached() {
     let plenty = Duration::from_secs(3600);
-    let mut off = ReviewState::new(&FinalReview { enabled: false, ..review(1) });
+    let mut off = ReviewState::new(&FinalReview { enabled: false, ..review(1) }, HOUR);
     assert_eq!(after_goal(&mut off, plenty), None);
     assert_eq!(off.ran, 0);
     assert!(!off.skipped_for_budget);
-    let mut state = ReviewState::new(&review(1));
+    let mut state = ReviewState::new(&review(1), HOUR);
     assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
     assert_eq!(state.ran, 1);
     assert_eq!(after_goal(&mut state, plenty), None, "only once");
@@ -276,26 +278,26 @@ fn a_final_review_runs_once_when_the_goal_is_first_reached() {
 #[test]
 fn final_review_rounds_send_the_review_that_many_times() {
     let plenty = Duration::from_secs(3600);
-    let mut state = ReviewState::new(&review(2));
+    let mut state = ReviewState::new(&review(2), HOUR);
     assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
     assert_eq!(after_goal(&mut state, plenty).as_deref(), Some(FINAL_REVIEW_MESSAGE));
     assert_eq!(after_goal(&mut state, plenty), None);
     assert_eq!(state.ran, 2);
     assert!(!state.skipped_for_budget);
-    let mut none = ReviewState::new(&review(0));
+    let mut none = ReviewState::new(&review(0), HOUR);
     assert_eq!(after_goal(&mut none, plenty), None, "zero rounds is off");
     assert!(!none.skipped_for_budget);
 }
 
 #[test]
 fn a_review_is_skipped_when_too_little_time_is_left() {
-    let mut state = ReviewState::new(&review(2));
+    let mut state = ReviewState::new(&review(2), HOUR);
     assert_eq!(after_goal(&mut state, Duration::from_secs(599)), None);
     assert!(state.skipped_for_budget);
     assert_eq!(state.ran, 0);
     assert_eq!(after_goal(&mut state, Duration::from_secs(3600)), None, "a skip ends the review");
     // Enough time for the first round, not the second.
-    let mut state = ReviewState::new(&review(2));
+    let mut state = ReviewState::new(&review(2), HOUR);
     assert!(after_goal(&mut state, Duration::from_secs(600)).is_some());
     assert_eq!(after_goal(&mut state, Duration::from_secs(10)), None);
     assert_eq!(state.ran, 1);
@@ -843,17 +845,59 @@ async fn the_report_lists_the_files_the_review_changed() {
     assert_eq!(report["final_review"]["changed_files"], serde_json::json!(["fix.rs"]));
 }
 
+#[test]
+fn the_budget_guard_is_at_most_a_quarter_of_the_run() {
+    assert_eq!(ReviewState::new(&review(1), HOUR).min_budget, Duration::from_secs(600));
+    assert_eq!(
+        ReviewState::new(&review(1), Duration::from_secs(1200)).min_budget,
+        Duration::from_secs(300)
+    );
+    let mut short = ReviewState::new(&review(1), Duration::from_secs(120));
+    assert_eq!(short.min_budget, Duration::from_secs(30));
+    assert!(after_goal(&mut short, Duration::from_secs(100)).is_some(), "a short run still reviews");
+}
+
 #[tokio::test]
-async fn a_review_with_too_little_time_left_is_skipped_and_reported() {
+async fn a_short_run_still_reviews_and_reports_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut run = run_with(vec![done_task(1)], 5);
     run.report = Some(dir.path().join("run.json"));
-    // run_with gives the run 60 s, under the 600 s minimum.
+    // run_with gives the run 60 s: under the 600 s minimum, but the guard
+    // is then a quarter of the run (15 s).
     run.final_review = review(1);
-    let (end, _) = drive_with(scripted(&["Done.", "never sent"]), &run, &CancellationToken::new()).await;
-    assert_eq!(end.iterations, 1);
+    let (end, _) = drive_with(scripted(&["Done.", "Reviewed."]), &run, &CancellationToken::new()).await;
+    assert_eq!(end.iterations, 2);
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("run.json")).unwrap()).unwrap();
-    assert_eq!(report["final_review"]["ran"], 0);
-    assert_eq!(report["final_review"]["skipped_for_budget"], true);
+    assert_eq!(report["final_review"]["ran"], 1);
+    assert_eq!(report["final_review"]["skipped_for_budget"], false);
+}
+
+#[tokio::test]
+async fn a_fresh_review_message_fits_a_quarter_of_the_context_window() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let executor = ToolExecutor::new(ToolRegistry::new(), Arc::new(AllowAll), Arc::new(NoopConfiner));
+    let mut agent = Agent::new(
+        scripted(&[]),
+        executor,
+        "system",
+        crate::AgentConfig { context_tokens: 8192, ..Default::default() },
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    let goal = "Build the app described in BRIEF.md.";
+    let context = crate::agent::ReviewContext {
+        goal: goal.to_string(),
+        files: (0..4).map(|i| (format!("f{i}.md"), "spec line\n".repeat(6_500))).collect(),
+        diff: Some("+code\n".repeat(11_000)),
+        last_verification: Some("test output\n".repeat(1_400)),
+    };
+    let message = agent.replace_history_for_review(context, FINAL_REVIEW_MESSAGE);
+    assert!(agent.estimate_tokens(&message) < 2048, "{} tokens", agent.estimate_tokens(&message));
+    assert!(message.contains(goal));
+    assert!(message.contains(FINAL_REVIEW_MESSAGE));
+    assert!(message.contains("bytes cut"), "the cut is marked");
+    assert!(agent.history_snapshot().is_empty());
 }
