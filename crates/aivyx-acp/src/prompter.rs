@@ -35,7 +35,7 @@ const REJECT_ALWAYS: &str = "reject_always";
 fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
     let mut options = vec![PermissionOption::new(
         ALLOW_ONCE,
-        "Allow",
+        "Allow once",
         PermissionOptionKind::AllowOnce,
     )];
     if !aivyx_sandbox::is_one_off_command(request)
@@ -43,7 +43,7 @@ fn options_for(request: &PermissionRequest) -> Vec<PermissionOption> {
     {
         options.push(PermissionOption::new(
             ALLOW_ALWAYS,
-            "Always Allow",
+            "Always allow",
             PermissionOptionKind::AllowAlways,
         ));
     }

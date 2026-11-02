@@ -372,19 +372,10 @@ pub async fn run(
                                 app.resolve_permission(UserResponse::Allow);
                             }
                             (KeyCode::Char('a'), KeyModifiers::NONE) => {
-                                // Not offered (and not honored, even if typed
-                                // blind) for a target `offer_always_allow`
-                                // flags -- one approval must not silently
-                                // bless every future edit to a file that
-                                // runs code outside Landlock's confinement.
-                                // Nor for a command or diff the box clipped,
-                                // until the whole of it has been on screen.
-                                let offered = app.pending_permission.as_ref().is_some_and(|modal| {
-                                    offer_always_allow(&modal.request) && app.modal_view.seen_all()
-                                });
-                                if offered {
-                                    app.resolve_permission(UserResponse::AllowAlways);
-                                }
+                                app.approval_show_all();
+                            }
+                            (KeyCode::Char('A'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                                app.approval_always_allow();
                             }
                             // Only the /commit modal has an `e`: cancel it and
                             // put the draft in the input box to edit.
@@ -740,6 +731,27 @@ impl App {
     fn resolve_permission(&mut self, response: UserResponse) {
         if let Some(modal) = self.pending_permission.take() {
             let _ = modal.reply_tx.send(response);
+        }
+    }
+
+    /// `a` in an approval prompt: show the whole text. It marks the text as
+    /// seen and never grants anything.
+    fn approval_show_all(&mut self) {
+        self.modal_view.show_all();
+    }
+
+    /// `A` (Shift+a) in an approval prompt: Always Allow. Not offered (and
+    /// not honored, even if typed blind) for a target `offer_always_allow`
+    /// flags -- one approval must not silently bless every future edit to a
+    /// file that runs code outside Landlock's confinement. Nor for a command
+    /// or diff the box clipped, until the whole of it has been on screen.
+    fn approval_always_allow(&mut self) {
+        let offered = self
+            .pending_permission
+            .as_ref()
+            .is_some_and(|modal| offer_always_allow(&modal.request) && self.modal_view.seen_all());
+        if offered {
+            self.resolve_permission(UserResponse::AllowAlways);
         }
     }
 
@@ -1492,7 +1504,7 @@ fn new_input_box() -> TextArea<'static> {
 /// the autocomplete hint's own logic reads, so this listing can never
 /// drift from what actually exists), then a "Keys" section listing only
 /// the bindings that actually exist in the key-handling loop above
-/// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`a`/`n` during an approval prompt,
+/// (`Enter`, `Ctrl+C`, `Ctrl+P`, `y`/`n`/`a`/`A` during an approval prompt,
 /// and the `/diff` pager's own keys -- the transcript has no scrolling
 /// binding, so none is claimed for it), then the test-command line
 /// (`/undo` itself is listed with the other commands).
@@ -1509,7 +1521,8 @@ fn help_text(tests_line: &str) -> String {
     lines.push("  Enter       send".to_string());
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
-    lines.push("  y / a / n   in an approval prompt: allow / always-allow / deny".to_string());
+    lines.push("  y / n       in an approval prompt: allow / deny (Enter and Esc deny)".to_string());
+    lines.push("  a / A       in an approval prompt: show all of the text / always allow".to_string());
     lines.push("  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
     lines.push(String::new());
     lines.push(tests_line.to_string());
@@ -1622,6 +1635,13 @@ impl ModalView {
     fn scroll_by(&self, delta: isize) {
         let next = self.scroll.get().saturating_add_signed(delta);
         self.scroll.set(next.min(self.max_scroll.get()));
+    }
+
+    /// Jumps to the end of the text, which counts as having seen all of it
+    /// (the next draw puts the last rows on screen).
+    fn show_all(&self) {
+        self.scroll.set(self.max_scroll.get());
+        self.seen_end.set(true);
     }
 
     /// True once the last line has been shown (or nothing was clipped).
@@ -1768,21 +1788,26 @@ fn render_permission_modal_in(
     let always_hidden_by_clip = !view.seen_end.get();
 
     let footer_text = if request.tool_name == "commit" {
-        "[y] Commit    [e] Edit message    [n] / [Esc] / [Enter] Cancel"
+        "[y] Commit    [e] Edit message    [n] Cancel (default)"
     } else if request.tool_name == "undo" {
-        "[y] Undo    [n] / [Esc] / [Enter] Cancel"
+        "[y] Undo    [n] Cancel (default)"
     } else if request.tool_name == "redo" {
-        "[y] Redo    [n] / [Esc] / [Enter] Cancel"
+        "[y] Redo    [n] Cancel (default)"
     } else if offer_always_allow(request) && always_hidden_by_clip {
-        "[y] Allow    [n] / [Esc] / [Enter] Deny    (scroll to the end to offer Always Allow)"
+        "[y] allow  [n] deny (default)  [a] show all  (always allow once you have seen it all)"
     } else if offer_always_allow(request) {
-        "[y] Allow    [a] Always Allow    [n] / [Esc] / [Enter] Deny"
+        APPROVAL_KEYS
+    } else if always_hidden_by_clip {
+        "[y] allow  [n] deny (default)  [a] show all"
     } else {
-        "[y] Allow    [n] / [Esc] / [Enter] Deny"
+        "[y] allow  [n] deny (default)"
     };
     let footer = Paragraph::new(Line::from(footer_text)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, rows[1]);
 }
+
+/// The approval prompt's key line. Enter denies, and says so.
+const APPROVAL_KEYS: &str = "[y] allow  [n] deny (default)  [a] show all  [A] always allow";
 
 fn target_lines(target: &PermissionTarget) -> Vec<Line<'static>> {
     // Split on embedded newlines into separate `Line`s. Ratatui's `Span`
@@ -2222,7 +2247,7 @@ mod tests {
 
         let rendered = render_to_string(&terminal);
         assert!(
-            rendered.contains("Allow"),
+            rendered.contains("[y] allow  [n] deny (default)"),
             "the Allow/Deny button row must always be visible, even for a long diff:\n{rendered}"
         );
     }
@@ -2315,7 +2340,7 @@ mod tests {
             .unwrap();
         let rendered = render_to_string(&terminal);
         assert!(
-            !rendered.contains("Always Allow"),
+            !rendered.contains("always allow"),
             "Always Allow must not be offered for a file that runs code later:\n{rendered}"
         );
     }
@@ -2336,7 +2361,7 @@ mod tests {
             .draw(|frame| render_permission_modal(frame, &request))
             .unwrap();
         let rendered = render_to_string(&terminal);
-        assert!(rendered.contains("Always Allow"), "{rendered}");
+        assert!(rendered.contains("always allow"), "{rendered}");
     }
 
     #[test]
@@ -3299,7 +3324,7 @@ mod tests {
         assert!(text.contains("Enter") && text.contains("send"));
         assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
         assert!(text.contains("Ctrl+P") && text.contains("plan mode on/off"));
-        assert!(text.contains("y / a / n"));
+        assert!(text.contains("y / n") && text.contains("a / A"));
         // The transcript has no scrolling binding -- must not be claimed.
         // Only the /diff pager scrolls, and only its own line names the
         // paging keys.
@@ -3680,7 +3705,7 @@ mod tests {
         let rendered = render_to_string(&terminal);
         assert!(rendered.contains("[y] Commit"), "{rendered}");
         assert!(rendered.contains("[e] Edit message"), "{rendered}");
-        assert!(rendered.contains("[n] / [Esc] / [Enter] Cancel"), "{rendered}");
+        assert!(rendered.contains("[n] Cancel (default)"), "{rendered}");
         assert!(!rendered.contains("Always"), "{rendered}");
     }
 
@@ -4089,18 +4114,58 @@ mod tests {
         assert!(!top.contains("attacker.example"), "{top}");
         assert!(top.contains("more line(s) below"), "{top}");
         assert!(!view.seen_all());
-        assert!(!top.contains("[a] Always Allow"), "{top}");
+        assert!(!top.contains("[A] always allow"), "{top}");
 
         view.scroll_by(isize::MAX / 2);
         let end = draw_modal(&request, &view);
         assert!(end.contains("attacker.example"), "{end}");
         assert!(view.seen_all());
-        assert!(end.contains("[a] Always Allow"), "{end}");
+        assert!(end.contains("[A] always allow"), "{end}");
 
         // Scrolling back up keeps the "seen it all" state.
         view.scroll_by(-5);
         draw_modal(&request, &view);
         assert!(view.seen_all());
+    }
+
+    #[test]
+    fn the_key_line_names_the_default_and_the_new_keys() {
+        let mut request = long_script_request();
+        request.target = PermissionTarget::Command { program: "ls".to_string(), args: vec![] };
+        let text = draw_modal(&request, &ModalView::default());
+        assert!(
+            text.contains("[y] allow  [n] deny (default)  [a] show all  [A] always allow"),
+            "{text}"
+        );
+    }
+
+    fn run_modal_app(request: PermissionRequest) -> (App, oneshot::Receiver<UserResponse>) {
+        let (reply_tx, rx) = oneshot::channel();
+        let mut app = App::new(None, PlanMode::new());
+        app.open_permission(ModalRequest { request, reply_tx });
+        (app, rx)
+    }
+
+    #[test]
+    fn lowercase_a_never_grants_and_shift_a_does_only_after_the_text_is_seen() {
+        let (mut app, mut rx) = run_modal_app(long_script_request());
+        draw_modal(&app.pending_permission.as_ref().unwrap().request, &app.modal_view);
+        // Clipped and unseen: neither key grants.
+        app.approval_always_allow();
+        assert!(app.pending_permission.is_some());
+        app.approval_show_all();
+        assert!(app.pending_permission.is_some(), "`a` must not resolve the prompt");
+        assert!(rx.try_recv().is_err(), "`a` must not send any answer");
+        assert!(app.modal_view.seen_all());
+        app.approval_always_allow();
+        assert!(matches!(rx.try_recv(), Ok(UserResponse::AllowAlways)));
+    }
+
+    #[test]
+    fn enter_style_denial_is_deny_not_allow() {
+        let (mut app, mut rx) = run_modal_app(long_script_request());
+        app.resolve_permission(UserResponse::Deny);
+        assert!(matches!(rx.try_recv(), Ok(UserResponse::Deny)));
     }
 
     #[test]
@@ -4114,7 +4179,7 @@ mod tests {
         let text = draw_modal(&request, &view);
         assert!(!text.contains("more line(s)"), "{text}");
         assert!(view.seen_all());
-        assert!(text.contains("[a] Always Allow"), "{text}");
+        assert!(text.contains("[A] always allow"), "{text}");
     }
 
     #[test]

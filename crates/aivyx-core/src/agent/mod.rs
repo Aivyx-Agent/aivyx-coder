@@ -2079,7 +2079,7 @@ impl Agent {
             // shown in plan mode: no edits happen there, so running tests
             // is moot.
             // "Exactly as written": each run then asks to approve the same
-            // command, so the user can allow it once ([a] Always Allow)
+            // command, so the user can allow it once ([A] Always Allow)
             // instead of approving every variation the model invents.
             system.push_str(&format!(
                 "\n\nThis project's tests run with `{}`. After changing code, run them (with \

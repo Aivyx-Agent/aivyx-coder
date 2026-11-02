@@ -169,8 +169,8 @@ Every tool call passes through the gate before it runs:
    except for a target flagged by `runs_code_later` (below), where Always
    Allow isn't offered at all. A command or diff taller than the modal is
    wrapped and scrolls (Down/Up, PgDn/PgUp, Home/End); a marker row says how
-   many lines are below, and Always Allow is offered only once the end of the
-   text has been on screen.
+   many lines are below, and Always Allow (`A`) is offered only once the end of the
+   text has been on screen; `a` jumps to the end. Enter denies.
 6. **Pre-approved commands**: entries in `permissions.allowed_commands` are
    seeded into the Always-Allow cache at startup, so a command you already
    trusted by writing it into config runs without a prompt. This is the

@@ -6,8 +6,8 @@ edit the tool, not this page.
 
 **Asks first?** Reading, searching and fetching from the web don't ask.
 Anything that writes, deletes, moves or runs something, calls an MCP
-server, or saves memory asks you (`y` once, `a` always for that exact file,
-command or topic, `n` no) — unless you pre-approved it. In plan mode the
+server, or saves memory asks you (`y` once, `A` always for that exact file,
+command or topic, `n` no, `a` to show all of a long text) — unless you pre-approved it. In plan mode the
 tools that change things are hidden from the model and refused if it tries.
 Files on your deny list are refused outright. Delegated sub-agents and
 specialists ask for their own actions the same way. See the

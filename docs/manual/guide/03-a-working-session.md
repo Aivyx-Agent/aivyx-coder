@@ -24,7 +24,8 @@ command it found for this project.
 | Enter | Send |
 | Ctrl+C | Stop the reply in progress; when idle, quit |
 | Ctrl+P | Plan mode on or off ([Plan mode](04-plan-mode.md)) |
-| `y` / `a` / `n` | In an approval prompt: allow once / always allow / deny |
+| `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
+| `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
 
 The transcript itself doesn't scroll by key; `/diff` opens a scrollable
 view. `/help` lists every command.
@@ -37,10 +38,11 @@ command, committing — stops with an approval prompt showing exactly what
 will happen: a diff for a file change, the full command for a command.
 
 - **`y`** allows it once.
-- **`a`** allows it and remembers that exact target for the rest of the
+- **`a`** shows the whole command or diff when it is longer than the box. It never grants anything.
+- **`A`** (Shift+a) allows it and remembers that exact target for the rest of the
   session — that file, or that exact command with those arguments. It never
   blesses a different file or different arguments.
-- **`n`** refuses; the model is told and can try another way.
+- **`n`** refuses (so do Esc and Enter); the model is told and can try another way.
 
 A few things never get **always allow**: edits to files that run code later
 (your shell start-up files, autostart entries, systemd user units) show an
