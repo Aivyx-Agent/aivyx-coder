@@ -180,11 +180,9 @@ pub(crate) async fn run_then(after: AfterSetup) -> anyhow::Result<()> {
         println!("  warning: {warning}");
     }
 
-    let settings = Settings {
-        backend,
-        ..Default::default()
-    };
-    let written = settings.write_if_absent()?;
+    // Only what was chosen is written; every other setting stays at the
+    // built-in default, so later default changes reach this user.
+    let written = Settings::write_minimal_if_absent(Some(&backend))?;
     println!("Wrote {}", written.display());
 
     if std::env::var("AIVYX_CODER_ACP_TERMINAL_AUTH").is_ok() {

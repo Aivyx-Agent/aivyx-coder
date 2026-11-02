@@ -1326,9 +1326,10 @@ impl Settings {
         let path = Self::config_path()?;
 
         if !path.exists() {
-            let defaults = Self::default();
-            defaults.write_to(&path)?;
-            return Ok(defaults);
+            // Header only: no defaults pinned, so later default changes
+            // reach this user.
+            Self::write_minimal_if_absent_at(&path, None)?;
+            return Ok(Self::default());
         }
 
         let raw = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
@@ -1392,6 +1393,37 @@ impl Settings {
     /// so it would silently stop re-tightening an existing wide-mode file
     /// at that point (matching `session::save`'s own documented trade-off).
     fn write_to(&self, path: &Path) -> Result<(), ConfigError> {
+        write_config_text(path, &toml::to_string_pretty(self)?)
+    }
+}
+
+/// Header of every config file this program writes.
+pub const CONFIG_HEADER: &str = "# aivyx-coder config. Only the settings you chose are here; everything else uses the built-in defaults.\n# Every key is listed in docs/manual/reference/03-configuration.md. To change these answers, run `aivyx-coder --setup`.\n";
+
+/// The minimal config text: the header plus, when given, the backend
+/// answers the user chose (address, model, kind, context window).
+pub fn minimal_config_text(backend: Option<&BackendSettings>) -> Result<String, ConfigError> {
+    let mut text = CONFIG_HEADER.to_string();
+    if let Some(b) = backend {
+        let mut table = toml::Table::new();
+        table.insert("base_url".into(), toml::Value::String(b.base_url.clone()));
+        table.insert("model".into(), toml::Value::String(b.model.clone()));
+        let kind = toml::Value::try_from(b.kind)?;
+        table.insert("kind".into(), kind);
+        table.insert(
+            "context_tokens".into(),
+            toml::Value::Integer(i64::from(b.context_tokens)),
+        );
+        let mut root = toml::Table::new();
+        root.insert("backend".into(), toml::Value::Table(table));
+        text.push('\n');
+        text.push_str(&toml::to_string_pretty(&root)?);
+    }
+    Ok(text)
+}
+
+fn write_config_text(path: &Path, toml_string: &str) -> Result<(), ConfigError> {
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
@@ -1408,7 +1440,6 @@ impl Settings {
                 )?;
             }
         }
-        let toml_string = toml::to_string_pretty(self)?;
 
         #[cfg(unix)]
         let mut file = {
@@ -1445,7 +1476,9 @@ impl Settings {
 
         Ok(())
     }
+}
 
+impl Settings {
     /// Writes `self` to `path`, but only if nothing is there yet -- never
     /// overwrites an existing config file. Reuses the existing, private
     /// `write_to` internally (same 0600-at-create/0700-parent-dir
@@ -1465,6 +1498,26 @@ impl Settings {
         }
         self.write_to(path)?;
         Ok(path.to_path_buf())
+    }
+
+    /// Writes only what the user chose (see `minimal_config_text`), and
+    /// only if nothing is at `path` yet.
+    pub fn write_minimal_if_absent_at(
+        path: &Path,
+        backend: Option<&BackendSettings>,
+    ) -> Result<PathBuf, ConfigError> {
+        if path.exists() {
+            return Err(ConfigError::AlreadyExists {
+                path: path.to_path_buf(),
+            });
+        }
+        write_config_text(path, &minimal_config_text(backend)?)?;
+        Ok(path.to_path_buf())
+    }
+
+    /// `write_minimal_if_absent_at` at the standard config path.
+    pub fn write_minimal_if_absent(backend: Option<&BackendSettings>) -> Result<PathBuf, ConfigError> {
+        Self::write_minimal_if_absent_at(&Self::config_path()?, backend)
     }
 
     /// Same as `write_if_absent_at`, resolved against the standard XDG
@@ -2688,5 +2741,52 @@ mod tests {
         let text = toml::to_string_pretty(&Settings::default()).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(back.routing, Settings::default().routing);
+    }
+
+    #[test]
+    fn minimal_config_has_only_the_chosen_backend_and_a_header() {
+        let backend = BackendSettings {
+            base_url: "http://localhost:9999/v1".into(),
+            model: "m".into(),
+            kind: BackendKind::Generic,
+            context_tokens: 32768,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Settings::write_minimal_if_absent_at(&path, Some(&backend)).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# "), "{text}");
+        assert!(text.contains("03-configuration.md") && text.contains("--setup"), "{text}");
+        assert!(!text.contains("deny_paths"), "{text}");
+        assert!(!text.contains("final_review"), "{text}");
+        assert!(text.lines().filter(|l| l.starts_with('[')).count() == 1, "{text}");
+        let parsed: Settings = toml::from_str(&text).unwrap();
+        let expected = Settings {
+            backend,
+            ..Default::default()
+        };
+        assert_eq!(
+            toml::to_string(&parsed).unwrap(),
+            toml::to_string(&expected).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Never overwrites.
+        assert!(Settings::write_minimal_if_absent_at(&path, None).is_err());
+    }
+
+    #[test]
+    fn a_minimal_config_picks_up_a_later_default_change() {
+        // Keys absent from the file come from Default, whatever it is
+        // today: the file pins nothing but the backend answers.
+        let text = minimal_config_text(Some(&BackendSettings::default())).unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        assert_eq!(table.keys().collect::<Vec<_>>(), vec!["backend"]);
+        let header_only: toml::Table = toml::from_str(&minimal_config_text(None).unwrap()).unwrap();
+        assert!(header_only.is_empty());
     }
 }
