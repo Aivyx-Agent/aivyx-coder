@@ -446,6 +446,22 @@ pub async fn run(
                                 continue;
                             }
                             let text = app.take_input();
+                            match classify_slash(&text) {
+                                SlashInput::Complete(name) => {
+                                    // The hint below the box says what it does;
+                                    // a second Enter runs it.
+                                    app.set_input(&command_with_room(name));
+                                    continue;
+                                }
+                                SlashInput::Unknown(word) => {
+                                    app.set_input(&text);
+                                    app.transcript.push(ChatLine::Info(format!(
+                                        "{word} isn't a command — /help lists them."
+                                    )));
+                                    continue;
+                                }
+                                SlashInput::Message | SlashInput::Command => {}
+                            }
                             if !text.is_empty() {
                                 if aivyx_core::commands::parse_slash_command(&text, "/quit").is_some() {
                                     break;
@@ -474,6 +490,13 @@ pub async fn run(
                         (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                             if let Some(message) = app.toggle_plan_mode_and_maybe_approve() {
                                 let _ = input_tx.send(message);
+                            }
+                            continue;
+                        }
+                        (KeyCode::Tab, KeyModifiers::NONE) => {
+                            let text = app.input.lines().join("\n");
+                            if let Some(completed) = complete_slash(&text) {
+                                app.set_input(&completed);
                             }
                             continue;
                         }
@@ -900,6 +923,12 @@ impl App {
 
     fn scrolled_up(&self) -> bool {
         self.transcript_back.get() > 0
+    }
+
+    /// Replaces the input box's text, cursor at the end.
+    fn set_input(&mut self, text: &str) {
+        self.input = new_input_box();
+        self.input.insert_str(text);
     }
 
     /// Puts a paste into the input box as one block, its line breaks kept.
@@ -1683,6 +1712,7 @@ fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     lines.push(String::new());
     lines.push("Keys:".to_string());
     lines.push("  Enter       send".to_string());
+    lines.push("  Tab         complete a /command".to_string());
     lines.push("  Alt+Enter   new line (Shift+Enter too, where the terminal tells them apart)".to_string());
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
@@ -1800,6 +1830,79 @@ struct ModalView {
     /// Keys before this moment were typed for something else (the next
     /// message, usually) and don't answer the prompt; see `keys_ready`.
     quiet_until: std::cell::Cell<Option<Instant>>,
+}
+
+/// What Enter should do with a message, as far as slash commands go.
+#[derive(Debug, PartialEq)]
+enum SlashInput {
+    /// Not a command (no leading slash, or a path like `/etc/hosts`).
+    Message,
+    /// A known command, with or without arguments.
+    Command,
+    /// The start of exactly one command (`/he`): complete it rather than
+    /// guess that it should run.
+    Complete(&'static str),
+    /// Looks like a command but isn't one; never sent to the model.
+    Unknown(String),
+}
+
+fn classify_slash(text: &str) -> SlashInput {
+    let Some(word) = text.split_whitespace().next() else {
+        return SlashInput::Message;
+    };
+    let Some(name) = word.strip_prefix('/') else {
+        return SlashInput::Message;
+    };
+    // `/etc/hosts is wrong`: a path, so a message.
+    if name.contains('/') {
+        return SlashInput::Message;
+    }
+    let commands = aivyx_core::commands::COMMANDS;
+    if commands.iter().any(|c| c.name == word) {
+        return SlashInput::Command;
+    }
+    let mut starting = commands.iter().filter(|c| c.name.starts_with(word));
+    match (starting.next(), starting.next()) {
+        (Some(only), None) if word == text.trim() => SlashInput::Complete(only.name),
+        _ => SlashInput::Unknown(word.to_string()),
+    }
+}
+
+/// Tab on a partly typed command: the command when only one fits (with a
+/// space after it when it takes arguments), else as much as all that fit
+/// share. `None` when nothing fits or the text isn't a bare command word.
+fn complete_slash(text: &str) -> Option<String> {
+    if !text.starts_with('/') || text.contains(char::is_whitespace) {
+        return None;
+    }
+    let fits: Vec<_> = aivyx_core::commands::COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(text))
+        .collect();
+    match fits.as_slice() {
+        [] => None,
+        [only] => Some(command_with_room(only.name)),
+        [first, rest @ ..] => {
+            let shared = rest.iter().fold(first.name, |shared, c| {
+                let len = shared
+                    .char_indices()
+                    .zip(c.name.chars())
+                    .take_while(|((_, a), b)| a == b)
+                    .last()
+                    .map_or(0, |((i, a), _)| i + a.len_utf8());
+                &shared[..len]
+            });
+            Some(shared.to_string())
+        }
+    }
+}
+
+/// The command's name, with a space after it when it takes arguments.
+fn command_with_room(name: &str) -> String {
+    let takes_args = aivyx_core::commands::COMMANDS
+        .iter()
+        .any(|c| c.name == name && c.args_hint.is_some());
+    if takes_args { format!("{name} ") } else { name.to_string() }
 }
 
 /// Rows one ↑/↓ (or one notch of the mouse wheel) scrolls the transcript.
@@ -4273,6 +4376,39 @@ mod tests {
         app.scroll_transcript(-1_000);
         let bottom = rendered_app(&app);
         assert!(!app.scrolled_up() && bottom.contains("line 29"), "{bottom}");
+    }
+
+    #[test]
+    fn enter_sorts_commands_from_messages() {
+        assert_eq!(classify_slash("fix the tests"), SlashInput::Message);
+        assert_eq!(classify_slash("/etc/hosts has a typo"), SlashInput::Message);
+        assert_eq!(classify_slash("/help"), SlashInput::Command);
+        assert_eq!(classify_slash("/diff turn"), SlashInput::Command);
+        assert_eq!(classify_slash("/he"), SlashInput::Complete("/help"));
+        assert_eq!(classify_slash("  /he  "), SlashInput::Complete("/help"));
+        // More than one fits, or there's more after the word: not a guess.
+        assert_eq!(classify_slash("/c"), SlashInput::Unknown("/c".into()));
+        assert_eq!(classify_slash("/he me"), SlashInput::Unknown("/he".into()));
+        assert_eq!(classify_slash("/frobnicate"), SlashInput::Unknown("/frobnicate".into()));
+    }
+
+    #[test]
+    fn tab_completes_one_command_or_what_several_share() {
+        assert_eq!(complete_slash("/he").as_deref(), Some("/help"));
+        // Takes arguments: room to type them.
+        assert_eq!(complete_slash("/arch").as_deref(), Some("/architect "));
+        // /checkpoints, /clear, /commit, /council share only "/c".
+        assert_eq!(complete_slash("/c").as_deref(), Some("/c"));
+        assert_eq!(complete_slash("/re").as_deref(), Some("/re"));
+        assert_eq!(complete_slash("/res").as_deref(), Some("/resume "));
+        assert_eq!(complete_slash("/xyz"), None);
+        assert_eq!(complete_slash("hello"), None);
+        assert_eq!(complete_slash("/diff turn"), None);
+    }
+
+    #[test]
+    fn help_names_tab() {
+        assert!(help_text("", HelpSetup::default()).contains("Tab         complete a /command"));
     }
 
     #[test]

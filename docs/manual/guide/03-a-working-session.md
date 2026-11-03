@@ -22,6 +22,7 @@ command it found for this project.
 | Key | What it does |
 |---|---|
 | Enter | Send |
+| Tab | Complete a `/command` (Enter on a part that fits one command completes it too; a second Enter runs it) |
 | Alt+Enter | New line in the message (Shift+Enter too, where the terminal tells them apart) |
 | Ctrl+C | Stop the reply in progress; when idle, quit |
 | Ctrl+P | Plan mode on or off ([Plan mode](04-plan-mode.md)) |
@@ -36,7 +37,9 @@ not sent until you press Enter.
 While you are scrolled up, the title says how many lines are below and new
 output doesn't move what you are reading; sending a message takes you back
 to the end. Selecting and copying text with the mouse works as usual.
-`/help` lists every command.
+`/help` lists every command. A message that starts with a slash but isn't
+a command (`/frobnicate`) stays in the box with a note instead of going to
+the model; a path such as `/etc/hosts is wrong` is sent as usual.
 
 ## Approving what it does
 
