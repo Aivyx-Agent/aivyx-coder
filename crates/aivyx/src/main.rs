@@ -41,6 +41,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn help_is_one_plain_line_per_flag() {
+        use clap::CommandFactory;
+        let short = Cli::command().render_help().to_string();
+        let long = Cli::command().render_long_help().to_string();
+        for text in [&short, &long] {
+            for internal in [
+                "InitializeResponse",
+                "session/set_mode",
+                "aivyx-acp",
+                "[autonomous]",
+                "[verification]",
+                "ACP's own",
+            ] {
+                assert!(!text.contains(internal), "{internal} in help:\n{text}");
+            }
+        }
+        // -h: every flag is a single line, however long its --help text is.
+        let options = short.split("Options:").nth(1).unwrap();
+        for line in options.lines().filter(|l| l.trim_start().starts_with('-')) {
+            assert!(line.len() < 130, "flag line too long for -h: {line}");
+        }
+        assert!(short.contains("--auto <AUTO>") && short.contains("Work unattended toward a goal"));
+        assert!(!short.contains("budget"), "the long text belongs to --help:\n{short}");
+        assert!(long.contains("budget"), "{long}");
+    }
+
+    #[test]
     fn every_flag_has_a_command_line_reference_heading() {
         use clap::CommandFactory;
         let manual = include_str!("../../../docs/manual/reference/01-command-line.md");
@@ -477,84 +504,93 @@ fn build_system_prompt(edit_format: EditFormat, autonomous: bool) -> String {
     about = "A TUI coding agent for local LLMs (Ollama, Lemonade, llama.cpp, vLLM, ...)"
 )]
 struct Cli {
-    /// Override config.toml's backend base_url (e.g. http://localhost:11434/v1)
+    /// Use this server address for this session
+    ///
+    /// Overrides the address in config.toml, e.g. http://localhost:11434/v1.
     #[arg(long)]
     base_url: Option<String>,
 
-    /// Override config.toml's backend model
+    /// Use this model for this session
+    ///
+    /// Overrides the model in config.toml.
     #[arg(long)]
     model: Option<String>,
 
-    /// Resume a saved conversation for this project: the latest with bare
-    /// --resume, or number N from /sessions with --resume=N.
+    /// Resume a saved conversation (--resume=N picks number N)
+    ///
+    /// Bare --resume picks up the latest conversation for this project. For a
+    /// specific one, use the number /sessions shows: --resume=N.
     #[arg(long, value_name = "N", num_args = 0..=1, require_equals = true)]
     resume: Option<Option<usize>>,
 
-    /// Start in plan mode: the model can only read, search, and build a
-    /// task list until you approve with Ctrl+P in the TUI.
+    /// Start in plan mode (read and plan only, Ctrl+P to approve)
+    ///
+    /// The model can only read, search, and build a task list until you
+    /// approve it with Ctrl+P in the terminal UI.
     #[arg(long)]
     plan: bool,
 
-    /// Run unattended toward a goal: no permission modals, edits and
-    /// pre-approved commands auto-resolve, and the loop continues on its
-    /// own until the goal is achieved (every task marked done) or the
-    /// [autonomous] budget is exhausted. Mutually exclusive with --plan and
-    /// --resume. Requires a test command: [verification].command, or one
-    /// detected in the project.
+    /// Work unattended toward a goal
+    ///
+    /// No permission prompts: edits and pre-approved commands go through on
+    /// their own, and the agent keeps going until the goal is achieved (every
+    /// task marked done) or its budget is used up. Can't be combined with
+    /// --plan or --resume. Needs a test command, either set in config.toml or
+    /// found in the project.
     #[arg(long)]
     auto: Option<String>,
 
-    /// With --auto: when the run stops, write what aivyx-coder checked
-    /// itself (outcome, iterations, verification, final checks, changed
-    /// files) to this file as JSON.
+    /// With --auto: save a JSON summary of the run to this file
+    ///
+    /// Written when the run stops: the outcome, iterations, what it checked
+    /// itself, and the files it changed.
     #[arg(long, value_name = "PATH", requires = "auto")]
     report: Option<std::path::PathBuf>,
 
-    /// With --auto: run without the terminal UI. Progress goes to stderr,
-    /// the stop notice to stdout, and the exit code says how the run ended
-    /// (0 goal achieved, 1 achieved but a check failed, 2 budget used up,
-    /// 3 failed, 4 injection detected, 130 stopped by a signal). The
-    /// default when stdout isn't a terminal.
+    /// With --auto: run without the terminal UI
+    ///
+    /// Progress goes to stderr and the final notice to stdout. The exit code
+    /// says how the run ended: 0 goal achieved, 1 achieved but a check
+    /// failed, 2 budget used up, 3 failed, 4 injection detected, 130 stopped
+    /// by a signal. This is the default when stdout isn't a terminal.
     #[arg(long, requires = "auto")]
     headless: bool,
 
-    /// With --auto in headless mode: also print the model's text as it
-    /// streams.
+    /// With --auto and --headless: also print the model's text as it streams
     #[arg(long, short = 'v', requires = "auto")]
     verbose: bool,
 
-    /// Override config.toml's backend edit_format ("native" or "prompted")
-    /// for this session — mainly for comparing the two on a given model.
+    /// Use "native" or "prompted" file edits for this session
+    ///
+    /// Overrides edit_format in config.toml. Mainly for comparing the two on
+    /// a given model.
     #[arg(long, value_parser = ["native", "prompted"])]
     edit_format: Option<String>,
 
-    /// Run as an Agent Client Protocol (ACP) server over stdin/stdout,
-    /// for embedding in an editor (Zed, or VS Code via the
-    /// formulahendry.acp-client extension) instead of the TUI. Mutually
-    /// exclusive with --plan (ACP's own session/set_mode supersedes it),
-    /// --auto (not supported together yet), and --resume (the editor manages its own conversation view, so
-    /// resumed history would be invisible to it).
+    /// Run as an editor agent (ACP) over stdin/stdout
+    ///
+    /// For Zed, or VS Code with the formulahendry.acp-client extension; your
+    /// editor starts this for you. Works alone: not with --plan, --auto or
+    /// --resume (the editor keeps its own conversation view).
     #[arg(long)]
     acp: bool,
 
-    /// Run as an MCP (Model Context Protocol) server over stdin/stdout,
-    /// for delegation from another local MCP client (e.g. aivyx-pa).
-    /// Requires [mcp_server].max_access_level to be configured in
-    /// config.toml first -- refuses to start otherwise. Mutually
-    /// exclusive with --acp/--plan/--auto/--resume: this frontend has no
-    /// human to show a modal to, no editor session to embed in, and no
-    /// unattended-goal concept of its own (each MCP call is its own
-    /// bounded, isolated session)
+    /// Run as an MCP server over stdin/stdout, for another tool to delegate to
+    ///
+    /// For a local MCP client such as aivyx-pa. Set max_access_level under
+    /// [mcp_server] in config.toml first; it refuses to start without it.
+    /// Works alone: not with --acp, --plan, --auto or --resume, since there is
+    /// nobody to show an approval prompt to. Each call is its own isolated
+    /// session.
     #[arg(long)]
     mcp_server: bool,
 
-    /// Run the interactive first-run setup wizard (pick a backend, pick
-    /// a model, write config.toml) instead of starting the agent. If
-    /// config.toml already exists it asks before replacing it (the old one
-    /// is kept as config.toml.bak). Also the
-    /// entry point Zed/JetBrains/other ACP clients launch for this
-    /// agent's "terminal" authentication method (see aivyx-acp's own
-    /// InitializeResponse wiring).
+    /// Run the setup wizard (pick a server and a model)
+    ///
+    /// Finds your local model server, lists its models, and writes
+    /// config.toml. If one already exists it asks first and keeps the old one
+    /// as config.toml.bak. Editors that use aivyx-coder also start this for
+    /// their sign-in step.
     #[arg(long)]
     setup: bool,
 

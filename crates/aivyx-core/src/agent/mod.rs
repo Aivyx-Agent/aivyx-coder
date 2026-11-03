@@ -868,6 +868,16 @@ impl Agent {
         self.tests = tests;
     }
 
+    /// Whether `/council` has a council to convene (for `/help`'s notes).
+    pub fn has_council(&self) -> bool {
+        self.council.is_some()
+    }
+
+    /// Whether `/architect` has a planning model (for `/help`'s notes).
+    pub fn has_architect(&self) -> bool {
+        self.architect.is_some()
+    }
+
     pub fn tests(&self) -> Option<&crate::test_detect::EffectiveTests> {
         self.tests.as_ref()
     }

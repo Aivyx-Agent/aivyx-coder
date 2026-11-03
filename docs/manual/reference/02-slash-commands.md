@@ -14,6 +14,9 @@ over ACP, all appear in the editor's command picker except `/resume` and
 | `/council`, `/wiki`, `/architect` | yes — they run a turn |
 | everything else | no — they act on the session directly |
 
+`/help` marks a command "(needs setup: …)" while it can't work yet: `/council` and
+`/architect` until their config sections exist, `/test` until a test command is found.
+
 ## Conversations
 
 ### `/clear`

@@ -252,6 +252,11 @@ pub async fn run(
     let tests_line = aivyx_core::test_detect::status_line(agent.tests());
     let mut app = App::new(restored, plan_mode);
     app.tests_line = tests_line;
+    app.setup = HelpSetup {
+        council: agent.has_council(),
+        architect: agent.has_architect(),
+        tests: agent.tests().is_some(),
+    };
     // Read before `autonomous` moves into the background task below --
     // there is no other point after this where it's still available.
     app.autonomous = autonomous.is_some();
@@ -588,6 +593,8 @@ struct App {
     /// the welcome hint and appended to `/help`. Defaults to an empty
     /// string here; `run()` always overwrites it before the first render.
     tests_line: String,
+    /// Which optional commands are set up, for `/help`'s notes.
+    setup: HelpSetup,
     /// Whether this run was started with `--auto` — `run()` sets this from
     /// `autonomous.is_some()` before that `Option` moves into the
     /// background task, since nothing after that point can still ask it.
@@ -638,6 +645,7 @@ impl App {
             turn_is_test_command: false,
             diff_view: None,
             tests_line: String::new(),
+            setup: HelpSetup::default(),
             autonomous: false,
             autonomous_finished: false,
             project: None,
@@ -838,7 +846,7 @@ impl App {
     /// (U4/U5) -- deliberately not `Notice` (see that variant's doc
     /// comment).
     fn show_help(&mut self) {
-        self.transcript.push(ChatLine::Help(help_text(&self.tests_line)));
+        self.transcript.push(ChatLine::Help(help_text(&self.tests_line, self.setup)));
     }
 
     /// Slash-command suggestions for the input box's current
@@ -1499,6 +1507,30 @@ fn new_input_box() -> TextArea<'static> {
     input
 }
 
+/// Which commands that need configuring are ready, so `/help` can say which
+/// are not. The default (nothing set up) is what a test's bare `App` has.
+#[derive(Clone, Copy, Debug, Default)]
+struct HelpSetup {
+    council: bool,
+    architect: bool,
+    tests: bool,
+}
+
+impl HelpSetup {
+    /// A short " (needs setup: …)" suffix for a command that is not usable
+    /// yet, or an empty string.
+    fn note_for(self, command: &str) -> &'static str {
+        match command {
+            "/council" if !self.council => " (needs setup: add a [council] section to config.toml)",
+            "/architect" if !self.architect => {
+                " (needs setup: add an [architect] section to config.toml)"
+            }
+            "/test" if !self.tests => " (needs setup: no tests found)",
+            _ => "",
+        }
+    }
+}
+
 /// Builds the `/help` block (U4/U5): every known slash command (sourced
 /// from `aivyx_core::commands::COMMANDS` -- the same table `/clear`'s and
 /// the autocomplete hint's own logic reads, so this listing can never
@@ -1508,12 +1540,13 @@ fn new_input_box() -> TextArea<'static> {
 /// and the `/diff` pager's own keys -- the transcript has no scrolling
 /// binding, so none is claimed for it), then the test-command line
 /// (`/undo` itself is listed with the other commands).
-fn help_text(tests_line: &str) -> String {
+fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     let mut lines = vec!["Available commands:".to_string()];
     for cmd in aivyx_core::commands::COMMANDS {
+        let note = setup.note_for(cmd.name);
         match cmd.args_hint {
-            Some(hint) => lines.push(format!("  {} <{hint}> — {}", cmd.name, cmd.description)),
-            None => lines.push(format!("  {} — {}", cmd.name, cmd.description)),
+            Some(hint) => lines.push(format!("  {} <{hint}> — {}{note}", cmd.name, cmd.description)),
+            None => lines.push(format!("  {} — {}{note}", cmd.name, cmd.description)),
         }
     }
     lines.push(String::new());
@@ -1546,6 +1579,8 @@ fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
     ];
     lines
         .iter()
+        // Missing tests only matter once /test or --auto is used; /help says it.
+        .filter(|t| **t != aivyx_core::test_detect::NO_TESTS_FOUND)
         .map(|t| Line::from(t.to_string()).style(dim))
         .collect()
 }
@@ -3319,7 +3354,7 @@ mod tests {
 
     #[test]
     fn help_text_lists_real_keybindings_and_the_undo_commands() {
-        let text = help_text("");
+        let text = help_text("", HelpSetup::default());
         assert!(text.contains("Keys:"));
         assert!(text.contains("Enter") && text.contains("send"));
         assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
@@ -3345,7 +3380,7 @@ mod tests {
 
     #[test]
     fn help_text_shows_the_args_hint_for_commands_that_have_one() {
-        let text = help_text("");
+        let text = help_text("", HelpSetup::default());
         assert!(
             text.lines().any(|l| l == "  /model <model id, or auto> — Pin this conversation to a \
                 model (`/model <id>`), or `/model auto` to let routing choose"),
@@ -3364,12 +3399,39 @@ mod tests {
     #[test]
     fn help_and_welcome_show_the_test_command() {
         let line = "Tests: `cargo test` (detected from Cargo.toml) — run them with /test";
-        assert!(help_text(line).ends_with(line));
+        assert!(help_text(line, HelpSetup::default()).ends_with(line));
         let hint: Vec<String> = first_message_hint(line)
             .into_iter()
             .map(|l| l.to_string())
             .collect();
         assert!(hint.iter().any(|l| l == line), "{hint:?}");
+    }
+
+    #[test]
+    fn welcome_hides_the_no_tests_line_but_help_keeps_it() {
+        let none = aivyx_core::test_detect::NO_TESTS_FOUND;
+        let hint: Vec<String> = first_message_hint(none)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!hint.iter().any(|l| l.contains("No tests found")), "{hint:?}");
+        assert!(!hint.iter().any(|l| l.contains("config.toml")), "{hint:?}");
+        assert!(help_text(none, HelpSetup::default()).ends_with(none));
+    }
+
+    #[test]
+    fn help_marks_commands_that_need_setup() {
+        let off = help_text("", HelpSetup::default());
+        let line = |t: &str, name: &str| {
+            t.lines().find(|l| l.trim_start().starts_with(name)).unwrap().to_string()
+        };
+        assert!(line(&off, "/council").ends_with("(needs setup: add a [council] section to config.toml)"));
+        assert!(line(&off, "/architect").ends_with("(needs setup: add an [architect] section to config.toml)"));
+        assert!(line(&off, "/test").ends_with("(needs setup: no tests found)"));
+        // /wiki needs no setup; nothing else is marked.
+        assert_eq!(off.matches("needs setup").count(), 3, "{off}");
+        let on = help_text("", HelpSetup { council: true, architect: true, tests: true });
+        assert!(!on.contains("needs setup"), "{on}");
     }
 
     #[test]

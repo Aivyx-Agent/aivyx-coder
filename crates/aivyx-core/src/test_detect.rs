@@ -10,7 +10,7 @@ use std::path::Path;
 const MAX_READ_BYTES: u64 = 256 * 1024;
 
 pub const NO_TESTS_FOUND: &str =
-    "No test command found — set [verification] command in config.toml";
+    "No tests found for /test and --auto (see the manual: Undo, diff, commit and test)";
 
 /// How long `/test` may run, in seconds, before it's killed — the single
 /// source of truth for both `agent/test_command.rs`'s own `TEST_TIMEOUT`
@@ -313,8 +313,9 @@ mod tests {
         assert_eq!(EffectiveTests::resolve(None, dir.path()), None);
         assert_eq!(
             status_line(None),
-            "No test command found — set [verification] command in config.toml"
+            "No tests found for /test and --auto (see the manual: Undo, diff, commit and test)"
         );
+        assert!(!status_line(None).contains('['), "no config syntax on the first screen");
     }
 
     #[test]
