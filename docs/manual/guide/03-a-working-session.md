@@ -22,10 +22,14 @@ command it found for this project.
 | Key | What it does |
 |---|---|
 | Enter | Send |
+| Alt+Enter | New line in the message (Shift+Enter too, where the terminal tells them apart) |
 | Ctrl+C | Stop the reply in progress; when idle, quit |
 | Ctrl+P | Plan mode on or off ([Plan mode](04-plan-mode.md)) |
 | `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
 | `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
+
+A paste goes into the message box as it is, line breaks included; it is
+not sent until you press Enter.
 
 The transcript itself doesn't scroll by key; `/diff` opens a scrollable
 view. `/help` lists every command.
@@ -36,6 +40,9 @@ Reading and searching happen without asking. Anything that changes
 something — writing, editing, moving or deleting a file, running a
 command, committing — stops with an approval prompt showing exactly what
 will happen: a diff for a file change, the full command for a command.
+A prompt that opens while you are typing doesn't take those keys as an
+answer: it waits until you have stopped typing for a moment, and what you
+typed stays in the message box.
 
 - **`y`** allows it once.
 - **`a`** shows the whole command or diff when it is longer than the box. It never grants anything.

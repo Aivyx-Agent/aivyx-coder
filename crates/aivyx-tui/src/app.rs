@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aivyx_core::{Agent, AgentEvent, SessionState, SpecialistSessionSummary, Task, TaskStatus};
 use aivyx_sandbox::{
@@ -354,9 +355,19 @@ pub async fn run(
                 let Some(event) = maybe_event else { break };
                 let event = event?;
 
+                // A paste (with bracketed paste, one event) goes into the
+                // input box as text: never to an open prompt, and its line
+                // breaks don't send it.
+                if let CtEvent::Paste(text) = &event {
+                    app.paste(text);
+                    continue;
+                }
+
                 if let CtEvent::Key(key) = &event
                     && key.kind == KeyEventKind::Press
                 {
+                    let now = Instant::now();
+                    let previous_key = app.last_key_at.replace(now);
                     // The /diff pager takes every key but Ctrl+C while it's
                     // open. It is never open at the same time as a permission modal
                     // (`open_permission` closes it), so this can't starve one.
@@ -365,6 +376,12 @@ pub async fn run(
                         continue;
                     }
                     if app.pending_permission.is_some() {
+                        let ctrl_c =
+                            key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
+                        if !ctrl_c && !app.modal_view.keys_ready(now) {
+                            app.keep_early_key(key.code, key.modifiers);
+                            continue;
+                        }
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 app.resolve_permission(UserResponse::Deny);
@@ -424,6 +441,10 @@ pub async fn run(
                             continue;
                         }
                         (KeyCode::Enter, KeyModifiers::NONE) => {
+                            if enter_is_part_of_paste(previous_key, now) {
+                                app.input.insert_newline();
+                                continue;
+                            }
                             let text = app.take_input();
                             if !text.is_empty() {
                                 if aivyx_core::commands::parse_slash_command(&text, "/quit").is_some() {
@@ -528,6 +549,10 @@ struct App {
     /// Scroll position and "seen everything" state of the open permission
     /// modal; reset whenever a new modal opens.
     modal_view: ModalView,
+    /// When the last key was pressed: an Enter right behind another key is
+    /// part of a paste (from a terminal without bracketed paste), not a
+    /// send.
+    last_key_at: Option<Instant>,
     /// Latest `(used, limit)` context-token counts from the backend, shown
     /// in the status line. `None` until the first response reports usage.
     context_usage: Option<(u32, u32)>,
@@ -633,6 +658,7 @@ impl App {
             streaming_active: false,
             pending_permission: None,
             modal_view: ModalView::default(),
+            last_key_at: None,
             context_usage: None,
             routed_model: None,
             tasks,
@@ -682,7 +708,7 @@ impl App {
     /// the modal is visible and every key reaches it.
     fn open_permission(&mut self, modal: ModalRequest) {
         self.diff_view = None;
-        self.modal_view = ModalView::default();
+        self.modal_view = ModalView::opened(Instant::now());
         self.pending_permission = Some(modal);
     }
 
@@ -804,6 +830,24 @@ impl App {
         let text = self.input.lines().join("\n");
         self.input = new_input_box();
         text.trim().to_string()
+    }
+
+    /// A key typed before an approval prompt was ready for it: the user was
+    /// writing a message, so a letter goes into the input box (behind the
+    /// prompt) rather than being lost. Anything else is dropped.
+    fn keep_early_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match (code, modifiers) {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => self.input.insert_char(c),
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                self.input.delete_char();
+            }
+            _ => {}
+        }
+    }
+
+    /// Puts a paste into the input box as one block, its line breaks kept.
+    fn paste(&mut self, text: &str) {
+        self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     fn push_user_message(&mut self, text: String) {
@@ -1076,7 +1120,7 @@ impl App {
         if mission_height > 0 {
             constraints.push(Constraint::Length(mission_height));
         }
-        constraints.push(Constraint::Length(3));
+        constraints.push(Constraint::Length(input_box_height(self.input.lines().len())));
         constraints.push(Constraint::Length(1));
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1500,6 +1544,12 @@ fn format_tokens(n: u32) -> String {
     }
 }
 
+/// The input box grows with a message of several lines (a paste, Alt+Enter)
+/// up to six, then scrolls; plus its two border rows.
+fn input_box_height(lines: usize) -> u16 {
+    u16::try_from(lines.clamp(1, 6)).unwrap_or(6) + 2
+}
+
 fn new_input_box() -> TextArea<'static> {
     let mut input = TextArea::default();
     input.set_placeholder_text("Type a message and press Enter to send...");
@@ -1552,6 +1602,7 @@ fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     lines.push(String::new());
     lines.push("Keys:".to_string());
     lines.push("  Enter       send".to_string());
+    lines.push("  Alt+Enter   new line (Shift+Enter too, where the terminal tells them apart)".to_string());
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  y / n       in an approval prompt: allow / deny (Enter and Esc deny)".to_string());
@@ -1664,9 +1715,44 @@ struct ModalView {
     scroll: std::cell::Cell<usize>,
     max_scroll: std::cell::Cell<usize>,
     seen_end: std::cell::Cell<bool>,
+    /// Keys before this moment were typed for something else (the next
+    /// message, usually) and don't answer the prompt; see `keys_ready`.
+    quiet_until: std::cell::Cell<Option<Instant>>,
 }
 
+/// An Enter this soon after the previous key was not typed by hand: it is a
+/// line break inside a paste, from a terminal without bracketed paste.
+const PASTE_KEY_GAP: Duration = Duration::from_millis(15);
+
+fn enter_is_part_of_paste(previous_key: Option<Instant>, now: Instant) -> bool {
+    previous_key.is_some_and(|at| now.saturating_duration_since(at) < PASTE_KEY_GAP)
+}
+
+/// How long the keyboard must be quiet before a prompt takes its answer.
+/// Someone typing their next message while a reply runs keeps typing when
+/// a prompt opens; without this, the `y` in "my" allows the action.
+const PROMPT_QUIET: Duration = Duration::from_millis(600);
+
 impl ModalView {
+    fn opened(now: Instant) -> Self {
+        let view = Self::default();
+        view.quiet_until.set(Some(now + PROMPT_QUIET));
+        view
+    }
+
+    /// True when a key pressed `now` may answer the prompt. A key that
+    /// comes too soon is refused and restarts the wait, so a run of typing
+    /// never answers it; a deliberate press after a short pause does.
+    fn keys_ready(&self, now: Instant) -> bool {
+        match self.quiet_until.get() {
+            Some(until) if now < until => {
+                self.quiet_until.set(Some(now + PROMPT_QUIET));
+                false
+            }
+            _ => true,
+        }
+    }
+
     fn scroll_by(&self, delta: isize) {
         let next = self.scroll.get().saturating_add_signed(delta);
         self.scroll.set(next.min(self.max_scroll.get()));
@@ -3043,6 +3129,74 @@ mod tests {
         assert_eq!(sent, None);
         assert!(!app.plan_mode.active());
         assert!(matches!(app.transcript.last(), Some(ChatLine::Notice(_))));
+    }
+
+    #[test]
+    fn a_new_prompt_refuses_keys_until_the_keyboard_has_been_quiet() {
+        let t0 = Instant::now();
+        let view = ModalView::opened(t0);
+        let ms = |n| t0 + Duration::from_millis(n);
+
+        // Typing straight on from a message never answers the prompt...
+        assert!(!view.keys_ready(ms(100)));
+        assert!(!view.keys_ready(ms(500)));
+        assert!(!view.keys_ready(ms(1000)));
+        // ...a deliberate press after a pause does.
+        assert!(view.keys_ready(ms(1700)));
+        assert!(view.keys_ready(ms(1710)));
+    }
+
+    #[test]
+    fn a_prompt_left_alone_takes_the_first_key() {
+        let t0 = Instant::now();
+        let view = ModalView::opened(t0);
+        assert!(view.keys_ready(t0 + PROMPT_QUIET));
+    }
+
+    #[test]
+    fn early_letters_go_to_the_input_box_and_other_keys_are_dropped() {
+        let mut app = App::new(None, PlanMode::new());
+        for c in "my note".chars() {
+            app.keep_early_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.keep_early_key(KeyCode::Char('!'), KeyModifiers::SHIFT);
+        app.keep_early_key(KeyCode::Backspace, KeyModifiers::NONE);
+        app.keep_early_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.keep_early_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.input.lines(), ["my note"]);
+        assert!(app.pending_permission.is_none());
+    }
+
+    #[test]
+    fn a_paste_lands_in_the_input_box_as_one_block() {
+        let mut app = App::new(None, PlanMode::new());
+        app.paste("error: boom\r\n  at main.rs:3\rnext");
+
+        assert_eq!(app.input.lines(), ["error: boom", "  at main.rs:3", "next"]);
+        assert!(app.transcript.is_empty(), "nothing was sent");
+        assert_eq!(app.take_input(), "error: boom\n  at main.rs:3\nnext");
+    }
+
+    #[test]
+    fn only_an_enter_right_behind_another_key_counts_as_pasted() {
+        let t0 = Instant::now();
+        assert!(enter_is_part_of_paste(Some(t0), t0 + Duration::from_millis(2)));
+        assert!(!enter_is_part_of_paste(Some(t0), t0 + Duration::from_millis(80)));
+        assert!(!enter_is_part_of_paste(None, t0));
+    }
+
+    #[test]
+    fn the_input_box_grows_to_six_lines() {
+        assert_eq!(input_box_height(0), 3);
+        assert_eq!(input_box_height(1), 3);
+        assert_eq!(input_box_height(4), 6);
+        assert_eq!(input_box_height(40), 8);
+    }
+
+    #[test]
+    fn help_names_the_new_line_key() {
+        assert!(help_text("", HelpSetup::default()).contains("Alt+Enter   new line"));
     }
 
     #[test]

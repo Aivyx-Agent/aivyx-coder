@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -46,6 +47,10 @@ impl TerminalGuard {
         execute!(
             stdout,
             EnterAlternateScreen,
+            // A paste arrives as one `Event::Paste`, not as keystrokes: its
+            // newlines would otherwise send each line as a message, and its
+            // letters would answer an open approval prompt.
+            EnableBracketedPaste,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0)
         )?;
@@ -70,7 +75,7 @@ fn restore_terminal() -> io::Result<()> {
     // skip the other, since they restore unrelated pieces of terminal
     // state (raw mode vs. the alternate screen buffer).
     let raw_mode_result = disable_raw_mode();
-    let alt_screen_result = execute!(io::stdout(), LeaveAlternateScreen);
+    let alt_screen_result = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     raw_mode_result?;
     alt_screen_result?;
     Ok(())
