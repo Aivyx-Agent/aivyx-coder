@@ -25,14 +25,18 @@ command it found for this project.
 | Alt+Enter | New line in the message (Shift+Enter too, where the terminal tells them apart) |
 | Ctrl+C | Stop the reply in progress; when idle, quit |
 | Ctrl+P | Plan mode on or off ([Plan mode](04-plan-mode.md)) |
+| PgUp / PgDn | Scroll the conversation a page; ↑ / ↓ (and, in most terminals, the mouse wheel) scroll it a few lines while the message is one line long |
+| Esc | Back to the newest output after scrolling up |
 | `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
 | `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
 
 A paste goes into the message box as it is, line breaks included; it is
 not sent until you press Enter.
 
-The transcript itself doesn't scroll by key; `/diff` opens a scrollable
-view. `/help` lists every command.
+While you are scrolled up, the title says how many lines are below and new
+output doesn't move what you are reading; sending a message takes you back
+to the end. Selecting and copying text with the mouse works as usual.
+`/help` lists every command.
 
 ## Approving what it does
 

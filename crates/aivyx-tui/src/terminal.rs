@@ -51,6 +51,11 @@ impl TerminalGuard {
             // newlines would otherwise send each line as a message, and its
             // letters would answer an open approval prompt.
             EnableBracketedPaste,
+            // "Alternate scroll": the mouse wheel sends ↑/↓ on this screen,
+            // which scroll the transcript — without capturing the mouse,
+            // so selecting and copying text still works. Ignored by
+            // terminals that don't know it.
+            crossterm::style::Print("\x1b[?1007h"),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0)
         )?;
@@ -75,7 +80,12 @@ fn restore_terminal() -> io::Result<()> {
     // skip the other, since they restore unrelated pieces of terminal
     // state (raw mode vs. the alternate screen buffer).
     let raw_mode_result = disable_raw_mode();
-    let alt_screen_result = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+    let alt_screen_result = execute!(
+        io::stdout(),
+        crossterm::style::Print("\x1b[?1007l"),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     raw_mode_result?;
     alt_screen_result?;
     Ok(())

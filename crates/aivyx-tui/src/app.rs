@@ -477,6 +477,32 @@ pub async fn run(
                             }
                             continue;
                         }
+                        // Reading back through the transcript. ↑/↓ scroll
+                        // while the message is one line (in a longer one
+                        // they move the cursor); terminals that turn the
+                        // mouse wheel into ↑/↓ scroll with it too.
+                        (KeyCode::PageUp, _) => {
+                            app.scroll_transcript(app.transcript_page_rows());
+                            continue;
+                        }
+                        (KeyCode::PageDown, _) => {
+                            app.scroll_transcript(-app.transcript_page_rows());
+                            continue;
+                        }
+                        (KeyCode::Up, KeyModifiers::NONE) if app.input.lines().len() == 1 => {
+                            app.scroll_transcript(TRANSCRIPT_STEP);
+                            continue;
+                        }
+                        (KeyCode::Down, KeyModifiers::NONE) if app.input.lines().len() == 1 => {
+                            app.scroll_transcript(-TRANSCRIPT_STEP);
+                            continue;
+                        }
+                        (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::End, KeyModifiers::CONTROL)
+                            if app.scrolled_up() =>
+                        {
+                            app.scroll_transcript(isize::MIN);
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -553,6 +579,15 @@ struct App {
     /// part of a paste (from a terminal without bracketed paste), not a
     /// send.
     last_key_at: Option<Instant>,
+    /// How many rows up from the newest one the transcript is scrolled
+    /// (0 = following new output). Set by the scroll keys; the render pass
+    /// clamps it and moves it along with new output.
+    transcript_back: std::cell::Cell<usize>,
+    /// The transcript's total rows at the last frame drawn while scrolled
+    /// up (0 when not scrolled), to tell how much output arrived since.
+    transcript_rows_seen: std::cell::Cell<usize>,
+    /// Rows of transcript on screen at the last frame: one page.
+    transcript_page: std::cell::Cell<u16>,
     /// Latest `(used, limit)` context-token counts from the backend, shown
     /// in the status line. `None` until the first response reports usage.
     context_usage: Option<(u32, u32)>,
@@ -659,6 +694,9 @@ impl App {
             pending_permission: None,
             modal_view: ModalView::default(),
             last_key_at: None,
+            transcript_back: std::cell::Cell::new(0),
+            transcript_rows_seen: std::cell::Cell::new(0),
+            transcript_page: std::cell::Cell::new(0),
             context_usage: None,
             routed_model: None,
             tasks,
@@ -845,12 +883,33 @@ impl App {
         }
     }
 
+    /// Scrolls the transcript `rows` up (negative: down, toward the newest
+    /// output). Clamped to the transcript's length when it is next drawn.
+    fn scroll_transcript(&self, rows: isize) {
+        let back = self.transcript_back.get().saturating_add_signed(rows);
+        self.transcript_back.set(back);
+        if back == 0 {
+            self.transcript_rows_seen.set(0);
+        }
+    }
+
+    /// One screenful, keeping a row of the previous one for context.
+    fn transcript_page_rows(&self) -> isize {
+        isize::try_from(self.transcript_page.get().saturating_sub(1).max(1)).unwrap_or(1)
+    }
+
+    fn scrolled_up(&self) -> bool {
+        self.transcript_back.get() > 0
+    }
+
     /// Puts a paste into the input box as one block, its line breaks kept.
     fn paste(&mut self, text: &str) {
         self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
     fn push_user_message(&mut self, text: String) {
+        // Back to the newest output, where the reply will appear.
+        self.scroll_transcript(isize::MIN);
         self.turn_is_test_command =
             aivyx_core::commands::parse_slash_command(&text, "/test").is_some();
         self.transcript.push(ChatLine::User(text));
@@ -1142,18 +1201,40 @@ impl App {
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
-        let newest_first = hint.into_iter().rev().chain(
-            self.transcript
-                .iter()
-                .rev()
-                .flat_map(|l| chat_line_to_lines(l).into_iter().rev()),
-        );
-        let (lines, scroll) = transcript_tail(newest_first, content_width, viewport_height);
+        let newest_first = || {
+            hint.clone().into_iter().rev().chain(
+                self.transcript
+                    .iter()
+                    .rev()
+                    .flat_map(|l| chat_line_to_lines(l).into_iter().rev()),
+            )
+        };
+        self.transcript_page.set(viewport_height);
+        let mut back = self.transcript_back.get();
+        if back > 0 {
+            // Scrolled up: new output lands below the window, so move the
+            // window by as much to keep the same text in view.
+            let total = transcript_rows(newest_first(), content_width);
+            let seen = self.transcript_rows_seen.replace(total);
+            if seen > 0 {
+                back += total.saturating_sub(seen);
+            }
+        }
+        let window = transcript_window(newest_first(), content_width, viewport_height, back);
+        self.transcript_back.set(window.back);
+        if window.back == 0 {
+            self.transcript_rows_seen.set(0);
+        }
+        let title = if window.back > 0 {
+            format!("aivyx-coder ── {} more lines below · Esc to return", window.back)
+        } else {
+            "aivyx-coder".to_string()
+        };
 
-        let transcript = Paragraph::new(lines)
+        let transcript = Paragraph::new(window.lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title("aivyx-coder"))
-            .scroll((scroll, 0));
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((window.scroll, 0));
         frame.render_widget(transcript, layout[0]);
 
         let mut panel_index = 1;
@@ -1605,6 +1686,7 @@ fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     lines.push("  Alt+Enter   new line (Shift+Enter too, where the terminal tells them apart)".to_string());
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
+    lines.push("  PgUp/PgDn   scroll the conversation (↑/↓ and the mouse wheel too); Esc back to the end".to_string());
     lines.push("  y / n       in an approval prompt: allow / deny (Enter and Esc deny)".to_string());
     lines.push("  a / A       in an approval prompt: show all of the text / always allow".to_string());
     lines.push("  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
@@ -1719,6 +1801,9 @@ struct ModalView {
     /// message, usually) and don't answer the prompt; see `keys_ready`.
     quiet_until: std::cell::Cell<Option<Instant>>,
 }
+
+/// Rows one ↑/↓ (or one notch of the mouse wheel) scrolls the transcript.
+const TRANSCRIPT_STEP: isize = 3;
 
 /// An Enter this soon after the previous key was not typed by hand: it is a
 /// line break inside a paste, from a terminal without bracketed paste.
@@ -2172,15 +2257,40 @@ fn hang_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 /// Rows are counted per line with `line_count` (each `Line` wraps on its
 /// own, so the counts add up), and before any block is attached: a block's
 /// borders would be counted too and over-scroll by their height.
+#[cfg(test)]
 fn transcript_tail(
     newest_first: impl Iterator<Item = Line<'static>>,
     width: u16,
     height: u16,
 ) -> (Vec<Line<'static>>, u16) {
+    let window = transcript_window(newest_first, width, height, 0);
+    (window.lines, window.scroll)
+}
+
+/// The rows a frame shows of the transcript.
+struct TranscriptWindow {
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    /// How far up from the newest row the window really is: the requested
+    /// distance, or less when the transcript isn't that long.
+    back: usize,
+}
+
+/// Like the tail above, but `back` rows up from the newest one (0 = the
+/// bottom). Only the rows down to the window's top are wrapped, so a
+/// reader near the bottom of a long run costs no more than the tail did.
+fn transcript_window(
+    newest_first: impl Iterator<Item = Line<'static>>,
+    width: u16,
+    height: u16,
+    back: usize,
+) -> TranscriptWindow {
+    let height = usize::from(height);
+    let want = height.saturating_add(back);
     let mut tail = Vec::new();
     let mut rows = 0;
     for line in newest_first {
-        if rows >= usize::from(height) {
+        if rows >= want {
             break;
         }
         for row in hang_wrap(vec![line], width).into_iter().rev() {
@@ -2189,8 +2299,23 @@ fn transcript_tail(
         }
     }
     tail.reverse();
-    let scroll = rows.saturating_sub(usize::from(height));
-    (tail, u16::try_from(scroll).unwrap_or(u16::MAX))
+    // Ran out of transcript: the top is as far back as it goes.
+    let back = back.min(rows.saturating_sub(height));
+    let scroll = rows.saturating_sub(height + back);
+    TranscriptWindow {
+        lines: tail,
+        scroll: u16::try_from(scroll).unwrap_or(u16::MAX),
+        back,
+    }
+}
+
+/// Every row the transcript takes at `width`; only needed while the reader
+/// is scrolled up, to keep their place as new output arrives.
+fn transcript_rows(lines: impl Iterator<Item = Line<'static>>, width: u16) -> usize {
+    lines
+        .flat_map(|line| hang_wrap(vec![line], width))
+        .map(|row| Paragraph::new(row).wrap(Wrap { trim: false }).line_count(width))
+        .sum()
 }
 
 /// `text` in rows of at most `room` columns, breaking after spaces where
@@ -3514,17 +3639,18 @@ mod tests {
         assert!(text.contains("Ctrl+C") && text.contains("cancel a reply"));
         assert!(text.contains("Ctrl+P") && text.contains("plan mode on/off"));
         assert!(text.contains("y / n") && text.contains("a / A"));
-        // The transcript has no scrolling binding -- must not be claimed.
-        // Only the /diff pager scrolls, and only its own line names the
-        // paging keys.
-        assert!(!text.to_lowercase().contains("scroll"));
+        // Exactly two lines name paging keys: the conversation's and the
+        // /diff pager's.
         let paging_lines: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("PgUp") || l.contains('↑') || l.contains("Home"))
             .collect();
         assert_eq!(
             paging_lines,
-            ["  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close"],
+            [
+                "  PgUp/PgDn   scroll the conversation (↑/↓ and the mouse wheel too); Esc back to the end",
+                "  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close",
+            ],
             "{text}"
         );
         // Undo is an in-app command now, not a pointer to the README.
@@ -4071,6 +4197,87 @@ mod tests {
         }
         // Otherwise the scroll offset goes untested.
         assert!(scrolled > 0);
+    }
+
+    #[test]
+    fn a_scrolled_window_draws_what_the_whole_transcript_did_at_that_offset() {
+        let mut checked = 0;
+        for transcript in [0, 1, 3, 40].map(sample_transcript) {
+            for (width, height) in [(40, 12), (90, 30), (17, 5)] {
+                let (inner_w, inner_h) = (width - 2, height - 2);
+                let all: Vec<_> = transcript.iter().flat_map(chat_line_to_lines).collect();
+                let all = hang_wrap(all, inner_w);
+                let rows =
+                    Paragraph::new(all.clone()).wrap(Wrap { trim: false }).line_count(inner_w);
+                let room = rows.saturating_sub(inner_h.into());
+                for back in [1, 4, 25, 10_000] {
+                    let back_then = back.min(room);
+                    let scroll = (room - back_then) as u16;
+                    let want = draw_transcript(all.clone(), scroll, width, height);
+
+                    let window =
+                        transcript_window(newest_first_lines(&transcript), inner_w, inner_h, back);
+                    assert_eq!(window.back, back_then, "clamped to the top");
+                    let got = draw_transcript(window.lines, window.scroll, width, height);
+                    assert_eq!(got, want, "{} lines, {width}x{height}, back {back}", transcript.len());
+                    checked += usize::from(back_then > 0);
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    fn rendered_app(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        render_to_string(&terminal)
+    }
+
+    #[test]
+    fn scrolling_up_keeps_its_place_while_new_output_arrives() {
+        let mut app = App::new(None, PlanMode::new());
+        for i in 0..40 {
+            app.transcript.push(ChatLine::Info(format!("old line {i}")));
+        }
+        assert!(rendered_app(&app).contains("old line 39"));
+
+        app.scroll_transcript(20);
+        let before = rendered_app(&app);
+        assert!(before.contains("more lines below"), "{before}");
+        assert!(before.contains("old line 19") && !before.contains("old line 39"), "{before}");
+
+        for i in 0..5 {
+            app.transcript.push(ChatLine::Info(format!("new line {i}")));
+        }
+        let after = rendered_app(&app);
+        assert!(after.contains("old line 19") && !after.contains("new line"), "{after}");
+        assert!(after.contains("25 more lines below"), "{after}");
+
+        app.push_user_message("next".into());
+        let bottom = rendered_app(&app);
+        assert!(bottom.contains("next") && !bottom.contains("more lines below"), "{bottom}");
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_top_and_down_returns_to_following() {
+        let mut app = App::new(None, PlanMode::new());
+        for i in 0..30 {
+            app.transcript.push(ChatLine::Info(format!("line {i}")));
+        }
+        rendered_app(&app);
+        app.scroll_transcript(1_000);
+        let top = rendered_app(&app);
+        assert!(top.contains("line 0"), "{top}");
+        assert!(app.transcript_back.get() < 1_000, "clamped by the frame");
+
+        app.scroll_transcript(-1_000);
+        let bottom = rendered_app(&app);
+        assert!(!app.scrolled_up() && bottom.contains("line 29"), "{bottom}");
+    }
+
+    #[test]
+    fn help_names_the_scroll_keys() {
+        assert!(help_text("", HelpSetup::default()).contains("PgUp/PgDn   scroll the conversation"));
     }
 
     #[test]
