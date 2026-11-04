@@ -30,6 +30,7 @@ command it found for this project.
 | Esc | Back to the newest output after scrolling up |
 | `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
 | `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
+| `d` | In an approval prompt: deny and say why — type a short note, Enter sends it to the model with the denial |
 
 A message you send while a reply is still running waits under it as
 `queued > …` and goes out when the reply ends, in order. Esc (with an empty
@@ -62,6 +63,9 @@ typed stays in the message box.
   session — that file, or that exact command with those arguments. It never
   blesses a different file or different arguments.
 - **`n`** refuses (so do Esc and Enter); the model is told and can try another way.
+- **`d`** refuses and lets you say why in a line ("use the test database",
+  "don't touch the lockfile"); the model gets your note with the refusal
+  instead of having to guess.
 
 A few things never get **always allow**: edits to files that run code later
 (your shell start-up files, autostart entries, systemd user units) show an

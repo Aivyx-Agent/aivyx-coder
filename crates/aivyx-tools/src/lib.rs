@@ -791,7 +791,7 @@ mod tests {
         impl PermissionPrompter for FakePrompter {
             async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                self.response
+                self.response.clone()
             }
         }
 

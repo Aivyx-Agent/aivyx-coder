@@ -43,7 +43,7 @@ impl PermissionPrompter for TieredPrompter {
         if self.allowed_names.contains(&request.tool_name) {
             UserResponse::Allow
         } else {
-            UserResponse::Deny
+            UserResponse::Deny(None)
         }
     }
 }
@@ -833,7 +833,7 @@ mod tests {
         let allow = futures::executor::block_on(prompter.prompt(&allowed));
         let deny = futures::executor::block_on(prompter.prompt(&denied));
         assert_eq!(allow, UserResponse::Allow);
-        assert_eq!(deny, UserResponse::Deny);
+        assert_eq!(deny, UserResponse::Deny(None));
     }
 
     // Every response is a tool call with no final answer, so the agent

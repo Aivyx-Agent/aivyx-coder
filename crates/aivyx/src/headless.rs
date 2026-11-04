@@ -26,7 +26,7 @@ impl PermissionPrompter for NoHumanPrompter {
             tool = %request.tool_name,
             "headless: a permission prompt was denied (no one to ask)"
         );
-        UserResponse::Deny
+        UserResponse::Deny(None)
     }
 }
 

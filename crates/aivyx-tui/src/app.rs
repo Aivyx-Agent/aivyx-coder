@@ -387,9 +387,13 @@ pub async fn run(
                             app.keep_early_key(key.code, key.modifiers);
                             continue;
                         }
+                        if !ctrl_c && app.writing_deny_note() {
+                            app.note_key(key.code, key.modifiers);
+                            continue;
+                        }
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                                app.resolve_permission(UserResponse::Deny);
+                                app.resolve_permission(UserResponse::Deny(None));
                                 if let Some(cancellation) = active_cancellation.lock().unwrap().as_ref() {
                                     cancellation.cancel();
                                     app.cancel_requested = true;
@@ -404,6 +408,9 @@ pub async fn run(
                             (KeyCode::Char('A'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                                 app.approval_always_allow();
                             }
+                            (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                                app.start_deny_note();
+                            }
                             // Only the /commit modal has an `e`: cancel it and
                             // put the draft in the input box to edit.
                             (KeyCode::Char('e'), KeyModifiers::NONE) => {
@@ -412,7 +419,7 @@ pub async fn run(
                             (KeyCode::Char('n'), KeyModifiers::NONE)
                             | (KeyCode::Esc, KeyModifiers::NONE)
                             | (KeyCode::Enter, KeyModifiers::NONE) => {
-                                app.resolve_permission(UserResponse::Deny);
+                                app.resolve_permission(UserResponse::Deny(None));
                             }
                             // Scrolling a long command or diff.
                             (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
@@ -900,7 +907,7 @@ impl App {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        self.resolve_permission(UserResponse::Deny);
+        self.resolve_permission(UserResponse::Deny(None));
         if self.input.is_empty() {
             self.input = new_input_box();
             self.input.insert_str(commit_edit_input(&draft));
@@ -960,6 +967,44 @@ impl App {
         self.transcript_back.get() > 0
     }
 
+    fn writing_deny_note(&self) -> bool {
+        self.modal_view.note.borrow().is_some()
+    }
+
+    /// `d` in an approval prompt: start writing why not.
+    fn start_deny_note(&mut self) {
+        if self
+            .pending_permission
+            .as_ref()
+            .is_some_and(|modal| takes_a_note(&modal.request))
+        {
+            *self.modal_view.note.borrow_mut() = Some(String::new());
+        }
+    }
+
+    /// A key while writing the note: Enter denies with it, Esc goes back
+    /// to the prompt's keys, the rest edit it.
+    fn note_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match (code, modifiers) {
+            (KeyCode::Enter, _) => {
+                let note = self.modal_view.note.borrow_mut().take().filter(|n| !n.trim().is_empty());
+                self.resolve_permission(UserResponse::Deny(note));
+            }
+            (KeyCode::Esc, _) => *self.modal_view.note.borrow_mut() = None,
+            (KeyCode::Backspace, _) => {
+                if let Some(note) = self.modal_view.note.borrow_mut().as_mut() {
+                    note.pop();
+                }
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                if let Some(note) = self.modal_view.note.borrow_mut().as_mut() {
+                    note.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Esc with an empty box: the last queued message back into it, to edit
     /// or drop. False (key not used) when there is nothing to take back.
     fn take_back_queued(&mut self) -> bool {
@@ -999,8 +1044,14 @@ impl App {
         self.input.insert_str(text);
     }
 
-    /// Puts a paste into the input box as one block, its line breaks kept.
+    /// Puts a paste into the input box as one block, its line breaks kept
+    /// — or, while a denial note is being written, into the note as one
+    /// line. Never an answer to the prompt.
     fn paste(&mut self, text: &str) {
+        if let Some(note) = self.modal_view.note.borrow_mut().as_mut() {
+            note.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+            return;
+        }
         self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
     }
 
@@ -1801,6 +1852,7 @@ fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     lines.push("  Ctrl+P      plan mode on/off".to_string());
     lines.push("  PgUp/PgDn   scroll the conversation (↑/↓ and the mouse wheel too); Esc back to the end".to_string());
     lines.push("  y / n       in an approval prompt: allow / deny (Enter and Esc deny)".to_string());
+    lines.push("  d           in an approval prompt: deny and say why (the model gets the note)".to_string());
     lines.push("  a / A       in an approval prompt: show all of the text / always allow".to_string());
     lines.push("  /diff view  ↑↓ PgUp/PgDn Home/End · Esc to close".to_string());
     lines.push(String::new());
@@ -1913,6 +1965,9 @@ struct ModalView {
     /// Keys before this moment were typed for something else (the next
     /// message, usually) and don't answer the prompt; see `keys_ready`.
     quiet_until: std::cell::Cell<Option<Instant>>,
+    /// The note being written after `d` (why not), `None` when there isn't
+    /// one; it goes to the model with the denial.
+    note: std::cell::RefCell<Option<String>>,
 }
 
 /// What Enter should do with a message, as far as slash commands go.
@@ -2179,6 +2234,19 @@ fn render_permission_modal_in(
     frame.render_widget(Paragraph::new(shown), rows[0]);
     let always_hidden_by_clip = !view.seen_end.get();
 
+    if let Some(note) = view.note.borrow().as_deref() {
+        let footer = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Why not? ", Style::default().fg(Color::Yellow)),
+                Span::raw(note.to_string()),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from("Enter: deny with this note (the model gets it)   Esc: back")
+                .style(Style::default().fg(Color::DarkGray)),
+        ]);
+        frame.render_widget(footer, rows[1]);
+        return;
+    }
     let footer_text = if request.tool_name == "commit" {
         "[y] Commit    [e] Edit message    [n] Cancel (default)"
     } else if request.tool_name == "undo" {
@@ -2194,8 +2262,20 @@ fn render_permission_modal_in(
     } else {
         "[y] allow  [n] deny (default)"
     };
-    let footer = Paragraph::new(Line::from(footer_text)).style(Style::default().fg(Color::DarkGray));
+    let mut footer_lines = vec![Line::from(footer_text)];
+    if takes_a_note(request) {
+        footer_lines.push(Line::from(DENY_WITH_NOTE_KEY));
+    }
+    let footer = Paragraph::new(footer_lines).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, rows[1]);
+}
+
+const DENY_WITH_NOTE_KEY: &str = "[d] deny and say why";
+
+/// Approvals the model asked for take a note with a denial; the /commit,
+/// /undo and /redo confirmations are the user's own and don't.
+fn takes_a_note(request: &PermissionRequest) -> bool {
+    !matches!(request.tool_name.as_str(), "commit" | "undo" | "redo")
 }
 
 /// The approval prompt's key line. Enter denies, and says so.
@@ -4259,7 +4339,7 @@ mod tests {
         app.open_permission(modal);
         assert!(app.edit_commit_message());
         assert!(app.pending_permission.is_none());
-        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny);
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny(None));
         assert_eq!(
             app.input.lines().join("\n"),
             "/commit -m \"Say \\\"hi\\\"\""
@@ -4273,7 +4353,7 @@ mod tests {
         let (modal, mut rx) = commit_modal("Fix the average");
         app.open_permission(modal);
         assert!(app.edit_commit_message());
-        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny);
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny(None));
         assert_eq!(app.input.lines().join("\n"), "half a thought");
         assert!(matches!(
             app.transcript.last(),
@@ -4529,6 +4609,11 @@ mod tests {
         assert!(app.queued.is_empty());
         assert_eq!(app.take_input(), "half written\n\none\n\ntwo");
         assert!(matches!(app.transcript.last(), Some(ChatLine::Info(t)) if t.contains("back in the box")));
+    }
+
+    #[test]
+    fn help_names_the_deny_with_a_note_key() {
+        assert!(help_text("", HelpSetup::default()).contains("deny and say why"));
     }
 
     #[test]
@@ -4846,10 +4931,57 @@ mod tests {
     }
 
     #[test]
+    fn d_writes_a_note_that_goes_with_the_denial() {
+        let (mut app, mut rx) = run_modal_app(long_script_request());
+        app.start_deny_note();
+        for c in "use the dev database".chars() {
+            app.note_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.note_key(KeyCode::Backspace, KeyModifiers::NONE);
+        app.paste("e\ninstead");
+        let screen = draw_modal(&app.pending_permission.as_ref().unwrap().request, &app.modal_view);
+        assert!(screen.contains("Why not? use the dev database instead"), "{screen}");
+        assert!(rx.try_recv().is_err(), "nothing answered while writing");
+        assert!(app.input.is_empty(), "the paste went to the note");
+
+        app.note_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny(Some("use the dev database instead".into())));
+    }
+
+    #[test]
+    fn esc_leaves_the_note_and_an_empty_note_is_a_plain_denial() {
+        let (mut app, mut rx) = run_modal_app(long_script_request());
+        app.start_deny_note();
+        app.note_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(rx.try_recv().is_err(), "y is text while writing the note");
+        app.note_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.writing_deny_note() && app.pending_permission.is_some());
+
+        app.start_deny_note();
+        app.note_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.note_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(rx.try_recv().unwrap(), UserResponse::Deny(None));
+    }
+
+    #[test]
+    fn the_prompt_offers_d_but_the_commit_confirmation_does_not() {
+        let screen = draw_modal(&long_script_request(), &ModalView::default());
+        assert!(screen.contains("[d] deny and say why"), "{screen}");
+        let (modal, _rx) = commit_modal("Fix it");
+        let screen = draw_modal(&modal.request, &ModalView::default());
+        assert!(!screen.contains("[d]"), "{screen}");
+
+        let mut app = App::new(None, PlanMode::new());
+        app.open_permission(modal);
+        app.start_deny_note();
+        assert!(!app.writing_deny_note());
+    }
+
+    #[test]
     fn enter_style_denial_is_deny_not_allow() {
         let (mut app, mut rx) = run_modal_app(long_script_request());
-        app.resolve_permission(UserResponse::Deny);
-        assert!(matches!(rx.try_recv(), Ok(UserResponse::Deny)));
+        app.resolve_permission(UserResponse::Deny(None));
+        assert!(matches!(rx.try_recv(), Ok(UserResponse::Deny(None))));
     }
 
     #[test]

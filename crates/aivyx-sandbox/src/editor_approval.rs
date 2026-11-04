@@ -279,7 +279,7 @@ pub(crate) async fn poll_for_response(path: &Path, expected_request_id: &str) ->
         {
             return match response.decision {
                 Decision::Allow => UserResponse::Allow,
-                Decision::Deny => UserResponse::Deny,
+                Decision::Deny => UserResponse::Deny(None),
                 Decision::AlwaysAllow => UserResponse::AllowAlways,
             };
         }
@@ -521,7 +521,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             poll_for_response(&deny_path, "r1").await,
-            UserResponse::Deny
+            UserResponse::Deny(None)
         );
 
         let always_path = dir.path().join("always.json");

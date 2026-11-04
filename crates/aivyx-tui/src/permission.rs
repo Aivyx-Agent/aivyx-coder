@@ -38,9 +38,9 @@ impl PermissionPrompter for TuiPrompter {
             .is_err()
         {
             // Render loop is gone (app shutting down) — fail closed.
-            return UserResponse::Deny;
+            return UserResponse::Deny(None);
         }
-        reply_rx.await.unwrap_or(UserResponse::Deny)
+        reply_rx.await.unwrap_or(UserResponse::Deny(None))
     }
 }
 

@@ -197,15 +197,15 @@ pub(crate) fn permission_request_to_acp_in(
 /// (the enum is `#[non_exhaustive]`, so the match needs a catch-all arm).
 fn acp_response_to_user_response(response: RequestPermissionResponse) -> UserResponse {
     match response.outcome {
-        RequestPermissionOutcome::Cancelled => UserResponse::Deny,
+        RequestPermissionOutcome::Cancelled => UserResponse::Deny(None),
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.0.as_ref() {
                 ALLOW_ONCE => UserResponse::Allow,
                 ALLOW_ALWAYS => UserResponse::AllowAlways,
-                _ => UserResponse::Deny,
+                _ => UserResponse::Deny(None),
             }
         }
-        _ => UserResponse::Deny,
+        _ => UserResponse::Deny(None),
     }
 }
 
@@ -266,13 +266,13 @@ impl PermissionPrompter for AcpPrompter {
         };
         let answer = tokio::select! {
             answer = self.connection.send_request(acp_request).block_task() => answer,
-            _ = cancelled => return UserResponse::Deny,
+            _ = cancelled => return UserResponse::Deny(None),
         };
         match answer {
             Ok(response) => acp_response_to_user_response(response),
             // Connection gone / request failed — fail closed, matching
             // `TuiPrompter`'s "render loop is gone" fallback.
-            Err(_) => UserResponse::Deny,
+            Err(_) => UserResponse::Deny(None),
         }
     }
 }
@@ -325,7 +325,7 @@ impl PermissionPrompter for DeferredPrompter {
             // Should not happen in practice — `session/new` always runs
             // before the first `session/prompt` that could trigger a
             // gated tool call. Fail closed if it somehow does.
-            None => UserResponse::Deny,
+            None => UserResponse::Deny(None),
         }
     }
 }
@@ -580,9 +580,9 @@ mod tests {
             SelectedPermissionOutcome::new(REJECT_ALWAYS),
         ));
         let cancelled = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
-        assert_eq!(acp_response_to_user_response(reject_once), UserResponse::Deny);
-        assert_eq!(acp_response_to_user_response(reject_always), UserResponse::Deny);
-        assert_eq!(acp_response_to_user_response(cancelled), UserResponse::Deny);
+        assert_eq!(acp_response_to_user_response(reject_once), UserResponse::Deny(None));
+        assert_eq!(acp_response_to_user_response(reject_always), UserResponse::Deny(None));
+        assert_eq!(acp_response_to_user_response(cancelled), UserResponse::Deny(None));
     }
 
     /// End-to-end regression test for a real bug: `agent-client-protocol`

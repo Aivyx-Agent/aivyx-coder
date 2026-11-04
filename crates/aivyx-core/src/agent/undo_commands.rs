@@ -174,7 +174,7 @@ impl Agent {
         };
         // Allow and AllowAlways both mean yes for this one decision; nothing
         // is ever cached for /undo.
-        !matches!(prompter.prompt(&request).await, UserResponse::Deny)
+        !matches!(prompter.prompt(&request).await, UserResponse::Deny(_))
     }
 
     /// Whether the project has saved conversations besides this one.

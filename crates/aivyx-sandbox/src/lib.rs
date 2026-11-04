@@ -349,11 +349,13 @@ impl AutonomousMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserResponse {
     Allow,
     AllowAlways,
-    Deny,
+    /// With the user's note on why, if they gave one; the model gets it
+    /// with the denial.
+    Deny(Option<String>),
 }
 
 /// Decides allow/deny for every tool call, uniformly, before `Tool::execute`
@@ -1218,7 +1220,7 @@ mod audit_probes {
         impl PermissionPrompter for CountingPrompter {
             async fn prompt(&self, _r: &PermissionRequest) -> UserResponse {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                UserResponse::Deny
+                UserResponse::Deny(None)
             }
         }
         let prompter = Arc::new(CountingPrompter(std::sync::atomic::AtomicUsize::new(0)));

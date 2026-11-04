@@ -767,6 +767,6 @@ impl Agent {
             preview: Some(preview),
             diff: None,
         };
-        !matches!(prompter.prompt(&request).await, UserResponse::Deny)
+        !matches!(prompter.prompt(&request).await, UserResponse::Deny(_))
     }
 }

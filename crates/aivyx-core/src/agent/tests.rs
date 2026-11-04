@@ -3380,7 +3380,7 @@ struct ScriptedPrompter { replies: Mutex<VecDeque<UserResponse>>, seen: Mutex<Ve
 impl PermissionPrompter for ScriptedPrompter {
     async fn prompt(&self, r: &PermissionRequest) -> UserResponse {
         self.seen.lock().unwrap().push(r.clone());
-        self.replies.lock().unwrap().pop_front().unwrap_or(UserResponse::Deny)
+        self.replies.lock().unwrap().pop_front().unwrap_or(UserResponse::Deny(None))
     }
 }
 
@@ -3417,7 +3417,7 @@ async fn a_hand_edit_is_flagged_and_deny_changes_nothing() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let mut agent = undo_agent(&cwd, vec![write_call("c1", "tracked.txt", "v2\n"), text_response("done")]).await;
-    let prompter = Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny].into()), seen: Mutex::default() });
+    let prompter = Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny(None)].into()), seen: Mutex::default() });
     agent.set_command_prompter(prompter.clone());
     agent.run_turn("edit".into(), &cwd, CancellationToken::new()).await.unwrap();
     std::fs::write(cwd.join("tracked.txt"), "hand edit\n").unwrap();
@@ -3709,7 +3709,7 @@ async fn undo_and_redo_success_notices_are_info_not_error() {
 }
 
 fn deny_prompter() -> Arc<ScriptedPrompter> {
-    Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny].into()), seen: Mutex::default() })
+    Arc::new(ScriptedPrompter { replies: Mutex::new(vec![UserResponse::Deny(None)].into()), seen: Mutex::default() })
 }
 
 #[tokio::test]
@@ -4000,7 +4000,7 @@ async fn redo_flags_paths_changed_since_the_undo() {
         write_call("c1", "tracked.txt", "v2\n"), write_call("c2", "a.txt", "a\n"), text_response("done"),
     ]).await;
     let prompter = Arc::new(ScriptedPrompter {
-        replies: Mutex::new(vec![UserResponse::Allow, UserResponse::Deny].into()),
+        replies: Mutex::new(vec![UserResponse::Allow, UserResponse::Deny(None)].into()),
         seen: Mutex::default(),
     });
     agent.set_command_prompter(prompter.clone());
@@ -8520,7 +8520,7 @@ async fn commit_preview_never_runs_a_repo_textconv_and_still_sees_binary() {
     std::fs::write(cwd.join("x.bin"), [0u8, 0, 1, 2, 0, 3]).unwrap();
     let mock = Arc::new(MockBackend::new(vec![text_response(DRAFT)]));
     let (mut agent, _rx) = undo_agent_over(&cwd, mock).await;
-    let prompter = scripted(vec![UserResponse::Deny]);
+    let prompter = scripted(vec![UserResponse::Deny(None)]);
     agent.set_command_prompter(prompter.clone());
 
     agent.run_turn("/commit".into(), &cwd, CancellationToken::new()).await.unwrap();
@@ -8559,7 +8559,7 @@ async fn commit_cancelled_leaves_the_index_as_it_was() {
     std::fs::write(cwd.join("new.txt"), "fresh\n").unwrap();
     let (mut agent, mut rx) =
         undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT), text_response(DRAFT)]))).await;
-    agent.set_command_prompter(scripted(vec![UserResponse::Deny, UserResponse::Deny]));
+    agent.set_command_prompter(scripted(vec![UserResponse::Deny(None), UserResponse::Deny(None)]));
 
     // Nothing staged: everything /commit staged is unstaged again.
     let status_before = git_text(&cwd, &["status", "--porcelain"]).await;
@@ -8709,7 +8709,7 @@ async fn commit_works_in_a_repository_with_no_commits() {
     std::fs::write(cwd.join("one.txt"), "1\n").unwrap();
     let (mut agent, _rx) =
         undo_agent_over(&cwd, Arc::new(MockBackend::new(vec![text_response(DRAFT)]))).await;
-    agent.set_command_prompter(scripted(vec![UserResponse::Deny]));
+    agent.set_command_prompter(scripted(vec![UserResponse::Deny(None)]));
 
     // Cancel first: with no HEAD the staged files are removed from the
     // index again rather than reset.
@@ -8826,7 +8826,7 @@ async fn undo_after_commit_says_the_commit_stays() {
     init_git_repo(dir.path()).await;
     let cwd = dir.path().canonicalize().unwrap();
     let mut agent = undo_agent(&cwd, vec![write_call("c1", "a.txt", "a\n"), text_response("done")]).await;
-    let prompter = scripted(vec![UserResponse::Deny, UserResponse::Deny]);
+    let prompter = scripted(vec![UserResponse::Deny(None), UserResponse::Deny(None)]);
     agent.set_command_prompter(prompter.clone());
     agent.run_turn("write".into(), &cwd, CancellationToken::new()).await.unwrap();
 

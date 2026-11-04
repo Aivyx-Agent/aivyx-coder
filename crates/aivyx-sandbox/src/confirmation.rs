@@ -136,6 +136,15 @@ impl PermissionKey {
 /// outright while plan mode is active, otherwise prompts (with an
 /// in-memory, per-exact-target Always-Allow cache for the rest of the
 /// session).
+/// What the model is told when the user says no: with their note, when
+/// they gave one, so it needn't guess why.
+fn denial_reason(note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|note| !note.is_empty()) {
+        Some(note) => format!("the user denied this action and said: {note}"),
+        None => "the user denied this action".to_string(),
+    }
+}
+
 pub struct ConfirmationGate {
     prompter: Arc<dyn PermissionPrompter>,
     deny_paths: Vec<PathBuf>,
@@ -609,9 +618,7 @@ impl PermissionGate for ConfirmationGate {
                 }
                 PermissionDecision::AllowAlways
             }
-            UserResponse::Deny => {
-                PermissionDecision::Deny(Some("the user denied this action".to_string()))
-            }
+            UserResponse::Deny(note) => PermissionDecision::Deny(Some(denial_reason(note.as_deref()))),
         };
         match &decision {
             PermissionDecision::Deny(_) => tracing::warn!(
@@ -677,7 +684,7 @@ mod tests {
     impl PermissionPrompter for FakePrompter {
         async fn prompt(&self, _request: &PermissionRequest) -> UserResponse {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.response
+            self.response.clone()
         }
     }
 
@@ -900,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn autonomous_mode_allows_a_move_within_the_worktree() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let autonomous_mode = AutonomousMode::new();
@@ -1082,7 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn reads_auto_allow_without_prompting() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -1106,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn internal_actions_auto_allow_without_prompting() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -1253,7 +1260,7 @@ mod tests {
     #[tokio::test]
     async fn forget_always_allow_never_evicts_a_config_pre_approved_command() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let autonomous_mode = AutonomousMode::new();
@@ -1539,7 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn pre_approved_commands_skip_the_prompt_entirely() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -1641,7 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_leaves_reads_and_internal_actions_untouched() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let plan_mode = PlanMode::new();
@@ -1738,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn plain_deny_is_never_cached() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -1760,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn autonomous_mode_allows_edits_inside_cwd() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let autonomous_mode = AutonomousMode::new();
@@ -1995,7 +2002,7 @@ mod tests {
         // Regression: the new taint check must not change any existing
         // autonomous-mode behavior when nothing has been flagged.
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let autonomous_mode = AutonomousMode::new();
@@ -2133,7 +2140,7 @@ mod tests {
     #[tokio::test]
     async fn interact_actions_auto_allow_in_act_mode_without_prompting() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -2567,7 +2574,7 @@ mod tests {
     async fn no_structured_diff_falls_back_to_the_terminal_even_when_enabled() {
         let cwd_dir = tempfile::tempdir().unwrap();
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -2791,7 +2798,7 @@ mod tests {
         // doesn't regress ordinary UX (no new prompt for a routine,
         // untainted fetch).
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -2960,7 +2967,7 @@ mod tests {
     #[tokio::test]
     async fn reading_inside_dot_git_is_unaffected() {
         let prompter = Arc::new(FakePrompter {
-            response: UserResponse::Deny,
+            response: UserResponse::Deny(None),
             calls: AtomicUsize::new(0),
         });
         let gate = ConfirmationGate::new(
@@ -3080,6 +3087,16 @@ mod tests {
             2,
             "the prompter must be asked again -- a runs_code_later target must never \
              be satisfied from the Always-Allow cache"
+        );
+    }
+
+    #[test]
+    fn a_denial_carries_the_users_note_when_there_is_one() {
+        assert_eq!(denial_reason(None), "the user denied this action");
+        assert_eq!(denial_reason(Some("  ")), "the user denied this action");
+        assert_eq!(
+            denial_reason(Some(" use cargo nextest ")),
+            "the user denied this action and said: use cargo nextest"
         );
     }
 }
