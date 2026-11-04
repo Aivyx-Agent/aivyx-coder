@@ -131,7 +131,10 @@ autonomous run stopped: goal achieved after 5 iteration(s)
 ```
 
 - **Final checks:** `[verification] final_checks` names allowed commands
-  (a linter, say) that aivyx-coder runs itself when the goal is reached.
+  (a linter, a type check, a build) that aivyx-coder runs itself when the
+  goal is reached. If one fails, the run isn't over: its output goes back
+  to the model, which fixes it and reaches the goal again — up to
+  `final_check_retries` times (2), while the run has turns and time left.
 - **Changed:** compares the project with a snapshot taken when the run
   started, leaving out build output.
 - **Read-only files changed:** any of those files that are in

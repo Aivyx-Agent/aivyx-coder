@@ -10729,13 +10729,10 @@ async fn final_checks_report_passes_failures_and_warnings_outside_the_conversati
             &CancellationToken::new(),
         )
         .await;
-    assert_eq!(
-        checks,
-        [
-            crate::run_facts::FinalCheck { name: "clippy".into(), passed: true, warnings: 2 },
-            crate::run_facts::FinalCheck { name: "fmt".into(), passed: false, warnings: 0 },
-        ]
-    );
+    let summary: Vec<_> = checks.iter().map(|c| (c.name.as_str(), c.passed, c.warnings)).collect();
+    assert_eq!(summary, [("clippy", true, 2), ("fmt", false, 0)]);
+    // Kept for the model if the check fails.
+    assert!(checks[1].output.contains("exit status: 1 (failed)"), "{:?}", checks[1].output);
     assert_eq!(agent.history.len(), before, "final checks are not part of the conversation");
 }
 

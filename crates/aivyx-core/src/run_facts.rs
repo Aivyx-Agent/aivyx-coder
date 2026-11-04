@@ -15,6 +15,29 @@ pub struct FinalCheck {
     pub name: String,
     pub passed: bool,
     pub warnings: usize,
+    /// The end of what the command printed, sent back to the model when
+    /// the check fails. Not part of `--report`.
+    #[serde(skip)]
+    pub output: String,
+}
+
+/// The most of a command's output a failing final check sends back.
+pub const OUTPUT_TAIL_BYTES: usize = 4000;
+
+/// The end of `text`, at most `OUTPUT_TAIL_BYTES`, starting on a whole line
+/// where it is cut.
+pub fn output_tail(text: &str) -> &str {
+    if text.len() <= OUTPUT_TAIL_BYTES {
+        return text;
+    }
+    let mut start = text.len() - OUTPUT_TAIL_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    match text[start..].find('\n') {
+        Some(i) => &text[start + i + 1..],
+        None => &text[start..],
+    }
 }
 
 /// A file that differs between the run's start and its end.
@@ -274,8 +297,8 @@ mod tests {
         let facts = RunFacts {
             verification: Some(("test".into(), Some(true))),
             final_checks: vec![
-                FinalCheck { name: "clippy".into(), passed: true, warnings: 3 },
-                FinalCheck { name: "fmt".into(), passed: false, warnings: 0 },
+                FinalCheck { name: "clippy".into(), passed: true, warnings: 3, output: String::new() },
+                FinalCheck { name: "fmt".into(), passed: false, warnings: 0, output: String::new() },
             ],
             changed: Some(vec![
                 file("src/main.rs", "modified", 10, 2, false),
@@ -318,7 +341,7 @@ mod tests {
 
     #[test]
     fn the_report_serializes_every_field() {
-        let checks = [FinalCheck { name: "clippy".into(), passed: true, warnings: 3 }];
+        let checks = [FinalCheck { name: "clippy".into(), passed: true, warnings: 3, output: String::new() }];
         let files = [
             file("src/main.rs", "modified", 10, 2, false),
             file("BRIEF.md", "modified", 1, 1, true),
@@ -410,5 +433,14 @@ mod tests {
             usage,
             UsageTotals { requests: 3, prompt_tokens: 600, completion_tokens: 35, peak_prompt_tokens: 300 }
         );
+    }
+
+    #[test]
+    fn output_tail_keeps_short_output_and_cuts_long_output_on_a_line() {
+        assert_eq!(output_tail("short"), "short");
+        let long = format!("{}\nlast line", "x".repeat(OUTPUT_TAIL_BYTES + 50));
+        assert_eq!(output_tail(&long), "last line");
+        let wide = "é".repeat(OUTPUT_TAIL_BYTES);
+        assert!(output_tail(&wide).len() <= OUTPUT_TAIL_BYTES);
     }
 }

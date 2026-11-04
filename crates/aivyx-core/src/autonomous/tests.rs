@@ -497,6 +497,66 @@ impl aivyx_tools::Tool for HangingRunCommand {
     }
 }
 
+/// A `run_command` whose check fails its first `fails` runs, then passes.
+struct CheckThatFails {
+    fails: u32,
+    runs: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl aivyx_tools::Tool for CheckThatFails {
+    fn name(&self) -> &str {
+        "run_command"
+    }
+
+    fn definition(&self) -> aivyx_types::ToolDefinition {
+        aivyx_types::ToolDefinition {
+            name: "run_command".to_string(),
+            description: "a check".to_string(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, aivyx_tools::ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "run_command".to_string(),
+            action: aivyx_sandbox::ActionKind::Internal,
+            target: aivyx_sandbox::PermissionTarget::Other("check".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &aivyx_tools::ToolExecutionContext,
+    ) -> Result<aivyx_types::ToolOutput, aivyx_tools::ToolError> {
+        let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(aivyx_types::ToolOutput::Ok(if run < self.fails {
+            "src/app.ts(3,1): error TS2345: wrong type\nexit status: 2 (failed)".to_string()
+        } else {
+            "exit status: 0 (success)".to_string()
+        }))
+    }
+}
+
+async fn drive_with_check(fails: u32, retries: u32, replies: &[&str]) -> (RunEnd, u32) {
+    let mut run = run_with(vec![done_task(1)], 10);
+    run.final_checks = vec!["typecheck".to_string()];
+    run.final_check_retries = retries;
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(CheckThatFails { fails, runs: Arc::clone(&runs) }));
+    let (end, _) = drive_with_tools(scripted(replies), registry, &run, &CancellationToken::new()).await;
+    (end, runs.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 fn text(reply: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(reply.to_string()),
@@ -518,6 +578,7 @@ fn run_with(tasks: Vec<Task>, max_iterations: u32) -> AutonomousRun {
         mission_plan: None,
         specialist_session_pool: None,
         final_checks: Vec::new(),
+        final_check_retries: 2,
         read_only_paths: Vec::new(),
         report: None,
         final_review: FinalReview::default(),
@@ -1019,4 +1080,49 @@ async fn a_fresh_review_keeps_the_saved_session_whole() {
     let all: String = saved.history.iter().map(|m| m.text_content()).collect::<Vec<_>>().join("\n");
     assert!(all.contains("OLD-CONVERSATION-MARKER"), "the run's conversation was lost: {all}");
     assert!(all.contains("REVIEW-REPLY-MARKER"), "the review was not saved: {all}");
+}
+
+#[tokio::test]
+async fn a_failing_final_check_goes_back_to_the_model_and_the_run_ends_when_it_passes() {
+    let (end, check_runs) = drive_with_check(1, 2, &["Done.", "Fixed the type."]).await;
+    assert_eq!(end.outcome, Outcome::GoalAchieved, "{}", end.notice);
+    assert_eq!(end.iterations, 2, "one more turn for the failing check");
+    assert_eq!(check_runs, 2, "checked again after the fix, and not a third time for the report");
+    assert!(end.final_checks_passed, "{}", end.notice);
+}
+
+#[tokio::test]
+async fn final_checks_go_back_at_most_final_check_retries_times() {
+    let (end, check_runs) = drive_with_check(u32::MAX, 2, &["Done.", "Tried.", "Tried again."]).await;
+    assert_eq!(end.outcome, Outcome::GoalAchieved, "{}", end.notice);
+    assert_eq!(end.iterations, 3);
+    assert_eq!(check_runs, 3);
+    assert!(!end.final_checks_passed);
+}
+
+#[tokio::test]
+async fn with_no_retries_final_checks_only_report() {
+    let (end, check_runs) = drive_with_check(u32::MAX, 0, &["Done."]).await;
+    assert_eq!(end.iterations, 1);
+    assert_eq!(check_runs, 1);
+    assert!(!end.final_checks_passed);
+}
+
+#[test]
+fn the_failed_checks_message_names_each_failure_with_its_output() {
+    let check = |name: &str, passed, output: &str| crate::run_facts::FinalCheck {
+        name: name.into(),
+        passed,
+        warnings: 0,
+        output: output.into(),
+    };
+    let message = final_checks_failed_message(&[
+        check("typecheck", false, "src/a.ts(1,1): error TS1\n"),
+        check("lint", true, "all good"),
+        check("build", false, "error: boom"),
+    ]);
+    assert!(message.starts_with("The goal is not done yet"), "{message}");
+    assert!(message.contains("`typecheck` failed") && message.contains("error TS1"), "{message}");
+    assert!(message.contains("`build` failed") && message.contains("error: boom"), "{message}");
+    assert!(!message.contains("lint") && !message.contains("all good"), "{message}");
 }

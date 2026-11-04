@@ -108,6 +108,10 @@ pub struct VerificationSettings {
     /// say. Their results, with warning counts, go into the stop notice
     /// and `--report`, so the run's end doesn't rest on the model's claims.
     pub final_checks: Vec<String>,
+    /// How many times a failing final check goes back to the model, with
+    /// its output, before the run stops anyway (0: never — the checks only
+    /// report). Each try is one more turn within the run's budget.
+    pub final_check_retries: u32,
 }
 
 impl Default for VerificationSettings {
@@ -118,6 +122,7 @@ impl Default for VerificationSettings {
             scoped_command: None,
             sandbox_failures: Vec::new(),
             final_checks: Vec::new(),
+            final_check_retries: 2,
         }
     }
 }
@@ -1582,6 +1587,10 @@ mod tests {
         let settings: Settings =
             toml::from_str("[verification]\nfinal_checks = [\"clippy\"]").unwrap();
         assert_eq!(settings.verification.final_checks, ["clippy"]);
+        assert_eq!(VerificationSettings::default().final_check_retries, 2);
+        let settings: Settings =
+            toml::from_str("[verification]\nfinal_check_retries = 0").unwrap();
+        assert_eq!(settings.verification.final_check_retries, 0);
     }
 
     #[test]

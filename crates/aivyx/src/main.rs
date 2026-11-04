@@ -1073,6 +1073,7 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
         mission_plan: built.mission_plan.clone(),
         specialist_session_pool: built.specialist_session_pool.clone(),
         final_checks: settings.verification.final_checks.clone(),
+        final_check_retries: settings.verification.final_check_retries,
         read_only_paths: settings.permissions.resolved_read_only_paths(&built.cwd),
         report: cli.report.clone(),
         final_review: aivyx_core::autonomous::FinalReview {

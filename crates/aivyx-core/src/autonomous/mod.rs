@@ -316,6 +316,9 @@ pub struct AutonomousRun {
     /// `[verification] final_checks`: run by aivyx-coder when the goal is
     /// reached, reported in the stop notice.
     pub final_checks: Vec<String>,
+    /// `[verification] final_check_retries`: how many times failing final
+    /// checks go back to the model before the run stops anyway.
+    pub final_check_retries: u32,
     /// Resolved `[permissions] read_only_paths`, to mark changed files.
     pub read_only_paths: Vec<PathBuf>,
     /// `--report`: where to write the run's facts as JSON when it stops.
@@ -393,6 +396,10 @@ pub async fn drive(
     let mut iterations_used = 0u32;
     let mut failed_in_a_row = 0u32;
     let mut next_message = Some(run.goal.clone());
+    let mut check_retries_left = run.final_check_retries;
+    // The final checks' results when they last ran, right before the run
+    // stopped with its goal reached: `finish` reports these.
+    let mut final_checks: Option<Vec<crate::run_facts::FinalCheck>> = None;
     // Kept by the agent too: compaction can drop the turn that carried it,
     // and there's no one to ask to restate it.
     agent.set_autonomous_goal(run.goal.clone());
@@ -465,6 +472,39 @@ pub async fn drive(
             )
             .await;
         }
+        // The goal is reached (and reviewed): the final checks decide
+        // whether it really is. A failing one goes back to the model while
+        // there are tries, turns and time left.
+        if next_message.is_none() && !run.final_checks.is_empty() {
+            let cancellation = stop.child_token();
+            *active_cancellation.lock().unwrap() = Some(cancellation.clone());
+            let checks = agent.run_final_checks(&run.final_checks, cwd, &cancellation).await;
+            *active_cancellation.lock().unwrap() = None;
+            if stop.is_cancelled() {
+                // They count as failed; the run was cancelled, not finished
+                // with failing checks.
+                break (
+                    Outcome::Cancelled,
+                    format!(
+                        "{} (goal reached; cancelled during the final checks)",
+                        cancelled_notice(iterations_used)
+                    ),
+                );
+            }
+            let failing = checks.iter().any(|check| !check.passed);
+            if failing
+                && check_retries_left > 0
+                && iterations_used < run.max_iterations
+                && Instant::now() < deadline
+            {
+                check_retries_left -= 1;
+                agent.info("final checks failed: their output goes back to the model");
+                next_message = Some(final_checks_failed_message(&checks));
+                final_checks = None;
+            } else {
+                final_checks = Some(checks);
+            }
+        }
     };
     let review_changed = match &review_start {
         Some(oid) => agent.changed_paths_since(oid).await.unwrap_or_default(),
@@ -487,8 +527,22 @@ pub async fn drive(
         stop,
         active_cancellation,
         &review,
+        final_checks,
     )
     .await
+}
+
+/// The message after failing final checks: which failed and the end of
+/// their output. Says nothing about how to fix them.
+fn final_checks_failed_message(checks: &[crate::run_facts::FinalCheck]) -> String {
+    let mut message = String::from(
+        "The goal is not done yet: these final checks fail. Fix what they report \
+         (without weakening the checks or the tests), then say the goal is achieved again.",
+    );
+    for check in checks.iter().filter(|check| !check.passed) {
+        message.push_str(&format!("\n\n`{}` failed; the end of its output:\n```\n{}\n```", check.name, check.output.trim_end()));
+    }
+    message
 }
 
 /// The goal is reached: the next review turn's message, if one is due,
@@ -559,6 +613,7 @@ async fn finish(
     stop: &CancellationToken,
     active_cancellation: &Mutex<Option<CancellationToken>>,
     review: &crate::run_facts::FinalReviewFacts,
+    checked: Option<Vec<crate::run_facts::FinalCheck>>,
 ) -> RunEnd {
     let mut facts = RunFacts {
         verification: agent
@@ -566,7 +621,12 @@ async fn finish(
             .map(|name| (name.to_string(), agent.last_verification_passed())),
         ..Default::default()
     };
-    if outcome == Outcome::GoalAchieved && !run.final_checks.is_empty() {
+    if outcome == Outcome::GoalAchieved
+        && let Some(checks) = checked
+    {
+        // Run by the loop just before it stopped; nothing has changed since.
+        facts.final_checks = checks;
+    } else if outcome == Outcome::GoalAchieved && !run.final_checks.is_empty() {
         let cancellation = stop.child_token();
         *active_cancellation.lock().unwrap() = Some(cancellation.clone());
         facts.final_checks = agent.run_final_checks(&run.final_checks, cwd, &cancellation).await;

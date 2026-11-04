@@ -972,15 +972,17 @@ impl Agent {
             self.emit(AgentEvent::ToolCallDetected(call.clone()));
             let result = self.executor.dispatch(call, cwd, cancellation.clone()).await;
             self.report_checkpoint_failure();
-            let (passed, warnings) = match &result.output {
+            let (passed, warnings, text) = match &result.output {
                 ToolOutput::Ok(text) => (
                     command_reported_success(text),
                     crate::run_facts::warnings_in(text),
+                    text.as_str(),
                 ),
-                ToolOutput::Error(_) | ToolOutput::Denied(_) => (false, 0),
+                ToolOutput::Error(text) | ToolOutput::Denied(text) => (false, 0, text.as_str()),
             };
+            let output = crate::run_facts::output_tail(text).to_string();
             self.emit(AgentEvent::ToolResult(result));
-            checks.push(crate::run_facts::FinalCheck { name: name.clone(), passed, warnings });
+            checks.push(crate::run_facts::FinalCheck { name: name.clone(), passed, warnings, output });
         }
         checks
     }

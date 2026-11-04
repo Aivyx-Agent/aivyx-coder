@@ -123,6 +123,7 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 #                              # named to the model as not its task, and a
 #                              # run whose only failures they are passes.
 # final_checks = ["clippy"]   # allowed_commands entries --auto runs itself
+# final_check_retries = 2      # a failing one goes back to the model this often (0: report only)
 #                              # when the goal is reached; results (with
 #                              # warning counts) go in the stop notice and
 #                              # --report.

@@ -191,6 +191,7 @@ Check the work after edits by running a test command before a turn may end. See 
 | `scoped_command` | string | `"test_scoped"` | Another `[[permissions.allowed_commands]]` entry name, whose `args` may contain the literal token `"{touched_paths}"` — substituted at runtime with the files touched since edits became unverified, one argv entry per path. |
 | `sandbox_failures` | list of string | `["global::*"]` | Tests that fail only inside the sandbox, not because of a bug — one that lists `/tmp` or walks up to `/`, say. The model is told to leave them alone, and a test run whose only failures are these counts as passed. |
 | `final_checks` | list of string | `["clippy"]` | Commands (`[[permissions.allowed_commands]]` names) aivyx-coder runs itself when an autonomous run reaches its goal — a linter, say. Their results, with warning counts, go into the stop notice and `--report`, so the run's end doesn't rest on the model's claims. |
+| `final_check_retries` | integer | `2` | How many times a failing final check goes back to the model — with the end of its output — before the run stops anyway. Each try is one more turn within the run's budget; `0` makes the checks report only, as before 0.7. |
 
 ### `[autonomous]`
 
