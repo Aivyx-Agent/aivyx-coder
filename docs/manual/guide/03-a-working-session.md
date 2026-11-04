@@ -31,6 +31,11 @@ command it found for this project.
 | `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
 | `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
 
+A message you send while a reply is still running waits under it as
+`queued > …` and goes out when the reply ends, in order. Esc (with an empty
+box) takes the last one back to edit; Ctrl+C, which stops the reply, also
+puts queued messages back in the box instead of sending them.
+
 A paste goes into the message box as it is, line breaks included; it is
 not sent until you press Enter.
 

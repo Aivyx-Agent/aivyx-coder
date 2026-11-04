@@ -245,6 +245,9 @@ pub async fn run(
     repl_resize: std::sync::Arc<dyn aivyx_sandbox::ResizeTarget>,
 ) -> anyhow::Result<()> {
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<String>();
+    // One `()` per input the agent task has finished with, so the render
+    // loop knows when to send the next queued message.
+    let (input_done_tx, mut input_done_rx) = mpsc::unbounded_channel::<()>();
     let active_cancellation: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
 
     // Computed from `agent` before it moves into the background task below
@@ -304,6 +307,7 @@ pub async fn run(
                     // sequentially here is sufficient.
                     agent.clear_conversation();
                     agent.info("New conversation — the previous one is in /sessions.");
+                    let _ = input_done_tx.send(());
                     continue;
                 }
                 let cancellation = CancellationToken::new();
@@ -331,6 +335,7 @@ pub async fn run(
                 if let Some(finding) = agent.injection_taint().current() {
                     agent.notify(interactive_injection_notice(&finding));
                 }
+                let _ = input_done_tx.send(());
             }
         }
     });
@@ -435,6 +440,9 @@ pub async fn run(
                                 Some(cancellation) => {
                                     cancellation.cancel();
                                     app.cancel_requested = true;
+                                    // Stopping usually means rethinking: what
+                                    // was queued goes back to the box.
+                                    app.unqueue_all();
                                 }
                                 None => break,
                             }
@@ -480,8 +488,12 @@ pub async fn run(
                                     ));
                                 } else if app.reject_input_after_autonomous_end() {
                                     // Nothing reads `input_tx` any more.
+                                } else if app.inputs_in_flight > 0 {
+                                    // Sent when the reply in progress ends.
+                                    app.queued.push_back(text);
                                 } else {
                                     app.push_user_message(text.clone());
+                                    app.inputs_in_flight += 1;
                                     let _ = input_tx.send(text);
                                 }
                             }
@@ -489,6 +501,7 @@ pub async fn run(
                         }
                         (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                             if let Some(message) = app.toggle_plan_mode_and_maybe_approve() {
+                                app.inputs_in_flight += 1;
                                 let _ = input_tx.send(message);
                             }
                             continue;
@@ -520,6 +533,11 @@ pub async fn run(
                             app.scroll_transcript(-TRANSCRIPT_STEP);
                             continue;
                         }
+                        (KeyCode::Esc, KeyModifiers::NONE)
+                            if !app.scrolled_up() && app.take_back_queued() =>
+                        {
+                            continue;
+                        }
                         (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::End, KeyModifiers::CONTROL)
                             if app.scrolled_up() =>
                         {
@@ -546,6 +564,16 @@ pub async fn run(
                         agent_events_open = false;
                         app.mark_autonomous_finished();
                     }
+                }
+            }
+            Some(()) = input_done_rx.recv() => {
+                app.inputs_in_flight = app.inputs_in_flight.saturating_sub(1);
+                if app.inputs_in_flight == 0
+                    && let Some(next) = app.queued.pop_front()
+                {
+                    app.push_user_message(next.clone());
+                    app.inputs_in_flight += 1;
+                    let _ = input_tx.send(next);
                 }
             }
             maybe_modal = permission_rx.recv(), if permissions_open => {
@@ -602,6 +630,11 @@ struct App {
     /// part of a paste (from a terminal without bracketed paste), not a
     /// send.
     last_key_at: Option<Instant>,
+    /// Inputs sent to the agent task that it hasn't finished with yet.
+    inputs_in_flight: usize,
+    /// Messages written while a reply was running, oldest first; each is
+    /// sent when the input before it is done.
+    queued: std::collections::VecDeque<String>,
     /// How many rows up from the newest one the transcript is scrolled
     /// (0 = following new output). Set by the scroll keys; the render pass
     /// clamps it and moves it along with new output.
@@ -717,6 +750,8 @@ impl App {
             pending_permission: None,
             modal_view: ModalView::default(),
             last_key_at: None,
+            inputs_in_flight: 0,
+            queued: std::collections::VecDeque::new(),
             transcript_back: std::cell::Cell::new(0),
             transcript_rows_seen: std::cell::Cell::new(0),
             transcript_page: std::cell::Cell::new(0),
@@ -923,6 +958,39 @@ impl App {
 
     fn scrolled_up(&self) -> bool {
         self.transcript_back.get() > 0
+    }
+
+    /// Esc with an empty box: the last queued message back into it, to edit
+    /// or drop. False (key not used) when there is nothing to take back.
+    fn take_back_queued(&mut self) -> bool {
+        if !self.input.is_empty() {
+            return false;
+        }
+        match self.queued.pop_back() {
+            Some(text) => {
+                self.set_input(&text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every queued message back into the input box (after what is already
+    /// there), one paragraph each.
+    fn unqueue_all(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let current = self.input.lines().join("\n");
+        if !current.trim().is_empty() {
+            parts.push(current);
+        }
+        parts.extend(self.queued.drain(..));
+        self.set_input(&parts.join("\n\n"));
+        self.transcript.push(ChatLine::Info(
+            "Queued messages are back in the box; Enter sends them.".to_string(),
+        ));
     }
 
     /// Replaces the input box's text, cursor at the end.
@@ -1230,8 +1298,17 @@ impl App {
         let viewport_height = layout[0].height.saturating_sub(2);
         // border chars, left + right
         let content_width = layout[0].width.saturating_sub(2);
+        let queued_lines: Vec<Line<'static>> = self
+            .queued
+            .iter()
+            .map(|text| {
+                let first = text.lines().next().unwrap_or_default();
+                let more = if text.lines().nth(1).is_some() { " …" } else { "" };
+                Line::from(format!("queued > {first}{more}")).style(Style::default().fg(Color::DarkGray))
+            })
+            .collect();
         let newest_first = || {
-            hint.clone().into_iter().rev().chain(
+            queued_lines.clone().into_iter().rev().chain(hint.clone().into_iter().rev()).chain(
                 self.transcript
                     .iter()
                     .rev()
@@ -1348,6 +1425,12 @@ impl App {
             ));
         }
         status_spans.push(Span::styled(base, Style::default().fg(Color::DarkGray)));
+        if !self.queued.is_empty() {
+            status_spans.push(Span::styled(
+                format!("   ·   {} queued (Esc: take back)", self.queued.len()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if let Some((used, limit)) = self.context_usage {
             let pct = (used as f64 / limit.max(1) as f64 * 100.0).round() as u32;
             // Green under 60%, amber approaching the ceiling, red once
@@ -4404,6 +4487,48 @@ mod tests {
         assert_eq!(complete_slash("/xyz"), None);
         assert_eq!(complete_slash("hello"), None);
         assert_eq!(complete_slash("/diff turn"), None);
+    }
+
+    #[test]
+    fn a_message_written_during_a_reply_waits_below_it_until_its_turn() {
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("first".into());
+        app.inputs_in_flight = 1;
+        app.handle_agent_event(AgentEvent::TextDelta("working on it".into()));
+        app.queued.push_back("second\nwith more".into());
+
+        let screen = rendered_app(&app);
+        assert!(!screen.contains("you  > second"), "{screen}");
+        let reply = screen.find("working on it").unwrap();
+        let queued = screen.find("queued > second …").unwrap();
+        assert!(queued > reply, "the queued message sits under the reply: {screen}");
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let wide = render_to_string(&terminal);
+        assert!(wide.contains("1 queued (Esc: take back)"), "{wide}");
+    }
+
+    #[test]
+    fn esc_takes_the_last_queued_message_back_only_into_an_empty_box() {
+        let mut app = App::new(None, PlanMode::new());
+        app.queued.extend(["one".to_string(), "two".to_string()]);
+        app.set_input("draft");
+        assert!(!app.take_back_queued(), "never overwrites a draft");
+        app.set_input("");
+        assert!(app.take_back_queued());
+        assert_eq!(app.input.lines(), ["two"]);
+        assert_eq!(app.queued, ["one"]);
+    }
+
+    #[test]
+    fn stopping_a_reply_puts_queued_messages_back_in_the_box() {
+        let mut app = App::new(None, PlanMode::new());
+        app.set_input("half written");
+        app.queued.extend(["one".to_string(), "two".to_string()]);
+        app.unqueue_all();
+        assert!(app.queued.is_empty());
+        assert_eq!(app.take_input(), "half written\n\none\n\ntwo");
+        assert!(matches!(app.transcript.last(), Some(ChatLine::Info(t)) if t.contains("back in the box")));
     }
 
     #[test]
