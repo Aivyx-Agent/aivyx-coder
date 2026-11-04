@@ -2201,20 +2201,6 @@ fn render_permission_modal_in(
     project: Option<&std::path::Path>,
     view: &ModalView,
 ) {
-    let area = centered_rect(70, 60, frame.area());
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if aivyx_sandbox::is_one_off_command(request) {
-            "Confirm"
-        } else {
-            "Permission required"
-        })
-        .style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let mut lines: Vec<Line> = vec![
         Line::from(format!("Tool: {}", request.tool_name))
             .style(Style::default().add_modifier(Modifier::BOLD)),
@@ -2254,6 +2240,30 @@ fn render_permission_modal_in(
         }
         _ => {}
     }
+
+    // As tall as its text needs (a one-line command gets a small box), up
+    // to 60% of the screen; longer text scrolls inside it.
+    let width = centered_rect(70, 60, frame.area()).width;
+    let text_rows = lines
+        .iter()
+        .map(|line| wrap_modal_line(line.clone(), usize::from(width.saturating_sub(2))).len())
+        .sum::<usize>();
+    let area = fitted_modal_rect(frame.area(), text_rows);
+    frame.render_widget(Clear, area);
+
+    // Yellow for the frame and title only: the text inside keeps its own
+    // colours, so a diff's unchanged lines don't drown its changes.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if aivyx_sandbox::is_one_off_command(request) {
+            "Confirm"
+        } else {
+            "Permission required"
+        })
+        .border_style(Style::default().fg(Color::Yellow))
+        .title_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     // The action-key legend renders in its own fixed-height footer row,
     // never inside the same scroll-clipped Paragraph as the diff/content
@@ -2323,8 +2333,11 @@ fn render_permission_modal_in(
         "[y] Redo    [n] Cancel (default)"
     } else if offer_always_allow(request) && always_hidden_by_clip {
         "[y] allow  [n] deny (default)  [a] show all  (always allow once you have seen it all)"
-    } else if offer_always_allow(request) {
+    } else if offer_always_allow(request) && max_scroll > 0 {
         APPROVAL_KEYS
+    } else if offer_always_allow(request) {
+        // Everything is on screen: nothing for `a` to show.
+        "[y] allow  [n] deny (default)  [A] always allow"
     } else if always_hidden_by_clip {
         "[y] allow  [n] deny (default)  [a] show all"
     } else {
@@ -2402,6 +2415,20 @@ fn diff_line(line: &str) -> Line<'static> {
         Style::default()
     };
     Line::from(line.to_string()).style(style)
+}
+
+/// The approval box: 70% of the width, centred, and tall enough for
+/// `text_rows` rows of text plus its key lines and borders — at least 8 rows
+/// and at most 60% of the screen.
+fn fitted_modal_rect(screen: Rect, text_rows: usize) -> Rect {
+    let largest = centered_rect(70, 60, screen);
+    let wanted = u16::try_from(text_rows).unwrap_or(u16::MAX).saturating_add(4);
+    let height = wanted.clamp(8.min(largest.height), largest.height);
+    Rect {
+        y: screen.y + screen.height.saturating_sub(height) / 2,
+        height,
+        ..largest
+    }
 }
 
 /// Standard ratatui centered-popup pattern: split vertically then
@@ -5029,13 +5056,58 @@ mod tests {
 
     #[test]
     fn the_key_line_names_the_default_and_the_new_keys() {
-        let mut request = long_script_request();
-        request.target = PermissionTarget::Command { program: "ls".to_string(), args: vec![] };
-        let text = draw_modal(&request, &ModalView::default());
+        // A long text: `a` has something to show.
+        let view = ModalView::default();
+        let request = long_script_request();
+        draw_modal(&request, &view);
+        view.show_all();
+        let text = draw_modal(&request, &view);
         assert!(
             text.contains("[y] allow  [n] deny (default)  [a] show all  [A] always allow"),
             "{text}"
         );
+        // All of it on screen: `a` isn't offered.
+        let mut request = long_script_request();
+        request.target = PermissionTarget::Command { program: "ls".to_string(), args: vec![] };
+        let text = draw_modal(&request, &ModalView::default());
+        assert!(text.contains("[y] allow  [n] deny (default)  [A] always allow"), "{text}");
+        assert!(!text.contains("[a] show all"), "{text}");
+    }
+
+    #[test]
+    fn a_short_request_gets_a_small_box_and_a_long_one_stops_at_sixty_percent() {
+        let screen = Rect::new(0, 0, 120, 40);
+        assert_eq!(fitted_modal_rect(screen, 3).height, 8);
+        assert_eq!(fitted_modal_rect(screen, 10).height, 14);
+        assert_eq!(fitted_modal_rect(screen, 500).height, 24);
+        let small = fitted_modal_rect(screen, 3);
+        assert_eq!(small.y, 16, "centred");
+        assert_eq!(small.width, centered_rect(70, 60, screen).width);
+    }
+
+    #[test]
+    fn unchanged_diff_lines_keep_the_normal_colour_inside_the_yellow_frame() {
+        let mut request = long_script_request();
+        request.target = PermissionTarget::Path(std::path::PathBuf::from("src/a.rs"));
+        request.action = ActionKind::Write;
+        request.tool_name = "edit_file".into();
+        request.preview = Some("--- src/a.rs\n+++ src/a.rs\n@@ -1 +1 @@\n context line\n-old\n+new".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal_in(frame, &request, None, &ModalView::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let cell_of = |needle: &str| {
+            let text: Vec<String> = (0..buffer.area.height)
+                .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let (y, row) = text.iter().enumerate().find(|(_, row)| row.contains(needle)).unwrap();
+            let x = row[..row.find(needle).unwrap()].chars().count();
+            buffer[(x as u16, y as u16)].clone()
+        };
+        assert_eq!(cell_of("context line").fg, Color::Reset);
+        assert_eq!(cell_of("+new").fg, Color::Green);
+        assert_eq!(cell_of("Permission required").fg, Color::Yellow);
     }
 
     fn run_modal_app(request: PermissionRequest) -> (App, oneshot::Receiver<UserResponse>) {
