@@ -1252,8 +1252,12 @@ impl App {
                 {
                     self.changed_files.extend(files);
                 }
-                self.transcript
-                    .push(ChatLine::ToolResult(tool_output_text(&result.output)));
+                let text = tool_output_text(&result.output);
+                let text = match std::env::current_dir() {
+                    Ok(project) => without_project_prefix(&text, &project),
+                    Err(_) => text,
+                };
+                self.transcript.push(ChatLine::ToolResult(text));
             }
             AgentEvent::TurnComplete => {
                 self.streaming_active = false;
@@ -1956,6 +1960,18 @@ fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
 
 /// A path as the person reads it: relative to the project directory when
 /// it's inside it, as given otherwise.
+/// `text` with the project folder's own path dropped from the paths in it
+/// (`edited /home/me/app/src/main.rs` → `edited src/main.rs`), as the tool
+/// call above it already shows them. For the transcript only: the model
+/// gets the text as the tool wrote it.
+fn without_project_prefix(text: &str, project: &std::path::Path) -> String {
+    let root = project.display().to_string();
+    if root.len() <= 1 {
+        return text.to_string();
+    }
+    text.replace(&format!("{}/", root.trim_end_matches('/')), "")
+}
+
 fn display_path(path: &std::path::Path) -> String {
     std::env::current_dir()
         .ok()
@@ -4839,6 +4855,22 @@ mod tests {
             .collect();
         assert_eq!(line, format!("  thinking: {}… (Ctrl+T shows reasoning)", "a".repeat(70)));
         assert!(folded_reasoning("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn tool_results_name_project_files_as_the_call_did() {
+        let project = std::path::Path::new("/home/me/app");
+        assert_eq!(
+            without_project_prefix("edited /home/me/app/src/main.rs", project),
+            "edited src/main.rs"
+        );
+        // Outside the project, and a folder that only starts the same way,
+        // stay whole.
+        assert_eq!(
+            without_project_prefix("read /etc/hosts and /home/me/application/x", project),
+            "read /etc/hosts and /home/me/application/x"
+        );
+        assert_eq!(without_project_prefix("a /x/y", std::path::Path::new("/")), "a /x/y");
     }
 
     #[test]
