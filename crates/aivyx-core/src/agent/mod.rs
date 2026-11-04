@@ -878,6 +878,12 @@ impl Agent {
         self.architect.is_some()
     }
 
+    /// Whether model routing is on, so `/models` and `/model` have
+    /// something to list and pin (for `/help`'s notes).
+    pub fn has_router(&self) -> bool {
+        self.router.is_some()
+    }
+
     pub fn tests(&self) -> Option<&crate::test_detect::EffectiveTests> {
         self.tests.as_ref()
     }

@@ -262,6 +262,7 @@ pub async fn run(
         council: agent.has_council(),
         architect: agent.has_architect(),
         tests: agent.tests().is_some(),
+        routing: agent.has_router(),
     };
     // Read before `autonomous` moves into the background task below --
     // there is no other point after this where it's still available.
@@ -1882,6 +1883,7 @@ struct HelpSetup {
     council: bool,
     architect: bool,
     tests: bool,
+    routing: bool,
 }
 
 impl HelpSetup {
@@ -1894,6 +1896,9 @@ impl HelpSetup {
                 " (needs setup: add an [architect] section to config.toml)"
             }
             "/test" if !self.tests => " (needs setup: no tests found)",
+            "/models" | "/model" if !self.routing => {
+                " (needs setup: model routing is off — [routing] in config.toml)"
+            }
             _ => "",
         }
     }
@@ -2562,7 +2567,7 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         // Plain block, no prefix — see the variant's own doc comment.
-        ChatLine::Help(text) => prefixed_lines(text, "", Style::default()),
+        ChatLine::Help(text) => help_lines(text),
         ChatLine::Cancelled(text) | ChatLine::Info(text) => {
             prefixed_lines(text, "  ", Style::default().fg(Color::DarkGray))
         }
@@ -2615,6 +2620,34 @@ fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
             out
         }
     }
+}
+
+/// `/help` as two-span lines, so a long entry wraps under its description
+/// instead of back at the left edge: a command's label is everything up to
+/// its " — ", a key's is its 14-column key field. Headings and blank lines
+/// stay whole.
+fn help_lines(text: &str) -> Vec<Line<'static>> {
+    const KEY_COLUMN: usize = 14;
+    text.lines()
+        .map(|line| {
+            let split = if line.starts_with("  /")
+                && let Some(i) = line.find(" — ")
+            {
+                Some(i + " — ".len())
+            } else if line.starts_with("  ") && line.len() > KEY_COLUMN && line.is_char_boundary(KEY_COLUMN) {
+                Some(KEY_COLUMN)
+            } else {
+                None
+            };
+            match split {
+                Some(at) => Line::from(vec![
+                    Span::raw(line[..at].to_string()),
+                    Span::raw(line[at..].to_string()),
+                ]),
+                None => Line::from(line.to_string()),
+            }
+        })
+        .collect()
 }
 
 fn prefixed_lines(text: &str, prefix: &'static str, style: Style) -> Vec<Line<'static>> {
@@ -4079,7 +4112,7 @@ mod tests {
 
     #[test]
     fn help_text_shows_the_args_hint_for_commands_that_have_one() {
-        let text = help_text("", HelpSetup::default());
+        let text = help_text("", HelpSetup { routing: true, ..HelpSetup::default() });
         assert!(
             text.lines().any(|l| l == "  /model <model id, or auto> — Pin this conversation to a \
                 model (`/model <id>`), or `/model auto` to let routing choose"),
@@ -4127,9 +4160,10 @@ mod tests {
         assert!(line(&off, "/council").ends_with("(needs setup: add a [council] section to config.toml)"));
         assert!(line(&off, "/architect").ends_with("(needs setup: add an [architect] section to config.toml)"));
         assert!(line(&off, "/test").ends_with("(needs setup: no tests found)"));
+        assert!(line(&off, "/models").ends_with("(needs setup: model routing is off — [routing] in config.toml)"));
         // /wiki needs no setup; nothing else is marked.
-        assert_eq!(off.matches("needs setup").count(), 3, "{off}");
-        let on = help_text("", HelpSetup { council: true, architect: true, tests: true });
+        assert_eq!(off.matches("needs setup").count(), 5, "{off}");
+        let on = help_text("", HelpSetup { council: true, architect: true, tests: true, routing: true });
         assert!(!on.contains("needs setup"), "{on}");
     }
 
@@ -4871,6 +4905,31 @@ mod tests {
             "read /etc/hosts and /home/me/application/x"
         );
         assert_eq!(without_project_prefix("a /x/y", std::path::Path::new("/")), "a /x/y");
+    }
+
+    #[test]
+    fn help_wraps_each_entry_under_its_own_description() {
+        let help = ChatLine::Help(help_text("", HelpSetup::default()));
+        let rows: Vec<String> = hang_wrap(chat_line_to_lines(&help), 58)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let council = rows.iter().position(|r| r.starts_with("  /council")).unwrap();
+        let label = rows[council].split(" — ").next().unwrap().chars().count() + " — ".chars().count();
+        assert!(rows[council + 1].starts_with(&" ".repeat(label)), "{:#?}", &rows[council..council + 3]);
+        let keys = rows.iter().position(|r| r.starts_with("  PgUp/PgDn")).unwrap();
+        assert!(rows[keys + 1].starts_with(&" ".repeat(14)), "{:#?}", &rows[keys..keys + 2]);
+        // Every row fits.
+        assert!(rows.iter().all(|r| r.chars().count() <= 58), "{rows:#?}");
+    }
+
+    #[test]
+    fn help_marks_the_routing_commands_when_routing_is_off() {
+        let off = help_text("", HelpSetup::default());
+        assert!(off.lines().any(|l| l.starts_with("  /models") && l.contains("model routing is off")), "{off}");
+        assert!(off.lines().any(|l| l.starts_with("  /model <") && l.contains("model routing is off")), "{off}");
+        let on = help_text("", HelpSetup { routing: true, ..HelpSetup::default() });
+        assert!(!on.contains("model routing is off"), "{on}");
     }
 
     #[test]
