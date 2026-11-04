@@ -878,6 +878,12 @@ impl Agent {
         self.architect.is_some()
     }
 
+    /// The configured `[backend]` model (with routing on, the one untagged
+    /// calls use), for the TUI's status line.
+    pub fn model_id(&self) -> &str {
+        self.llm.model_id()
+    }
+
     /// Whether model routing is on, so `/models` and `/model` have
     /// something to list and pin (for `/help`'s notes).
     pub fn has_router(&self) -> bool {

@@ -255,9 +255,11 @@ pub async fn run(
     // owns `app`) still has access to it.
     let tests_line = aivyx_core::test_detect::status_line(agent.tests());
     let sessions_saved = agent.session_store().is_some();
+    let configured_model = short_model_name(agent.model_id());
     let mut app = App::new(restored, plan_mode);
     app.tests_line = tests_line;
     app.sessions_saved = sessions_saved;
+    app.configured_model = configured_model;
     app.setup = HelpSetup {
         council: agent.has_council(),
         architect: agent.has_architect(),
@@ -733,6 +735,9 @@ struct App {
     /// status line. `None` until routing reports a choice (always `None`
     /// with routing off).
     routed_model: Option<String>,
+    /// The configured model's short name, shown in the status line until
+    /// routing names the model a turn really used.
+    configured_model: String,
     /// The full-screen `/diff` pager, while it's open. Never open at the
     /// same time as `pending_permission`.
     diff_view: Option<DiffView>,
@@ -794,6 +799,7 @@ impl App {
             transcript_page: std::cell::Cell::new(0),
             context_usage: None,
             routed_model: None,
+            configured_model: String::new(),
             tasks,
             mission_plan: None,
             open_specialist_sessions: Vec::new(),
@@ -1583,6 +1589,11 @@ impl App {
                 format!("   ·   model {model}"),
                 Style::default().fg(Color::Cyan),
             ));
+        } else if !self.configured_model.is_empty() {
+            status_spans.push(Span::styled(
+                format!("   ·   {}", self.configured_model),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         frame.render_widget(Paragraph::new(Line::from(status_spans)), status_area);
 
@@ -1965,6 +1976,13 @@ fn first_message_hint(tests_line: &str) -> Vec<Line<'static>> {
 
 /// A path as the person reads it: relative to the project directory when
 /// it's inside it, as given otherwise.
+/// A model id as the status line shows it: no folder, no `.gguf`
+/// (`/models/Qwen3.8-27B-UD-Q4_K_XL.gguf` → `Qwen3.8-27B-UD-Q4_K_XL`).
+fn short_model_name(model: &str) -> String {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    name.strip_suffix(".gguf").unwrap_or(name).to_string()
+}
+
 /// `text` with the project folder's own path dropped from the paths in it
 /// (`edited /home/me/app/src/main.rs` → `edited src/main.rs`), as the tool
 /// call above it already shows them. For the transcript only: the model
@@ -4930,6 +4948,25 @@ mod tests {
         assert!(off.lines().any(|l| l.starts_with("  /model <") && l.contains("model routing is off")), "{off}");
         let on = help_text("", HelpSetup { routing: true, ..HelpSetup::default() });
         assert!(!on.contains("model routing is off"), "{on}");
+    }
+
+    #[test]
+    fn the_status_line_names_the_configured_model_until_routing_names_one() {
+        assert_eq!(short_model_name("/models/Qwen3.8-27B-UD-Q4_K_XL.gguf"), "Qwen3.8-27B-UD-Q4_K_XL");
+        assert_eq!(short_model_name("qwen3.5:9b"), "qwen3.5:9b");
+
+        let mut app = App::new(None, PlanMode::new());
+        app.configured_model = "Qwen3.8-27B-UD-Q4_K_XL".into();
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let shown = render_to_string(&terminal);
+        assert!(shown.contains("ready — Enter to send, Ctrl+C to quit   ·   Qwen3.8-27B-UD-Q4_K_XL"), "{shown}");
+
+        app.handle_agent_event(AgentEvent::ModelRouted { model: "big@gpu".into(), reason: "large".into() });
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let routed = render_to_string(&terminal);
+        assert!(routed.contains("model big@gpu") && !routed.contains("Qwen3.8-27B"), "{routed}");
     }
 
     #[test]
