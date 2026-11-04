@@ -515,6 +515,10 @@ pub async fn run(
                             }
                             continue;
                         }
+                        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                            app.show_reasoning = !app.show_reasoning;
+                            continue;
+                        }
                         (KeyCode::Tab, KeyModifiers::NONE) => {
                             let text = app.input.lines().join("\n");
                             if let Some(completed) = complete_slash(&text) {
@@ -654,6 +658,9 @@ struct App {
     file_calls: std::collections::HashMap<aivyx_types::ToolCallId, Vec<String>>,
     /// Files the model's own file tools changed this session.
     changed_files: std::collections::BTreeSet<String>,
+    /// Ctrl+T: the model's reasoning in full; folded to one line each when
+    /// off (the default), so the answer and the tool calls stay in view.
+    show_reasoning: bool,
     /// Inputs sent to the agent task that it hasn't finished with yet.
     inputs_in_flight: usize,
     /// Messages written while a reply was running, oldest first; each is
@@ -778,6 +785,7 @@ impl App {
             sent_any: false,
             file_calls: std::collections::HashMap::new(),
             changed_files: std::collections::BTreeSet::new(),
+            show_reasoning: false,
             inputs_in_flight: 0,
             queued: std::collections::VecDeque::new(),
             transcript_back: std::cell::Cell::new(0),
@@ -1047,6 +1055,14 @@ impl App {
             lines.push("(commands it ran may have changed others; `git status` shows everything)".to_string());
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// A transcript line as drawn: reasoning folded unless Ctrl+T showed it.
+    fn display_lines(&self, line: &ChatLine) -> Vec<Line<'static>> {
+        match line {
+            ChatLine::Reasoning(text) if !self.show_reasoning => folded_reasoning(text),
+            _ => chat_line_to_lines(line),
+        }
     }
 
     /// Esc with an empty box: the last queued message back into it, to edit
@@ -1417,7 +1433,7 @@ impl App {
                 self.transcript
                     .iter()
                     .rev()
-                    .flat_map(|l| chat_line_to_lines(l).into_iter().rev()),
+                    .flat_map(|l| self.display_lines(l).into_iter().rev()),
             )
         };
         self.transcript_page.set(viewport_height);
@@ -1904,6 +1920,7 @@ fn help_text(tests_line: &str, setup: HelpSetup) -> String {
     lines.push("  Alt+Enter   new line (Shift+Enter too, where the terminal tells them apart)".to_string());
     lines.push("  Ctrl+C      cancel a reply / quit when idle".to_string());
     lines.push("  Ctrl+P      plan mode on/off".to_string());
+    lines.push("  Ctrl+T      show or fold the model's reasoning (folded to one line by default)".to_string());
     lines.push("  PgUp/PgDn   scroll the conversation (↑/↓ and the mouse wheel too); Esc back to the end".to_string());
     lines.push("  y / n       in an approval prompt: allow / deny (Enter and Esc deny)".to_string());
     lines.push("  d           in an approval prompt: deny and say why (the model gets the note)".to_string());
@@ -2480,6 +2497,31 @@ fn render_command_hint(
         .collect();
     let block = Block::default().borders(Borders::ALL).title("Commands");
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Reasoning as one dim line: how it starts and how much more there is.
+fn folded_reasoning(text: &str) -> Vec<Line<'static>> {
+    const START: usize = 70;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let more = lines.count();
+    let mut start: String = first.chars().take(START).collect();
+    if start.len() < first.len() {
+        start.push('…');
+    }
+    let rest = match more {
+        0 => " (Ctrl+T shows reasoning)".to_string(),
+        n => format!(" (+{n} lines · Ctrl+T shows)"),
+    };
+    prefixed_lines(
+        &format!("{start}{rest}"),
+        "  thinking: ",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )
 }
 
 fn chat_line_to_lines(line: &ChatLine) -> Vec<Line<'static>> {
@@ -4766,6 +4808,42 @@ mod tests {
         let summary = app.exit_summary().unwrap();
         assert!(!summary.contains("--resume"), "{summary}");
         assert!(summary.contains("f09.rs and 2 more"), "{summary}");
+    }
+
+    #[test]
+    fn reasoning_folds_to_one_line_until_ctrl_t_shows_it() {
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("fix it".into());
+        let thought = (0..25).map(|i| format!("step {i} of my reasoning")).collect::<Vec<_>>().join("\n");
+        app.handle_agent_event(AgentEvent::ReasoningDelta(thought));
+        app.handle_agent_event(AgentEvent::TextDelta("Done: the bug was in add.".into()));
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 16)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let folded = render_to_string(&terminal);
+        assert!(folded.contains("thinking: step 0 of my reasoning (+24 lines · Ctrl+T shows)"), "{folded}");
+        assert!(!folded.contains("step 7 of my reasoning"), "{folded}");
+        assert!(folded.contains("Done: the bug was in add."), "{folded}");
+
+        app.show_reasoning = true;
+        let shown = rendered_app(&app);
+        assert!(shown.contains("step 24 of my reasoning"), "{shown}");
+    }
+
+    #[test]
+    fn a_folded_thought_shows_its_start_cut_at_seventy_characters() {
+        let long = "a".repeat(100);
+        let line: String = folded_reasoning(&long)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(line, format!("  thinking: {}… (Ctrl+T shows reasoning)", "a".repeat(70)));
+        assert!(folded_reasoning("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn help_names_ctrl_t() {
+        assert!(help_text("", HelpSetup::default()).contains("Ctrl+T      show or fold the model's reasoning"));
     }
 
     #[test]

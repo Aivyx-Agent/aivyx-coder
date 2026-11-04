@@ -26,6 +26,7 @@ command it found for this project.
 | Alt+Enter | New line in the message (Shift+Enter too, where the terminal tells them apart) |
 | Ctrl+C | Stop the reply in progress; when idle, quit |
 | Ctrl+P | Plan mode on or off ([Plan mode](04-plan-mode.md)) |
+| Ctrl+T | Show the model's reasoning in full, or fold it again (by default each block of reasoning is one line: how it starts and how many lines follow) |
 | PgUp / PgDn | Scroll the conversation a page; ↑ / ↓ (and, in most terminals, the mouse wheel) scroll it a few lines while the message is one line long |
 | Esc | Back to the newest output after scrolling up |
 | `y` / `n` | In an approval prompt: allow once / deny (Enter and Esc also deny) |
