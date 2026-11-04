@@ -32,6 +32,11 @@ command it found for this project.
 | `a` / `A` | In an approval prompt: show all of the text / always allow (`A` is Shift+a) |
 | `d` | In an approval prompt: deny and say why — type a short note, Enter sends it to the model with the denial |
 
+When you quit (Ctrl+C when idle, or `/quit`), aivyx-coder prints how to
+continue the conversation (`aivyx-coder --resume`) and the files its own
+file tools changed; commands it ran may have changed others, so
+`git status` is the full picture.
+
 A message you send while a reply is still running waits under it as
 `queued > …` and goes out when the reply ends, in order. Esc (with an empty
 box) takes the last one back to edit; Ctrl+C, which stops the reply, also

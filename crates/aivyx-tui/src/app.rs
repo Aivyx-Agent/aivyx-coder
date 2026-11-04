@@ -254,8 +254,10 @@ pub async fn run(
     // — there is no other point after this where the render loop (which
     // owns `app`) still has access to it.
     let tests_line = aivyx_core::test_detect::status_line(agent.tests());
+    let sessions_saved = agent.session_store().is_some();
     let mut app = App::new(restored, plan_mode);
     app.tests_line = tests_line;
+    app.sessions_saved = sessions_saved;
     app.setup = HelpSetup {
         council: agent.has_council(),
         architect: agent.has_architect(),
@@ -604,6 +606,12 @@ pub async fn run(
         }
     }
 
+    // Back on the normal screen, which the alternate one hid: what the
+    // session left behind.
+    drop(guard);
+    if let Some(summary) = app.exit_summary() {
+        println!("{summary}");
+    }
     Ok(())
 }
 
@@ -637,6 +645,15 @@ struct App {
     /// part of a paste (from a terminal without bracketed paste), not a
     /// send.
     last_key_at: Option<Instant>,
+    /// Whether conversations are saved (a state directory exists), so the
+    /// exit summary can offer `--resume`.
+    sessions_saved: bool,
+    /// A message was sent this session.
+    sent_any: bool,
+    /// File-changing tool calls not yet answered: the files each touches.
+    file_calls: std::collections::HashMap<aivyx_types::ToolCallId, Vec<String>>,
+    /// Files the model's own file tools changed this session.
+    changed_files: std::collections::BTreeSet<String>,
     /// Inputs sent to the agent task that it hasn't finished with yet.
     inputs_in_flight: usize,
     /// Messages written while a reply was running, oldest first; each is
@@ -757,6 +774,10 @@ impl App {
             pending_permission: None,
             modal_view: ModalView::default(),
             last_key_at: None,
+            sessions_saved: false,
+            sent_any: false,
+            file_calls: std::collections::HashMap::new(),
+            changed_files: std::collections::BTreeSet::new(),
             inputs_in_flight: 0,
             queued: std::collections::VecDeque::new(),
             transcript_back: std::cell::Cell::new(0),
@@ -1005,6 +1026,29 @@ impl App {
         }
     }
 
+    /// Printed after the TUI closes, when a message was sent: how to come
+    /// back to the conversation, and which files the model's own file tools
+    /// changed. Commands it ran may have changed others, which this can't
+    /// see, so it says where to look.
+    fn exit_summary(&self) -> Option<String> {
+        if !self.sent_any {
+            return None;
+        }
+        let mut lines = Vec::new();
+        if self.sessions_saved {
+            lines.push("Conversation saved. To continue it: aivyx-coder --resume".to_string());
+        }
+        if !self.changed_files.is_empty() {
+            const SHOWN: usize = 10;
+            let names: Vec<&str> = self.changed_files.iter().take(SHOWN).map(String::as_str).collect();
+            let more = self.changed_files.len().saturating_sub(SHOWN);
+            let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+            lines.push(format!("Files it changed: {}{more}", names.join(", ")));
+            lines.push("(commands it ran may have changed others; `git status` shows everything)".to_string());
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
     /// Esc with an empty box: the last queued message back into it, to edit
     /// or drop. False (key not used) when there is nothing to take back.
     fn take_back_queued(&mut self) -> bool {
@@ -1056,6 +1100,7 @@ impl App {
     }
 
     fn push_user_message(&mut self, text: String) {
+        self.sent_any = true;
         // Back to the newest output, where the reply will appear.
         self.scroll_transcript(isize::MIN);
         self.turn_is_test_command =
@@ -1179,9 +1224,18 @@ impl App {
                     "{prefix}{}",
                     tool_call_summary(&call.name, &call.arguments)
                 )));
+                let files = files_a_call_changes(&call.name, &call.arguments);
+                if !files.is_empty() {
+                    self.file_calls.insert(call.id.clone(), files);
+                }
             }
             AgentEvent::ToolResult(result) => {
                 self.turn_had_model_activity = true;
+                if let Some(files) = self.file_calls.remove(&result.call_id)
+                    && matches!(result.output, ToolOutput::Ok(_))
+                {
+                    self.changed_files.extend(files);
+                }
                 self.transcript
                     .push(ChatLine::ToolResult(tool_output_text(&result.output)));
             }
@@ -1914,6 +1968,20 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
             format!("{name}({cut}{ellipsis})")
         }
     }
+}
+
+/// The files a call to one of the file tools changes when it succeeds,
+/// shown as in the transcript; none for any other tool.
+fn files_a_call_changes(name: &str, args: &serde_json::Value) -> Vec<String> {
+    let keys: &[&str] = match name {
+        "write_file" | "edit_file" | "patch_file" | "delete_file" => &["path"],
+        "move_file" => &["from", "to"],
+        _ => &[],
+    };
+    keys.iter()
+        .filter_map(|key| args.get(*key).and_then(|v| v.as_str()))
+        .map(|path| display_path(std::path::Path::new(path)))
+        .collect()
 }
 
 /// Whether the modal should offer "Always Allow" for this request — `false`
@@ -4609,6 +4677,68 @@ mod tests {
         assert!(app.queued.is_empty());
         assert_eq!(app.take_input(), "half written\n\none\n\ntwo");
         assert!(matches!(app.transcript.last(), Some(ChatLine::Info(t)) if t.contains("back in the box")));
+    }
+
+    fn file_call(id: &str, name: &str, args: serde_json::Value) -> AgentEvent {
+        let mut call = tool_call(id, name);
+        call.arguments = args;
+        AgentEvent::ToolCallDetected(call)
+    }
+
+    fn result(id: &str, output: ToolOutput) -> AgentEvent {
+        AgentEvent::ToolResult(aivyx_types::ToolResult {
+            call_id: aivyx_types::ToolCallId(id.to_string()),
+            output,
+        })
+    }
+
+    #[test]
+    fn only_file_tools_name_the_files_they_change() {
+        let path = |p: &str| serde_json::json!({ "path": p });
+        for tool in ["write_file", "edit_file", "patch_file", "delete_file"] {
+            assert_eq!(files_a_call_changes(tool, &path("src/a.rs")), ["src/a.rs"], "{tool}");
+        }
+        assert_eq!(
+            files_a_call_changes("move_file", &serde_json::json!({ "from": "a.rs", "to": "b.rs" })),
+            ["a.rs", "b.rs"]
+        );
+        assert!(files_a_call_changes("read_file", &path("src/a.rs")).is_empty());
+        assert!(files_a_call_changes("run_command", &serde_json::json!({ "command": "test" })).is_empty());
+    }
+
+    #[test]
+    fn the_exit_summary_offers_resume_and_lists_files_changed_by_successful_calls() {
+        let mut app = App::new(None, PlanMode::new());
+        app.sessions_saved = true;
+        assert_eq!(app.exit_summary(), None, "nothing to say before a message");
+
+        app.push_user_message("fix it".into());
+        app.handle_agent_event(file_call("1", "edit_file", serde_json::json!({ "path": "src/main.rs" })));
+        app.handle_agent_event(result("1", ToolOutput::Ok("edited".into())));
+        app.handle_agent_event(file_call("2", "write_file", serde_json::json!({ "path": "src/lost.rs" })));
+        app.handle_agent_event(result("2", ToolOutput::Denied("the user denied this action".into())));
+        app.handle_agent_event(file_call("3", "move_file", serde_json::json!({ "from": "a.txt", "to": "b.txt" })));
+        app.handle_agent_event(result("3", ToolOutput::Ok("moved".into())));
+
+        let summary = app.exit_summary().unwrap();
+        assert!(summary.contains("aivyx-coder --resume"), "{summary}");
+        assert!(summary.contains("Files it changed: a.txt, b.txt, src/main.rs"), "{summary}");
+        assert!(!summary.contains("lost.rs"), "a denied write changed nothing: {summary}");
+        assert!(summary.contains("git status"), "{summary}");
+    }
+
+    #[test]
+    fn without_saved_sessions_or_changed_files_the_summary_says_nothing_untrue() {
+        let mut app = App::new(None, PlanMode::new());
+        app.push_user_message("hello".into());
+        assert_eq!(app.exit_summary(), None);
+
+        for i in 0..12 {
+            app.changed_files.insert(format!("f{i:02}.rs"));
+        }
+        let summary = app.exit_summary().unwrap();
+        assert!(!summary.contains("--resume"), "{summary}");
+        assert!(summary.contains("f09.rs and 2 more"), "{summary}");
     }
 
     #[test]
