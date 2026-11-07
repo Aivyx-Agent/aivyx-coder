@@ -336,6 +336,14 @@ alongside `aivyx-pa` (or any other unrelated process using `llama-server`'s
 `/slots` mechanism) still fights over slots uncoordinated, since only
 `aivyx-coder` itself participates in this locking scheme.
 
+This was measured on 2026-11-08 against one `llama-server` with two slots
+(`-np 2`): `aivyx-coder` (`kind = "llama_server"`) and `aivyx-pa`
+(`provider = "llamacpp"`) both sent `id_slot` 0, so the second request waited
+behind the first (about a minute of head-of-line blocking) while slot 1 sat
+idle. With `aivyx-broker` in front and both products in broker mode, they
+ran at the same time on slots 0 and 1. **If `aivyx-coder` and `aivyx-pa`
+share a `llama-server`, run `aivyx-broker` and point both at it.**
+
 [`aivyx-broker`](https://github.com/Aivyx-Agent/aivyx-broker) is a
 standalone daemon that sits in front of a single shared `llama-server` and
 coordinates GPU-slot access across every local process pointed at it — it
