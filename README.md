@@ -93,7 +93,8 @@ Details in [Install and first run](docs/manual/guide/02-install-and-first-run.md
 reference for every flag, command, setting and tool, and a developer part.
 Start with [Troubleshooting](docs/manual/guide/15-troubleshooting.md) when
 something goes wrong. [`docs/HISTORY.md`](docs/HISTORY.md) is the full
-phase-by-phase history and audit trail.
+phase-by-phase history and audit trail. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) is the 1.0
+stability promise.
 
 ## Contributing
 
