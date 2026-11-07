@@ -447,7 +447,6 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
                     .mistralrs_chat_template_path
                     .clone()
                     .map(PathBuf::from),
-                settings.backend.mistralrs_constrain_tool_calls,
                 settings.backend.model.clone(),
             )
             .await

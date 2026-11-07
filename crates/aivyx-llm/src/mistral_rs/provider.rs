@@ -61,10 +61,6 @@ async fn forward_stream_via_mpsc<S, T>(
 pub struct MistralRsBackend {
     model: Arc<Model>,
     model_id: String,
-    #[allow(dead_code)] // wired into request construction once tool-call
-    // constraining lands; kept as a field now so the constructor
-    // signature (and Task 5's call site) doesn't need to change later.
-    constrain_tool_calls: bool,
 }
 
 impl MistralRsBackend {
@@ -85,7 +81,6 @@ impl MistralRsBackend {
         model_path: PathBuf,
         model_file: Option<String>,
         chat_template_path: Option<PathBuf>,
-        constrain_tool_calls: bool,
         model_id: String,
     ) -> Result<Self, LlmError> {
         let (dir, files) = match &model_file {
@@ -131,7 +126,6 @@ impl MistralRsBackend {
         Ok(MistralRsBackend {
             model: Arc::new(model),
             model_id,
-            constrain_tool_calls,
         })
     }
 }
@@ -282,7 +276,6 @@ mod construction_tests {
             std::path::PathBuf::from("/definitely/does/not/exist/model.gguf"),
             None,
             None,
-            false,
             "test-model".to_string(),
         )
         .await;

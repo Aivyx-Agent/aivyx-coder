@@ -244,6 +244,21 @@ mod tests {
     }
 
     #[test]
+    fn removed_tool_calling_keys_warn_and_still_load() {
+        // Both were reserved and never read; 1.0 removed them (R13).
+        let raw = "[backend]\nmodel = \"m\"\ntool_calling_mode = \"native\"\n\
+                   mistralrs_constrain_tool_calls = true\n";
+        let (settings, keys) = parse_reporting::<Settings>(raw).unwrap();
+        assert_eq!(settings.backend.model, "m");
+        let mut got: Vec<&str> = keys.iter().map(|k| k.path.as_str()).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["backend.mistralrs_constrain_tool_calls", "backend.tool_calling_mode"]
+        );
+    }
+
+    #[test]
     fn loaded_values_are_unchanged_by_the_warning_path() {
         let raw = "stray = 1\n[backend]\nmodel = \"m\"\nbase_url = \"http://h/v1\"\nstray2 = 2\n";
         let (with, keys) = parse_reporting::<Settings>(raw).unwrap();

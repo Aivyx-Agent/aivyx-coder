@@ -38,7 +38,6 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `base_url` | string | `"http://localhost:11434/v1"` | The model server's OpenAI-compatible address, e.g. `http://localhost:11434/v1` (Ollama) or `http://localhost:8080/v1` (llama.cpp). `--base-url` overrides it. |
 | `model` | string | `"qwen3.5:9b"` | The model id, as the server names it. `--model` overrides it. |
 | `api_key` | string | `"..."` | Key for an auth-protected local server. Usually unset. |
-| `tool_calling_mode` | `native` \| `text_fallback` \| `native_with_fallback` |  | Reserved for a text-fallback tool-call parser; not used yet. |
 | `context_tokens` | integer | `8192` | The model's context window, in tokens — used to show a live budget indicator and to trigger context compaction before the window overflows. Conservative default; **set this to your model's actual window** (qwen3.5/qwen3.6 support far more than the default). |
 | `edit_format` | `native` \| `prompted` |  | How edit content travels: "native" sends edits as edit_file / write_file tool-call arguments; "prompted" teaches the model to write SEARCH/REPLACE blocks as plain text instead (parsed by aivyx and applied through the same permission gate). |
 | `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `broker_base_url`), `mistral_rs` (the embedded engine, if built in). |
@@ -49,7 +48,6 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `mistralrs_model_path` | string |  | With `kind = "mistral_rs"`: a GGUF file, or a directory of them. Required for that kind. |
 | `mistralrs_model_file` | string |  | Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
 | `mistralrs_chat_template_path` | string |  | Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
-| `mistralrs_constrain_tool_calls` | bool |  | Reserved for grammar-constrained tool calls in the embedded engine; not used yet. |
 | `reasoning_effort` | string |  | How hard a reasoning model thinks before it answers, e.g. `"medium"`. |
 
 ### `[routing]`

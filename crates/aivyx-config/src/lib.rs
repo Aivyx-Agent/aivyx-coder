@@ -111,9 +111,10 @@ pub struct VerificationSettings {
     /// say. Their results, with warning counts, go into the stop notice
     /// and `--report`, so the run's end doesn't rest on the model's claims.
     pub final_checks: Vec<String>,
-    /// How many times a failing final check goes back to the model, with
-    /// its output, before the run stops anyway (0: never — the checks only
-    /// report). Each try is one more turn within the run's budget.
+    /// How many times a failing final check goes back to the model — with
+    /// the end of its output — before the run stops anyway. Each try is one
+    /// more turn within the run's budget; `0` makes the checks report only,
+    /// as before 0.7.
     pub final_check_retries: u32,
 }
 
@@ -863,9 +864,6 @@ pub struct BackendSettings {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
-    /// Parsed and validated now; only exercised once the text-fallback
-    /// parser lands (see project plan, milestone M4).
-    pub tool_calling_mode: ToolCallingMode,
     /// The model's context window, in tokens — used to show a live budget
     /// indicator and to trigger context compaction before the window
     /// overflows. Conservative default; **set this to your model's actual
@@ -939,18 +937,6 @@ pub struct BackendSettings {
     /// Overrides the chat template mistral.rs would otherwise infer
     /// from the model's own metadata.
     pub mistralrs_chat_template_path: Option<String>,
-    /// Reserved for grammar-constrained tool-calling via mistral.rs's
-    /// own JSON-Schema constraint support (mirroring aivyx's own
-    /// Chapter Stencil). Accepted and stored today, but **not yet wired
-    /// into request construction** -- `MistralRsBackend::stream_chat`
-    /// (`crates/aivyx-llm/src/mistral_rs/provider.rs`) currently ignores
-    /// this flag. Real grammar-constrained tool-calling needs
-    /// infrastructure this repo doesn't have yet (a `tool_call_grammar`
-    /// JSON-Schema builder, a constrained-output parser, prompt
-    /// augmentation) -- setting this to `true` has no effect until that
-    /// lands. Default off.
-    #[serde(default)]
-    pub mistralrs_constrain_tool_calls: bool,
     /// How hard a reasoning model thinks before it answers, e.g.
     /// `"medium"`. Unset (the default), the model uses its own default,
     /// which for some models (Qwen3.8's `xhigh`) is far slower than an
@@ -1010,7 +996,6 @@ impl Default for BackendSettings {
             base_url: "http://localhost:11434/v1".to_string(),
             model: "qwen3.5:9b".to_string(),
             api_key: None,
-            tool_calling_mode: ToolCallingMode::Native,
             context_tokens: 8192,
             // Evidence-based default: the Phase 2 A/B (qwen3.5:9b, see
             // ROADMAP.md) measured native 7/9 vs prompted 6/9 with zero
@@ -1026,18 +1011,9 @@ impl Default for BackendSettings {
             mistralrs_model_path: None,
             mistralrs_model_file: None,
             mistralrs_chat_template_path: None,
-            mistralrs_constrain_tool_calls: false,
             reasoning_effort: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCallingMode {
-    Native,
-    TextFallback,
-    NativeWithFallback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2570,7 +2546,6 @@ mod tests {
         assert!(settings.backend.mistralrs_model_path.is_none());
         assert!(settings.backend.mistralrs_model_file.is_none());
         assert!(settings.backend.mistralrs_chat_template_path.is_none());
-        assert!(!settings.backend.mistralrs_constrain_tool_calls);
     }
 
     #[test]
@@ -2581,7 +2556,6 @@ mod tests {
             mistralrs_model_path = "/models/qwen3-4b.gguf"
             mistralrs_model_file = "qwen3-4b-q4_k_m.gguf"
             mistralrs_chat_template_path = "/templates/qwen3.json"
-            mistralrs_constrain_tool_calls = true
         "#;
         let settings: Settings = toml::from_str(toml_str).expect("parse");
         assert_eq!(
@@ -2596,7 +2570,6 @@ mod tests {
             settings.backend.mistralrs_chat_template_path.as_deref(),
             Some("/templates/qwen3.json")
         );
-        assert!(settings.backend.mistralrs_constrain_tool_calls);
     }
 
     #[test]
