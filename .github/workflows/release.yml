@@ -18,7 +18,7 @@ jobs:
             runner: ubuntu-latest
             stage_suffix: x86_64-linux-musl
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             stage_suffix: darwin-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
