@@ -595,6 +595,10 @@ an `api_key`; on a first run without it, defaults are written. Every
 section is optional. For one session, `--base-url`, `--model` and
 `--edit-format` override the file — see the [command line](01-command-line.md).
 
+A key this version does not know is reported at startup (on stderr and in
+`aivyx.log`), once per key, with the nearest known key if there is one; the
+file still loads and the key is ignored.
+
 ## Reading the tables
 
 - **Type**: `string`, `integer`, `number`, `bool`, `path`, a list, or the

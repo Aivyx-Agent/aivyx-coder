@@ -6,6 +6,9 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod unknown_keys;
+pub use unknown_keys::{UnknownKey, parse_reporting};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine a config directory for this platform")]
@@ -1341,7 +1344,10 @@ impl Settings {
             path: path.clone(),
             source,
         })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })
+        let (settings, unknown) = parse_reporting(&raw)
+            .map_err(|source| ConfigError::Parse { path, source })?;
+        unknown_keys::report(&unknown);
+        Ok(settings)
     }
 
     /// Like `load()`, but never creates a config file — returns `None` if
@@ -1367,10 +1373,11 @@ impl Settings {
             path: path.to_path_buf(),
             source,
         })?;
-        let settings = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let (settings, unknown) = parse_reporting(&raw).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
+        unknown_keys::report(&unknown);
         Ok(Some(settings))
     }
 
