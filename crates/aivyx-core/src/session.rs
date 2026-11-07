@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped if the on-disk shape changes incompatibly; a mismatch is treated
 /// as "no resumable session" (start fresh), not an error.
-const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 1;
 
 /// Who opened a given specialist session -- the lead itself, or another
 /// specialist (identified by ITS OWN session_id in the same pool).

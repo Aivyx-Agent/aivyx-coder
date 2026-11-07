@@ -40,6 +40,95 @@ fn validate_mcp_server_session_limits(ttl_secs: u64, max_concurrent: u32) -> any
 mod tests {
     use super::*;
 
+    /// The stable surface coder 1.0 promises (docs/COMPATIBILITY.md): config
+    /// keys with their defaults, CLI flags, and format versions. A change here
+    /// fails until `UPDATE_STABLE_SURFACE=1 cargo test` rewrites docs/stable/
+    /// on purpose.
+    fn stable_surface() -> [(&'static str, String); 3] {
+        use clap::CommandFactory;
+        // Config: every key path of the default Settings with its default.
+        // JSON keeps `None` fields as null, so optional keys are listed too.
+        fn walk(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(map) if !map.is_empty() => {
+                    for (k, v) in map {
+                        let path =
+                            if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                        walk(&path, v, out);
+                    }
+                }
+                other => out.push(format!("{prefix} = {other}")),
+            }
+        }
+        let mut config = Vec::new();
+        walk("", &serde_json::to_value(aivyx_config::Settings::default()).unwrap(), &mut config);
+        config.sort();
+        // CLI: every subcommand path and its arguments with value names.
+        fn flags(path: &str, cmd: &clap::Command, out: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if arg.is_hide_set() {
+                    continue;
+                }
+                let name = match (arg.get_long(), arg.get_short()) {
+                    (Some(l), _) => format!("--{l}"),
+                    (None, Some(s)) => format!("-{s}"),
+                    (None, None) => format!("<{}>", arg.get_id()),
+                };
+                let value = arg
+                    .get_value_names()
+                    .filter(|_| arg.get_action().takes_values() && arg.get_long().is_some())
+                    .map(|v| {
+                        format!(
+                            " <{}>",
+                            v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
+                        )
+                    })
+                    .unwrap_or_default();
+                out.push(format!("{path} {name}{value}"));
+            }
+            for sub in cmd.get_subcommands() {
+                if !sub.is_hide_set() {
+                    flags(&format!("{path} {}", sub.get_name()), sub, out);
+                }
+            }
+        }
+        let mut cli = Vec::new();
+        flags("aivyx-coder", &Cli::command(), &mut cli);
+        cli.sort();
+        // Formats: the version constants coder writes.
+        let formats = [
+            format!("report.report_version = {}", aivyx_core::run_facts::REPORT_VERSION),
+            format!("session.version = {}", aivyx_core::session::SESSION_VERSION),
+            "pack.formats = 2".to_string(),
+        ];
+        [
+            ("config.txt", config.join("\n") + "\n"),
+            ("cli.txt", cli.join("\n") + "\n"),
+            ("formats.txt", formats.join("\n") + "\n"),
+        ]
+    }
+
+    #[test]
+    fn stable_surface_matches_the_snapshot() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/stable");
+        let update = std::env::var_os("UPDATE_STABLE_SURFACE").is_some();
+        for (name, text) in stable_surface() {
+            let path = dir.join(name);
+            if update {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(&path, &text).unwrap();
+                continue;
+            }
+            let saved = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                saved == text,
+                "docs/stable/{name} differs from the code: a change to coder's stable surface \
+                 (docs/COMPATIBILITY.md). If it is intended, run \
+                 UPDATE_STABLE_SURFACE=1 cargo test -p aivyx stable_surface and commit docs/stable/"
+            );
+        }
+    }
+
     #[test]
     fn help_is_one_plain_line_per_flag() {
         use clap::CommandFactory;

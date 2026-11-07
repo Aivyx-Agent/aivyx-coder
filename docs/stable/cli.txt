@@ -1,0 +1,20 @@
+aivyx-coder --acp
+aivyx-coder --auto <AUTO>
+aivyx-coder --base-url <BASE_URL>
+aivyx-coder --edit-format <EDIT_FORMAT>
+aivyx-coder --headless
+aivyx-coder --mcp-server
+aivyx-coder --model <MODEL>
+aivyx-coder --plan
+aivyx-coder --report <PATH>
+aivyx-coder --resume <N>
+aivyx-coder --setup
+aivyx-coder --verbose
+aivyx-coder pack check <dir>
+aivyx-coder pack inspect --allow-untrusted
+aivyx-coder pack inspect <file>
+aivyx-coder pack install <file>
+aivyx-coder pack off --global
+aivyx-coder pack remove <name>
+aivyx-coder pack use --global
+aivyx-coder pack use <name>
