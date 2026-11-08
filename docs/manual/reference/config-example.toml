@@ -134,6 +134,12 @@ enabled = true  # a no-op until an external editor plugin writes a response file
 #                              # warning counts) go in the stop notice and
 #                              # --report.
 
+# Limits for an --auto run; whichever is reached first stops it. The time
+# limit is usually the one that does.
+# [autonomous]
+# max_iterations = 40       # "continue" round trips for the whole run
+# max_duration_secs = 3600  # wall-clock limit, in seconds
+
 # REPL/interactive-process support (repl_start/repl_send/repl_stop):
 # timing knobs for deciding when a call has "enough" output to return,
 # and for auto-killing a forgotten session. All optional — zero-config

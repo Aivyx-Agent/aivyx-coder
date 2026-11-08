@@ -215,8 +215,8 @@ Limits for `--auto` runs. See [Autonomous and advanced modes](../guide/10-autono
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|
-| `max_iterations` | integer |  | Total "continue" round-trips for the whole autonomous run. |
-| `max_duration_secs` | integer |  | Wall-clock ceiling, in seconds, for the whole autonomous run. A turn still running when it passes is stopped. |
+| `max_iterations` | integer | `40` | Total "continue" round-trips for the whole autonomous run. Default 40, so `max_duration_secs` is usually the limit that stops a run. |
+| `max_duration_secs` | integer | `3600` | Wall-clock ceiling, in seconds, for the whole autonomous run. A turn still running when it passes is stopped. |
 
 ### `[architect]`
 

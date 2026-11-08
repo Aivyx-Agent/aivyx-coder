@@ -148,7 +148,8 @@ impl Default for VerificationSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutonomousSettings {
-    /// Total "continue" round-trips for the whole autonomous run.
+    /// Total "continue" round-trips for the whole autonomous run. Default
+    /// 40, so `max_duration_secs` is usually the limit that stops a run.
     pub max_iterations: u32,
     /// Wall-clock ceiling, in seconds, for the whole autonomous run. A turn
     /// still running when it passes is stopped.
@@ -158,7 +159,7 @@ pub struct AutonomousSettings {
 impl Default for AutonomousSettings {
     fn default() -> Self {
         Self {
-            max_iterations: 20,
+            max_iterations: 40,
             max_duration_secs: 3600,
         }
     }
@@ -1980,7 +1981,7 @@ mod tests {
     #[test]
     fn autonomous_settings_have_conservative_defaults() {
         let settings: Settings = toml::from_str("").unwrap();
-        assert_eq!(settings.autonomous.max_iterations, 20);
+        assert_eq!(settings.autonomous.max_iterations, 40);
         assert_eq!(settings.autonomous.max_duration_secs, 3600);
     }
 

@@ -68,7 +68,7 @@ notice after the turn.) It's a pattern scan, not a guarantee.
 
 ```toml
 [autonomous]
-max_iterations = 20       # "continue" round trips for the whole run
+max_iterations = 40       # "continue" round trips for the whole run
 max_duration_secs = 3600  # wall-clock limit
 ```
 

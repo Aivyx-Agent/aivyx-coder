@@ -5,7 +5,7 @@ architect.base_url = ""
 architect.model = ""
 architect.tail_budget_tokens = 3072
 autonomous.max_duration_secs = 3600
-autonomous.max_iterations = 20
+autonomous.max_iterations = 40
 backend.api_key = null
 backend.base_url = "http://localhost:11434/v1"
 backend.broker_base_url (deprecated: use broker.base_url)
