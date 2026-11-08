@@ -605,8 +605,17 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
             ));
             None
         }
-        // Declined, or never asked about: nothing runs.
-        Ok(_) => None,
+        // Declined, or never asked about: nothing runs, but say so once
+        // per start so a newer version's commands don't go unnoticed.
+        Ok(Some(_)) => {
+            notices.push(format!(
+                "Pack {name} has commands you haven't approved — run aivyx-coder pack use {name} \
+                 to review them.",
+                name = installed.name
+            ));
+            None
+        }
+        Ok(None) => None,
         Err(e) => {
             notices.push(format!(
                 "Pack {}'s settings file doesn't load ({e}), so its commands aren't used — \
@@ -721,11 +730,9 @@ pub fn apply_to_settings(layer: &mut PackLayer, settings: &mut Settings) {
 /// split at whitespace and run directly, no shell. A user's own entry of
 /// that name is kept, with a notice if it runs something else.
 fn add_pack_command(layer: &mut PackLayer, settings: &mut Settings, command: String) {
-    let mut words = command.split_whitespace().map(str::to_string);
-    let Some(program) = words.next() else {
+    let Some(entry) = pack_entry(&command) else {
         return;
     };
-    let entry = AllowedCommand { name: command.clone(), program, args: words.collect(), timeout_secs: None };
     match settings.permissions.allowed_commands.iter().find(|c| c.name == command) {
         None => settings.permissions.allowed_commands.push(entry),
         Some(mine) if mine.program == entry.program && mine.args == entry.args => {}
@@ -801,21 +808,68 @@ pub fn consent_text(server: &McpServerConfig) -> String {
     out
 }
 
-/// What the user is asked to approve for a pack's verification commands:
-/// one line per command, each shown safely.
-pub fn settings_lines(v: &PackVerification) -> Vec<String> {
+/// The `allowed_commands` entry a pack command becomes: its command line,
+/// split at whitespace (`check_coder_settings` refuses shell syntax).
+fn pack_entry(command: &str) -> Option<AllowedCommand> {
+    let mut words = command.split_whitespace().map(str::to_string);
+    let program = words.next()?;
+    Some(AllowedCommand { name: command.to_string(), program, args: words.collect(), timeout_secs: None })
+}
+
+/// The user's own `allowed_commands` entry named `command`, when it runs
+/// something other than the pack's command line — that entry is what runs.
+fn clashing_entry<'a>(command: &str, allowed: &'a [AllowedCommand]) -> Option<&'a AllowedCommand> {
+    let ours = pack_entry(command)?;
+    allowed
+        .iter()
+        .find(|c| c.name == command)
+        .filter(|mine| mine.program != ours.program || mine.args != ours.args)
+}
+
+/// Each command with its label (`runs:`, `final check:` …).
+fn labelled(v: &PackVerification) -> Vec<(&'static str, &str)> {
     let mut out = Vec::new();
     if let Some(command) = &v.command {
-        out.push(format!("runs: {}", shown(command)));
+        out.push(("runs", command.as_str()));
     }
     if let Some(command) = &v.scoped_command {
-        out.push(format!("runs on the changed files: {}", shown(command)));
+        out.push(("runs on the changed files", command.as_str()));
     }
     for command in &v.final_checks {
-        out.push(format!("final check: {}", shown(command)));
+        out.push(("final check", command.as_str()));
     }
     out
 }
+
+/// A pack's verification commands, one line per command, each shown
+/// safely (for `pack check` and `inspect`).
+pub fn settings_lines(v: &PackVerification) -> Vec<String> {
+    consent_lines(v, &[])
+}
+
+/// What the user is asked to approve at `pack use`: [`settings_lines`],
+/// plus — under a command whose name is one of the user's own
+/// `[[permissions.allowed_commands]]` entries running something else —
+/// what will actually run.
+pub fn consent_lines(v: &PackVerification, allowed: &[AllowedCommand]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (label, command) in labelled(v) {
+        out.push(format!("{label}: {}", shown(command)));
+        if let Some(mine) = clashing_entry(command, allowed) {
+            let line = std::iter::once(mine.program.as_str())
+                .chain(mine.args.iter().map(String::as_str))
+                .map(shown)
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(format!("  (your own allowed command of that name runs instead: {line})"));
+        }
+    }
+    out
+}
+
+/// The sentence after the commands, at `pack use` and with `--yes`.
+pub const SETTINGS_CONSENT_NOTE: &str =
+    "They run without asking each time, and the model may run them without asking too.";
 
 /// `skills: 1 · roster members: 0 · MCP servers: 1 · settings: 2 commands`.
 fn summary_counts(s: &CoderPartSummary) -> String {
@@ -1343,7 +1397,85 @@ mcp = "coder/mcp.toml"
         assert!(!text.contains("settings"), "{text}");
         let layer = resolve_layer(&packs, &tmp("settings-decline-project")).unwrap();
         assert!(layer.verification.is_none());
-        assert_eq!(layer.notices.len(), 1, "no nagging about a no: {:?}", layer.notices);
+        let unapproved = "Pack business-manager has commands you haven't approved — run aivyx-coder pack use \
+                          business-manager to review them.";
+        assert_eq!(layer.notices.iter().filter(|n| *n == unapproved).count(), 1, "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn commands_a_newer_version_adds_get_one_notice() {
+        let packs = installed_packs("settings-added");
+        let project = tmp("settings-added-project");
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
+        assert_eq!(resolve_layer(&packs, &project).unwrap().notices.len(), 1, "no settings, no notice");
+        // A newer version brings commands the user never reviewed.
+        add_settings(&packs.find("business-manager").unwrap().dir, SETTINGS);
+        let mut layer = resolve_layer(&packs, &project).unwrap();
+        assert!(layer.verification.is_none());
+        let mut settings = Settings::default();
+        apply_to_settings(&mut layer, &mut settings);
+        assert!(settings.verification.command.is_none());
+        let hits = layer.notices.iter().filter(|n| n.contains("has commands you haven't approved")).count();
+        assert_eq!(hits, 1, "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn the_consent_shows_what_a_clashing_allowed_command_runs() {
+        let v = PackVerification { command: Some("cargo test".into()), ..Default::default() };
+        let same = AllowedCommand {
+            name: "cargo test".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            timeout_secs: None,
+        };
+        assert_eq!(consent_lines(&v, std::slice::from_ref(&same)), vec!["runs: cargo test"]);
+        let mine = AllowedCommand { args: vec!["nextest".into(), "run".into()], ..same };
+        assert_eq!(
+            consent_lines(&v, &[mine]),
+            vec!["runs: cargo test", "  (your own allowed command of that name runs instead: cargo nextest run)"]
+        );
+        assert!(SETTINGS_CONSENT_NOTE.contains("the model may run them without asking too"));
+    }
+
+    #[test]
+    fn shell_syntax_is_refused_everywhere_a_pack_is_read() {
+        let shell = "[verification]\ncommand = \"cargo build && cargo test\"\n";
+        // pack check (and install, which runs the same check).
+        let d = good_pack("shell-check");
+        add_settings(&d, shell);
+        let problems = check_coder_part(&d).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("shell syntax")), "{problems:?}");
+        let d = good_pack("plain-check");
+        add_settings(&d, "[verification]\ncommand = \"cargo test\"\n");
+        assert!(check_coder_part(&d).is_ok());
+
+        // pack use.
+        let packs = installed_packs("shell-use");
+        add_settings(&packs.find("business-manager").unwrap().dir, shell);
+        let err = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| true).unwrap_err();
+        assert!(err.contains("shell syntax"), "{err}");
+
+        // Start-up: approved while plain, then changed to shell syntax.
+        let packs = installed_with_settings("shell-start");
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| true).unwrap();
+        rewrite(&packs.find("business-manager").unwrap().dir, "coder/settings.toml", |_| shell.into());
+        let layer = resolve_layer(&packs, &tmp("shell-start-project")).unwrap();
+        assert!(layer.verification.is_none());
+        assert!(
+            layer.notices.iter().any(|n| n.contains("settings file doesn't load") && n.contains("shell syntax")),
+            "{:?}",
+            layer.notices
+        );
+    }
+
+    #[test]
+    fn touched_paths_is_allowed_only_as_a_whole_word() {
+        let d = good_pack("touched-ok");
+        add_settings(&d, "[verification]\nscoped_command = \"cargo test {touched_paths}\"\n");
+        assert!(check_coder_part(&d).is_ok());
+        let d = good_pack("touched-bad");
+        add_settings(&d, "[verification]\nscoped_command = \"cargo test --x={touched_paths}\"\n");
+        assert!(check_coder_part(&d).is_err());
     }
 
     #[test]

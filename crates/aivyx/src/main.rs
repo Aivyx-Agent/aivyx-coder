@@ -953,17 +953,17 @@ fn ask_mcp_consent(server: &aivyx_config::McpServerConfig) -> bool {
 
 /// Ask, at a terminal, before a pack's verification commands may run.
 /// Without a terminal the answer is no.
-fn ask_settings_consent(v: &aivyx_pack::PackVerification) -> bool {
+fn ask_settings_consent(v: &aivyx_pack::PackVerification, allowed: &[aivyx_config::AllowedCommand]) -> bool {
     use std::io::{BufRead, IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
         println!("The pack's commands left off (no terminal to ask).");
         return false;
     }
-    let lines: Vec<String> = packs::settings_lines(v).iter().map(|l| format!("  {l}\n")).collect();
+    let lines: Vec<String> = packs::consent_lines(v, allowed).iter().map(|l| format!("  {l}\n")).collect();
     print!(
-        "This pack wants aivyx-coder to run these commands to check its work:\n{}\
-         They run without asking each time. Allow them? [y/N] ",
-        lines.concat()
+        "This pack wants aivyx-coder to run these commands to check its work:\n{}{}\nAllow them? [y/N] ",
+        lines.concat(),
+        packs::SETTINGS_CONSENT_NOTE
     );
     let _ = std::io::stdout().flush();
     let mut line = String::new();
@@ -999,16 +999,21 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
                 println!("approved: MCP server {}", packs::consent_text(server));
                 true
             };
+            // The user's own allowed commands, so a name clash shows what
+            // will actually run.
+            let allowed = Settings::load_existing()?.unwrap_or_default().permissions.allowed_commands;
             let mut approve_settings = |v: &aivyx_pack::PackVerification| {
-                for line in packs::settings_lines(v) {
+                for line in packs::consent_lines(v, &allowed) {
                     println!("approved: {line}");
                 }
+                println!("({})", packs::SETTINGS_CONSENT_NOTE);
                 true
             };
+            let mut ask_settings = |v: &aivyx_pack::PackVerification| ask_settings_consent(v, &allowed);
             let used = if yes {
                 packs::use_pack(&packs, &name, scope, &mut approve_mcp, &mut approve_settings)
             } else {
-                packs::use_pack(&packs, &name, scope, &mut ask_mcp_consent, &mut ask_settings_consent)
+                packs::use_pack(&packs, &name, scope, &mut ask_mcp_consent, &mut ask_settings)
             }
             .map_err(anyhow::Error::msg)?;
             let mut with = Vec::new();

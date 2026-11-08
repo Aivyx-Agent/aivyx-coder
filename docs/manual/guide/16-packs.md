@@ -56,7 +56,8 @@ stops running until you run `pack use` again.
 
 For a script — a setup script, or a benchmark harness — `pack use --yes`
 approves every MCP server and command without asking, printing each one
-with `approved:` in front, so the log shows exactly what was agreed to.
+with `approved:` in front, so the log shows exactly what was agreed to —
+including that the model may run the approved commands without asking.
 
 ## Commands a pack can run
 
@@ -70,9 +71,18 @@ scoped_command = "cargo test {touched_paths}"   # optional: on the changed files
 final_checks = ["cargo fmt --check"] # run when an --auto goal is reached
 ```
 
-That's all it may set: any other key, an empty command or a control
-character in one makes `pack check` and `install` refuse the pack. (A pack
-with a settings file needs aivyx-coder 1.0.0 or later.)
+Each command is one program and its arguments, run without a shell, so
+shell syntax can't work: `&&`, `|`, `;`, redirections, `$`, quotes, globs
+and the like are refused. To run two commands, use one that runs both (a
+`just` or `make` target, say). `{touched_paths}` — replaced by the files
+changed since the last check — must be a whole word on its own
+(`cargo test {touched_paths}`, not `--files={touched_paths}`).
+
+That's all a pack may set: any other key, an empty command, a control
+character or shell syntax makes `pack check`, `install` and `pack use`
+refuse the pack, and a pack already in use whose file turns bad gets a
+notice at start-up instead. (A pack with a settings file needs aivyx-coder
+1.0.0 or later.)
 
 `pack use` shows the commands and asks before allowing them:
 
@@ -80,13 +90,22 @@ with a settings file needs aivyx-coder 1.0.0 or later.)
 This pack wants aivyx-coder to run these commands to check its work:
   runs: cargo test
   final check: cargo fmt --check
-They run without asking each time. Allow them? [y/N]
+They run without asking each time, and the model may run them without asking too.
+Allow them? [y/N]
 ```
+
+If a command's name matches one of your own
+`[[permissions.allowed_commands]]` entries that runs something else, the
+prompt says so under it — `(your own allowed command of that name runs
+instead: cargo nextest run)` — since yours is what will run.
 
 Without a terminal the answer is no, unless you pass `--yes`. aivyx-coder
 records exactly the commands you approved; if a later version of the pack
 changes them, they aren't used, and a notice at start-up asks you to run
-`pack use` again to review them.
+`pack use` again to review them. Commands you declined, or that a newer
+version of the pack added, get one notice each time aivyx-coder starts:
+`Pack <name> has commands you haven't approved — run aivyx-coder pack use
+<name> to review them.`
 
 An approved command runs like one of your own
 `[[permissions.allowed_commands]]` entries, named by its command line: it
