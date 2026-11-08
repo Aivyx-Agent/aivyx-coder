@@ -85,3 +85,6 @@ tempfile = "3.27.0"
 # Asserts which endpoint receives `[backend] api_key` (routing.rs tests).
 wiremock = "0.6.5"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "test-util"] }
+# The stable-surface snapshot (docs/stable/config.txt) traces Settings'
+# Deserialize impl for every key and every enum's accepted values.
+serde-reflection = "0.6.0"

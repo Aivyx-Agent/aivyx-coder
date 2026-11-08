@@ -10,17 +10,25 @@ backend.api_key = null
 backend.base_url = "http://localhost:11434/v1"
 backend.broker_base_url (deprecated: use broker.base_url)
 backend.context_tokens = 8192
-backend.edit_format = "native"
-backend.kind = "generic"
+backend.edit_format = "native" (one of: native | prompted)
+backend.kind = "generic" (one of: generic | llama_server | llama_server_broker | mistral_rs)
 backend.kvcache_max_bytes (deprecated: use kvcache.max_bytes)
 backend.kvcache_store_path (deprecated: use kvcache.store_path)
+backend.locality = null (one of: local | cloud)
 backend.mistralrs_chat_template_path = null
 backend.mistralrs_model_file = null
 backend.mistralrs_model_path = null
 backend.model = "qwen3.5:9b"
+backend.reasoning_effort = null
 broker.base_url = null
 council.chairman = null
+council.chairman.api_key: string?
+council.chairman.base_url: string
+council.chairman.model: string
 council.members = []
+council.members[].api_key: string?
+council.members[].base_url: string
+council.members[].model: string
 council.tail_budget_tokens = 3072
 editor_approval.enabled = true
 editor_context.enabled = true
@@ -30,15 +38,24 @@ kvcache.max_bytes = 10737418240
 kvcache.store_path = null
 lsp.timeout_secs = 60
 mcp.servers = []
-mcp_server.max_access_level = null
+mcp.servers[].args: [string]
+mcp.servers[].command: string
+mcp.servers[].env: {string}
+mcp.servers[].name: string
+mcp.servers[].timeout_secs: integer
+mcp_server.max_access_level = null (one of: plan | edit | execute)
 mcp_server.max_concurrent_sessions = 8
 mcp_server.max_iterations = 10
 mcp_server.session_ttl_secs = 1800
 pack.trusted_publishers = []
 permissions.allowed_commands = []
+permissions.allowed_commands[].args: [string]
+permissions.allowed_commands[].name: string
+permissions.allowed_commands[].program: string
+permissions.allowed_commands[].timeout_secs: integer?
 permissions.deny_paths = ["~/.ssh","~/.aws","~/.config/aivyx-coder","~/.local/state/aivyx-coder","~/.gnupg","~/.netrc","~/.docker/config.json","~/.kube/config","~/.npmrc","~/.pypirc","~/.config/gcloud","~/.azure","~/.cargo/credentials.toml","~/.config/gh",".env",".env.*","id_rsa","id_ed25519","*.pem","*.key"]
 permissions.max_tool_iterations_per_turn = 25
-permissions.mode = "confirm"
+permissions.mode = "confirm" (one of: confirm)
 permissions.read_only_paths = []
 persona.enabled = true
 repl.idle_timeout_secs = 600
@@ -49,8 +66,23 @@ repo_map.enabled = true
 routing.discover = true
 routing.enabled = false
 routing.endpoints = {}
+routing.endpoints.*.base_url: string?
+routing.endpoints.*.kind: enum (one of: ollama | llama_router | openai_compat | lemonade | anthropic | openai)
+routing.endpoints.*.locality: enum? (one of: local | cloud)
 routing.models = []
+routing.models[].capabilities: [enum] (one of: completion | tools | vision | thinking | audio | embedding)
+routing.models[].capabilities_deny: [enum] (one of: completion | tools | vision | thinking | audio | embedding)
+routing.models[].context_window: integer?
+routing.models[].endpoint: string?
+routing.models[].id: string
+routing.models[].locality: enum? (one of: local | cloud)
+routing.models[].priority: integer?
+routing.models[].strengths: [enum]? (one of: code | reasoning | chat | summarize)
+routing.models[].tier: enum? (one of: small | medium | large)
 routing.tasks = {}
+routing.tasks.*.strengths: [enum]? (one of: code | reasoning | chat | summarize)
+routing.tasks.*.tier: enum? (one of: small | medium | large)
+routing.vram_bytes = null
 sandbox.allow_leaving_process_group = false
 sandbox.allow_unix_sockets = false
 sandbox.extra_read_paths = []

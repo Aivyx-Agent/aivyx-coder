@@ -13,6 +13,19 @@ pub enum AccessLevel {
 }
 
 impl AccessLevel {
+    /// Every level, lowest first. `docs/stable/config.txt` lists these as
+    /// `[mcp_server] max_access_level`'s accepted values.
+    pub const ALL: [AccessLevel; 3] = [Self::Plan, Self::Edit, Self::Execute];
+
+    /// The spelling `parse` accepts.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Edit => "edit",
+            Self::Execute => "execute",
+        }
+    }
+
     /// Parses the MCP tool parameter / config value. Case-sensitive,
     /// exactly "plan" | "edit" | "execute" — no aliases, so a typo fails
     /// loudly rather than silently mapping to something unintended.
@@ -63,6 +76,20 @@ impl AccessLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_lists_every_level_and_each_parses_back() {
+        // No wildcard: a new level fails to compile here until it is in
+        // `ALL` (and so in docs/stable/config.txt).
+        for level in AccessLevel::ALL {
+            match level {
+                AccessLevel::Plan | AccessLevel::Edit | AccessLevel::Execute => {}
+            }
+            assert_eq!(AccessLevel::parse(level.as_str()), Ok(level));
+        }
+        let ranks: Vec<u8> = AccessLevel::ALL.iter().map(AccessLevel::rank).collect();
+        assert_eq!(ranks, [0, 1, 2]);
+    }
 
     #[test]
     fn parse_accepts_exactly_the_three_valid_strings() {

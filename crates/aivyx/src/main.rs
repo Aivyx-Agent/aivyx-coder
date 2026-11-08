@@ -40,33 +40,188 @@ fn validate_mcp_server_session_limits(ttl_secs: u64, max_concurrent: u32) -> any
 mod tests {
     use super::*;
 
+    /// Every config key, as `docs/stable/config.txt` lists it, one per line:
+    ///
+    /// - `path = default`: a key and its default (`null`: unset), from
+    ///   `Settings::default()`.
+    /// - `path[].field: type` and `path.*.field: type`: a field of each
+    ///   list entry or table entry (`?`: optional).
+    /// - ` (one of: a | b)`: the values an enum key accepts.
+    /// - `old (deprecated: use new)`: a deprecated spelling still read.
+    ///
+    /// The keys and the enum values come from tracing `Settings`' own
+    /// `Deserialize` (serde-reflection), so a key skipped when serialized
+    /// (an unset `Option`) and the fields inside empty lists are listed too.
+    fn config_snapshot() -> Vec<String> {
+        use serde_reflection::{ContainerFormat, Format, Registry, Tracer, TracerConfig};
+
+        let mut tracer = Tracer::new(TracerConfig::default());
+        tracer.trace_simple_type::<Settings>().expect("Settings traces");
+        // Each enum is traced on its own so every variant is seen.
+        // `registry()` below fails, naming the enum, for one not listed here.
+        tracer.trace_simple_type::<aivyx_config::BackendKind>().unwrap();
+        tracer.trace_simple_type::<aivyx_config::EditFormat>().unwrap();
+        tracer.trace_simple_type::<aivyx_config::PermissionMode>().unwrap();
+        tracer.trace_simple_type::<aivyx_route::Locality>().unwrap();
+        tracer.trace_simple_type::<aivyx_route::Capability>().unwrap();
+        tracer.trace_simple_type::<aivyx_route::EndpointKind>().unwrap();
+        tracer.trace_simple_type::<aivyx_route::Strength>().unwrap();
+        tracer.trace_simple_type::<aivyx_route::Tier>().unwrap();
+        let registry = tracer.registry().unwrap_or_else(|e| {
+            panic!("a config enum is not traced in config_snapshot (add it there): {e:?}")
+        });
+        // String keys parsed into a fixed set after loading.
+        let string_sets: [(&str, Vec<&str>); 1] = [(
+            "mcp_server.max_access_level",
+            aivyx_mcp_server::AccessLevel::ALL.iter().map(|l| l.as_str()).collect(),
+        )];
+        let defaults = serde_json::to_value(Settings::default()).unwrap();
+
+        fn variants(registry: &Registry, f: &Format) -> Option<Vec<String>> {
+            match f {
+                Format::Option(inner) | Format::Seq(inner) => variants(registry, inner),
+                Format::TypeName(t) => match registry.get(t) {
+                    Some(ContainerFormat::Enum(vs)) => {
+                        Some(vs.values().map(|v| v.name.clone()).collect())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        fn type_name(registry: &Registry, f: &Format) -> String {
+            match f {
+                Format::Option(inner) => format!("{}?", type_name(registry, inner)),
+                Format::Seq(inner) => format!("[{}]", type_name(registry, inner)),
+                Format::Map { value, .. } => format!("{{{}}}", type_name(registry, value)),
+                Format::Str => "string".into(),
+                Format::Bool => "bool".into(),
+                Format::U8
+                | Format::U16
+                | Format::U32
+                | Format::U64
+                | Format::I32
+                | Format::I64 => "integer".into(),
+                Format::F32 | Format::F64 => "number".into(),
+                Format::TypeName(_) if variants(registry, f).is_some() => "enum".into(),
+                other => panic!("config_snapshot: no name for {other:?}"),
+            }
+        }
+        fn struct_of<'f>(registry: &Registry, f: &'f Format) -> Option<&'f str> {
+            match f {
+                Format::TypeName(t)
+                    if matches!(registry.get(t), Some(ContainerFormat::Struct(_))) =>
+                {
+                    Some(t)
+                }
+                _ => None,
+            }
+        }
+        struct Walk<'a> {
+            registry: &'a Registry,
+            defaults: &'a serde_json::Value,
+            string_sets: &'a [(&'a str, Vec<&'a str>)],
+            out: Vec<String>,
+        }
+        impl Walk<'_> {
+            fn default_of(&self, path: &str) -> String {
+                let mut v = self.defaults;
+                for seg in path.split('.') {
+                    match v.get(seg) {
+                        Some(next) => v = next,
+                        None => return "null".into(),
+                    }
+                }
+                v.to_string()
+            }
+            fn leaf(&mut self, path: &str, f: &Format, in_entry: bool) {
+                let mut line = if in_entry {
+                    format!("{path}: {}", type_name(self.registry, f))
+                } else {
+                    format!("{path} = {}", self.default_of(path))
+                };
+                let set = variants(self.registry, f).or_else(|| {
+                    self.string_sets
+                        .iter()
+                        .find(|(p, _)| *p == path)
+                        .map(|(_, vs)| vs.iter().map(|v| v.to_string()).collect())
+                });
+                if let Some(set) = set {
+                    line.push_str(&format!(" (one of: {})", set.join(" | ")));
+                }
+                self.out.push(line);
+            }
+            fn fields(&mut self, prefix: &str, name: &str, in_entry: bool) {
+                let Some(ContainerFormat::Struct(fields)) = self.registry.get(name) else {
+                    panic!("config_snapshot: {name} is not a struct");
+                };
+                for field in fields {
+                    let path = if prefix.is_empty() {
+                        field.name.clone()
+                    } else {
+                        format!("{prefix}.{}", field.name)
+                    };
+                    if aivyx_config::DEPRECATED_KEYS.iter().any(|(old, _)| *old == path) {
+                        continue;
+                    }
+                    let inner = match &field.value {
+                        Format::Option(inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    if let Some(s) = struct_of(self.registry, inner) {
+                        // An optional table (`council.chairman = null`): its
+                        // fields are listed like an entry's.
+                        let optional = matches!(field.value, Format::Option(_));
+                        if optional && !in_entry {
+                            self.out.push(format!("{path} = {}", self.default_of(&path)));
+                        }
+                        self.fields(&path, s, in_entry || optional);
+                        continue;
+                    }
+                    let entry = match inner {
+                        Format::Seq(e) => {
+                            struct_of(self.registry, e).map(|s| (format!("{path}[]"), s))
+                        }
+                        Format::Map { value, .. } => {
+                            struct_of(self.registry, value).map(|s| (format!("{path}.*"), s))
+                        }
+                        _ => None,
+                    };
+                    match entry {
+                        Some((entry_path, s)) => {
+                            if !in_entry {
+                                self.out.push(format!("{path} = {}", self.default_of(&path)));
+                            }
+                            self.fields(&entry_path, s, true);
+                        }
+                        None => self.leaf(&path, &field.value, in_entry),
+                    }
+                }
+            }
+        }
+        let mut walk = Walk {
+            registry: &registry,
+            defaults: &defaults,
+            string_sets: &string_sets,
+            out: Vec::new(),
+        };
+        walk.fields("", "Settings", false);
+        let mut config = walk.out;
+        // Deprecated spellings still read (and warned about) across 1.x.
+        for (old, new) in aivyx_config::DEPRECATED_KEYS {
+            config.push(format!("{old} (deprecated: use {new})"));
+        }
+        config.sort();
+        config
+    }
+
     /// The stable surface coder 1.0 promises (docs/COMPATIBILITY.md): config
     /// keys with their defaults, CLI flags, and format versions. A change here
     /// fails until `UPDATE_STABLE_SURFACE=1 cargo test` rewrites docs/stable/
     /// on purpose.
     fn stable_surface() -> [(&'static str, String); 3] {
         use clap::CommandFactory;
-        // Config: every key path of the default Settings with its default.
-        // JSON keeps `None` fields as null, so optional keys are listed too.
-        fn walk(prefix: &str, v: &serde_json::Value, out: &mut Vec<String>) {
-            match v {
-                serde_json::Value::Object(map) if !map.is_empty() => {
-                    for (k, v) in map {
-                        let path =
-                            if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
-                        walk(&path, v, out);
-                    }
-                }
-                other => out.push(format!("{prefix} = {other}")),
-            }
-        }
-        let mut config = Vec::new();
-        walk("", &serde_json::to_value(aivyx_config::Settings::default()).unwrap(), &mut config);
-        // Deprecated spellings still read (and warned about) across 1.x.
-        for (old, new) in aivyx_config::DEPRECATED_KEYS {
-            config.push(format!("{old} (deprecated: use {new})"));
-        }
-        config.sort();
+        let config = config_snapshot();
         // CLI: every subcommand path and its arguments with value names.
         fn flags(path: &str, cmd: &clap::Command, out: &mut Vec<String>) {
             for arg in cmd.get_arguments() {

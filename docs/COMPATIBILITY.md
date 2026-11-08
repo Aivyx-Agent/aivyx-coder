@@ -5,7 +5,9 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
 ## Stable
 
 - **Config keys and their defaults.** Every key path, with the default
-  from `Settings::default()`. Snapshot: `docs/stable/config.txt`.
+  from `Settings::default()`, the values each enum key accepts, the
+  fields of list and table entries, and the deprecated spellings still
+  read. Snapshot: `docs/stable/config.txt`.
 - **The CLI flags.** The subcommands and long flags, including `--auto`,
   `--headless` and `--report`. Snapshot: `docs/stable/cli.txt`.
 - **The `--report` JSON schema.** It carries `report_version`, and the
@@ -46,10 +48,14 @@ The test is `stable_surface_matches_the_snapshot` in
 
 The check has limits:
 
-- It freezes config keys and their defaults. A default that is an empty
-  list or table (for example `mcp.servers`, `routing.endpoints` and
-  `verification.final_checks`) freezes only the key, not the fields inside.
-  Review covers those.
+- It freezes config keys with their defaults (`null` is unset), and the
+  values an enum key accepts (`(one of: ...)`). The keys and the values
+  come from tracing the config types' own deserializer, so an unset
+  optional key is listed too.
+- Fields of list and table entries (`permissions.allowed_commands[].name`,
+  `routing.endpoints.*.kind`) are frozen with their types: an entry has no
+  default to freeze. What an omitted entry field means is covered by
+  review.
 - The CLI snapshot lists subcommands and long flags. Short flags and
   aliases of long flags are not in it.
 - The format snapshot lists versions. It does not test that old sessions

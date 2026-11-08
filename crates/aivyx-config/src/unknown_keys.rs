@@ -11,8 +11,23 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// The snapshot of every known key path; one `path = default` per line.
+/// The snapshot of every known key path, one per line: `path = default`,
+/// `path[].field: type` or `path.*.field: type` (list and table entries),
+/// each maybe followed by ` (...)`.
 const KNOWN_SNAPSHOT: &str = include_str!("../../../docs/stable/config.txt");
+
+/// The key path of one snapshot line, entry markers dropped:
+/// `permissions.allowed_commands[].name: string` gives
+/// `permissions.allowed_commands.name`, as a reported path reads once its
+/// array index is dropped.
+fn snapshot_path(line: &str) -> &str {
+    let end = [" = ", ": ", " ("]
+        .iter()
+        .filter_map(|sep| line.find(sep))
+        .min()
+        .unwrap_or(line.len());
+    &line[..end]
+}
 
 /// A key in the config file that this version does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,9 +52,10 @@ impl fmt::Display for UnknownKey {
 fn known_paths() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in KNOWN_SNAPSHOT.lines() {
-        let Some((path, _)) = line.split_once(" = ") else { continue };
+        let path = snapshot_path(line).replace("[]", "");
         let mut prefix = String::new();
-        for seg in path.split('.') {
+        // A table entry's name (`.*`) is the user's own; it is skipped.
+        for seg in path.split('.').filter(|s| *s != "*") {
             if !prefix.is_empty() {
                 prefix.push('.');
             }
@@ -235,6 +251,40 @@ mod tests {
     fn unknown_key_inside_an_array_of_tables_warns() {
         let raw = "[[mcp.servers]]\nname = \"x\"\ncommand = \"y\"\nbogus = 1\n";
         assert_eq!(paths(raw), vec!["mcp.servers.0.bogus"]);
+    }
+
+    #[test]
+    fn a_misspelled_entry_field_gets_a_suggestion() {
+        let raw = "[[permissions.allowed_commands]]\nname = \"t\"\nprogram = \"p\"\n\
+                   timeout_sec = 5\n";
+        let keys = unknown(raw);
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert_eq!(keys[0].path, "permissions.allowed_commands.0.timeout_sec");
+        assert_eq!(
+            keys[0].suggestion.as_deref(),
+            Some("permissions.allowed_commands.timeout_secs")
+        );
+    }
+
+    #[test]
+    fn every_snapshot_line_shape_gives_its_path() {
+        for (line, path) in [
+            ("backend.model = \"qwen3.5:9b\"", "backend.model"),
+            ("backend.kind = \"generic\" (one of: generic | llama_server)", "backend.kind"),
+            ("permissions.allowed_commands[].name: string", "permissions.allowed_commands[].name"),
+            ("routing.endpoints.*.kind: enum (one of: ollama)", "routing.endpoints.*.kind"),
+            (
+                "backend.broker_base_url (deprecated: use broker.base_url)",
+                "backend.broker_base_url",
+            ),
+        ] {
+            assert_eq!(snapshot_path(line), path);
+        }
+        let known = known_paths();
+        assert!(known.contains("permissions.allowed_commands.name"));
+        assert!(known.contains("routing.endpoints.kind"));
+        assert!(known.contains("backend.locality"), "an unset Option is known too");
+        assert!(!known.iter().any(|k| k.contains('*') || k.contains("[]") || k.contains(' ')));
     }
 
     #[test]
