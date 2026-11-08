@@ -2,7 +2,7 @@
 
 aivyx-coder talks to any server with an OpenAI-compatible API on your own
 machine or network. This chapter covers choosing and running one, sharing a
-GPU with other programs, and the embedded engine.
+GPU with other programs, the image tools, and the embedded engine.
 
 **The one setting that matters most:** `[backend] context_tokens` must
 match the context window your server **actually serves**. Too small a
@@ -384,6 +384,44 @@ attached to each outgoing request as a hint. The broker infers locality
 purely from the prefix hash and performs its own slot assignment entirely
 on its own side — its own occupancy tracking, not this client, is what
 makes same-session requests keep landing on a fast, already-warmed slot.
+
+## Image generation (`[vision]`)
+
+The model can make pictures with three tools. `generate_svg` draws a
+vector image with your own model and needs nothing else: it is always
+there, returns the SVG (sanitized), and the model saves it with
+`write_file`. `generate_image` makes a raster image (PNG, JPEG or WebP)
+with a separate local image server, and `generate_3d` is reserved for 3D
+models (every call fails for now). Those two appear only with
+`[vision] enabled = true`, because they need two programs aivyx-coder
+doesn't install:
+
+- **`mold serve`**, the image generator ([mold](https://github.com/utensils/mold)),
+  at `[vision] mold_url` (default `http://127.0.0.1:7680`). Set
+  `[vision] api_key` if you started it with `MOLD_API_KEY`.
+- **aivyx-broker**, which hands out the GPU: each `generate_image` call
+  takes the broker's GPU lock first and gives it back afterwards, so image
+  work and model inference don't fight over one card. It is the same
+  broker as above, at `[broker] base_url`, or `http://127.0.0.1:8899` when
+  that is unset. You don't need `kind = "llama_server_broker"` for this;
+  the broker only has to be running.
+
+```toml
+[vision]
+enabled = true
+# mold_url = "http://127.0.0.1:7680"
+
+[broker]
+# base_url = "http://127.0.0.1:8899"
+```
+
+If either program is down, or the GPU lock isn't granted in time, the call
+fails with an error and nothing is retried. Images are saved under `assets/generated/` in the
+project, and the first save of a session asks you for that folder.
+
+`[vision]` is about generating images. It is not the `vision` capability
+in `[[routing.models]]`, which marks a model that can read images (see
+[Models and routing](08-models-and-routing.md)).
 
 ## Embedded Rust-native inference
 

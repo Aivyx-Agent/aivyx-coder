@@ -308,7 +308,7 @@ Interactive processes the model can drive (`repl_start`, `repl_send`, `repl_stop
 
 ### `[vision]`
 
-Image generation tools, which need an image backend.
+The `generate_image` and `generate_3d` tools, which need `mold serve` and aivyx-broker running (`generate_svg` needs neither and is always there). Not the `vision` model capability in `[routing]`. See [Image generation](../guide/09-local-model-servers.md#image-generation-vision).
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|

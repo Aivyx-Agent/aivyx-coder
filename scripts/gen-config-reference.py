@@ -102,7 +102,7 @@ INTROS = {
     "web": "The `web_fetch` and `web_search` tools. Inference stays local; these reach the network.",
     "lsp": "Language-server tools (`go_to_definition`, `find_references`).",
     "repl": "Interactive processes the model can drive (`repl_start`, `repl_send`, `repl_stop`).",
-    "vision": "Image generation tools, which need an image backend.",
+    "vision": f"The `generate_image` and `generate_3d` tools, which need `mold serve` and aivyx-broker running (`generate_svg` needs neither and is always there). Not the `vision` model capability in `[routing]`. See [Image generation]({GUIDE}/09-local-model-servers.md#image-generation-vision).",
     "mcp": f"MCP servers whose tools the model can use, one `[[mcp.servers]]` block each. See [MCP]({GUIDE}/13-mcp.md).",
     "persona": f"Whether the model may propose additions to your personal `AGENTS.md`. See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
     "mcp_server": f"Running aivyx-coder as an MCP server (`--mcp-server`). Refuses to start until `max_access_level` is set. See [MCP]({GUIDE}/13-mcp.md).",
