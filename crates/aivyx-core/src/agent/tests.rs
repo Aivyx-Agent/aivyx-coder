@@ -9558,6 +9558,33 @@ async fn restore_session_continues_the_same_file() {
     assert_eq!(list[0].first_user_text, "original");
 }
 
+#[tokio::test]
+async fn a_resumed_conversation_rewritten_by_another_version_is_kept_and_saved_as_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("proj");
+    let (mut agent, _rx) = store_agent(&store_dir, vec![text_response("a")]);
+    agent.run_turn("original".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+    let store = crate::session::SessionStore::new(store_dir.clone());
+    let id = store.list()[0].id.clone();
+
+    let (mut agent2, mut rx2) = store_agent(&store_dir, vec![text_response("b")]);
+    agent2.restore_session(store.load(&id).unwrap());
+    // Another aivyx-coder version rewrites the file in the meantime.
+    let newer = r#"{"version": 2, "history": "a new shape"}"#;
+    std::fs::write(store.path_for(&id), newer).unwrap();
+    agent2.run_turn("more".into(), Path::new("."), CancellationToken::new()).await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(store.path_for(&id)).unwrap(), newer, "kept as it is");
+    let list = store.list();
+    assert_eq!(list.len(), 1);
+    assert_ne!(list[0].id, id, "saved as a new conversation");
+    assert_eq!(list[0].first_user_text, "original");
+    assert!(
+        infos(&mut rx2).iter().any(|n| n.contains("can't read")),
+        "the user is told"
+    );
+}
+
 // ---- sessions per project: fix round ----
 
 #[tokio::test]

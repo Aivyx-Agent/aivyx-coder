@@ -223,6 +223,10 @@ enum SessionTarget {
 const FORKED_CONVERSATION_NOTICE: &str = "This conversation was changed by another aivyx-coder window, so it \
                                           was saved as a new conversation (see /sessions).";
 
+const UNREADABLE_CONVERSATION_NOTICE: &str = "This conversation's saved file was replaced by one this version \
+                                             can't read (another aivyx-coder version?), so that file was kept \
+                                             as it is and this conversation was saved as a new one (see /sessions).";
+
 /// Identifies a session's content, ignoring its header (`meta`), so
 /// `persist` can tell whether anything changed since the last load or
 /// save. Stable within a process, which is all it is compared across.
@@ -1934,8 +1938,11 @@ impl Agent {
     /// written the file since, so this process's version is saved as a new
     /// conversation (fresh id and `created_unix`, same first user text)
     /// rather than overwriting those turns, and the user is told once.
-    /// Every save writes the next revision. A conversation file that has
-    /// disappeared (pruned or deleted) is simply written again.
+    /// The same happens, with its own notice, when the file is there but
+    /// no longer loads (another aivyx-coder version rewrote it, or it is
+    /// damaged): that file is kept exactly as it is. Every save writes the
+    /// next revision. A conversation file that has disappeared (pruned or
+    /// deleted) is simply written again.
     fn persist(&mut self) {
         if self.session_target.is_none() {
             return;
@@ -1946,7 +1953,7 @@ impl Agent {
             return;
         };
 
-        let mut forked = false;
+        let mut forked: Option<&str> = None;
         match target {
             SessionTarget::File(path) => {
                 if let Err(err) = session::save(path, &state) {
@@ -1964,13 +1971,21 @@ impl Agent {
                 if id.is_some() && *saved_fingerprint == Some(fingerprint) {
                     return;
                 }
-                if let Some(current) = id.as_deref()
-                    && store
-                        .load_meta(current)
-                        .is_some_and(|on_disk| on_disk.revision > *known_revision)
-                {
-                    *id = None;
-                    forked = true;
+                if let Some(current) = id.as_deref() {
+                    match store.try_load_meta(current) {
+                        Ok(on_disk) if on_disk.revision > *known_revision => {
+                            *id = None;
+                            forked = Some(FORKED_CONVERSATION_NOTICE);
+                        }
+                        Ok(_) | Err(session::LoadFailure::Missing) => {}
+                        // Another version rewrote this conversation's file
+                        // (or it was damaged) since this process loaded
+                        // it: keep that file as it is and save elsewhere.
+                        Err(_) => {
+                            *id = None;
+                            forked = Some(UNREADABLE_CONVERSATION_NOTICE);
+                        }
+                    }
                 }
                 if id.is_none() {
                     let ms = now_unix_ms();
@@ -1996,8 +2011,8 @@ impl Agent {
                 }
             }
         }
-        if forked {
-            self.info(FORKED_CONVERSATION_NOTICE);
+        if let Some(notice) = forked {
+            self.info(notice);
         }
     }
 

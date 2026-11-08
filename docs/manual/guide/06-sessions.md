@@ -32,6 +32,13 @@ always finds its conversations. The model can't read or change these files.
 Sessions saved by older versions, one file per project, are moved into the
 new layout automatically; a file that can't be read is kept, not deleted.
 
+A conversation file another aivyx-coder version wrote in a format this one
+can't read (or a damaged one) is left where it is, unchanged: it isn't
+listed, pruned or written to. If it is the newest, `--resume` says so once
+and resumes the newest conversation it can read, or starts fresh, and
+names the file. If such a file replaces the conversation you have open,
+yours is saved as a new conversation instead.
+
 ## Limits
 
 - `--resume` can't be combined with `--auto`, `--acp` or `--mcp-server`.

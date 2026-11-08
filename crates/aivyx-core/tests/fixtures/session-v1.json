@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "history": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "Text": "Add a --version flag to the CLI."
+        }
+      ],
+      "tool_call_id": null
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "Text": "I'll read the entry point first."
+        },
+        {
+          "ToolCall": {
+            "id": "call_1",
+            "name": "read_file",
+            "arguments": {
+              "path": "src/main.rs"
+            },
+            "source": "Native"
+          }
+        }
+      ],
+      "tool_call_id": null
+    },
+    {
+      "role": "tool",
+      "content": [
+        {
+          "ToolResult": {
+            "call_id": "call_1",
+            "output": {
+              "Ok": "fn main() {\n    run();\n}\n"
+            }
+          }
+        }
+      ],
+      "tool_call_id": "call_1"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "Text": "Done: `--version` prints the crate version."
+        }
+      ],
+      "tool_call_id": null
+    }
+  ],
+  "tasks": [
+    {
+      "id": 1,
+      "text": "Read src/main.rs",
+      "status": "done"
+    },
+    {
+      "id": 2,
+      "text": "Add the flag",
+      "status": "in_progress"
+    }
+  ],
+  "plan_mode_active": false,
+  "specialist_sessions": [],
+  "undo": {
+    "marks": [
+      {
+        "user_text_preview": "Add a --version flag to the CLI.",
+        "before_ref": "refs/aivyx/checkpoints/1793145601000",
+        "before_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "after_oid": "9d3f1c2b7a6e5d4c3b2a1908f7e6d5c4b3a29180",
+        "created_unix": 1793145601
+      }
+    ],
+    "redo": []
+  },
+  "pending_notes": [
+    "The user ran /undo."
+  ],
+  "meta": {
+    "id": "1793145600000-0a1b2c3d",
+    "created_unix": 1793145600,
+    "updated_unix": 1793145660,
+    "first_user_text": "Add a --version flag to the CLI.",
+    "turns": 1,
+    "revision": 3
+  }
+}

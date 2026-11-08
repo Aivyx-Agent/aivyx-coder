@@ -58,7 +58,10 @@ The check has limits:
   review.
 - The CLI snapshot lists subcommands and long flags. Short flags and
   aliases of long flags are not in it.
-- The format snapshot lists versions. It does not test that old sessions
-  still load.
+- The format snapshot lists versions. That old sessions still load is
+  tested separately: `crates/aivyx-core/tests/fixtures/session-v1.json`
+  is a session file as 1.0 writes it, and `tests/session_fixture.rs`
+  loads it. A session file from another version is kept unchanged, and
+  `--resume` says it can't be resumed.
 - The ACP behaviour is not in a snapshot. It is covered by the ACP tests
   and by review.

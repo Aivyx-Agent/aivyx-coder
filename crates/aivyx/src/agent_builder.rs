@@ -517,6 +517,43 @@ fn load_resumed(
     }
 }
 
+/// The one notice for a bare `--resume` that can't resume this project's
+/// newest saved session because its file doesn't load (another version
+/// wrote it, or it is damaged): `None` unless that file is newer than the
+/// conversation actually resumed, or nothing was. The file is left where
+/// it is, unchanged (see `SessionStore::unreadable`), and the notice says
+/// so. `--resume=N` numbers only loadable conversations, so it never
+/// needs this.
+fn unreadable_session_notice(
+    unreadable: &[session::UnreadableSession],
+    resumed: Option<&session::SessionState>,
+    resume: Option<Option<usize>>,
+) -> Option<String> {
+    if resume != Some(None) {
+        return None;
+    }
+    let newest = unreadable.first()?;
+    if resumed.is_some_and(|state| state.meta.updated_unix >= newest.modified_unix) {
+        return None;
+    }
+    let what = match newest.failure {
+        session::LoadFailure::UnknownVersion(v) => {
+            format!("is from another version of aivyx-coder (session format {v})")
+        }
+        _ => "is from another version of aivyx-coder or damaged".to_string(),
+    };
+    let (which, next) = if resumed.is_some() {
+        ("newest saved session", "resuming the newest one that can be")
+    } else {
+        ("saved session", "starting fresh")
+    };
+    Some(format!(
+        "This project's {which} {what} and can't be resumed; {next}. The file is kept, \
+         unchanged, at {}.",
+        newest.path.display()
+    ))
+}
+
 /// Builds `Agent` + every collaborator it needs, identically regardless
 /// of which frontend is asking — only `prompter` differs between the TUI
 /// (`TuiPrompter`) and ACP (`AcpPrompter`) call sites.
@@ -1760,6 +1797,8 @@ pub(crate) async fn build_agent(
             }
             let list = store.list();
             let restored = load_resumed(&store, &list, cli.resume)?;
+            let unreadable_notice =
+                unreadable_session_notice(&store.unreadable(), restored.as_ref(), cli.resume);
             if let Some(state) = &restored
                 && let Some(pool) = &specialist_session_pool
             {
@@ -1770,6 +1809,10 @@ pub(crate) async fn build_agent(
             // own doc comment for the critical bug this single call fixes
             // (every `--resume` silently forking into a second file).
             agent.attach_store_and_resume(store, restored.clone());
+            if let Some(notice) = unreadable_notice {
+                tracing::warn!("{notice}");
+                agent.info(notice);
+            }
             restored
         }
         None => {
@@ -1954,6 +1997,45 @@ mod tests {
         );
         assert!(load_resumed(&store, &list, Some(None)).unwrap().is_none());
         assert!(load_resumed(&store, &list, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn unreadable_session_notice_cases() {
+        use aivyx_core::session::{LoadFailure, SessionState, UnreadableSession};
+
+        let newer = |failure| UnreadableSession {
+            path: "/s/p/2000-bbbbbbbb.json".into(),
+            modified_unix: 2000,
+            failure,
+        };
+        let resumed_at = |updated| {
+            let mut state = SessionState::new(vec![], vec![], false, vec![]);
+            state.meta.updated_unix = updated;
+            state
+        };
+        let unknown = [newer(LoadFailure::UnknownVersion(2))];
+
+        assert_eq!(
+            unreadable_session_notice(&unknown, None, Some(None)).unwrap(),
+            "This project's saved session is from another version of aivyx-coder (session \
+             format 2) and can't be resumed; starting fresh. The file is kept, unchanged, at \
+             /s/p/2000-bbbbbbbb.json."
+        );
+        let older = resumed_at(1000);
+        let notice = unreadable_session_notice(&unknown, Some(&older), Some(None)).unwrap();
+        assert!(notice.starts_with("This project's newest saved session is from another version"));
+        assert!(notice.contains("resuming the newest one that can be"));
+        let damaged = [newer(LoadFailure::Unreadable)];
+        assert!(
+            unreadable_session_notice(&damaged, None, Some(None)).unwrap().contains("or damaged")
+        );
+
+        // Nothing to say: the resumed one is newer, no --resume, --resume=N,
+        // or no unreadable file at all.
+        assert_eq!(unreadable_session_notice(&unknown, Some(&resumed_at(3000)), Some(None)), None);
+        assert_eq!(unreadable_session_notice(&unknown, None, None), None);
+        assert_eq!(unreadable_session_notice(&unknown, None, Some(Some(1))), None);
+        assert_eq!(unreadable_session_notice(&[], None, Some(None)), None);
     }
 
     #[test]

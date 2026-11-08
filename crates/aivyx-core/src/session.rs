@@ -264,13 +264,51 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Why `try_load` has no session to hand back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadFailure {
+    /// No file at the path.
+    Missing,
+    /// A file is there, but it couldn't be read or doesn't parse as a
+    /// session this version writes: damaged, or from another version
+    /// whose shape changed without a `version` this one recognises.
+    Unreadable,
+    /// It carries a `version` other than `SESSION_VERSION`: written by
+    /// another aivyx-coder version.
+    UnknownVersion(u32),
+}
+
+/// Loads a session, or says why there is none. Only `Missing` means there
+/// is no file; the other two mean a file is there that this version must
+/// leave alone (see `SessionStore::unreadable` and `Agent::persist`).
+pub fn try_load(path: &Path) -> Result<SessionState, LoadFailure> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LoadFailure::Missing);
+        }
+        Err(_) => return Err(LoadFailure::Unreadable),
+    };
+    // The version first, on its own, so a file from another version is
+    // named as such even when the rest of its shape no longer parses.
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        version: u32,
+    }
+    if let Ok(VersionOnly { version }) = serde_json::from_str::<VersionOnly>(&raw)
+        && version != SESSION_VERSION
+    {
+        return Err(LoadFailure::UnknownVersion(version));
+    }
+    serde_json::from_str(&raw).map_err(|_| LoadFailure::Unreadable)
+}
+
 /// Loads a resumable session, or `None` if there's nothing usable to resume
 /// (no file, unreadable, unparseable, or an unrecognized version) — every
-/// one of those is a "start fresh" case, not a hard error.
+/// one of those is a "start fresh" case, not a hard error. `try_load`
+/// tells them apart.
 pub fn load(path: &Path) -> Option<SessionState> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let state: SessionState = serde_json::from_str(&raw).ok()?;
-    (state.version == SESSION_VERSION).then_some(state)
+    try_load(path).ok()
 }
 
 /// Writes the session owner-only (it can contain file contents / command
@@ -350,6 +388,15 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// A conversation file `SessionStore::unreadable` found: where it is,
+/// when it was last written, and why it can't be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableSession {
+    pub path: PathBuf,
+    pub modified_unix: i64,
+    pub failure: LoadFailure,
 }
 
 /// A handle onto one project's conversation directory
@@ -461,6 +508,46 @@ impl SessionStore {
     /// substitution `load` makes.
     pub fn load_meta(&self, id: &str) -> Option<SessionMeta> {
         self.load(id).map(|state| state.meta)
+    }
+
+    /// `load_meta`, but saying why there is none: `Agent::persist` must
+    /// tell a missing file (write it again) from one that is there but
+    /// unreadable (keep it, save elsewhere).
+    pub fn try_load_meta(&self, id: &str) -> Result<SessionMeta, LoadFailure> {
+        try_load(&self.path_for(id)).map(|state| state.meta)
+    }
+
+    /// The conversation files in this store that are there but can't be
+    /// loaded (`LoadFailure::Unreadable` or `UnknownVersion`), newest
+    /// modification time first. `list` skips them, `prune` therefore
+    /// never deletes them, and nothing writes to them: a new conversation
+    /// gets a freshly minted id, and only a loaded conversation's id is
+    /// ever adopted. So such a file stays exactly as it is, where it is,
+    /// for the version that wrote it -- this is only for telling the user.
+    pub fn unreadable(&self) -> Vec<UnreadableSession> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<UnreadableSession> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| {
+                let failure = match try_load(&path) {
+                    Ok(_) | Err(LoadFailure::Missing) => return None,
+                    Err(failure) => failure,
+                };
+                let modified_unix = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Some(UnreadableSession { path, modified_unix, failure })
+            })
+            .collect();
+        found.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix).then_with(|| b.path.cmp(&a.path)));
+        found
     }
 
     /// Saves `state` to the path its own `meta.id` names -- callers set
@@ -688,6 +775,51 @@ mod tests {
         )
         .unwrap();
         assert!(load(&path).is_none());
+    }
+
+    #[test]
+    fn try_load_tells_a_missing_file_from_an_unreadable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        assert_eq!(try_load(&missing).unwrap_err(), LoadFailure::Missing);
+
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, "{not json").unwrap();
+        assert_eq!(try_load(&garbage).unwrap_err(), LoadFailure::Unreadable);
+
+        // A newer version is named as such even when the rest of its
+        // shape no longer parses as this version's `SessionState`.
+        let newer = dir.path().join("newer.json");
+        std::fs::write(&newer, r#"{"version": 2, "turns": "a new shape"}"#).unwrap();
+        assert_eq!(try_load(&newer).unwrap_err(), LoadFailure::UnknownVersion(2));
+    }
+
+    #[test]
+    fn the_store_lists_unreadable_files_apart_and_never_prunes_or_overwrites_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("p"));
+        store.save(&meta_state("1000-aaaaaaaa", 1, "hello")).unwrap();
+        let newer_version = store.path_for("2000-bbbbbbbb");
+        let newer_bytes = r#"{"version": 2, "history": "elsewhere"}"#;
+        std::fs::write(&newer_version, newer_bytes).unwrap();
+        let damaged = store.path_for("3000-cccccccc");
+        std::fs::write(&damaged, "{not json").unwrap();
+        std::fs::write(store.dir().join("4000-dddddddd.json.tmp-1"), "{").unwrap();
+
+        let unreadable = store.unreadable();
+        let mut paths: Vec<_> = unreadable.iter().map(|u| u.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![newer_version.clone(), damaged.clone()]);
+        let failure_of = |p: &Path| unreadable.iter().find(|u| u.path == p).unwrap().failure;
+        assert_eq!(failure_of(&newer_version), LoadFailure::UnknownVersion(2));
+        assert_eq!(failure_of(&damaged), LoadFailure::Unreadable);
+        assert_eq!(store.list().len(), 1, "list shows only the readable one");
+        assert_eq!(store.try_load_meta("2000-bbbbbbbb"), Err(LoadFailure::UnknownVersion(2)));
+        assert_eq!(store.try_load_meta("9000-eeeeeeee"), Err(LoadFailure::Missing));
+
+        store.prune(0);
+        assert_eq!(std::fs::read_to_string(&newer_version).unwrap(), newer_bytes);
+        assert_eq!(std::fs::read_to_string(&damaged).unwrap(), "{not json");
     }
 
     #[test]
