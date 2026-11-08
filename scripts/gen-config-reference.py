@@ -91,7 +91,7 @@ INTROS = {
     "repo_map": "The token-budgeted map of the repository's symbols added to every turn.",
     "agents_file": f"Project and personal instructions (`AGENTS.md`) loaded into every turn. See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
     "editor_context": f"Your editor's open file, cursor and selection, read from a small JSON file. See [Editor integration]({GUIDE}/12-editor-integration.md).",
-    "skills": "The shared library of `SKILL.md` capability packages the model can load.",
+    "skills": "The shared library of `SKILL.md` capability packages the model can load. Aivyx PA spells this section `[skill_defaults]`; its own `[skills]` is something else (skills the agent learns).",
     "pack": f"Config packs: whose signed packs `aivyx-coder pack install` accepts. See [Packs]({GUIDE}/16-packs.md).",
     "verification": f"Check the work after edits by running a test command before a turn may end. See [Undo, diff, commit and test]({GUIDE}/05-undo-diff-commit-test.md).",
     "autonomous": f"Limits for `--auto` runs. See [Autonomous and advanced modes]({GUIDE}/10-autonomous-and-advanced-modes.md).",
@@ -104,7 +104,7 @@ INTROS = {
     "repl": "Interactive processes the model can drive (`repl_start`, `repl_send`, `repl_stop`).",
     "vision": f"The `generate_image` and `generate_3d` tools, which need `mold serve` and aivyx-broker running (`generate_svg` needs neither and is always there). Not the `vision` model capability in `[routing]`. See [Image generation]({GUIDE}/09-local-model-servers.md#image-generation-vision).",
     "mcp": f"MCP servers whose tools the model can use, one `[[mcp.servers]]` block each. See [MCP]({GUIDE}/13-mcp.md).",
-    "persona": f"Whether the model may propose additions to your personal `AGENTS.md`. See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
+    "persona": f"Whether the model may propose additions to your personal `AGENTS.md`. This is narrower than Aivyx PA's `[persona]`, which governs its whole learned Persona. See [Memory and learning]({GUIDE}/07-memory-and-learning.md).",
     "mcp_server": f"Running aivyx-coder as an MCP server (`--mcp-server`). Refuses to start until `max_access_level` is set. See [MCP]({GUIDE}/13-mcp.md).",
     "editor_approval": f"Answering approval prompts from your editor instead of the terminal. See [Editor integration]({GUIDE}/12-editor-integration.md).",
 }

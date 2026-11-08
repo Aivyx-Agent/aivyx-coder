@@ -178,7 +178,7 @@ Your editor's open file, cursor and selection, read from a small JSON file. See 
 
 ### `[skills]`
 
-The shared library of `SKILL.md` capability packages the model can load.
+The shared library of `SKILL.md` capability packages the model can load. Aivyx PA spells this section `[skill_defaults]`; its own `[skills]` is something else (skills the agent learns).
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|
@@ -333,7 +333,7 @@ MCP servers whose tools the model can use, one `[[mcp.servers]]` block each. See
 
 ### `[persona]`
 
-Whether the model may propose additions to your personal `AGENTS.md`. See [Memory and learning](../guide/07-memory-and-learning.md).
+Whether the model may propose additions to your personal `AGENTS.md`. This is narrower than Aivyx PA's `[persona]`, which governs its whole learned Persona. See [Memory and learning](../guide/07-memory-and-learning.md).
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|
