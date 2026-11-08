@@ -42,7 +42,7 @@ aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffa
 aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "1ab893732e07daca13d37ea2a1695b229c058a20" }
 # The signed pack format shared with aivyx-pa (config packs). Not on
 # crates.io -- pinned by commit SHA like the others; MUST stay public.
-aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "aec62513f35e20ffc59bbc45e299bc8f3a7127f1" }
+aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "6cdd44f639498334aed63e974d1dcd0f344adc96" }
 # Not on crates.io -- pinned by commit SHA, same as aivyx-checkpoint/
 # aivyx-confine/aivyx-injection-guard above. No platform-specific
 # backend, so no target-gating needed. All three pinned to the same rev

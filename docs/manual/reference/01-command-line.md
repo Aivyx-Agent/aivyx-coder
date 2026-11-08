@@ -185,9 +185,12 @@ replacing an older version.
 
 ### `pack use`
 
-`aivyx-coder pack use <name> [--global]` — use an installed pack in this
-project, or with `--global` in every project. Asks before allowing each of
-the pack's MCP servers (no terminal: none allowed).
+`aivyx-coder pack use <name> [--global] [--yes]` — use an installed pack in
+this project, or with `--global` in every project. Asks before allowing each
+of the pack's MCP servers, and then its verification commands (no terminal:
+none allowed). `--yes` approves them all without asking, printing each with
+`approved:` in front — for scripted setups. See
+[Packs](../guide/16-packs.md#commands-a-pack-can-run).
 
 ### `pack off`
 

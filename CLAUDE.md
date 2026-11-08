@@ -119,10 +119,13 @@ Workspace crates (`crates/*`), roughly bottom-up:
 `crates/aivyx/src/packs.rs` owns config packs (the shared `aivyx-pack`
 format, `format = 2`, pinned git dep): `pack install|use|off|list|remove|
 check|inspect`, `packs/<name>/<version>/` plus `packs/active.toml` (which
-pack each canonical project path — or `*` — uses, and the MCP servers the
-user approved with their exact command). At startup `main::apply_pack_layer`
+pack each canonical project path — or `*` — uses, and the MCP servers and
+`coder/settings.toml` `[verification]` commands the user approved, exactly;
+`pack use --yes` approves all, printing each). At startup `main::apply_pack_layer`
 resolves the cwd's pack and applies it to an in-memory copy of `Settings`
-(roster if unset, skills into a free slot, approved MCP servers), and
+(roster if unset, skills into a free slot, approved MCP servers, approved
+verification commands into unset `[verification]` fields, each also added
+as an `allowed_commands` entry named by its command line), and
 `Agent::set_pack_instructions` adds its `AGENTS.md` between the user's and
 the project's. Nothing ever edits the user's files. See
 `docs/manual/guide/16-packs.md`.

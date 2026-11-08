@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "aivyx-pack"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-pack?rev=aec62513f35e20ffc59bbc45e299bc8f3a7127f1#aec62513f35e20ffc59bbc45e299bc8f3a7127f1"
+source = "git+https://github.com/Aivyx-Agent/aivyx-pack?rev=6cdd44f639498334aed63e974d1dcd0f344adc96#6cdd44f639498334aed63e974d1dcd0f344adc96"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

@@ -17,4 +17,5 @@ aivyx-coder pack install <file>
 aivyx-coder pack off --global
 aivyx-coder pack remove <name>
 aivyx-coder pack use --global
+aivyx-coder pack use --yes
 aivyx-coder pack use <name>

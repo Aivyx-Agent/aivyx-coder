@@ -378,7 +378,12 @@ mod tests {
         let cli = Cli::try_parse_from(["aivyx-coder", "pack", "use", "bm", "--global"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Pack { action: PackAction::Use { ref name, global: true } }) if name == "bm"
+            Some(Command::Pack { action: PackAction::Use { ref name, global: true, yes: false } }) if name == "bm"
+        ));
+        let cli = Cli::try_parse_from(["aivyx-coder", "pack", "use", "bm", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pack { action: PackAction::Use { global: false, yes: true, .. } })
         ));
         assert!(Cli::try_parse_from(["aivyx-coder", "pack", "frobnicate"]).is_err());
     }
@@ -891,6 +896,9 @@ enum PackAction {
         /// Use it in every project
         #[arg(long)]
         global: bool,
+        /// Approve the pack's MCP servers and commands without asking
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop using a pack in this project (or the one used everywhere)
     Off {
@@ -943,6 +951,26 @@ fn ask_mcp_consent(server: &aivyx_config::McpServerConfig) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes")
 }
 
+/// Ask, at a terminal, before a pack's verification commands may run.
+/// Without a terminal the answer is no.
+fn ask_settings_consent(v: &aivyx_pack::PackVerification) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        println!("The pack's commands left off (no terminal to ask).");
+        return false;
+    }
+    let lines: Vec<String> = packs::settings_lines(v).iter().map(|l| format!("  {l}\n")).collect();
+    print!(
+        "This pack wants aivyx-coder to run these commands to check its work:\n{}\
+         They run without asking each time. Allow them? [y/N] ",
+        lines.concat()
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    matches!(line.trim(), "y" | "Y" | "yes")
+}
+
 /// `aivyx-coder pack …`. Reads `config.toml` only for trusted keys and
 /// never creates it.
 fn run_pack(action: PackAction) -> anyhow::Result<()> {
@@ -960,19 +988,37 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
                 installed.name, installed.version, installed.name
             );
         }
-        PackAction::Use { name, global } => {
+        PackAction::Use { name, global, yes } => {
             let scope = if global {
                 packs::GLOBAL.to_string()
             } else {
                 packs::project_scope(&std::env::current_dir()?)
             };
-            let used = packs::use_pack(&packs, &name, scope, &mut ask_mcp_consent)
-                .map_err(anyhow::Error::msg)?;
-            let mcp = if used.mcp.is_empty() {
-                String::new()
-            } else {
-                format!(" with {} MCP server(s)", used.mcp.len())
+            // `--yes` approves exactly what it prints.
+            let mut approve_mcp = |server: &aivyx_config::McpServerConfig| {
+                println!("approved: MCP server {}", packs::consent_text(server));
+                true
             };
+            let mut approve_settings = |v: &aivyx_pack::PackVerification| {
+                for line in packs::settings_lines(v) {
+                    println!("approved: {line}");
+                }
+                true
+            };
+            let used = if yes {
+                packs::use_pack(&packs, &name, scope, &mut approve_mcp, &mut approve_settings)
+            } else {
+                packs::use_pack(&packs, &name, scope, &mut ask_mcp_consent, &mut ask_settings_consent)
+            }
+            .map_err(anyhow::Error::msg)?;
+            let mut with = Vec::new();
+            if !used.mcp.is_empty() {
+                with.push(format!("{} MCP server(s)", used.mcp.len()));
+            }
+            if let Some(v) = &used.settings {
+                with.push(format!("{} verification command(s)", packs::command_count(v)));
+            }
+            let mcp = if with.is_empty() { String::new() } else { format!(" with {}", with.join(" and ")) };
             let place = if global { "every project" } else { "this project" };
             println!("Using pack {name}{mcp} in {place}. It applies next time aivyx-coder starts.");
         }

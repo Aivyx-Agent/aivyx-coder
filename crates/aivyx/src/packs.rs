@@ -1,19 +1,20 @@
 //! Config packs: a signed, configuration-only bundle (the shared
 //! `aivyx-pack` format, `format = 2`) whose aivyx-coder part — an
-//! `AGENTS.md`, skills, an optional roster and MCP servers — is installed
+//! `AGENTS.md`, skills, an optional roster, MCP servers and verification
+//! commands — is installed
 //! once and then switched on per project as a layer over the user's own
 //! setup. Nothing here ever edits `config.toml`, an `AGENTS.md`, or any file
 //! in a project.
 //!
 //! Layout, beside `config.toml`: `packs/<name>/<version>/` (one version per
 //! pack) and `packs/active.toml` (which project uses which pack, and the MCP
-//! servers the user approved).
+//! servers and verification commands the user approved).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use aivyx_config::{McpServerConfig, Settings};
-use aivyx_pack::{ConfigPackManifest, Manifest};
+use aivyx_config::{AllowedCommand, McpServerConfig, Settings};
+use aivyx_pack::{ConfigPackManifest, Manifest, PackVerification};
 use serde::{Deserialize, Serialize};
 
 /// The folder installed packs live in.
@@ -94,6 +95,8 @@ pub struct CoderPartSummary {
     /// Members of the roster; 0 when the pack has none.
     pub roster_members: usize,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// The verification commands in `coder.settings`, if it names any.
+    pub settings: Option<PackVerification>,
 }
 
 /// `coder.mcp`'s shape: `[[servers]]` blocks, as in `config.toml`'s `[mcp]`.
@@ -114,6 +117,24 @@ pub fn pack_mcp_servers(dir: &Path, manifest: &ConfigPackManifest) -> Vec<McpSer
         .and_then(|text| toml::from_str::<McpFile>(&text).ok())
         .map(|f| f.servers)
         .unwrap_or_default()
+}
+
+/// The verification commands a pack folder's `coder.settings` file names:
+/// `Ok(None)` when it has no settings file or the file names no command,
+/// `Err` when the file can't be read or fails `check_coder_settings`.
+pub fn pack_settings(dir: &Path, manifest: &ConfigPackManifest) -> Result<Option<PackVerification>, String> {
+    let Some(rel) = manifest.coder.as_ref().and_then(|c| c.settings.as_ref()) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(dir.join(rel)).map_err(|e| format!("can't read {rel}: {e}"))?;
+    let settings = aivyx_pack::check_coder_settings(&text).map_err(|e| format!("{rel}: {e}"))?;
+    let v = settings.verification;
+    Ok((command_count(&v) > 0).then_some(v))
+}
+
+/// How many commands `v` names.
+pub fn command_count(v: &PackVerification) -> usize {
+    usize::from(v.command.is_some()) + usize::from(v.scoped_command.is_some()) + v.final_checks.len()
 }
 
 /// Check the aivyx-coder part of a pack folder. `Err` lists every problem.
@@ -213,8 +234,13 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
         }
     }
 
+    let settings = pack_settings(dir, &manifest).unwrap_or_else(|e| {
+        problems.push(format!("the settings file doesn't load: {e}"));
+        None
+    });
+
     if problems.is_empty() {
-        Ok(CoderPartSummary { manifest, skills, roster_members, mcp_servers })
+        Ok(CoderPartSummary { manifest, skills, roster_members, mcp_servers, settings })
     } else {
         Err(problems)
     }
@@ -322,14 +348,14 @@ pub fn render_inspect(payload: &[u8]) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(&dir);
         match result {
             Ok(s) => {
-                out.push_str(&format!(
-                    "  skills: {} · roster members: {} · MCP servers: {}\n  checks: OK\n",
-                    s.skills.len(),
-                    s.roster_members,
-                    s.mcp_servers.len()
-                ));
+                out.push_str(&format!("  {}\n  checks: OK\n", summary_counts(&s)));
                 for server in &s.mcp_servers {
                     out.push_str(&format!("    MCP {}\n", consent_text(server)));
+                }
+                if let Some(v) = &s.settings {
+                    for line in settings_lines(v) {
+                        out.push_str(&format!("    {line}\n"));
+                    }
                 }
             }
             Err(problems) => {
@@ -370,6 +396,10 @@ pub struct Use {
     /// MCP servers the user approved, with the exact command approved.
     #[serde(default)]
     pub mcp: Vec<ApprovedServer>,
+    /// The pack's verification commands, exactly as the user approved them
+    /// (`None`: declined, or the pack has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<PackVerification>,
 }
 
 /// An MCP server the user agreed to run: everything that decides what
@@ -459,23 +489,28 @@ pub fn project_scope(cwd: &Path) -> String {
         .to_string()
 }
 
-/// Switch `name` on for `scope`, asking about each of its MCP servers.
-/// Replaces whatever that scope used before.
+/// Switch `name` on for `scope`, asking about each of its MCP servers and
+/// then about its verification commands, if it has any. Replaces whatever
+/// that scope used before.
 pub fn use_pack(
     packs: &PacksDir,
     name: &str,
     scope: String,
     ask: &mut dyn FnMut(&McpServerConfig) -> bool,
+    ask_settings: &mut dyn FnMut(&PackVerification) -> bool,
 ) -> Result<Use, String> {
     let installed = packs
         .find(name)
         .ok_or_else(|| format!("pack `{name}` isn't installed — see `aivyx-coder pack list`"))?;
+    let settings = pack_settings(&installed.dir, &installed.manifest)
+        .map_err(|e| format!("pack `{name}`'s settings file doesn't load ({e}) — install it again"))?;
     let mcp = pack_mcp_servers(&installed.dir, &installed.manifest)
         .iter()
         .filter(|server| ask(server))
         .map(ApprovedServer::of)
         .collect();
-    let new_use = Use { scope: scope.clone(), pack: name.to_string(), mcp };
+    let settings = settings.filter(|v| ask_settings(v));
+    let new_use = Use { scope: scope.clone(), pack: name.to_string(), mcp, settings };
     let mut state = ActiveState::load(packs);
     state.uses.retain(|u| u.scope != scope);
     state.uses.push(new_use.clone());
@@ -509,6 +544,9 @@ pub struct PackLayer {
     pub roster: Option<PathBuf>,
     /// Approved and unchanged since approval.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// The pack's verification commands — set only when they are exactly
+    /// the ones the user approved.
+    pub verification: Option<PackVerification>,
     /// Shown at startup.
     pub notices: Vec<String>,
 }
@@ -526,6 +564,7 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
             skills_dir: None,
             roster: None,
             mcp_servers: Vec::new(),
+            verification: None,
             notices: vec![format!(
                 "Pack {} is in use here but isn't installed any more — run \
                  'aivyx-coder pack off' (or install it again).",
@@ -556,6 +595,27 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
             None => {}
         }
     }
+    let verification = match pack_settings(&installed.dir, &installed.manifest) {
+        Ok(Some(current)) if used.settings.as_ref() == Some(&current) => Some(current),
+        Ok(Some(_)) if used.settings.is_some() => {
+            notices.push(format!(
+                "Pack {name}'s commands changed since you approved them — run \
+                 aivyx-coder pack use {name} to review them.",
+                name = installed.name
+            ));
+            None
+        }
+        // Declined, or never asked about: nothing runs.
+        Ok(_) => None,
+        Err(e) => {
+            notices.push(format!(
+                "Pack {}'s settings file doesn't load ({e}), so its commands aren't used — \
+                 install the pack again.",
+                installed.name
+            ));
+            None
+        }
+    };
     Some(PackLayer {
         name: installed.name.clone(),
         version: installed.version.clone(),
@@ -563,6 +623,7 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
         skills_dir: coder.skills.as_ref().map(|r| installed.dir.join(r)),
         roster: coder.roster.as_ref().map(|r| installed.dir.join(r)),
         mcp_servers,
+        verification,
         notices,
     })
 }
@@ -570,7 +631,9 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
 /// Apply the layer to this session's settings (in memory only): the roster
 /// only if `[team] roster_path` is unset; the skills into the unset skills
 /// slot (project, then user); approved MCP servers unless the user already
-/// has one of that name. Anything not applied gets a notice.
+/// has one of that name; approved verification commands into each
+/// `[verification]` field the user left unset (`final_checks` only when
+/// empty). Anything not applied gets a notice.
 pub fn apply_to_settings(layer: &mut PackLayer, settings: &mut Settings) {
     if !settings.agents_file.enabled && layer.agents_file.is_file() {
         layer.notices.push(format!(
@@ -610,6 +673,67 @@ pub fn apply_to_settings(layer: &mut PackLayer, settings: &mut Settings) {
         } else {
             settings.mcp.servers.push(server.clone());
         }
+    }
+    if let Some(v) = layer.verification.clone() {
+        let mut used: Vec<String> = Vec::new();
+        if let Some(command) = v.command {
+            if settings.verification.command.is_none() {
+                settings.verification.command = Some(command.clone());
+                used.push(command);
+            } else {
+                layer.notices.push(format!(
+                    "Pack {}'s verification command isn't used: [verification] command is set.",
+                    layer.name
+                ));
+            }
+        }
+        if let Some(command) = v.scoped_command {
+            if settings.verification.scoped_command.is_none() {
+                settings.verification.scoped_command = Some(command.clone());
+                used.push(command);
+            } else {
+                layer.notices.push(format!(
+                    "Pack {}'s scoped verification command isn't used: [verification] \
+                     scoped_command is set.",
+                    layer.name
+                ));
+            }
+        }
+        if !v.final_checks.is_empty() {
+            if settings.verification.final_checks.is_empty() {
+                settings.verification.final_checks = v.final_checks.clone();
+                used.extend(v.final_checks);
+            } else {
+                layer.notices.push(format!(
+                    "Pack {}'s final checks aren't used: [verification] final_checks is set.",
+                    layer.name
+                ));
+            }
+        }
+        for command in used {
+            add_pack_command(layer, settings, command);
+        }
+    }
+}
+
+/// `[verification]` names `[[permissions.allowed_commands]]` entries, so a
+/// pack command the user approved becomes one, named by its command line:
+/// split at whitespace and run directly, no shell. A user's own entry of
+/// that name is kept, with a notice if it runs something else.
+fn add_pack_command(layer: &mut PackLayer, settings: &mut Settings, command: String) {
+    let mut words = command.split_whitespace().map(str::to_string);
+    let Some(program) = words.next() else {
+        return;
+    };
+    let entry = AllowedCommand { name: command.clone(), program, args: words.collect(), timeout_secs: None };
+    match settings.permissions.allowed_commands.iter().find(|c| c.name == command) {
+        None => settings.permissions.allowed_commands.push(entry),
+        Some(mine) if mine.program == entry.program && mine.args == entry.args => {}
+        Some(_) => layer.notices.push(format!(
+            "Pack {}'s command {} runs your own [[permissions.allowed_commands]] entry of that name.",
+            layer.name,
+            shown(&command)
+        )),
     }
 }
 
@@ -677,17 +801,52 @@ pub fn consent_text(server: &McpServerConfig) -> String {
     out
 }
 
+/// What the user is asked to approve for a pack's verification commands:
+/// one line per command, each shown safely.
+pub fn settings_lines(v: &PackVerification) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(command) = &v.command {
+        out.push(format!("runs: {}", shown(command)));
+    }
+    if let Some(command) = &v.scoped_command {
+        out.push(format!("runs on the changed files: {}", shown(command)));
+    }
+    for command in &v.final_checks {
+        out.push(format!("final check: {}", shown(command)));
+    }
+    out
+}
+
+/// `skills: 1 · roster members: 0 · MCP servers: 1 · settings: 2 commands`.
+fn summary_counts(s: &CoderPartSummary) -> String {
+    let commands = s.settings.as_ref().map(command_count).unwrap_or(0);
+    format!(
+        "skills: {} · roster members: {} · MCP servers: {} · settings: {} command{}",
+        s.skills.len(),
+        s.roster_members,
+        s.mcp_servers.len(),
+        commands,
+        if commands == 1 { "" } else { "s" }
+    )
+}
+
 /// `pack check`: what it prints.
 pub fn render_check(result: &Result<CoderPartSummary, Vec<String>>) -> String {
     match result {
-        Ok(s) => format!(
-            "✓ {} v{} — aivyx-coder part looks good\n  skills: {} · roster members: {} · MCP servers: {}\n",
-            s.manifest.name,
-            s.manifest.version,
-            s.skills.len(),
-            s.roster_members,
-            s.mcp_servers.len()
-        ),
+        Ok(s) => {
+            let mut out = format!(
+                "✓ {} v{} — aivyx-coder part looks good\n  {}\n",
+                s.manifest.name,
+                s.manifest.version,
+                summary_counts(s)
+            );
+            if let Some(v) = &s.settings {
+                for line in settings_lines(v) {
+                    out.push_str(&format!("    {line}\n"));
+                }
+            }
+            out
+        }
         Err(problems) => {
             let mut out = format!(
                 "✗ {} problem{} in the aivyx-coder part:\n",
@@ -872,7 +1031,7 @@ mcp = "coder/mcp.toml"
         let packs = installed_packs("use");
         let project = tmp("use-project");
         let scope = project_scope(&project);
-        let used = use_pack(&packs, "business-manager", scope, &mut |_| true).unwrap();
+        let used = use_pack(&packs, "business-manager", scope, &mut |_| true, &mut |_| true).unwrap();
         assert_eq!(used.mcp.len(), 1);
         assert_eq!(used.mcp[0].command, "mcp-files");
         let state = ActiveState::load(&packs);
@@ -889,7 +1048,7 @@ mcp = "coder/mcp.toml"
     #[test]
     fn a_declined_server_is_not_recorded() {
         let packs = installed_packs("decline");
-        let used = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
+        let used = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |_| false).unwrap();
         assert!(used.mcp.is_empty());
     }
 
@@ -898,8 +1057,8 @@ mcp = "coder/mcp.toml"
         let packs = installed_packs("precedence");
         let project = tmp("precedence-project");
         let other = tmp("precedence-other");
-        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |_| false).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
         let state = ActiveState::load(&packs);
         assert_eq!(state.for_project(&project).unwrap().mcp.len(), 1);
         assert_eq!(state.for_project(&other).unwrap().scope, GLOBAL);
@@ -909,8 +1068,8 @@ mcp = "coder/mcp.toml"
     fn off_removes_only_that_scope() {
         let packs = installed_packs("off");
         let project = tmp("off-project");
-        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| false).unwrap();
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |_| false).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| false, &mut |_| false).unwrap();
         assert!(off(&packs, &project_scope(&project)).unwrap());
         assert!(!off(&packs, &project_scope(&project)).unwrap(), "already off");
         assert_eq!(ActiveState::load(&packs).for_project(&project).unwrap().scope, GLOBAL);
@@ -919,13 +1078,14 @@ mcp = "coder/mcp.toml"
     #[test]
     fn using_a_pack_that_isnt_installed_is_an_error() {
         let packs = PacksDir::at(tmp("missing-root"));
-        assert!(use_pack(&packs, "nope", GLOBAL.into(), &mut |_| true).unwrap_err().contains("isn't installed"));
+        let err = use_pack(&packs, "nope", GLOBAL.into(), &mut |_| true, &mut |_| true).unwrap_err();
+        assert!(err.contains("isn't installed"));
     }
 
     #[test]
     fn removing_a_pack_switches_it_off() {
         let packs = installed_packs("remove-off");
-        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |_| false).unwrap();
         remove(&packs, "business-manager").unwrap();
         assert!(ActiveState::load(&packs).uses.is_empty());
     }
@@ -934,7 +1094,7 @@ mcp = "coder/mcp.toml"
     fn the_pack_line_says_when_its_instructions_cannot_load() {
         let packs = installed_packs("layer-noinstr");
         let project = tmp("layer-noinstr-project");
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
         let mut layer = resolve_layer(&packs, &project).unwrap();
         let mut settings = Settings::default();
         settings.agents_file.enabled = false;
@@ -951,7 +1111,7 @@ mcp = "coder/mcp.toml"
     fn resolve_layer_returns_the_projects_pack() {
         let packs = installed_packs("layer");
         let project = tmp("layer-project");
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
         let layer = resolve_layer(&packs, &project).unwrap();
         assert_eq!(layer.name, "business-manager");
         assert!(layer.agents_file.is_file());
@@ -965,7 +1125,7 @@ mcp = "coder/mcp.toml"
     fn a_changed_mcp_command_is_not_started() {
         let packs = installed_packs("changed");
         let project = tmp("changed-project");
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
         let mut state = ActiveState::load(&packs);
         state.uses[0].mcp[0].args = vec!["--root".into(), "/".into()];
         state.save(&packs).unwrap();
@@ -978,7 +1138,7 @@ mcp = "coder/mcp.toml"
     fn an_mcp_server_whose_env_changed_is_not_started() {
         let packs = installed_packs("env-changed");
         let project = tmp("env-changed-project");
-        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
         // A later version of the pack adds an environment variable.
         let dir = packs.find("business-manager").unwrap().dir;
         rewrite(&dir, "coder/mcp.toml", |t| t + "env = { LD_PRELOAD = \"/tmp/x.so\" }\n");
@@ -1021,7 +1181,7 @@ mcp = "coder/mcp.toml"
     #[test]
     fn a_missing_installed_pack_gives_a_notice() {
         let packs = installed_packs("gone");
-        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false).unwrap();
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |_| false).unwrap();
         std::fs::remove_dir_all(packs.root().join("business-manager")).unwrap();
         let layer = resolve_layer(&packs, &tmp("gone-project")).unwrap();
         assert!(layer.notices[0].contains("isn't installed any more"));
@@ -1030,7 +1190,7 @@ mcp = "coder/mcp.toml"
     #[test]
     fn apply_fills_only_unset_settings() {
         let packs = installed_packs("apply");
-        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true).unwrap();
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| true).unwrap();
         let mut layer = resolve_layer(&packs, &tmp("apply-project")).unwrap();
         layer.roster = Some(PathBuf::from("/pack/team.toml"));
 
@@ -1052,6 +1212,223 @@ mcp = "coder/mcp.toml"
         assert_eq!(full.mcp.servers.len(), 1, "the user's server of that name stays");
         assert!(layer.notices.iter().any(|n| n.contains("skills aren't loaded")));
         assert!(layer.notices.iter().any(|n| n.contains("already have one with that name")));
+    }
+
+    const SETTINGS: &str = "[verification]\ncommand = \"cargo test\"\nfinal_checks = [\"cargo fmt --check\"]\n";
+
+    /// Give a pack folder a `coder/settings.toml` (and the `min_version`
+    /// a settings file needs).
+    fn add_settings(dir: &Path, text: &str) {
+        rewrite(dir, "manifest.toml", |t| {
+            t.replace(r#"min_version = "0.4.0""#, r#"min_version = "1.0.0""#)
+                .replace("mcp = \"coder/mcp.toml\"", "mcp = \"coder/mcp.toml\"\nsettings = \"coder/settings.toml\"")
+        });
+        rewrite(dir, "coder/settings.toml", |_| text.to_string());
+    }
+
+    /// An installed pack with settings: installed without them (this
+    /// aivyx-coder is older than the 1.0.0 a settings file needs), then
+    /// given them in place, as a newer version would bring them.
+    fn installed_with_settings(tag: &str) -> PacksDir {
+        let packs = installed_packs(tag);
+        add_settings(&packs.find("business-manager").unwrap().dir, SETTINGS);
+        packs
+    }
+
+    fn layer_with_settings(verification: PackVerification) -> PackLayer {
+        PackLayer {
+            name: "rust".into(),
+            version: "0.1.0".into(),
+            agents_file: PathBuf::new(),
+            skills_dir: None,
+            roster: None,
+            mcp_servers: Vec::new(),
+            verification: Some(verification),
+            notices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn approved_settings_fill_unset_verification_fields() {
+        let mut layer = layer_with_settings(PackVerification {
+            command: Some("cargo test".into()),
+            scoped_command: None,
+            final_checks: vec!["cargo fmt --check".into()],
+        });
+        let mut settings = Settings::default();
+        apply_to_settings(&mut layer, &mut settings);
+        assert_eq!(settings.verification.command.as_deref(), Some("cargo test"));
+        assert_eq!(settings.verification.final_checks, vec!["cargo fmt --check".to_string()]);
+        // Each names an allowed command that runs exactly that line.
+        let entry = |name: &str| settings.permissions.allowed_commands.iter().find(|c| c.name == name).cloned();
+        let test = entry("cargo test").unwrap();
+        assert_eq!((test.program.as_str(), test.args.as_slice()), ("cargo", &["test".to_string()][..]));
+        let fmt = entry("cargo fmt --check").unwrap();
+        assert_eq!(fmt.args, vec!["fmt".to_string(), "--check".to_string()]);
+        assert!(layer.notices.is_empty(), "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn a_users_own_command_wins_with_a_notice() {
+        let mut layer = layer_with_settings(PackVerification {
+            command: Some("cargo test".into()),
+            ..Default::default()
+        });
+        let mut settings = Settings::default();
+        settings.verification.command = Some("just test".into());
+        apply_to_settings(&mut layer, &mut settings);
+        assert_eq!(settings.verification.command.as_deref(), Some("just test"));
+        assert!(layer.notices.iter().any(|n| n.contains("[verification] command is set")));
+        assert!(settings.permissions.allowed_commands.is_empty(), "nothing of the pack's is added");
+    }
+
+    #[test]
+    fn a_users_own_final_checks_and_scoped_command_win() {
+        let mut layer = layer_with_settings(PackVerification {
+            command: None,
+            scoped_command: Some("cargo test {touched_paths}".into()),
+            final_checks: vec!["cargo fmt --check".into()],
+        });
+        let mut settings = Settings::default();
+        settings.verification.scoped_command = Some("mine".into());
+        settings.verification.final_checks = vec!["lint".into()];
+        apply_to_settings(&mut layer, &mut settings);
+        assert_eq!(settings.verification.scoped_command.as_deref(), Some("mine"));
+        assert_eq!(settings.verification.final_checks, vec!["lint".to_string()]);
+        assert!(layer.notices.iter().any(|n| n.contains("scoped_command is set")), "{:?}", layer.notices);
+        assert!(layer.notices.iter().any(|n| n.contains("final_checks is set")), "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn a_users_allowed_command_of_the_same_name_is_kept() {
+        let mut layer = layer_with_settings(PackVerification {
+            command: Some("cargo test".into()),
+            ..Default::default()
+        });
+        let mut settings = Settings::default();
+        settings.permissions.allowed_commands.push(AllowedCommand {
+            name: "cargo test".into(),
+            program: "cargo".into(),
+            args: vec!["nextest".into(), "run".into()],
+            timeout_secs: None,
+        });
+        apply_to_settings(&mut layer, &mut settings);
+        assert_eq!(settings.permissions.allowed_commands.len(), 1);
+        assert_eq!(settings.permissions.allowed_commands[0].args[0], "nextest");
+        assert!(layer.notices.iter().any(|n| n.contains("runs your own")), "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn use_asks_about_the_settings_and_records_what_was_approved() {
+        let packs = installed_with_settings("settings-use");
+        let mut asked = Vec::new();
+        let used = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| false, &mut |v| {
+            asked = settings_lines(v);
+            true
+        })
+        .unwrap();
+        assert_eq!(asked, vec!["runs: cargo test", "final check: cargo fmt --check"]);
+        assert_eq!(used.settings.as_ref().unwrap().command.as_deref(), Some("cargo test"));
+        assert_eq!(ActiveState::load(&packs).uses[0].settings, used.settings);
+        let layer = resolve_layer(&packs, &tmp("settings-use-project")).unwrap();
+        assert_eq!(layer.verification, used.settings);
+    }
+
+    #[test]
+    fn declined_settings_are_not_recorded_or_used() {
+        let packs = installed_with_settings("settings-decline");
+        let used = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| false).unwrap();
+        assert!(used.settings.is_none());
+        let text = std::fs::read_to_string(packs.root().join("active.toml")).unwrap();
+        assert!(!text.contains("settings"), "{text}");
+        let layer = resolve_layer(&packs, &tmp("settings-decline-project")).unwrap();
+        assert!(layer.verification.is_none());
+        assert_eq!(layer.notices.len(), 1, "no nagging about a no: {:?}", layer.notices);
+    }
+
+    #[test]
+    fn a_pack_without_settings_is_not_asked_about_them() {
+        let packs = installed_packs("settings-none");
+        let used = use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| {
+            panic!("asked about settings the pack doesn't have")
+        })
+        .unwrap();
+        assert!(used.settings.is_none());
+    }
+
+    #[test]
+    fn changed_settings_are_not_used_until_approved_again() {
+        let packs = installed_with_settings("settings-changed");
+        let project = tmp("settings-changed-project");
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
+        assert!(resolve_layer(&packs, &project).unwrap().verification.is_some());
+        // A later version of the pack changes a command.
+        let dir = packs.find("business-manager").unwrap().dir;
+        rewrite(&dir, "coder/settings.toml", |t| t.replace("cargo test", "cargo test --all-features"));
+        let layer = resolve_layer(&packs, &project).unwrap();
+        assert!(layer.verification.is_none());
+        assert!(
+            layer.notices.iter().any(|n| n.contains("commands changed since you approved them")
+                && n.contains("aivyx-coder pack use business-manager")),
+            "{:?}",
+            layer.notices
+        );
+        // Approving again uses the new ones.
+        use_pack(&packs, "business-manager", project_scope(&project), &mut |_| true, &mut |_| true).unwrap();
+        let layer = resolve_layer(&packs, &project).unwrap();
+        assert_eq!(layer.verification.unwrap().command.as_deref(), Some("cargo test --all-features"));
+    }
+
+    #[test]
+    fn a_settings_file_that_stops_loading_gives_a_notice() {
+        let packs = installed_with_settings("settings-broken");
+        use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| true).unwrap();
+        let dir = packs.find("business-manager").unwrap().dir;
+        rewrite(&dir, "coder/settings.toml", |t| t + "[backend]\nmodel = \"x\"\n");
+        let layer = resolve_layer(&packs, &tmp("settings-broken-project")).unwrap();
+        assert!(layer.verification.is_none());
+        assert!(layer.notices.iter().any(|n| n.contains("settings file doesn't load")), "{:?}", layer.notices);
+        assert!(use_pack(&packs, "business-manager", GLOBAL.into(), &mut |_| true, &mut |_| true).is_err());
+    }
+
+    #[test]
+    fn check_shows_the_settings_commands() {
+        let d = good_pack("check-settings");
+        add_settings(&d, SETTINGS);
+        let s = check_coder_part(&d).unwrap();
+        let text = render_check(&Ok(s));
+        assert!(text.contains("MCP servers: 1 · settings: 2 commands"), "{text}");
+        assert!(text.contains("    runs: cargo test\n"), "{text}");
+        assert!(text.contains("    final check: cargo fmt --check\n"), "{text}");
+        let payload = aivyx_pack::build_payload(&d).unwrap();
+        let inspected = render_inspect(&payload).unwrap();
+        assert!(inspected.contains("final check: cargo fmt --check"), "{inspected}");
+    }
+
+    #[test]
+    fn check_reports_a_bad_settings_file() {
+        let d = good_pack("check-bad-settings");
+        add_settings(&d, "[verification]\ncommand = \"cargo test\"\n\n[backend]\nmodel = \"x\"\n");
+        let problems = check_coder_part(&d).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("the settings file doesn't load")), "{problems:?}");
+        let d = good_pack("check-empty-settings");
+        add_settings(&d, "[verification]\ncommand = \" \"\n");
+        assert!(check_coder_part(&d).unwrap_err()[0].contains("empty command"));
+    }
+
+    #[test]
+    fn settings_lines_show_text_safely() {
+        let v = PackVerification {
+            command: Some("cargo test".into()),
+            scoped_command: Some("cargo test \u{202E}x".into()),
+            final_checks: vec!["clippy\u{1b}[2K".into()],
+        };
+        let lines = settings_lines(&v);
+        assert_eq!(lines[0], "runs: cargo test");
+        assert!(lines[1].starts_with("runs on the changed files: "));
+        for line in &lines {
+            assert!(!line.chars().any(|c| c.is_control() || c == '\u{202E}'), "{line:?}");
+        }
     }
 
     #[test]
