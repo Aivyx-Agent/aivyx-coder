@@ -22,24 +22,30 @@ context_tokens = 8192
 # backend-specific features. "llama_server": KV-cache persistence, see
 # "KV-cache persistence" above. "llama_server_broker": multi-process GPU
 # sharing via aivyx-broker, see "Multi-process GPU sharing (aivyx-broker)"
-# above -- requires broker_base_url below. No effect on any other backend.
+# above -- requires [broker] base_url below. No effect on any other backend.
 # kind = "llama_server"
-# Only meaningful when kind = "llama_server". Bytes, not GiB; default 10 GiB.
-# kvcache_max_bytes = 10737418240
-# Overrides where the kvcache store directory lives (default:
-# ~/.local/share/aivyx-coder/kvcache). Supports a leading `~`. Set this
-# to the same directory as a locally delegated-from `aivyx-pa` process's
-# own kvcache_store_path (and point both at the same llama-server) to
-# share one store -- see aivyx-pa's own docs/MCP_RECIPES.md.
-# kvcache_store_path = "~/.local/share/shared-kvcache"
-# REQUIRED when kind = "llama_server_broker" -- address of a running
-# aivyx-broker instance. Replaces base_url as the address this process
-# actually connects to on that path.
-# broker_base_url = "http://127.0.0.1:8899"
 # Model routing only: whether this server is on your own network. Unset,
 # its address decides (see "Model routing"); set "local" for a LAN box
 # with a public-looking name, or "cloud" to keep routing off it.
 # locality = "local"
+
+# KV-cache persistence, for kind = "llama_server". Spelled as in Aivyx PA.
+[kvcache]
+# Bytes, not GiB; default 10 GiB.
+# max_bytes = 10737418240
+# Overrides where the kvcache store directory lives (default:
+# ~/.local/share/aivyx-coder/kvcache). Supports a leading `~`. Set this
+# to the same directory as Aivyx PA's own [kvcache] store_path (and point
+# both at the same llama-server) to share one store.
+# store_path = "~/.local/share/shared-kvcache"
+
+# aivyx-broker, which shares one llama-server between local processes.
+# Spelled as in Aivyx PA.
+[broker]
+# REQUIRED when kind = "llama_server_broker": replaces base_url as the
+# address chat connects to on that path. The image tools ([vision]) use it
+# too, or http://127.0.0.1:8899 when it is unset.
+# base_url = "http://127.0.0.1:8899"
 
 [permissions]
 # A path-separator entry (or a bare "~") is an exact absolute location,

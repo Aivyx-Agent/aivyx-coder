@@ -22,7 +22,7 @@ directories are the platform's equivalents.
 | Editor context (from your editor) | `~/.local/state/aivyx-coder/editor-context/` |
 | Editor approvals | `~/.local/state/aivyx-coder/editor-approval/` |
 | Cross-session memory (`memory_write`) | `~/.local/state/aivyx-coder/memory/` |
-| KV-cache slots (`kind = "llama_server"`) | `~/.local/share/aivyx-coder/kvcache/` (`[backend] kvcache_store_path` moves it) |
+| KV-cache slots (`kind = "llama_server"`) | `~/.local/share/aivyx-coder/kvcache/` (`[kvcache] store_path` moves it) |
 
 The whole `~/.config/aivyx-coder` and `~/.local/state/aivyx-coder` trees are
 on the built-in deny list: the model can't read or write them — so it can't

@@ -6,7 +6,9 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod deprecated;
 mod unknown_keys;
+pub use deprecated::{DEPRECATED_KEYS, Deprecation};
 pub use unknown_keys::{UnknownKey, parse_reporting};
 
 #[derive(Debug, Error)]
@@ -40,6 +42,12 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct Settings {
     pub backend: BackendSettings,
+    /// `[broker]`: the aivyx-broker this process talks to. Same spelling
+    /// as Aivyx PA's.
+    pub broker: BrokerSettings,
+    /// `[kvcache]`: where saved KV-cache slots live and how big the store
+    /// may grow. Same spelling as Aivyx PA's.
+    pub kvcache: KvCacheSettings,
     pub permissions: PermissionSettings,
     pub sandbox: SandboxSettings,
     pub git: GitSettings,
@@ -371,6 +379,61 @@ impl Default for WebSettings {
     }
 }
 
+/// `[broker]`: a running `aivyx-broker` instance, which sits in front of
+/// one shared `llama-server` and coordinates GPU-slot access across local
+/// processes (this one and Aivyx PA, say).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrokerSettings {
+    /// Address of a running `aivyx-broker` instance (e.g.
+    /// `http://127.0.0.1:8899`). Required when `[backend] kind =
+    /// "llama_server_broker"` -- checked at backend-construction time
+    /// (agent_builder.rs), not at config-load time, matching how
+    /// llama-server's own reachability isn't checked at load time either.
+    /// With that kind, this -- not `backend.base_url` -- is the address
+    /// chat connects to, and this process does no slot-picking or
+    /// `aivyx-kvcache` restore/save of its own: the broker owns that
+    /// lifecycle. The image tools (`[vision]`) use it too, or
+    /// `http://127.0.0.1:8899` when it is unset. See `aivyx-broker`'s own
+    /// README for the wire contract.
+    pub base_url: Option<String>,
+}
+
+/// Where the image tools find aivyx-broker when `broker.base_url` is
+/// unset: its usual local address.
+pub const DEFAULT_IMAGE_BROKER_URL: &str = "http://127.0.0.1:8899";
+
+impl BrokerSettings {
+    /// The broker address `generate_image`/`generate_3d` use.
+    pub fn image_tools_url(&self) -> String {
+        self.base_url.clone().unwrap_or_else(|| DEFAULT_IMAGE_BROKER_URL.to_string())
+    }
+}
+
+/// `[kvcache]`: KV-cache persistence for `[backend] kind = "llama_server"`
+/// (see the manual's "Local model servers" chapter).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvCacheSettings {
+    /// Overrides where the kvcache store directory lives. `None`
+    /// (default) keeps the per-app `ProjectDirs`-derived path. Set this
+    /// to the *same* directory as Aivyx PA's own `[kvcache] store_path`
+    /// (and point both at the same `llama-server`) to share prefill work
+    /// across the two processes. Supports a leading `~`, same convention
+    /// as `deny_paths`.
+    pub store_path: Option<String>,
+    /// Maximum bytes the kvcache store will hold on disk before evicting
+    /// the least-recently-used entry. Only meaningful when `[backend] kind
+    /// = "llama_server"`. Default 10 GiB.
+    pub max_bytes: u64,
+}
+
+impl Default for KvCacheSettings {
+    fn default() -> Self {
+        Self { store_path: None, max_bytes: 10 * 1024 * 1024 * 1024 }
+    }
+}
+
 /// Governs `generate_image`/`generate_3d` (`aivyx-tools`'s
 /// `GenerateImageTool`/`GenerateThreeDTool`) -- both registered only when
 /// `enabled`, since they depend on external infrastructure
@@ -382,7 +445,10 @@ impl Default for WebSettings {
 #[serde(default)]
 pub struct VisionSettings {
     pub enabled: bool,
-    pub broker_url: String,
+    /// Deprecated spelling of `broker.base_url`, read and moved there on
+    /// load (`deprecated::resolve`); never written.
+    #[serde(rename = "broker_url", skip_serializing)]
+    pub legacy_broker_url: Option<String>,
     pub mold_url: String,
     pub api_key: Option<String>,
 }
@@ -391,7 +457,7 @@ impl Default for VisionSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            broker_url: "http://127.0.0.1:8899".to_string(),
+            legacy_broker_url: None,
             mold_url: "http://127.0.0.1:7680".to_string(),
             api_key: None,
         }
@@ -531,8 +597,8 @@ pub struct TeamSettings {
     /// Path to a TOML file deserializing as `aivyx_team::TeamConfig`
     /// (`{ lead: String, members: [TeamMember] }`), used instead of
     /// `aivyx_team::default_coding_roster()` when set. Tilde-expanded and
-    /// symlink-canonicalized the same way as `BackendSettings
-    /// ::kvcache_store_path` (see `resolved_roster_path` below). `None`
+    /// symlink-canonicalized the same way as `KvCacheSettings
+    /// ::store_path` (see `resolved_roster_path` below). `None`
     /// (the default) means the fixed default roster, unchanged from
     /// before this field existed. Validated at startup
     /// (`TeamConfig::validate`) against the real registered tool list --
@@ -736,7 +802,7 @@ impl SandboxSettings {
     }
 }
 
-impl BackendSettings {
+impl KvCacheSettings {
     /// The kvcache store directory this run actually uses: the
     /// configured override (tilde-expanded, same convention as
     /// `PermissionSettings::resolved_deny_paths`), or the historical
@@ -744,8 +810,8 @@ impl BackendSettings {
     /// reused by both the real kvcache construction in `agent_builder.rs`
     /// and `Settings::effective_deny_paths` below -- the two can never
     /// silently diverge.
-    pub fn resolved_kvcache_store_path(&self) -> PathBuf {
-        match &self.kvcache_store_path {
+    pub fn resolved_store_path(&self) -> PathBuf {
+        match &self.store_path {
             Some(raw) => resolve_tilde_paths(std::slice::from_ref(raw))
                 .into_iter()
                 .next()
@@ -761,7 +827,7 @@ impl BackendSettings {
 impl TeamSettings {
     /// The custom roster file path this run actually uses, tilde-expanded
     /// and symlink-canonicalized the same way as
-    /// `BackendSettings::resolved_kvcache_store_path` -- `None` when
+    /// `KvCacheSettings::resolved_store_path` -- `None` when
     /// `roster_path` itself is unset, meaning "use
     /// `aivyx_team::default_coding_roster()`" (no path to resolve).
     pub fn resolved_roster_path(&self) -> Option<PathBuf> {
@@ -857,37 +923,19 @@ pub struct BackendSettings {
     /// own doc comment. Default `Generic`: no behavior change for
     /// existing configs.
     pub kind: BackendKind,
-    /// Maximum bytes the kvcache store (see the manual's "Local model
-    /// servers" chapter, KV-cache persistence) will hold on disk before
-    /// evicting the least-recently-used entry. Only meaningful when `kind = "llama_server"`. Default 10 GiB.
-    pub kvcache_max_bytes: u64,
-    /// Overrides where the kvcache store directory lives. `None`
-    /// (default) preserves the historical per-app `ProjectDirs`-derived
-    /// path. Set this to the *same* directory as `aivyx`'s own
-    /// `kvcache_store_path` (and point both configs' backends at the
-    /// same `llama-server`) to share prefill work across the two
-    /// processes — see `docs/MCP_RECIPES.md`'s `aivyx-coder` recipe in
-    /// the `aivyx` repo for the full pairing guidance. Supports a
-    /// leading `~`, same convention as `deny_paths`.
-    pub kvcache_store_path: Option<String>,
-    /// Address of a running `aivyx-broker` instance (e.g.
-    /// `http://127.0.0.1:8899`). Required when `kind =
-    /// "llama_server_broker"` -- checked at backend-construction time
-    /// (agent_builder.rs), not at config-load time, matching how
-    /// llama-server's own reachability isn't checked at load time either.
-    /// When set and `kind = "llama_server_broker"`, this -- not
-    /// `base_url` -- is the address `OpenAiCompatBackend` actually
-    /// connects to: `aivyx-broker` sits in front of a single shared
-    /// `llama-server` and coordinates GPU-slot access across multiple
-    /// local processes, so this process no longer contacts llama-server
-    /// directly on this path, and must not perform its own local
-    /// slot-picking or its own `aivyx-kvcache` restore/save calls -- the
-    /// broker owns that lifecycle now. See `aivyx-broker`'s own README
-    /// for the full rationale and wire contract.
-    pub broker_base_url: Option<String>,
+    /// Deprecated spelling of `kvcache.max_bytes`, read and moved there
+    /// on load (`deprecated::resolve`); never written.
+    #[serde(rename = "kvcache_max_bytes", skip_serializing)]
+    pub legacy_kvcache_max_bytes: Option<u64>,
+    /// Deprecated spelling of `kvcache.store_path`; see above.
+    #[serde(rename = "kvcache_store_path", skip_serializing)]
+    pub legacy_kvcache_store_path: Option<String>,
+    /// Deprecated spelling of `broker.base_url`; see above.
+    #[serde(rename = "broker_base_url", skip_serializing)]
+    pub legacy_broker_base_url: Option<String>,
     /// Whether this backend is on your own network, for model routing
     /// only (`[routing] enabled = true`). Unset, `aivyx-route` decides
-    /// from the address chat connects to (`broker_base_url` for
+    /// from the address chat connects to (`broker.base_url` for
     /// `llama_server_broker`, else `base_url`; the embedded `mistral_rs`
     /// backend is always local): loopback, private, link-local and
     /// CGNAT/Tailscale addresses and dotless, `.local`, `.lan`,
@@ -938,7 +986,7 @@ pub enum BackendKind {
     /// Points `OpenAiCompatBackend` at a running `aivyx-broker` instead
     /// of at llama-server directly -- still a plain `OpenAiCompatBackend`
     /// under the hood (like `LlamaServer`), just aimed at
-    /// `broker_base_url` instead of `base_url`. `aivyx-broker` is a
+    /// `broker.base_url` instead of `base_url`. `aivyx-broker` is a
     /// standalone daemon that coordinates GPU-slot access across
     /// multiple local processes sharing one `llama-server`; it owns KV-
     /// cache slot admission and the full restore/warm/save lifecycle on
@@ -976,9 +1024,9 @@ impl Default for BackendSettings {
             // genuinely mangle tool-call JSON.
             edit_format: EditFormat::Native,
             kind: BackendKind::Generic,
-            kvcache_max_bytes: 10 * 1024 * 1024 * 1024,
-            kvcache_store_path: None,
-            broker_base_url: None,
+            legacy_kvcache_max_bytes: None,
+            legacy_kvcache_store_path: None,
+            legacy_broker_base_url: None,
             locality: None,
             mistralrs_model_path: None,
             mistralrs_model_file: None,
@@ -1185,7 +1233,7 @@ impl Settings {
     /// under a path this run's `backend.kind` no longer even selects.
     pub fn effective_deny_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.permissions.resolved_deny_paths();
-        paths.push(self.backend.resolved_kvcache_store_path());
+        paths.push(self.kvcache.resolved_store_path());
         paths
     }
 }
@@ -1292,9 +1340,26 @@ impl Settings {
             path: path.clone(),
             source,
         })?;
-        let (settings, unknown) = parse_reporting(&raw)
-            .map_err(|source| ConfigError::Parse { path, source })?;
+        Self::parse_and_report(&raw).map_err(|source| ConfigError::Parse { path, source })
+    }
+
+    /// Parses a config file's text, returning beside it the unknown keys
+    /// and the deprecated keys it sets (each already moved to the key that
+    /// replaced it).
+    pub fn parse_with_warnings(
+        raw: &str,
+    ) -> Result<(Self, Vec<UnknownKey>, Vec<Deprecation>), toml::de::Error> {
+        let (mut settings, unknown) = parse_reporting::<Self>(raw)?;
+        let table = raw.parse::<toml::Table>()?;
+        let deprecated = deprecated::resolve(&mut settings, &table);
+        Ok((settings, unknown, deprecated))
+    }
+
+    /// `parse_with_warnings`, telling the user about each warning once.
+    fn parse_and_report(raw: &str) -> Result<Self, toml::de::Error> {
+        let (settings, unknown, deprecated) = Self::parse_with_warnings(raw)?;
         unknown_keys::report(&unknown);
+        deprecated::report(&deprecated);
         Ok(settings)
     }
 
@@ -1321,11 +1386,10 @@ impl Settings {
             path: path.to_path_buf(),
             source,
         })?;
-        let (settings, unknown) = parse_reporting(&raw).map_err(|source| ConfigError::Parse {
+        let settings = Self::parse_and_report(&raw).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-        unknown_keys::report(&unknown);
         Ok(Some(settings))
     }
 
@@ -1617,7 +1681,7 @@ mod tests {
     #[test]
     fn resolved_kvcache_store_path_matches_the_historical_default_when_unset() {
         let settings = Settings::default();
-        let path = settings.backend.resolved_kvcache_store_path();
+        let path = settings.kvcache.resolved_store_path();
         assert!(
             path.to_string_lossy()
                 .contains(".local/share/aivyx-coder/kvcache"),
@@ -1628,8 +1692,8 @@ mod tests {
     #[test]
     fn resolved_kvcache_store_path_uses_the_configured_override() {
         let mut settings = Settings::default();
-        settings.backend.kvcache_store_path = Some("~/shared-kvcache".to_string());
-        let path = settings.backend.resolved_kvcache_store_path();
+        settings.kvcache.store_path = Some("~/shared-kvcache".to_string());
+        let path = settings.kvcache.resolved_store_path();
         assert!(
             path.ends_with("shared-kvcache"),
             "overridden kvcache path must be used verbatim (tilde-expanded), got {path:?}"
@@ -1655,7 +1719,7 @@ mod tests {
     #[test]
     fn effective_deny_paths_tracks_an_overridden_kvcache_path_not_the_old_default() {
         let mut settings = Settings::default();
-        settings.backend.kvcache_store_path = Some("~/shared-kvcache".to_string());
+        settings.kvcache.store_path = Some("~/shared-kvcache".to_string());
         let paths = settings.effective_deny_paths();
         assert!(
             paths.iter().any(|p| p.ends_with("shared-kvcache")),
@@ -2145,7 +2209,9 @@ mod tests {
     fn vision_settings_default_is_disabled_with_sane_endpoints() {
         let settings = Settings::default();
         assert!(!settings.vision.enabled);
-        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:8899");
+        // No broker set: the image tools keep aivyx-broker's usual address.
+        assert_eq!(settings.broker.base_url, None);
+        assert_eq!(settings.broker.image_tools_url(), "http://127.0.0.1:8899");
         assert_eq!(settings.vision.mold_url, "http://127.0.0.1:7680");
         assert_eq!(settings.vision.api_key, None);
     }
@@ -2153,15 +2219,16 @@ mod tests {
     #[test]
     fn vision_settings_parses_from_a_full_toml_section() {
         let toml_str = r#"
+            [broker]
+            base_url = "http://127.0.0.1:9999"
             [vision]
             enabled = true
-            broker_url = "http://127.0.0.1:9999"
             mold_url = "http://127.0.0.1:8888"
             api_key = "secret"
         "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(settings.vision.enabled);
-        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:9999");
+        assert_eq!(settings.broker.image_tools_url(), "http://127.0.0.1:9999");
         assert_eq!(settings.vision.mold_url, "http://127.0.0.1:8888");
         assert_eq!(settings.vision.api_key.as_deref(), Some("secret"));
     }
@@ -2174,7 +2241,7 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(toml_str).unwrap();
         assert!(settings.vision.enabled);
-        assert_eq!(settings.vision.broker_url, "http://127.0.0.1:8899");
+        assert_eq!(settings.broker.image_tools_url(), "http://127.0.0.1:8899");
         assert_eq!(settings.vision.mold_url, "http://127.0.0.1:7680");
     }
 
@@ -2431,7 +2498,7 @@ mod tests {
     #[test]
     fn kvcache_max_bytes_defaults_to_ten_gib() {
         let settings: Settings = toml::from_str("").unwrap();
-        assert_eq!(settings.backend.kvcache_max_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(settings.kvcache.max_bytes, 10 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -2440,10 +2507,11 @@ mod tests {
             [backend]
             base_url = "http://127.0.0.1:8080/v1"
             model = "test-model"
-            kvcache_max_bytes = 5000000000
+            [kvcache]
+            max_bytes = 5000000000
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
-        assert_eq!(settings.backend.kvcache_max_bytes, 5_000_000_000);
+        assert_eq!(settings.kvcache.max_bytes, 5_000_000_000);
     }
 
     #[test]
@@ -2453,19 +2521,20 @@ mod tests {
             base_url = "http://127.0.0.1:8080/v1"
             model = "test-model"
             kind = "llama_server_broker"
-            broker_base_url = "http://127.0.0.1:8899"
+            [broker]
+            base_url = "http://127.0.0.1:8899"
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.backend.kind, BackendKind::LlamaServerBroker);
         assert_eq!(
-            settings.backend.broker_base_url.as_deref(),
+            settings.broker.base_url.as_deref(),
             Some("http://127.0.0.1:8899")
         );
     }
 
     #[test]
     fn backend_kind_llama_server_broker_parsing_does_not_require_broker_base_url() {
-        // Parsing itself must never fail just because broker_base_url is
+        // Parsing itself must never fail just because broker.base_url is
         // absent -- that's a dispatch-time (agent_builder.rs) validation
         // error, not a config-load-time one, matching how the mistral_rs
         // variant's own required field is handled.
@@ -2475,13 +2544,13 @@ mod tests {
         "#;
         let settings: Settings = toml::from_str(raw).expect("parse must succeed");
         assert_eq!(settings.backend.kind, BackendKind::LlamaServerBroker);
-        assert!(settings.backend.broker_base_url.is_none());
+        assert!(settings.broker.base_url.is_none());
     }
 
     #[test]
-    fn backend_settings_default_has_no_broker_base_url_set() {
+    fn settings_default_has_no_broker_base_url_set() {
         let settings = Settings::default();
-        assert!(settings.backend.broker_base_url.is_none());
+        assert!(settings.broker.base_url.is_none());
     }
 
     #[test]

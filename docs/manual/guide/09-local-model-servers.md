@@ -264,8 +264,8 @@ must be started with `--slot-save-path` pointed at *exactly* the
 directory this config actually uses — by default
 `~/.local/share/aivyx-coder/kvcache/slots` (on Linux; the exact default
 path is platform-specific, resolved via the `directories` crate — see
-its own docs for the macOS/Windows equivalents), or your own `[backend]
-kvcache_store_path`'s `slots` subdirectory if you've set one (see
+its own docs for the macOS/Windows equivalents), or your own `[kvcache]
+store_path`'s `slots` subdirectory if you've set one (see
 below — in particular, to share this store with a locally
 delegated-from `aivyx-pa` process pointed at the same `llama-server`, see
 `aivyx-pa`'s own `docs/MCP_RECIPES.md`). If `--slot-save-path` doesn't match this exact
@@ -274,7 +274,7 @@ path, saves and restores still succeed against llama-server's own
 `fs::metadata` stat on *its* expected path (`.../kvcache/slots`) misses,
 so every entry silently falls back to a 1-byte placeholder size instead of
 the real (often hundreds-of-MB) file size. That defeats
-`kvcache_max_bytes` below: nothing ever looks big enough to evict, so real
+`[kvcache] max_bytes` below: nothing ever looks big enough to evict, so real
 slot files accumulate on disk without limit until the mismatch is fixed.
 
 ```
@@ -285,13 +285,17 @@ llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q4_K_M \
 ```
 
 **Disk budget**: the on-disk store evicts its least-recently-used entry
-once it would exceed `kvcache_max_bytes` under `[backend]` (default 10
+once it would exceed `max_bytes` under `[kvcache]` (default 10
 GiB):
 
 ```toml
-[backend]
-kvcache_max_bytes = 10737418240  # 10 GiB, the default; bytes, not GiB
+[kvcache]
+max_bytes = 10737418240  # 10 GiB, the default; bytes, not GiB
 ```
+
+`[kvcache]` is spelled as in Aivyx PA. Before 1.0 these keys were
+`kvcache_store_path` and `kvcache_max_bytes` under `[backend]`; those are
+still read, with a warning naming the new key.
 
 **What this does and doesn't help.** The cached key covers the *stable
 prefix* only — system prompt, tool definitions, and repo map — never
@@ -354,19 +358,24 @@ its own `aivyx-kvcache` restore/save calls on this path. See
 separate process from `aivyx-coder`, started independently.
 
 **Enable it**: set `kind = "llama_server_broker"` and point
-`broker_base_url` at your running `aivyx-broker` instance instead of at
+`[broker] base_url` at your running `aivyx-broker` instance instead of at
 `llama-server` directly:
 
 ```toml
 [backend]
 model = "qwen3.5:9b"
 kind = "llama_server_broker"
-broker_base_url = "http://127.0.0.1:8899"
+
+[broker]
+base_url = "http://127.0.0.1:8899"
 ```
 
-`base_url` is no longer contacted directly by this process on this path —
-`broker_base_url` is (with or without a trailing `/v1`; requests go to
-`<broker_base_url>/v1/chat/completions` either way). `aivyx-broker` exposes the same
+`[broker]` is spelled as in Aivyx PA; before 1.0 this key was
+`[backend] broker_base_url` (and `[vision] broker_url` for the image
+tools), still read with a warning. `[backend] base_url` is no longer
+contacted directly by this process on this path — `[broker] base_url` is
+(with or without a trailing `/v1`; requests go to
+`<base_url>/v1/chat/completions` either way). `aivyx-broker` exposes the same
 `/v1/chat/completions` shape as a plain OpenAI-compatible server, so this
 is otherwise a drop-in swap; this repo's own contribution is just an
 additive `aivyx_slot_hint` field (a prefix hash, plus an always-omitted

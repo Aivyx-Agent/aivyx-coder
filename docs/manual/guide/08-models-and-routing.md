@@ -91,7 +91,7 @@ summarize = { tier = "small" }
   name), set `locality = "local"` on its `[routing.endpoints.*]` table;
   `locality = "cloud"` forces cloud.
 - The `[backend]` model is judged by the same rule, from the address chat
-  connects to (`broker_base_url` for `kind = "llama_server_broker"`, else
+  connects to (`[broker] base_url` for `kind = "llama_server_broker"`, else
   `base_url`; the embedded `mistral_rs` backend is always local). With
   routing on, a `[backend]` that counts as cloud is not used for routed
   calls — the main loop, `/architect` without an `[architect]` model and

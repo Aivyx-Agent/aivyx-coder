@@ -72,7 +72,7 @@ PRIMITIVES = {
 # ---------------------------------------------------------------------------
 
 GROUPS = [
-    ("The model", ["backend", "routing"]),
+    ("The model", ["backend", "broker", "kvcache", "routing"]),
     ("Safety", ["permissions", "sandbox", "git"]),
     ("Context the model gets", ["repo_map", "agents_file", "editor_context", "skills", "pack"]),
     ("Ways of working", ["verification", "autonomous", "architect", "council", "sub_agent", "team"]),
@@ -82,6 +82,8 @@ GROUPS = [
 
 INTROS = {
     "backend": f"The local model server and model aivyx-coder talks to. `aivyx-coder --setup` writes this for you. See [Install and first run]({GUIDE}/02-install-and-first-run.md) and [Local model servers]({GUIDE}/09-local-model-servers.md).",
+    "broker": f"A running aivyx-broker, which shares one llama.cpp server between local processes (this one and Aivyx PA, say). Spelled as in Aivyx PA. Before 1.0 this was `[backend] broker_base_url` and `[vision] broker_url`; both are still read, with a warning. See [Local model servers]({GUIDE}/09-local-model-servers.md).",
+    "kvcache": f"KV-cache persistence for `[backend] kind = \"llama_server\"`. Spelled as in Aivyx PA. Before 1.0 these were `[backend] kvcache_store_path` and `kvcache_max_bytes`; both are still read, with a warning. See [Local model servers]({GUIDE}/09-local-model-servers.md).",
     "routing": f"Per-call model routing across several local models. Off by default. See [Models and routing]({GUIDE}/08-models-and-routing.md).",
     "permissions": "What the model may touch and run: the deny list, pre-approved commands, and per-turn limits. See the [security model](05-security-model.md).",
     "sandbox": "Kernel confinement (Landlock + seccomp) for the commands the model runs, and its opt-outs. See the [security model](05-security-model.md).",
@@ -133,14 +135,14 @@ MEANINGS = {
     "permissions.allowed_commands.args": "Its fixed arguments. The model can't add to them.",
     "web.search_base_url": "Your SearXNG instance. Without it, `web_search` explains that it isn't set up.",
     "lsp.timeout_secs": "Longest wait for one language-server request, in seconds. Default 60 — the first call in a big project may index for a while.",
-    "vision.broker_url": "The aivyx-broker address. Default `http://127.0.0.1:8899`.",
+    "broker.base_url": "Address of a running aivyx-broker, e.g. `http://127.0.0.1:8899`. Required for `[backend] kind = \"llama_server_broker\"`, and then the address chat connects to. The image tools use it too, or `http://127.0.0.1:8899` when unset.",
     "vision.mold_url": "The `mold serve` image server address. Default `http://127.0.0.1:7680`.",
     "vision.api_key": "Key for the image backend, if it needs one.",
     "mcp.servers.args": "Arguments for the server's command.",
     "routing.enabled": "Turn routing on. Off (the default) means every call uses `[backend] model`.",
     "routing.models.endpoint": "Which `[routing.endpoints.<name>]` serves it. Unset means `[backend]`.",
-    "backend.kind": "Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `broker_base_url`), `mistral_rs` (the embedded engine, if built in).",
-    "backend.kvcache_store_path": "Where saved KV-cache slots go (default under `~/.local/share/aivyx-coder/kvcache`). Point it at the same directory as Aivyx PA's `[kvcache] store_path` when both share one llama.cpp server.",
+    "backend.kind": "Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `[broker] base_url`), `mistral_rs` (the embedded engine, if built in).",
+    "kvcache.store_path": "Where saved KV-cache slots go (default under `~/.local/share/aivyx-coder/kvcache`). Point it at the same directory as Aivyx PA's `[kvcache] store_path` when both share one llama.cpp server.",
     "backend.mistralrs_model_path": "With `kind = \"mistral_rs\"`: a GGUF file, or a directory of them. Required for that kind.",
     "verification.command": "Name of a `[[permissions.allowed_commands]]` entry to run after edits, before a turn may end. Setting it turns verification on.",
     "skills.project_dir": "An extra skills directory for this project, holding one `<skill-name>/SKILL.md` per skill.",

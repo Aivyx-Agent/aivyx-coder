@@ -62,6 +62,10 @@ mod tests {
         }
         let mut config = Vec::new();
         walk("", &serde_json::to_value(aivyx_config::Settings::default()).unwrap(), &mut config);
+        // Deprecated spellings still read (and warned about) across 1.x.
+        for (old, new) in aivyx_config::DEPRECATED_KEYS {
+            config.push(format!("{old} (deprecated: use {new})"));
+        }
         config.sort();
         // CLI: every subcommand path and its arguments with value names.
         fn flags(path: &str, cmd: &clap::Command, out: &mut Vec<String>) {

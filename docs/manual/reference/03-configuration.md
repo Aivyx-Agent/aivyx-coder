@@ -40,15 +40,29 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `api_key` | string | `"..."` | Key for an auth-protected local server. Usually unset. |
 | `context_tokens` | integer | `8192` | The model's context window, in tokens — used to show a live budget indicator and to trigger context compaction before the window overflows. Conservative default; **set this to your model's actual window** (qwen3.5/qwen3.6 support far more than the default). |
 | `edit_format` | `native` \| `prompted` |  | How edit content travels: "native" sends edits as edit_file / write_file tool-call arguments; "prompted" teaches the model to write SEARCH/REPLACE blocks as plain text instead (parsed by aivyx and applied through the same permission gate). |
-| `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `broker_base_url`), `mistral_rs` (the embedded engine, if built in). |
-| `kvcache_max_bytes` | integer | `10737418240` | Maximum bytes the kvcache store (see the manual's "Local model servers" chapter, KV-cache persistence) will hold on disk before evicting the least-recently-used entry. Only meaningful when `kind = "llama_server"`. |
-| `kvcache_store_path` | string | `"~/.local/share/shared-kvcache"` | Where saved KV-cache slots go (default under `~/.local/share/aivyx-coder/kvcache`). Point it at the same directory as Aivyx PA's `[kvcache] store_path` when both share one llama.cpp server. |
-| `broker_base_url` | string | `"http://127.0.0.1:8899"` | Address of a running `aivyx-broker` instance (e.g. `http://127.0.0.1:8899`). |
+| `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `[broker] base_url`), `mistral_rs` (the embedded engine, if built in). |
 | `locality` | `local` \| `cloud` | `"local"` | Whether this backend is on your own network, for model routing only (`[routing] enabled = true`). |
 | `mistralrs_model_path` | string |  | With `kind = "mistral_rs"`: a GGUF file, or a directory of them. Required for that kind. |
 | `mistralrs_model_file` | string |  | Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
 | `mistralrs_chat_template_path` | string |  | Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
 | `reasoning_effort` | string |  | How hard a reasoning model thinks before it answers, e.g. `"medium"`. |
+
+### `[broker]`
+
+A running aivyx-broker, which shares one llama.cpp server between local processes (this one and Aivyx PA, say). Spelled as in Aivyx PA. Before 1.0 this was `[backend] broker_base_url` and `[vision] broker_url`; both are still read, with a warning. See [Local model servers](../guide/09-local-model-servers.md).
+
+| Key | Type | Example | Meaning |
+|---|---|---|---|
+| `base_url` | string | `"http://127.0.0.1:8899"` | Address of a running aivyx-broker, e.g. `http://127.0.0.1:8899`. Required for `[backend] kind = "llama_server_broker"`, and then the address chat connects to. The image tools use it too, or `http://127.0.0.1:8899` when unset. |
+
+### `[kvcache]`
+
+KV-cache persistence for `[backend] kind = "llama_server"`. Spelled as in Aivyx PA. Before 1.0 these were `[backend] kvcache_store_path` and `kvcache_max_bytes`; both are still read, with a warning. See [Local model servers](../guide/09-local-model-servers.md).
+
+| Key | Type | Example | Meaning |
+|---|---|---|---|
+| `store_path` | string | `"~/.local/share/shared-kvcache"` | Where saved KV-cache slots go (default under `~/.local/share/aivyx-coder/kvcache`). Point it at the same directory as Aivyx PA's `[kvcache] store_path` when both share one llama.cpp server. |
+| `max_bytes` | integer | `10737418240` | Maximum bytes the kvcache store will hold on disk before evicting the least-recently-used entry. Only meaningful when `[backend] kind = "llama_server"`. |
 
 ### `[routing]`
 
@@ -299,7 +313,6 @@ Image generation tools, which need an image backend.
 | Key | Type | Example | Meaning |
 |---|---|---|---|
 | `enabled` | bool |  | Turn this on or off. |
-| `broker_url` | string |  | The aivyx-broker address. Default `http://127.0.0.1:8899`. |
 | `mold_url` | string |  | The `mold serve` image server address. Default `http://127.0.0.1:7680`. |
 | `api_key` | string |  | Key for the image backend, if it needs one. |
 

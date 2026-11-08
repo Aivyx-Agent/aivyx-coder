@@ -8,16 +8,17 @@ autonomous.max_duration_secs = 3600
 autonomous.max_iterations = 20
 backend.api_key = null
 backend.base_url = "http://localhost:11434/v1"
-backend.broker_base_url = null
+backend.broker_base_url (deprecated: use broker.base_url)
 backend.context_tokens = 8192
 backend.edit_format = "native"
 backend.kind = "generic"
-backend.kvcache_max_bytes = 10737418240
-backend.kvcache_store_path = null
+backend.kvcache_max_bytes (deprecated: use kvcache.max_bytes)
+backend.kvcache_store_path (deprecated: use kvcache.store_path)
 backend.mistralrs_chat_template_path = null
 backend.mistralrs_model_file = null
 backend.mistralrs_model_path = null
 backend.model = "qwen3.5:9b"
+broker.base_url = null
 council.chairman = null
 council.members = []
 council.tail_budget_tokens = 3072
@@ -25,6 +26,8 @@ editor_approval.enabled = true
 editor_context.enabled = true
 git.checkpoints = true
 git.ignore = ["__pycache__/","*.pyc","*.pyo",".pytest_cache/",".mypy_cache/",".ruff_cache/","node_modules/",".venv/","target/",".DS_Store"]
+kvcache.max_bytes = 10737418240
+kvcache.store_path = null
 lsp.timeout_secs = 60
 mcp.servers = []
 mcp_server.max_access_level = null
@@ -68,7 +71,7 @@ verification.max_auto_verify_retries = 3
 verification.sandbox_failures = []
 verification.scoped_command = null
 vision.api_key = null
-vision.broker_url = "http://127.0.0.1:8899"
+vision.broker_url (deprecated: use broker.base_url)
 vision.enabled = false
 vision.mold_url = "http://127.0.0.1:7680"
 web.allow_private_targets = false

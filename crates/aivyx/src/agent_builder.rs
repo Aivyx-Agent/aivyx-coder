@@ -412,15 +412,15 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
         )),
         BackendKind::LlamaServerBroker => {
-            let broker_url = settings.backend.broker_base_url.clone().ok_or_else(|| {
+            let broker_url = settings.broker.base_url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "backend.kind = \"llama_server_broker\" but backend.broker_base_url is \
-                     missing. Set it to your running aivyx-broker's address, e.g. \
-                     http://127.0.0.1:8899"
+                    "backend.kind = \"llama_server_broker\" but broker.base_url is missing. \
+                     Set `base_url` under [broker] to your running aivyx-broker's address, \
+                     e.g. http://127.0.0.1:8899"
                 )
             })?;
             // aivyx-broker serves `/v1/chat/completions`; the documented
-            // `broker_base_url` has no `/v1`, and one that does keeps it.
+            // `broker.base_url` has no `/v1`, and one that does keeps it.
             Ok(Arc::new(
                 OpenAiCompatBackend::new(
                     crate::routing::chat_base_url(&broker_url),
@@ -809,7 +809,7 @@ pub(crate) async fn build_agent(
     // turn. An unreachable/unknown server keeps the configured value.
     // Skipped for MistralRs (embedded inference, no served endpoint to
     // probe at all) and for LlamaServerBroker (the real request path goes
-    // through `broker_base_url`, not `settings.backend.base_url` — which
+    // through `broker.base_url`, not `settings.backend.base_url` — which
     // broker-mode users often leave at its default — so probing the latter
     // would just fire against the wrong address).
     let mut context_tokens = settings.backend.context_tokens;
@@ -987,7 +987,7 @@ pub(crate) async fn build_agent(
     // are, not always-registered like generate_svg.
     if settings.vision.enabled {
         let mold_config = aivyx_vision_mold::MoldConfig {
-            broker_url: settings.vision.broker_url.clone(),
+            broker_url: settings.broker.image_tools_url(),
             mold_url: settings.vision.mold_url.clone(),
             api_key: settings.vision.api_key.clone(),
             // `resolve`, not a raw `cwd.join(...)`, so the directory
@@ -1457,10 +1457,10 @@ pub(crate) async fn build_agent(
                                 // Single source of truth for the effective path
                                 // (configured override, or the historical
                                 // ProjectDirs-derived default) — see
-                                // BackendSettings::resolved_kvcache_store_path in
+                                // KvCacheSettings::resolved_store_path in
                                 // aivyx-config, also reused by Settings::effective_deny_paths
                                 // below so the two can never silently diverge.
-                                let store_path = settings.backend.resolved_kvcache_store_path();
+                                let store_path = settings.kvcache.resolved_store_path();
                                 match aivyx_kvcache::LlamaServerSlotStore::open(
                                     &store_path,
                                     origin, // NOT settings.backend.base_url -- /slots is a native
@@ -1468,7 +1468,7 @@ pub(crate) async fn build_agent(
                                     // (confirmed live: a /v1-prefixed base_url 404s on
                                     // /v1/slots/{id}?action=save, since the real path is
                                     // just /slots/{id}?action=save)
-                                    settings.backend.kvcache_max_bytes,
+                                    settings.kvcache.max_bytes,
                                 ) {
                                     Ok(store) => {
                                         // Scoped by origin (not just store_path, which
@@ -1979,7 +1979,7 @@ mod tests {
     /// as a safety bound so a regression here fails this test loudly
     /// (well within a normal test run) instead of hanging the suite.
     /// aivyx-broker serves `/v1/chat/completions`; the documented
-    /// `broker_base_url` (`http://127.0.0.1:8899`) has no `/v1`.
+    /// `broker.base_url` (`http://127.0.0.1:8899`) has no `/v1`.
     #[tokio::test]
     async fn a_broker_backend_posts_to_v1_chat_completions() {
         use wiremock::matchers::method;
@@ -1992,7 +1992,7 @@ mod tests {
             .await;
         let mut settings = Settings::default();
         settings.backend.kind = aivyx_config::BackendKind::LlamaServerBroker;
-        settings.backend.broker_base_url = Some(broker.uri());
+        settings.broker.base_url = Some(broker.uri());
         let backend = build_llm_backend(&settings).await.unwrap();
         let _ = backend
             .stream_chat(aivyx_llm::ChatRequest::new(vec![
@@ -2025,7 +2025,7 @@ mod tests {
                 let mut settings = Settings::default();
                 settings.backend.kind = kind;
                 settings.backend.base_url = format!("{}/v1", server.uri());
-                settings.backend.broker_base_url = Some(server.uri());
+                settings.broker.base_url = Some(server.uri());
                 settings.backend.reasoning_effort = effort.map(str::to_string);
                 let backend = build_llm_backend(&settings).await.unwrap();
                 let _ = backend
@@ -2091,14 +2091,14 @@ mod tests {
     async fn llama_server_broker_backend_construction_fails_clearly_without_broker_base_url() {
         let mut settings = Settings::default();
         settings.backend.kind = BackendKind::LlamaServerBroker;
-        // broker_base_url deliberately left None.
+        // broker.base_url deliberately left None.
         let result = build_llm_backend(&settings).await;
         let err = match result {
-            Ok(_) => panic!("must fail without a broker_base_url"),
+            Ok(_) => panic!("must fail without a broker.base_url"),
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("broker_base_url"),
+            err.to_string().contains("broker.base_url"),
             "error should name the missing field, got: {err}"
         );
     }
@@ -2107,11 +2107,11 @@ mod tests {
     async fn llama_server_broker_backend_construction_succeeds_with_broker_base_url() {
         let mut settings = Settings::default();
         settings.backend.kind = BackendKind::LlamaServerBroker;
-        settings.backend.broker_base_url = Some("http://127.0.0.1:8899".to_string());
+        settings.broker.base_url = Some("http://127.0.0.1:8899".to_string());
         let result = build_llm_backend(&settings).await;
         assert!(
             result.is_ok(),
-            "should construct successfully once broker_base_url is set"
+            "should construct successfully once broker.base_url is set"
         );
     }
 
