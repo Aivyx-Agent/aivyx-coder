@@ -102,8 +102,10 @@ instead: cargo nextest run)` — since yours is what will run.
 Without a terminal the answer is no, unless you pass `--yes`. aivyx-coder
 records exactly the commands you approved; if a later version of the pack
 changes them, they aren't used, and a notice at start-up asks you to run
-`pack use` again to review them. Commands you declined, or that a newer
-version of the pack added, get one notice each time aivyx-coder starts:
+`pack use` again to review them. A no is remembered too, so declined
+commands stay off quietly; but commands you haven't reviewed — added by a
+newer version of the pack, or changed since you declined them — get one
+notice each time aivyx-coder starts:
 `Pack <name> has commands you haven't approved — run aivyx-coder pack use
 <name> to review them.`
 

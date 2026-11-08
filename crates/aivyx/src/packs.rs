@@ -400,6 +400,10 @@ pub struct Use {
     /// (`None`: declined, or the pack has none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<PackVerification>,
+    /// The verification commands the user said no to, exactly, so the
+    /// decline is remembered until the pack's commands change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declined: Option<PackVerification>,
 }
 
 /// An MCP server the user agreed to run: everything that decides what
@@ -509,8 +513,12 @@ pub fn use_pack(
         .filter(|server| ask(server))
         .map(ApprovedServer::of)
         .collect();
-    let settings = settings.filter(|v| ask_settings(v));
-    let new_use = Use { scope: scope.clone(), pack: name.to_string(), mcp, settings };
+    let (settings, declined) = match settings {
+        Some(v) if ask_settings(&v) => (Some(v), None),
+        Some(v) => (None, Some(v)),
+        None => (None, None),
+    };
+    let new_use = Use { scope: scope.clone(), pack: name.to_string(), mcp, settings, declined };
     let mut state = ActiveState::load(packs);
     state.uses.retain(|u| u.scope != scope);
     state.uses.push(new_use.clone());
@@ -605,8 +613,10 @@ pub fn resolve_layer(packs: &PacksDir, cwd: &Path) -> Option<PackLayer> {
             ));
             None
         }
-        // Declined, or never asked about: nothing runs, but say so once
-        // per start so a newer version's commands don't go unnoticed.
+        // Declined these very commands: remembered, nothing runs, no notice.
+        Ok(Some(current)) if used.declined.as_ref() == Some(&current) => None,
+        // Never reviewed (a newer version added them, or changed ones the
+        // user declined): nothing runs, but say so once per start.
         Ok(Some(_)) => {
             notices.push(format!(
                 "Pack {name} has commands you haven't approved — run aivyx-coder pack use {name} \
@@ -1395,11 +1405,30 @@ mcp = "coder/mcp.toml"
         assert!(used.settings.is_none());
         let text = std::fs::read_to_string(packs.root().join("active.toml")).unwrap();
         assert!(!text.contains("settings"), "{text}");
-        let layer = resolve_layer(&packs, &tmp("settings-decline-project")).unwrap();
+        let project = tmp("settings-decline-project");
+        let layer = resolve_layer(&packs, &project).unwrap();
+        assert!(layer.verification.is_none());
+        assert_eq!(layer.notices.len(), 1, "a decline is remembered: {:?}", layer.notices);
+        assert_eq!(ActiveState::load(&packs).uses[0].declined.as_ref().unwrap().command.as_deref(), Some("cargo test"));
+
+        // The pack changes its commands: they were never reviewed.
+        let dir = packs.find("business-manager").unwrap().dir;
+        rewrite(&dir, "coder/settings.toml", |t| t.replace("cargo test", "cargo nextest run"));
+        let layer = resolve_layer(&packs, &project).unwrap();
         assert!(layer.verification.is_none());
         let unapproved = "Pack business-manager has commands you haven't approved — run aivyx-coder pack use \
                           business-manager to review them.";
         assert_eq!(layer.notices.iter().filter(|n| *n == unapproved).count(), 1, "{:?}", layer.notices);
+    }
+
+    #[test]
+    fn an_active_toml_from_before_declines_still_loads() {
+        let packs = PacksDir::at(tmp("old-active"));
+        std::fs::create_dir_all(packs.root()).unwrap();
+        std::fs::write(packs.root().join("active.toml"), "[[use]]\nscope = \"*\"\npack = \"p\"\n").unwrap();
+        let state = ActiveState::load(&packs);
+        assert_eq!(state.uses.len(), 1);
+        assert!(state.uses[0].settings.is_none() && state.uses[0].declined.is_none());
     }
 
     #[test]

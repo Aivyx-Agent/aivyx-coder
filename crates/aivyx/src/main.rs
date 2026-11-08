@@ -1001,7 +1001,20 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
             };
             // The user's own allowed commands, so a name clash shows what
             // will actually run.
-            let allowed = Settings::load_existing()?.unwrap_or_default().permissions.allowed_commands;
+            // Read only when the pack has commands to ask about.
+            let has_commands = packs
+                .find(&name)
+                .is_some_and(|p| matches!(packs::pack_settings(&p.dir, &p.manifest), Ok(Some(_))));
+            let allowed = if has_commands {
+                let path = Settings::config_path()?;
+                Settings::load_existing()
+                    .map_err(|e| anyhow::anyhow!("can't read {}: {e:#}", path.display()))?
+                    .unwrap_or_default()
+                    .permissions
+                    .allowed_commands
+            } else {
+                Vec::new()
+            };
             let mut approve_settings = |v: &aivyx_pack::PackVerification| {
                 for line in packs::consent_lines(v, &allowed) {
                     println!("approved: {line}");
