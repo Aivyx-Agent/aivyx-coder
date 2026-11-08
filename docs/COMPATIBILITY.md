@@ -7,7 +7,8 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
 - **Config keys and their defaults.** Every key path, with the default
   from `Settings::default()`, the values each enum key accepts, the
   fields of list and table entries, and the deprecated spellings still
-  read. Snapshot: `docs/stable/config.txt`.
+  read. Snapshot: `docs/stable/config.txt`. Two kinds of default may
+  move in a minor release (see Rules).
 - **The CLI flags.** The subcommands and long flags, including `--auto`,
   `--headless` and `--report`. Snapshot: `docs/stable/cli.txt`.
 - **The `--report` JSON schema.** It carries `report_version`, and the
@@ -27,6 +28,10 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
 - **Internal crates.** The crates in this repository are not a public API.
 - **The tools the model sees.** Their names, arguments and descriptions
   change as models change.
+- **Build-time features.** `backend.kind = "mistral_rs"` and the
+  `backend.mistralrs_*` keys work only in a build with the
+  `provider-mistral-rs` feature, which no release binary has. They can
+  change or be removed in any release.
 
 ## Rules
 
@@ -36,6 +41,12 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
   used.
 - A config key is never silently given a new meaning; a changed meaning
   gets a new key.
+- The suggested model (`backend.model`) and server address
+  (`backend.base_url`) may change in a minor release. `--setup` writes
+  your own choice into `config.toml`, so a config that sets them is not
+  affected.
+- The default `permissions.deny_paths` and `git.ignore` lists may grow in
+  a minor release, but never shrink.
 - Data written by 1.0 is read by every 1.x; migrations run forward on
   their own and say so.
 
@@ -52,6 +63,12 @@ The check has limits:
   values an enum key accepts (`(one of: ...)`). The keys and the values
   come from tracing the config types' own deserializer, so an unset
   optional key is listed too.
+- Lines tagged ` (build-time feature)` are excluded from the promise
+  (see Not stable). They are generated from one list in the code,
+  `BUILD_TIME_FEATURE_CONFIG` in `crates/aivyx-config/src/lib.rs`.
+- The defaults the Rules let move (`backend.model`, `backend.base_url`,
+  `permissions.deny_paths`, `git.ignore`) stay in the snapshot, so a
+  change to them is still deliberate.
 - Fields of list and table entries (`permissions.allowed_commands[].name`,
   `routing.endpoints.*.kind`) are frozen with their types: an entry has no
   default to freeze. What an omitted entry field means is covered by

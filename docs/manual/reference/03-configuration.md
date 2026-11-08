@@ -40,11 +40,11 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `api_key` | string | `"..."` | Key for an auth-protected local server. Usually unset. |
 | `context_tokens` | integer | `8192` | The model's context window, in tokens — used to show a live budget indicator and to trigger context compaction before the window overflows. Conservative default; **set this to your model's actual window** (qwen3.5/qwen3.6 support far more than the default). |
 | `edit_format` | `native` \| `prompted` |  | How edit content travels: "native" sends edits as edit_file / write_file tool-call arguments; "prompted" teaches the model to write SEARCH/REPLACE blocks as plain text instead (parsed by aivyx and applied through the same permission gate). |
-| `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `[broker] base_url`), `mistral_rs` (the embedded engine, if built in). |
+| `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `[broker] base_url`), `mistral_rs` (the embedded engine: a build-time feature, in no release binary, not stable). |
 | `locality` | `local` \| `cloud` | `"local"` | Whether this backend is on your own network, for model routing only (`[routing] enabled = true`). |
-| `mistralrs_model_path` | string |  | With `kind = "mistral_rs"`: a GGUF file, or a directory of them. Required for that kind. |
-| `mistralrs_model_file` | string |  | Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
-| `mistralrs_chat_template_path` | string |  | Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
+| `mistralrs_model_path` | string |  | Build-time feature, not stable. With `kind = "mistral_rs"`: a GGUF file, or a directory of them. Required for that kind. |
+| `mistralrs_model_file` | string |  | Build-time feature, not stable. Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
+| `mistralrs_chat_template_path` | string |  | Build-time feature, not stable. Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
 | `reasoning_effort` | string |  | How hard a reasoning model thinks before it answers, e.g. `"medium"`. |
 
 ### `[broker]`

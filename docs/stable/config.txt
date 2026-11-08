@@ -11,13 +11,14 @@ backend.base_url = "http://localhost:11434/v1"
 backend.broker_base_url (deprecated: use broker.base_url)
 backend.context_tokens = 8192
 backend.edit_format = "native" (one of: native | prompted)
-backend.kind = "generic" (one of: generic | llama_server | llama_server_broker | mistral_rs)
+backend.kind = "generic" (one of: generic | llama_server | llama_server_broker)
+backend.kind = "mistral_rs" (build-time feature)
 backend.kvcache_max_bytes (deprecated: use kvcache.max_bytes)
 backend.kvcache_store_path (deprecated: use kvcache.store_path)
 backend.locality = null (one of: local | cloud)
-backend.mistralrs_chat_template_path = null
-backend.mistralrs_model_file = null
-backend.mistralrs_model_path = null
+backend.mistralrs_chat_template_path = null (build-time feature)
+backend.mistralrs_model_file = null (build-time feature)
+backend.mistralrs_model_path = null (build-time feature)
 backend.model = "qwen3.5:9b"
 backend.reasoning_effort = null
 broker.base_url = null

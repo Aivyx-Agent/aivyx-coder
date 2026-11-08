@@ -330,6 +330,38 @@ mod tests {
     }
 
     #[test]
+    fn build_time_feature_lines_parse_to_their_key() {
+        // `backend.kind = "mistral_rs" (build-time feature)` and
+        // `backend.mistralrs_model_path = null (build-time feature)` (R9).
+        let tagged: Vec<&str> = KNOWN_SNAPSHOT
+            .lines()
+            .filter(|l| l.ends_with(" (build-time feature)"))
+            .collect();
+        assert_eq!(tagged.len(), crate::BUILD_TIME_FEATURE_CONFIG.len());
+        for line in tagged {
+            let path = snapshot_path(line);
+            assert!(
+                crate::BUILD_TIME_FEATURE_CONFIG.iter().any(|(k, _)| *k == path),
+                "{line:?} parsed as {path:?}"
+            );
+        }
+        let known = known_paths();
+        assert!(known.contains("backend.mistralrs_model_path"));
+        assert!(known.contains("backend.kind"));
+        assert!(known.iter().all(|k| !k.contains(' ') && !k.contains('(')));
+    }
+
+    #[test]
+    fn build_time_feature_keys_are_known_and_suggested() {
+        let raw = "[backend]\nkind = \"mistral_rs\"\nmistralrs_model_path = \"/m\"\n\
+                   mistralrs_model_fil = \"x.gguf\"\n";
+        let keys = unknown(raw);
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert_eq!(keys[0].path, "backend.mistralrs_model_fil");
+        assert_eq!(keys[0].suggestion.as_deref(), Some("backend.mistralrs_model_file"));
+    }
+
+    #[test]
     fn loaded_values_are_unchanged_by_the_warning_path() {
         let raw = "stray = 1\n[backend]\nmodel = \"m\"\nbase_url = \"http://h/v1\"\nstray2 = 2\n";
         let (with, keys) = parse_reporting::<Settings>(raw).unwrap();

@@ -48,6 +48,9 @@ mod tests {
     ///   list entry or table entry (`?`: optional).
     /// - ` (one of: a | b)`: the values an enum key accepts.
     /// - `old (deprecated: use new)`: a deprecated spelling still read.
+    /// - ` (build-time feature)`: a key, or `key = "value"` for one enum
+    ///   value, only a non-default build uses
+    ///   (`aivyx_config::BUILD_TIME_FEATURE_CONFIG`); not stable.
     ///
     /// The keys and the enum values come from tracing `Settings`' own
     /// `Deserialize` (serde-reflection), so a key skipped when serialized
@@ -76,6 +79,8 @@ mod tests {
             aivyx_mcp_server::AccessLevel::ALL.iter().map(|l| l.as_str()).collect(),
         )];
         let defaults = serde_json::to_value(Settings::default()).unwrap();
+        use aivyx_config::BUILD_TIME_FEATURE_CONFIG as BUILD_TIME;
+        const BUILD_TIME_TAG: &str = " (build-time feature)";
 
         fn variants(registry: &Registry, f: &Format) -> Option<Vec<String>> {
             match f {
@@ -146,8 +151,19 @@ mod tests {
                         .find(|(p, _)| *p == path)
                         .map(|(_, vs)| vs.iter().map(|v| v.to_string()).collect())
                 });
-                if let Some(set) = set {
+                if let Some(mut set) = set {
+                    // A build-time-feature value gets its own tagged line.
+                    for (_, value) in BUILD_TIME.iter().filter(|(k, _)| *k == path) {
+                        let Some(value) = value else { continue };
+                        let before = set.len();
+                        set.retain(|v| v != value);
+                        assert!(set.len() < before, "{path} has no value {value}");
+                        self.out.push(format!("{path} = \"{value}\"{BUILD_TIME_TAG}"));
+                    }
                     line.push_str(&format!(" (one of: {})", set.join(" | ")));
+                }
+                if BUILD_TIME.contains(&(path, None)) {
+                    line.push_str(BUILD_TIME_TAG);
                 }
                 self.out.push(line);
             }
@@ -212,6 +228,16 @@ mod tests {
             config.push(format!("{old} (deprecated: use {new})"));
         }
         config.sort();
+        for (key, value) in BUILD_TIME {
+            let tagged = match value {
+                Some(value) => format!("{key} = \"{value}\"{BUILD_TIME_TAG}"),
+                None => format!("{key} = "),
+            };
+            assert!(
+                config.iter().any(|l| l.starts_with(&tagged) && l.ends_with(BUILD_TIME_TAG)),
+                "BUILD_TIME_FEATURE_CONFIG names {key} {value:?}, which no config line tags"
+            );
+        }
         config
     }
 

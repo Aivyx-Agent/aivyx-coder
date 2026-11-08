@@ -11,6 +11,18 @@ mod unknown_keys;
 pub use deprecated::{DEPRECATED_KEYS, Deprecation};
 pub use unknown_keys::{UnknownKey, parse_reporting};
 
+/// The config a build only uses with a non-default Cargo feature
+/// (`provider-mistral-rs`): no release binary has it, so it is not part of
+/// the 1.x stable surface (docs/COMPATIBILITY.md). `(key, None)` is a
+/// whole key, `(key, Some(value))` one value of an enum key.
+/// `docs/stable/config.txt` tags each with ` (build-time feature)`.
+pub const BUILD_TIME_FEATURE_CONFIG: &[(&str, Option<&str>)] = &[
+    ("backend.kind", Some("mistral_rs")),
+    ("backend.mistralrs_chat_template_path", None),
+    ("backend.mistralrs_model_file", None),
+    ("backend.mistralrs_model_path", None),
+];
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine a config directory for this platform")]
@@ -946,17 +958,19 @@ pub struct BackendSettings {
     /// marks it cloud.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<aivyx_route::Locality>,
-    /// Absolute path to a local GGUF file or a directory containing GGUF
-    /// files. Required when `kind = "mistral_rs"` -- checked at
+    /// Build-time feature, not stable. Absolute path to a local GGUF file
+    /// or a directory containing GGUF files. Required when
+    /// `kind = "mistral_rs"` -- checked at
     /// backend-construction time (agent_builder.rs), not at config-load
     /// time, matching how llama-server's own reachability isn't checked
     /// at load time either.
     pub mistralrs_model_path: Option<String>,
-    /// Selects a specific `.gguf` file inside `mistralrs_model_path`
-    /// when it's a directory containing more than one candidate.
+    /// Build-time feature, not stable. Selects a specific `.gguf` file
+    /// inside `mistralrs_model_path` when it's a directory containing
+    /// more than one candidate.
     pub mistralrs_model_file: Option<String>,
-    /// Overrides the chat template mistral.rs would otherwise infer
-    /// from the model's own metadata.
+    /// Build-time feature, not stable. Overrides the chat template
+    /// mistral.rs would otherwise infer from the model's own metadata.
     pub mistralrs_chat_template_path: Option<String>,
     /// How hard a reasoning model thinks before it answers, e.g.
     /// `"medium"`. Unset (the default), the model uses its own default,
