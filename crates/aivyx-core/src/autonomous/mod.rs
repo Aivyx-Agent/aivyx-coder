@@ -161,96 +161,6 @@ fn cancelled_notice(iterations_used: u32) -> String {
     format!("autonomous run stopped: cancelled by user after {iterations_used} iteration(s)")
 }
 
-/// The review turn `[autonomous] final_review` sends when the goal is
-/// reached. In the build tests the 27B twice left out fields the brief says
-/// are `null` while its final answer said they were `null`; the rest of the
-/// checklist is general practice for reviewing a change against a spec.
-const FINAL_REVIEW_MESSAGE: &str = "Before this run ends, check your work against the task's \
-spec as a reviewer would. Read the code (don't rely on memory) and check: every request and \
-response the spec describes, field by field (names, types, status codes, and whether a missing \
-value is `null` or left out); malformed or missing input (bodies that are not valid JSON, missing \
-fields, wrong types) gets the documented client error, not a server error; boundary and impossible \
-values (empty strings, zero and negative numbers, dates that do not exist) are handled as the spec \
-says; documented defaults and limits apply when a value is omitted; responses use the documented \
-format and content type; and behaviour from earlier parts of the task, and the existing tests, \
-still work. Fix each mismatch with a test. If everything matches, say so and change nothing.";
-
-/// `[autonomous] final_review` and its settings, as a run uses them.
-/// `Default` is off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FinalReview {
-    pub enabled: bool,
-    /// Review turns to send, one each time the goal is reached.
-    pub rounds: u32,
-    /// A review turn is skipped when less time than this (or than a
-    /// quarter of the run's `max_duration`, if that is less) is left.
-    pub min_budget: Duration,
-    /// Each review turn starts from a fresh conversation
-    /// (`Agent::replace_history_for_review`).
-    pub fresh_context: bool,
-}
-
-/// A run's final review so far: what is left to send, and what happened,
-/// for `--report`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReviewState {
-    pub rounds_left: u32,
-    pub min_budget: Duration,
-    pub fresh_context: bool,
-    /// Review turns sent.
-    pub ran: u32,
-    /// A review turn was due but too little time (or the last iteration)
-    /// was left for it.
-    pub skipped_for_budget: bool,
-    /// Why a due review turn was not sent: `budget` (too little time
-    /// left), `iterations` (the last iteration) or `verification_failed`.
-    pub skip_reason: Option<&'static str>,
-}
-
-impl ReviewState {
-    /// The guard is `min_budget` or a quarter of the run's `max_duration`,
-    /// whichever is less, so a short run can still review.
-    pub fn new(review: &FinalReview, max_duration: Duration) -> Self {
-        Self {
-            rounds_left: if review.enabled { review.rounds } else { 0 },
-            min_budget: review.min_budget.min(max_duration / 4),
-            fresh_context: review.fresh_context,
-            ran: 0,
-            skipped_for_budget: false,
-            skip_reason: None,
-        }
-    }
-
-    /// A review turn was due but can't be sent (`reason`, see
-    /// `skip_reason`): no more are sent. Returns whether one was due.
-    fn skip(&mut self, reason: &'static str) -> bool {
-        if self.rounds_left == 0 {
-            return false;
-        }
-        self.rounds_left = 0;
-        self.skipped_for_budget = matches!(reason, "budget" | "iterations");
-        self.skip_reason = Some(reason);
-        true
-    }
-}
-
-/// What the driver sends when the goal is reached: the review message while
-/// review rounds are left and at least `min_budget` of the run's time
-/// (`remaining`) is; otherwise `None` (stop). Too little time ends the
-/// review for good.
-fn after_goal(review: &mut ReviewState, remaining: Duration) -> Option<String> {
-    if review.rounds_left == 0 {
-        return None;
-    }
-    if remaining < review.min_budget {
-        review.skip("budget");
-        return None;
-    }
-    review.rounds_left -= 1;
-    review.ran += 1;
-    Some(FINAL_REVIEW_MESSAGE.to_string())
-}
-
 /// The stop notice with the facts aivyx-coder checked itself indented
 /// under it, one per line (`RunFacts::notice_lines`).
 fn notice_with_facts(notice: &str, facts: &RunFacts) -> String {
@@ -323,9 +233,6 @@ pub struct AutonomousRun {
     pub read_only_paths: Vec<PathBuf>,
     /// `--report`: where to write the run's facts as JSON when it stops.
     pub report: Option<PathBuf>,
-    /// `[autonomous] final_review` and its settings: review turns against
-    /// the spec before the run stops with its goal reached.
-    pub final_review: FinalReview,
     /// `[backend]` model, address and reasoning effort, for `--report`.
     pub model: RunModel,
 }
@@ -389,10 +296,6 @@ pub async fn drive(
     let started = Instant::now();
     let deadline = started + run.max_duration;
     agent.mark_run_start().await;
-    let mut review = ReviewState::new(&run.final_review, run.max_duration);
-    // The worktree when the first review turn started, for the files the
-    // review changed (`--report`).
-    let mut review_start: Option<String> = None;
     let mut iterations_used = 0u32;
     let mut failed_in_a_row = 0u32;
     let mut next_message = Some(run.goal.clone());
@@ -460,19 +363,7 @@ pub async fn drive(
             mission_plan_snapshot.as_ref(),
             &open_specialist_sessions,
         );
-        if next_message.is_none() {
-            next_message = review_turn(
-                agent,
-                run,
-                cwd,
-                &mut review,
-                &mut review_start,
-                iterations_used,
-                deadline,
-            )
-            .await;
-        }
-        // The goal is reached (and reviewed): the final checks decide
+        // The goal is reached: the final checks decide
         // whether it really is. A failing one goes back to the model while
         // there are tries, turns and time left.
         if next_message.is_none() && !run.final_checks.is_empty() {
@@ -506,16 +397,6 @@ pub async fn drive(
             }
         }
     };
-    let review_changed = match &review_start {
-        Some(oid) => agent.changed_paths_since(oid).await.unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let review = crate::run_facts::FinalReviewFacts {
-        ran: review.ran,
-        skipped_for_budget: review.skipped_for_budget,
-        skip_reason: review.skip_reason,
-        changed_files: review_changed,
-    };
     finish(
         agent,
         run,
@@ -526,7 +407,6 @@ pub async fn drive(
         started,
         stop,
         active_cancellation,
-        &review,
         final_checks,
     )
     .await
@@ -545,59 +425,6 @@ fn final_checks_failed_message(checks: &[crate::run_facts::FinalCheck]) -> Strin
     message
 }
 
-/// The goal is reached: the next review turn's message, if one is due,
-/// there's budget for it and the last verification didn't fail, else `None`
-/// (stop). With `fresh_context`, the
-/// conversation is replaced first and the message opens with what the
-/// review needs (`Agent::replace_history_for_review`).
-async fn review_turn(
-    agent: &mut Agent,
-    run: &AutonomousRun,
-    cwd: &Path,
-    review: &mut ReviewState,
-    review_start: &mut Option<String>,
-    iterations_used: u32,
-    deadline: Instant,
-) -> Option<String> {
-    // Not on the last allowed iteration: the review would end the run as
-    // "budget exhausted" with the goal reached.
-    if iterations_used >= run.max_iterations {
-        if review.skip("iterations") {
-            agent.info("final review skipped: no iterations left (max_iterations)");
-        }
-        return None;
-    }
-    // A review checks finished work against the spec; with the tests
-    // failing the work isn't finished, and the run says so in its notice.
-    if agent.last_verification_passed() == Some(false) {
-        if review.skip("verification_failed") {
-            agent.info("final review skipped: the last verification run failed");
-        }
-        return None;
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let rounds_before = review.rounds_left;
-    let Some(message) = after_goal(review, remaining) else {
-        if review.skipped_for_budget && rounds_before > 0 {
-            agent.info(format!(
-                "final review skipped: {}s of the run's time left, under \
-                 final_review_min_budget_secs ({}s)",
-                remaining.as_secs(),
-                review.min_budget.as_secs()
-            ));
-        }
-        return None;
-    };
-    if review_start.is_none() {
-        *review_start = agent.snapshot_worktree("final review start").await;
-    }
-    if !review.fresh_context {
-        return Some(message);
-    }
-    let context = agent.review_context(&run.goal, cwd).await;
-    Some(agent.replace_history_for_review(context, &message))
-}
-
 /// Ends a run: runs the final checks (only when the goal was reached),
 /// collects the facts, writes `--report`, and returns the notice with the
 /// facts under it.
@@ -612,7 +439,6 @@ async fn finish(
     started: Instant,
     stop: &CancellationToken,
     active_cancellation: &Mutex<Option<CancellationToken>>,
-    review: &crate::run_facts::FinalReviewFacts,
     checked: Option<Vec<crate::run_facts::FinalCheck>>,
 ) -> RunEnd {
     let mut facts = RunFacts {
@@ -665,7 +491,6 @@ async fn finish(
             usage: agent.usage_totals(),
             checkpoints,
             checkpoint_failures,
-            final_review: review,
         };
         if let Err(err) = write_report(path, &report.to_json()) {
             agent.notify(format!("couldn't write the --report file {}: {err}", path.display()));

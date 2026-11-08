@@ -54,22 +54,6 @@ pub struct ChangedFile {
     pub read_only: bool,
 }
 
-/// `[autonomous] final_review` in `--report`: how many review turns ran,
-/// whether and why a due one was skipped, and the files changed from the
-/// first review turn on (relative to the repository root, generated files
-/// left out).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct FinalReviewFacts {
-    pub ran: u32,
-    /// A due review was skipped for lack of time or iterations
-    /// (`skip_reason` `budget` or `iterations`).
-    pub skipped_for_budget: bool,
-    /// `budget`, `iterations` or `verification_failed`; `null` when no due
-    /// review was skipped.
-    pub skip_reason: Option<&'static str>,
-    pub changed_files: Vec<String>,
-}
-
 /// What the stop notice and the report say beyond the stop reason.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunFacts {
@@ -102,8 +86,9 @@ impl UsageTotals {
 }
 
 /// The `--report` format's version: bumped when a field changes meaning
-/// or goes away, not when one is added.
-pub const REPORT_VERSION: u32 = 1;
+/// or goes away, not when one is added. 2: `final_review` removed with
+/// the option.
+pub const REPORT_VERSION: u32 = 2;
 
 /// The `--report` file's contents.
 #[derive(Debug, Clone)]
@@ -128,7 +113,6 @@ pub struct RunReport<'a> {
     /// Tool-call checkpoints during the run, and how many failed.
     pub checkpoints: u32,
     pub checkpoint_failures: u32,
-    pub final_review: &'a FinalReviewFacts,
 }
 
 /// The JSON shape: `RunReport` flattened, with the read-only files that
@@ -154,7 +138,6 @@ struct ReportJson<'a> {
     peak_context_tokens: u32,
     checkpoints: u32,
     checkpoint_failures: u32,
-    final_review: &'a FinalReviewFacts,
     /// Files in `read_only_paths` that changed anyway (a command can change
     /// what the file tools may not).
     read_only_touched: Vec<&'a str>,
@@ -264,7 +247,6 @@ impl RunReport<'_> {
             peak_context_tokens: self.usage.peak_prompt_tokens,
             checkpoints: self.checkpoints,
             checkpoint_failures: self.checkpoint_failures,
-            final_review: self.final_review,
             read_only_touched: self
                 .changed_files
                 .iter()
@@ -346,12 +328,6 @@ mod tests {
             file("src/main.rs", "modified", 10, 2, false),
             file("BRIEF.md", "modified", 1, 1, true),
         ];
-        let review = FinalReviewFacts {
-            ran: 2,
-            skipped_for_budget: false,
-            skip_reason: None,
-            changed_files: vec!["src/main.rs".into()],
-        };
         let report = RunReport {
             report_version: REPORT_VERSION,
             coder_version: "0.6.3",
@@ -374,10 +350,9 @@ mod tests {
             },
             checkpoints: 30,
             checkpoint_failures: 1,
-            final_review: &review,
         };
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
-        assert_eq!(json["report_version"], 1);
+        assert_eq!(json["report_version"], 2);
         let with_userinfo = RunReport { base_url: "http://user:secret@llama:8080/v1", ..report };
         let json_userinfo: serde_json::Value =
             serde_json::from_str(&with_userinfo.to_json()).unwrap();
@@ -399,15 +374,7 @@ mod tests {
         assert_eq!(json["checkpoints"], 30);
         assert_eq!(json["checkpoint_failures"], 1);
         assert_eq!(json["read_only_touched"], serde_json::json!(["BRIEF.md"]));
-        assert_eq!(
-            json["final_review"],
-            serde_json::json!({
-                "ran": 2,
-                "skipped_for_budget": false,
-                "skip_reason": null,
-                "changed_files": ["src/main.rs"],
-            })
-        );
+        assert!(json.get("final_review").is_none());
     }
 
     #[test]

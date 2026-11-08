@@ -19,8 +19,8 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
 ## Not stable
 
 - **Previews and experimental options.** Anything the manual marks
-  experimental, such as the `final_review` option, can change or be
-  removed in any release. No feature is labelled a preview today.
+  experimental or a preview can change or be removed in any release.
+  Nothing is so marked today.
 - **The TUI's look**, and keys beyond the documented ones.
 - **Internal crates.** The crates in this repository are not a public API.
 - **The tools the model sees.** Their names, arguments and descriptions

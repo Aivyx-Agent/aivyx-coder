@@ -99,13 +99,7 @@ aivyx-coder checked itself to this file as JSON:
   `peak_context_tokens` over the main loop's model requests (as the server
   reported them; sub-agents aren't counted);
 - `checkpoints` and `checkpoint_failures` during the run;
-- `final_review`: `ran` (review turns sent); `skip_reason`, why a due
-  review was not sent (`budget`: too little time left; `iterations`: the
-  last iteration; `verification_failed`: the last verification run failed;
-  `null` when none was skipped); `skipped_for_budget`, true when
-  `skip_reason` is `budget` or `iterations`; and `changed_files`, the files
-  changed from the first review turn on. See `[autonomous] final_review`;
-- `report_version` (1) and `coder_version`. The version goes up only when a
+- `report_version` (2) and `coder_version`. The version goes up only when a
   field changes meaning or is removed, not when one is added.
 
 The file is private to you (mode 600).

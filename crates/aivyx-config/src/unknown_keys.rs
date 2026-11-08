@@ -259,6 +259,27 @@ mod tests {
     }
 
     #[test]
+    fn removed_final_review_keys_warn_and_still_load() {
+        // The experiment measured no effect; 1.0 removed it (R10).
+        let raw = "[autonomous]\nmax_iterations = 7\nfinal_review = true\n\
+                   final_review_rounds = 2\nfinal_review_min_budget_secs = 60\n\
+                   final_review_fresh_context = true\n";
+        let (settings, keys) = parse_reporting::<Settings>(raw).unwrap();
+        assert_eq!(settings.autonomous.max_iterations, 7);
+        let mut got: Vec<&str> = keys.iter().map(|k| k.path.as_str()).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "autonomous.final_review",
+                "autonomous.final_review_fresh_context",
+                "autonomous.final_review_min_budget_secs",
+                "autonomous.final_review_rounds",
+            ]
+        );
+    }
+
+    #[test]
     fn loaded_values_are_unchanged_by_the_warning_path() {
         let raw = "stray = 1\n[backend]\nmodel = \"m\"\nbase_url = \"http://h/v1\"\nstray2 = 2\n";
         let (with, keys) = parse_reporting::<Settings>(raw).unwrap();

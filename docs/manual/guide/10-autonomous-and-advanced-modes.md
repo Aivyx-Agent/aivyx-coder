@@ -75,48 +75,6 @@ max_duration_secs = 3600  # wall-clock limit
 The time limit is exact: a turn still running when it passes is stopped,
 the same way Ctrl+C stops it, and the run reports the budget exhausted.
 
-**A last review (experimental).** With `final_review = true` under
-`[autonomous]`, when the goal is reached the model gets a review turn. It
-is asked to read the code and check it against the task's spec as a
-reviewer would: every request and response field by field (names, types,
-status codes, `null` versus left out); malformed or missing input getting
-the documented client error rather than a server error; boundary and
-impossible values; documented defaults and limits; response formats and
-content types; and that earlier behaviour and the existing tests still
-work. It fixes each mismatch with a test, or says everything matches and
-changes nothing. It is off by default while we measure whether it helps.
-
-```toml
-[autonomous]
-final_review = true
-final_review_rounds = 1             # review turns, one each time the goal is reached
-final_review_min_budget_secs = 600  # skip a review with less time than this left
-final_review_fresh_context = false  # start each review from a fresh conversation
-```
-
-Each review turn counts against `max_iterations`. None is sent on the
-last iteration, or while the last verification run failed (the work isn't
-finished then, and the stop notice says so). None is sent either with less
-than `final_review_min_budget_secs` of `max_duration_secs` left, or less
-than a quarter of `max_duration_secs` if that is smaller, so a short run
-can still review. This makes it less likely that the time limit stops a
-review turn partway through a fix; it can't rule it out. The transcript
-and `--report` say when a review was skipped, and why.
-
-With `final_review_fresh_context = true`, a review turn starts without the
-run's long history. Its message holds the goal; up to four files the goal
-names, read the way `read_file` reads them (so `deny_paths` applies) and
-each cut at 64 KiB; the end of the last verification output; and the diff
-since the run started, which opens with a summary of every changed file
-and leaves out the bodies of lockfiles (`Cargo.lock`, `package-lock.json`
-and the like). The whole message is kept to about a quarter of
-`[backend] context_tokens`, filled in that order: whatever doesn't fit is
-cut from the diff first, then the verification output, then the files,
-with a "… N bytes cut" marker where it was. Only the live conversation is
-replaced: the saved session keeps the run's conversation followed by the
-review's, and the task list, approvals, checkpoints, plan mode and the
-prompt-injection guard all carry on as before.
-
 **What the run reports.** The model writes its own final answer, and it can
 be wrong. In the build tests, models said fields were `null` when they
 weren't, and that clippy was clean after it had printed three warnings. So

@@ -182,7 +182,7 @@ async fn a_finished_run_exits_0_with_the_report() {
     assert!(stderr.contains("] tool set_tasks"), "{stderr}");
     assert!(stderr.contains("] tasks: 1/1 done"), "{stderr}");
     let json = read_report(&report);
-    assert_eq!(json["report_version"], 1);
+    assert_eq!(json["report_version"], 2);
     assert_eq!(json["outcome"], "goal_achieved");
     assert_eq!(json["model"], "fake-model");
     assert_eq!(json["model_requests"], 2);
