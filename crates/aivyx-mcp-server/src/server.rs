@@ -9,7 +9,7 @@ use aivyx_core::Agent;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -438,12 +438,12 @@ impl AivyxCoderMcpServer {
 // genuinely used instead of dead weight.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AivyxCoderMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` (== `InitializeResult`) is `#[non_exhaustive]` as of
-        // rmcp 2.x, so it can no longer be built with a plain struct
-        // literal -- `ServerInfo::new` + the `with_*` builder methods
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` (rmcp 3.x's name for `ServerInfo`, == `InitializeResult`) is
+        // `#[non_exhaustive]`, so it can't be built with a plain struct
+        // literal -- `ServerConfig::new` + the `with_*` builder methods
         // replace that, keeping the exact same fields set as before.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             // Not `Implementation::from_build_env()`: that is compiled
             // inside rmcp, so it reports rmcp's own name and version.

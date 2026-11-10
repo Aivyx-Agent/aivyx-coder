@@ -35,7 +35,7 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # which a partial bump could silently desync.
 aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8", default-features = false }
 aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "55f4c93ee87c593f58b5e0ca206263cead98f20d" }
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "4ec85e4d887a6f0de2318baf1fa4d7e9023a1ffc" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "7c1e9fbae40dc3c40fba847d28058d96d036a43e" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "c16530ecc58201e81c0e907fc1ffce150f63960d" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a3eb989ea86b4784a3bd118d21530c5731ae21f6" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffaff98acf1bd32955e6abdb659444215218416e" }
