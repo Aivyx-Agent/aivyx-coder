@@ -10,6 +10,11 @@ story:
 3. **Landlock + seccomp** — on Linux, every program the model runs is
    confined by the kernel.
 
+Model traffic stays on your machine or network: requests to the model
+server, to `mold serve` and to `aivyx-broker` never go through a proxy, even
+when `HTTP_PROXY` or `ALL_PROXY` is set. Only `web_fetch` and `web_search`,
+which reach the internet, use a configured proxy.
+
 Plus checkpoints, so a turn can be taken back (`/undo`), and a
 prompt-injection scan on everything that re-enters the model's context. What
 this does **not** protect against is in

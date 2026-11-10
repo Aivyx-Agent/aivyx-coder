@@ -35,11 +35,11 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # which a partial bump could silently desync.
 aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8", default-features = false }
 aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "55f4c93ee87c593f58b5e0ca206263cead98f20d" }
-aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "7c1e9fbae40dc3c40fba847d28058d96d036a43e" }
+aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "0fb15c3ed2728da49c192890bff6af45e78ecbcc" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "c16530ecc58201e81c0e907fc1ffce150f63960d" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a3eb989ea86b4784a3bd118d21530c5731ae21f6" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffaff98acf1bd32955e6abdb659444215218416e" }
-aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "1ab893732e07daca13d37ea2a1695b229c058a20" }
+aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "d1089d024a735a888e7ffa0669bddada03532542" }
 # The signed pack format shared with aivyx-pa (config packs). Not on
 # crates.io -- pinned by commit SHA like the others; MUST stay public.
 aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "2c9b51770ec0d568326f4dae774d35aae06b1aa9" }
@@ -48,9 +48,9 @@ aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "2c9b517
 # backend, so no target-gating needed. All three pinned to the same rev
 # (Milestone 2 Pass A's merge commit in that repo) so they never drift
 # out of lockstep with each other.
-aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
-aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
-aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "070189478d27bc4a04210d9c850c72fab02d8a6a" }
+aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "d138825efd1c5766cb9e41692a36dd287a2a1dbd" }
+aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "d138825efd1c5766cb9e41692a36dd287a2a1dbd" }
+aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "d138825efd1c5766cb9e41692a36dd287a2a1dbd" }
 
 [profile.release]
 strip = true

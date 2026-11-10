@@ -43,7 +43,7 @@ pub fn unreachable_notice(base_url: &str) -> String {
 /// uses) for its served context window.
 pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext {
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+    let client = match crate::model_client_builder().timeout(PROBE_TIMEOUT).build() {
         Ok(client) => client,
         Err(_) => return ServedContext::Unknown,
     };
@@ -107,7 +107,7 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 /// following `probe_served_context` can see it.
 pub async fn verify_model_responds(base_url: &str, model: &str) -> Result<(), String> {
     let base = base_url.trim_end_matches('/');
-    let client = reqwest::Client::builder()
+    let client = crate::model_client_builder()
         .timeout(VERIFY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;

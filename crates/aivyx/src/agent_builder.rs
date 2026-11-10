@@ -1453,6 +1453,9 @@ pub(crate) async fn build_agent(
     if let Some(notice) = carved_root_cargo_notice(&cwd, &deny_paths) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
     }
+    if let Some(notice) = remote_mold_notice(settings) {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
+    }
 
     // KV-cache persistence/sharing (aivyx-kvcache): only ever attempted
     // against a real llama-server backend, whose `/props` response both
@@ -1856,8 +1859,26 @@ pub(crate) async fn build_agent(
 /// handle. Matching `aivyx_llm::probe::probe_served_context`'s own
 /// handling of the identical failure (probe.rs:33-36): treat it as
 /// "kvcache unavailable this run", not a startup panic.
+/// A startup notice when image generation is on and `[vision] mold_url` is
+/// not a local address: `generate_image` sends it the prompt and, for
+/// image-to-image, the reference image's bytes. The same address rule as
+/// `[backend]` (aivyx-route's `url_locality`); aivyx-vision audit
+/// 2026-11-11 M2.
+fn remote_mold_notice(settings: &Settings) -> Option<String> {
+    if !settings.vision.enabled
+        || aivyx_route::url_locality(&settings.vision.mold_url) == aivyx_route::Locality::Local
+    {
+        return None;
+    }
+    Some(format!(
+        "[vision] mold_url `{}` is not a local address: generate_image sends it your prompts \
+         and any reference image. Point it at a mold serve on this machine or your own network.",
+        settings.vision.mold_url
+    ))
+}
+
 fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    aivyx_llm::model_client_builder()
         .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
         .build()
 }
@@ -2121,6 +2142,25 @@ mod tests {
                 assert_eq!(sent.and_then(|v| v.as_str()), effort, "{kind:?}");
                 assert_eq!(body.get("reasoning_effort").and_then(|v| v.as_str()), effort);
             }
+        }
+    }
+
+    /// aivyx-vision audit 2026-11-11 M2.
+    #[test]
+    fn a_remote_mold_url_gets_a_startup_notice_only_when_vision_is_on() {
+        let mut settings = Settings::default();
+        settings.vision.mold_url = "http://mold.example.com:7680".to_string();
+        assert_eq!(remote_mold_notice(&settings), None, "vision is off by default");
+        settings.vision.enabled = true;
+        let notice = remote_mold_notice(&settings).expect("a remote mold_url is named");
+        assert!(notice.contains("mold.example.com"), "{notice}");
+        for local in [
+            "http://127.0.0.1:7680",
+            "http://localhost:7680",
+            "http://192.168.1.20:7680",
+        ] {
+            settings.vision.mold_url = local.to_string();
+            assert_eq!(remote_mold_notice(&settings), None, "{local} is local");
         }
     }
 

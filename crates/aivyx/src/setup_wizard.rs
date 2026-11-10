@@ -216,7 +216,7 @@ pub(crate) fn backend_menu(running: [bool; 3]) -> ([String; 3], usize) {
 
 /// Which backends answer at their default address right now (menu order).
 async fn detect_running_backends() -> [bool; 3] {
-    let client = match reqwest::Client::builder()
+    let client = match aivyx_llm::model_client_builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
     {

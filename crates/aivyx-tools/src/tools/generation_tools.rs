@@ -224,10 +224,16 @@ fn success_message(kind: &str, asset: &GeneratedAsset) -> String {
         .seed_used
         .map(|s| s.to_string())
         .unwrap_or_else(|| "none".to_string());
-    format!(
+    let mut message = format!(
         "generated {kind} saved to {} (seed {seed_display})",
         asset.path.display()
-    )
+    );
+    // The backend's advisories (for example a size it adjusted), so the
+    // model reports what it got rather than what it asked for.
+    for warning in &asset.warnings {
+        message.push_str(&format!("; backend note: {warning}"));
+    }
+    message
 }
 
 #[cfg(test)]
@@ -246,6 +252,7 @@ mod tests {
             backend: "mold".to_string(),
             seed_used: Some(42),
             generated_at: std::time::SystemTime::now(),
+            warnings: Vec::new(),
         }
     }
 
@@ -280,6 +287,18 @@ mod tests {
         let tool = GenerateImageTool::new(Arc::new(provider), vec![]);
         assert!(tool.mutates_outside_session());
         assert!(tool.needs_checkpoint());
+    }
+
+    /// mold's advisories reach the model (aivyx-vision audit 2026-11-11 L6).
+    #[test]
+    fn success_message_passes_on_the_backend_warnings() {
+        let mut asset = sample_asset("assets/generated/a.png");
+        asset.warnings = vec!["dimensions adjusted from 1000x1000 to 1024x1024".to_string()];
+        let message = success_message("image", &asset);
+        assert!(
+            message.contains("backend note: dimensions adjusted from 1000x1000 to 1024x1024"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

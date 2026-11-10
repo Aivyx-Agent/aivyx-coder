@@ -23,7 +23,7 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "net", "io-util", "time"] }
 
 [features]
 provider-mistral-rs = ["dep:mistralrs", "dep:tokio"]

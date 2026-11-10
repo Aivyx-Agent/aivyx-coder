@@ -19,3 +19,13 @@ pub use probe::{
 };
 pub use routed::{BackendFactory, DEFAULT_COOLDOWN, ProfileRefresher, RouteRecord, RoutedBackend};
 pub use slot_pool_lock::{SlotPoolLock, fnv1a};
+
+/// The client builder for every request to a model server. aivyx-coder only
+/// talks to local models, so the client never uses a proxy: reqwest would
+/// otherwise send even loopback requests -- prompts and code included -- to
+/// `HTTP_PROXY`/`ALL_PROXY` when one is set (aivyx-vision audit 2026-11-11,
+/// X1). Internet tools (`web_fetch`, `web_search`) build their own clients
+/// and keep honouring a configured proxy.
+pub fn model_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}

@@ -64,7 +64,7 @@ impl OpenAiCompatBackend {
         api_key: Option<String>,
         idle_timeout: Duration,
     ) -> Self {
-        let http = reqwest::Client::builder()
+        let http = crate::model_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // Bounds the gap `connect_timeout` and the SSE idle-timeout
             // wrapper both miss: a backend that accepts the TCP connection

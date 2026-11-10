@@ -411,8 +411,16 @@ impl ResidencySources {
 /// and hands each snapshot to `routed`'s router; exits once `routed` is
 /// gone.
 pub(crate) fn spawn_residency_refresh(routed: Weak<RoutedBackend>, sources: ResidencySources) {
+    // aivyx-route's client: no redirects, and no proxy (residency only
+    // asks local servers).
+    let client = match aivyx_route::discovery::client() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "residency refresh disabled: could not build its HTTP client");
+            return;
+        }
+    };
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
         let mut tick = tokio::time::interval(RESIDENCY_REFRESH);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -443,7 +451,9 @@ pub(crate) async fn wrap_with_routing(
     let refresher = Arc::new(DiscoveryRefresher {
         config: config.clone(),
         default: default_endpoint(settings),
-        client: reqwest::Client::new(),
+        // aivyx-route's client: no redirects, and no proxy (discovery only
+        // asks local servers).
+        client: aivyx_route::discovery::client()?,
     });
     let profiles = refresher.refresh().await;
     let default_key = ModelKey {

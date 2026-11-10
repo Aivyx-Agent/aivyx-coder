@@ -22,7 +22,7 @@ pub enum ListModelsError {
 /// models across versions).
 pub async fn list_ollama_models(base_url: &str) -> Result<Vec<String>, ListModelsError> {
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let client = reqwest::Client::builder()
+    let client = crate::model_client_builder()
         .timeout(LIST_MODELS_TIMEOUT)
         .build()
         .map_err(|e| ListModelsError::Transport(e.to_string()))?;
@@ -65,7 +65,7 @@ fn parse_ollama_tags(json: &serde_json::Value) -> Vec<String> {
 /// manual entry.
 pub async fn list_openai_compatible_models(base_url: &str) -> Result<Vec<String>, ListModelsError> {
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let client = reqwest::Client::builder()
+    let client = crate::model_client_builder()
         .timeout(LIST_MODELS_TIMEOUT)
         .build()
         .map_err(|e| ListModelsError::Transport(e.to_string()))?;
