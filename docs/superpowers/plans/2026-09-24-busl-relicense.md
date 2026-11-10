@@ -547,7 +547,7 @@ see each repository's own `LICENSE` for its exact terms.
 
 > The authoritative terms are in each repository's own `LICENSE`; the
 > reasoning behind the model is in this ecosystem's
-> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-ecosystem/blob/main/LICENSING.md)
+> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/LICENSING.md)
 > and, for `aivyx-pa` specifically, `aivyx-pa/docs/LICENSING.md`. Where
 > this page and a repository's `LICENSE` ever appear to differ, that
 > repository's `LICENSE` governs.
@@ -768,7 +768,7 @@ covers this).
 > **Why this exists:** without it, the relicense and the commercial
 > offering could not legally cover contributed lines. This gate must
 > precede any external PR — see the ecosystem's own
-> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-ecosystem/blob/main/LICENSING.md).
+> [`LICENSING.md`](https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/LICENSING.md).
 
 ## Before you open a PR
 
@@ -982,7 +982,7 @@ Aivyx Coder moves from MIT OR Apache-2.0 to the Business Source License
 1.1 -- source-available, free for personal/non-commercial use, a paid
 commercial license for business/production use, converting to MIT four
 years after this release. See LICENSE, COMMERCIAL.md, and the
-ecosystem-wide policy at https://github.com/Aivyx-Agent/aivyx-ecosystem/blob/main/LICENSING.md."
+ecosystem-wide policy at https://github.com/Aivyx-Agent/aivyx-pa/blob/main/docs/LICENSING.md."
 ```
 
 **This tag stays local.** Pushing it (`git push origin v0.2.0`) fires
