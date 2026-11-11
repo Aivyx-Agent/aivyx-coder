@@ -464,6 +464,10 @@ pub struct VisionSettings {
     pub legacy_broker_url: Option<String>,
     pub mold_url: String,
     pub api_key: Option<String>,
+    /// Show the model a small preview of each image `generate_image` and
+    /// `upscale_image` make, when the model can take images, so it can
+    /// check its work. Default true.
+    pub show_model_previews: bool,
 }
 
 impl Default for VisionSettings {
@@ -473,6 +477,7 @@ impl Default for VisionSettings {
             legacy_broker_url: None,
             mold_url: "http://127.0.0.1:7680".to_string(),
             api_key: None,
+            show_model_previews: true,
         }
     }
 }

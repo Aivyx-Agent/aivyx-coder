@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
-use aivyx_types::{ToolDefinition, ToolOutput};
+use aivyx_types::{ImageData, ToolDefinition, ToolOutput};
 use aivyx_vision_core::{
     GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, UpscaleRequest,
     generate_variations,
@@ -66,6 +66,7 @@ struct GenerateImageArgs {
 pub struct GenerateImageTool {
     provider: Arc<dyn GenerationProvider>,
     deny_paths: Vec<PathBuf>,
+    previews: bool,
 }
 
 impl GenerateImageTool {
@@ -73,7 +74,15 @@ impl GenerateImageTool {
         Self {
             provider,
             deny_paths,
+            previews: true,
         }
+    }
+
+    /// `[vision] show_model_previews` (default on): give the agent a small
+    /// preview of each image, shown to a model that can take images.
+    pub fn with_model_previews(mut self, on: bool) -> Self {
+        self.previews = on;
+        self
     }
 }
 
@@ -121,6 +130,14 @@ impl Tool for GenerateImageTool {
         arguments: serde_json::Value,
         ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        Ok(self.execute_with_images(arguments, ctx).await?.0)
+    }
+
+    async fn execute_with_images(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<(ToolOutput, Vec<ImageData>), ToolError> {
         let args: GenerateImageArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let reference_image = args
@@ -142,10 +159,13 @@ impl Tool for GenerateImageTool {
             if let Some(path) = path
                 && path_is_denied(path, &self.deny_paths)
             {
-                return Ok(ToolOutput::Denied(format!(
-                    "{field} `{}` is under a configured deny_paths entry (hard-blocked)",
-                    path.display()
-                )));
+                return Ok((
+                    ToolOutput::Denied(format!(
+                        "{field} `{}` is under a configured deny_paths entry (hard-blocked)",
+                        path.display()
+                    )),
+                    Vec::new(),
+                ));
             }
         }
         let req = ImageRequest {
@@ -162,7 +182,9 @@ impl Tool for GenerateImageTool {
         if count != 1 {
             let results = match generate_variations(self.provider.as_ref(), req, count).await {
                 Ok(results) => results,
-                Err(e) => return Ok(ToolOutput::Error(format!("generate_image: {e}"))),
+                Err(e) => {
+                    return Ok((ToolOutput::Error(format!("generate_image: {e}")), Vec::new()));
+                }
             };
             let lines: Vec<String> = results
                 .iter()
@@ -173,19 +195,27 @@ impl Tool for GenerateImageTool {
                 })
                 .collect();
             if results.iter().all(|r| r.is_err()) {
-                return Ok(ToolOutput::Error(format!(
-                    "generate_image: every variation failed\n{}",
-                    lines.join("\n")
-                )));
+                return Ok((
+                    ToolOutput::Error(format!(
+                        "generate_image: every variation failed\n{}",
+                        lines.join("\n")
+                    )),
+                    Vec::new(),
+                ));
             }
-            return Ok(ToolOutput::Ok(format!(
-                "{count} variations:\n{}",
-                lines.join("\n")
-            )));
+            let paths = results.iter().flatten().map(|asset| asset.path.clone());
+            let images = previews(self.previews, paths).await;
+            return Ok((
+                ToolOutput::Ok(format!("{count} variations:\n{}", lines.join("\n"))),
+                images,
+            ));
         }
         match self.provider.generate_image(req).await {
-            Ok(asset) => Ok(ToolOutput::Ok(success_message("image", &asset))),
-            Err(e) => Ok(ToolOutput::Error(format!("generate_image: {e}"))),
+            Ok(asset) => Ok((
+                ToolOutput::Ok(success_message("image", &asset)),
+                previews(self.previews, [asset.path.clone()]).await,
+            )),
+            Err(e) => Ok((ToolOutput::Error(format!("generate_image: {e}")), Vec::new())),
         }
     }
 }
@@ -201,6 +231,7 @@ struct UpscaleImageArgs {
 pub struct UpscaleImageTool {
     provider: Arc<dyn GenerationProvider>,
     deny_paths: Vec<PathBuf>,
+    previews: bool,
 }
 
 impl UpscaleImageTool {
@@ -208,7 +239,15 @@ impl UpscaleImageTool {
         Self {
             provider,
             deny_paths,
+            previews: true,
         }
+    }
+
+    /// `[vision] show_model_previews` (default on): give the agent a small
+    /// preview of each image, shown to a model that can take images.
+    pub fn with_model_previews(mut self, on: bool) -> Self {
+        self.previews = on;
+        self
     }
 }
 
@@ -251,18 +290,32 @@ impl Tool for UpscaleImageTool {
         arguments: serde_json::Value,
         ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        Ok(self.execute_with_images(arguments, ctx).await?.0)
+    }
+
+    async fn execute_with_images(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<(ToolOutput, Vec<ImageData>), ToolError> {
         let args: UpscaleImageArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let image = resolve(&ctx.cwd, &args.image);
         if path_is_denied(&image, &self.deny_paths) {
-            return Ok(ToolOutput::Denied(format!(
-                "image `{}` is under a configured deny_paths entry (hard-blocked)",
-                image.display()
-            )));
+            return Ok((
+                ToolOutput::Denied(format!(
+                    "image `{}` is under a configured deny_paths entry (hard-blocked)",
+                    image.display()
+                )),
+                Vec::new(),
+            ));
         }
         match self.provider.upscale_image(UpscaleRequest { image }).await {
-            Ok(asset) => Ok(ToolOutput::Ok(success_message("image", &asset))),
-            Err(e) => Ok(ToolOutput::Error(format!("upscale_image: {e}"))),
+            Ok(asset) => Ok((
+                ToolOutput::Ok(success_message("image", &asset)),
+                previews(self.previews, [asset.path.clone()]).await,
+            )),
+            Err(e) => Ok((ToolOutput::Error(format!("upscale_image: {e}")), Vec::new())),
         }
     }
 }
@@ -363,6 +416,29 @@ impl Tool for GenerateThreeDTool {
             Err(e) => Ok(ToolOutput::Error(format!("generate_3d: {e}"))),
         }
     }
+}
+
+/// A small JPEG of each image (at most 768 px; `aivyx_vision_mold::preview`)
+/// for the model to look at, or none when `on` is false. An image that
+/// can't be previewed is left out; the result text still names its file.
+async fn previews(on: bool, paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageData> {
+    use base64::Engine;
+    if !on {
+        return Vec::new();
+    }
+    let paths: Vec<PathBuf> = paths.into_iter().take(crate::MAX_TOOL_IMAGES).collect();
+    tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .filter_map(|path| aivyx_vision_mold::preview::model_preview(path).ok())
+            .map(|(media_type, jpeg)| ImageData {
+                media_type,
+                data: base64::engine::general_purpose::STANDARD.encode(jpeg),
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn success_message(kind: &str, asset: &GeneratedAsset) -> String {
@@ -470,6 +546,41 @@ mod tests {
         );
         assert!(msg.contains("2. failed: generation timed out"), "{msg}");
         assert!(msg.contains("(seed 7)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn generated_images_come_with_a_preview_unless_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        image::RgbImage::from_pixel(1024, 512, image::Rgb([10, 20, 30])).save(&png).unwrap();
+        let asset = || sample_asset(png.to_str().unwrap());
+
+        let tool = GenerateImageTool::new(
+            Arc::new(FakeGenerationProvider::with_image_result(Ok(asset()))),
+            vec![],
+        );
+        let (output, images) = tool
+            .execute_with_images(json!({"prompt": "a band"}), &ctx())
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Ok(_)), "{output:?}");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/jpeg");
+        use base64::Engine;
+        let jpeg = base64::engine::general_purpose::STANDARD.decode(&images[0].data).unwrap();
+        let preview = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((preview.width(), preview.height()), (768, 384));
+
+        let off = GenerateImageTool::new(
+            Arc::new(FakeGenerationProvider::with_image_result(Ok(asset()))),
+            vec![],
+        )
+        .with_model_previews(false);
+        let (_, images) = off
+            .execute_with_images(json!({"prompt": "a band"}), &ctx())
+            .await
+            .unwrap();
+        assert!(images.is_empty());
     }
 
     #[tokio::test]

@@ -1040,14 +1040,15 @@ pub(crate) async fn build_agent(
         match aivyx_vision_mold::MoldProvider::new(mold_config) {
             Ok(provider) => {
                 let provider: Arc<dyn aivyx_vision_core::GenerationProvider> = Arc::new(provider);
-                registry.register(Arc::new(GenerateImageTool::new(
-                    provider.clone(),
-                    deny_paths.clone(),
-                )));
-                registry.register(Arc::new(UpscaleImageTool::new(
-                    provider.clone(),
-                    deny_paths.clone(),
-                )));
+                let previews = settings.vision.show_model_previews;
+                registry.register(Arc::new(
+                    GenerateImageTool::new(provider.clone(), deny_paths.clone())
+                        .with_model_previews(previews),
+                ));
+                registry.register(Arc::new(
+                    UpscaleImageTool::new(provider.clone(), deny_paths.clone())
+                        .with_model_previews(previews),
+                ));
                 registry.register(Arc::new(GenerateThreeDTool::new(
                     provider,
                     deny_paths.clone(),

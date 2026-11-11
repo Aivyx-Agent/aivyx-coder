@@ -308,13 +308,14 @@ Interactive processes the model can drive (`repl_start`, `repl_send`, `repl_stop
 
 ### `[vision]`
 
-The `generate_image` and `generate_3d` tools, which need `mold serve` and aivyx-broker running (`generate_svg` needs neither and is always there). Not the `vision` model capability in `[routing]`. See [Image generation](../guide/09-local-model-servers.md#image-generation-vision).
+The `generate_image`, `upscale_image` and `generate_3d` tools, which need `mold serve` and aivyx-broker running (`generate_svg` needs neither and is always there). Not the `vision` model capability in `[routing]`. See [Image generation](../guide/09-local-model-servers.md#image-generation-vision).
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|
 | `enabled` | bool |  | Turn this on or off. |
 | `mold_url` | string |  | The `mold serve` image server address. Default `http://127.0.0.1:7680`. |
 | `api_key` | string |  | Key for the image backend, if it needs one. |
+| `show_model_previews` | bool |  | Show the model a small preview of each image `generate_image` and `upscale_image` make, so it can check its work. Only reaches a model that can take images (`llama-server` with `--mmproj`, or a routing setup with a vision model); each costs about 600–800 tokens. Default `true`. |
 
 ### `[mcp]`
 

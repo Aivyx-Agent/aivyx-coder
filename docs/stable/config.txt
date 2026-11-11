@@ -107,6 +107,7 @@ vision.api_key = null
 vision.broker_url (deprecated: use broker.base_url)
 vision.enabled = false
 vision.mold_url = "http://127.0.0.1:7680"
+vision.show_model_previews = true
 web.allow_private_targets = false
 web.enabled = true
 web.fetch_timeout_secs = 30

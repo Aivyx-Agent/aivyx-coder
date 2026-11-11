@@ -155,6 +155,24 @@ fn log_line(log: &Arc<Mutex<std::fs::File>>, line: &str) {
 
 #[async_trait]
 impl LlmBackend for OpenAiCompatBackend {
+    /// llama.cpp's `llama-server` says in `GET /props` (at the server root,
+    /// beside `/v1`): `modalities.vision` is true when it was started with
+    /// `--mmproj`. Other servers don't have that endpoint, so can't tell.
+    async fn sees_images(&self) -> Option<bool> {
+        let root = self.base_url.trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        let mut request = self.http.get(format!("{root}/props")).timeout(Duration::from_secs(5));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let props: serde_json::Value = response.json().await.ok()?;
+        props.get("modalities")?.get("vision")?.as_bool()
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -432,7 +450,7 @@ impl WireRequest {
 struct WireMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<WireContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -451,6 +469,7 @@ impl From<&Message> for WireMessage {
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_result_text: Option<String> = None;
+        let mut images = Vec::new();
 
         for block in &message.content {
             match block {
@@ -463,14 +482,31 @@ impl From<&Message> for WireMessage {
                         ToolOutput::Denied(s) => format!("Denied: {s}"),
                     });
                 }
+                ContentBlock::Image(image) => images.push(image),
             }
         }
 
-        let content = tool_result_text.or(if text.is_empty() && !tool_calls.is_empty() {
-            None
+        let content = if images.is_empty() {
+            tool_result_text
+                .or(if text.is_empty() && !tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                })
+                .map(WireContent::Text)
         } else {
-            Some(text)
-        });
+            // OpenAI's multimodal form, which llama-server (with --mmproj),
+            // Ollama and vLLM accept: text first, then each image as a
+            // data URL.
+            let mut parts = vec![serde_json::json!({"type": "text", "text": text})];
+            parts.extend(images.iter().map(|image| {
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{};base64,{}", image.media_type, image.data)},
+                })
+            }));
+            Some(WireContent::Parts(parts))
+        };
 
         Self {
             role,
@@ -479,6 +515,15 @@ impl From<&Message> for WireMessage {
             tool_call_id: message.tool_call_id.as_ref().map(|id| id.0.clone()),
         }
     }
+}
+
+/// A message's `content`: plain text, or the parts of a message with
+/// images.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
 }
 
 #[derive(Serialize)]
@@ -590,6 +635,33 @@ struct WireUsage {
 mod tests {
     use super::*;
 
+    /// A message with images goes out in OpenAI's multimodal form, which
+    /// llama-server with --mmproj accepted in the 2026-11-12 live run.
+    #[test]
+    fn a_message_with_images_is_sent_as_text_and_image_parts() {
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text("look at this".to_string()),
+                ContentBlock::Image(aivyx_types::ImageData {
+                    media_type: "image/jpeg".to_string(),
+                    data: "/9j/".to_string(),
+                }),
+            ],
+            tool_call_id: None,
+        };
+        let wire = serde_json::to_value(WireMessage::from(&message)).unwrap();
+        assert_eq!(
+            wire["content"],
+            serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/"}},
+            ])
+        );
+        let plain = serde_json::to_value(WireMessage::from(&Message::text(Role::User, "hi"))).unwrap();
+        assert_eq!(plain["content"], "hi");
+    }
+
     #[test]
     fn wire_message_omits_content_for_tool_call_only_assistant_message() {
         let message = Message {
@@ -623,7 +695,7 @@ mod tests {
 
         let wire = WireMessage::from(&message);
         assert_eq!(wire.role, "tool");
-        assert_eq!(wire.content.as_deref(), Some("file contents"));
+        assert_eq!(wire.content, Some(WireContent::Text("file contents".to_string())));
         assert_eq!(wire.tool_call_id.as_deref(), Some("call_1"));
     }
 

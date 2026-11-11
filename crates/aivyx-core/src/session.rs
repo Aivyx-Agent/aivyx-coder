@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aivyx_types::{Message, Role};
+use aivyx_types::Message;
 pub use aivyx_types::{Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 
@@ -232,7 +232,7 @@ pub fn preview_text(text: &str) -> String {
 /// `Role::User` messages in its history (each user message starts one
 /// turn; the assistant's reply and any tool round-trips complete it).
 pub fn count_turns(history: &[Message]) -> usize {
-    history.iter().filter(|m| m.role == Role::User).count()
+    history.iter().filter(|m| m.starts_turn()).count()
 }
 
 /// Where cross-session memory (`memory_write`/`memory_read`/
@@ -636,7 +636,7 @@ impl SessionStore {
                     first_user_text: state
                         .history
                         .iter()
-                        .find(|m| m.role == Role::User)
+                        .find(|m| m.starts_turn())
                         .map(|m| preview_text(&m.text_content()))
                         .unwrap_or_default(),
                     turns: count_turns(&state.history),
@@ -663,6 +663,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivyx_types::Role;
 
     #[test]
     fn round_trips_through_disk() {

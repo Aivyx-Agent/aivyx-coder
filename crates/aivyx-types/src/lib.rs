@@ -26,6 +26,14 @@ impl Message {
         }
     }
 
+    /// Whether this message starts a turn: a user message, except one the
+    /// agent adds to show the model images its tools made (those carry
+    /// `ContentBlock::Image`).
+    pub fn starts_turn(&self) -> bool {
+        self.role == Role::User
+            && !self.content.iter().any(|block| matches!(block, ContentBlock::Image(_)))
+    }
+
     /// Concatenation of every `ContentBlock::Text` in this message.
     pub fn text_content(&self) -> String {
         self.content
@@ -43,6 +51,20 @@ pub enum ContentBlock {
     Text(String),
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// An image for the model to look at, in a user message: the agent
+    /// shows the model images its tools made (a backend that can't take
+    /// images never gets one). Added after 0.7.0; older saved sessions
+    /// simply have none.
+    Image(ImageData),
+}
+
+/// An image as the model receives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageData {
+    /// `image/png`, `image/jpeg` or `image/webp`.
+    pub media_type: String,
+    /// The image bytes, base64-encoded.
+    pub data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

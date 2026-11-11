@@ -14,6 +14,14 @@ pub trait LlmBackend: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError>;
+
+    /// Whether the model takes images as input: `Some(true)`/`Some(false)`
+    /// when the backend knows, `None` when it can't tell. The agent only
+    /// sends images (tool results, for example) on `Some(true)`, so the
+    /// default, `None`, is the safe answer. Asked about once per agent.
+    async fn sees_images(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]

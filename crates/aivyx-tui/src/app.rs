@@ -1708,6 +1708,8 @@ fn seed_transcript(history: &[Message]) -> Vec<ChatLine> {
     for message in history {
         match message.role {
             Role::System => {}
+            // Images the agent showed the model aren't something the user said.
+            Role::User if !message.starts_turn() => {}
             Role::User => lines.push(ChatLine::User(message.text_content())),
             Role::Assistant => {
                 for block in &message.content {

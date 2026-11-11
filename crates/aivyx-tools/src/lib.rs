@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aivyx_sandbox::{ActionKind, ExecutionConfiner, PermissionGate, PermissionRequest, PermissionTarget};
-use aivyx_types::{ToolCall, ToolDefinition, ToolOutput, ToolResult};
+use aivyx_types::{ImageData, ToolCall, ToolDefinition, ToolOutput, ToolResult};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -182,7 +182,22 @@ pub trait Tool: Send + Sync {
         arguments: serde_json::Value,
         ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError>;
+
+    /// `execute`, plus images for the model to look at (at most
+    /// `MAX_TOOL_IMAGES`, small previews): the agent shows them after the
+    /// step's tool results when the model can take images. Defaults to
+    /// `execute` with none; a tool that makes images overrides this.
+    async fn execute_with_images(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<(ToolOutput, Vec<ImageData>), ToolError> {
+        Ok((self.execute(arguments, ctx).await?, Vec::new()))
+    }
 }
+
+/// The most images one tool call (and one step) shows the model.
+pub const MAX_TOOL_IMAGES: usize = 4;
 
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
@@ -255,6 +270,9 @@ pub struct ToolExecutor {
     /// it (`take_checkpoint_failure`) instead of only the log: a failing
     /// checkpoint leaves nothing for `/undo` or a rollback to return to.
     checkpoint_health: std::sync::Mutex<CheckpointHealth>,
+    /// Images tool calls returned (`Tool::execute_with_images`), by call
+    /// id, until the agent takes them (`take_images`).
+    images: std::sync::Mutex<std::collections::HashMap<String, Vec<ImageData>>>,
 }
 
 /// See `ToolExecutor::checkpoint_health`.
@@ -287,6 +305,7 @@ impl ToolExecutor {
             checkpoint_cwd: None,
             checkpoint_deny_paths: Vec::new(),
             checkpoint_health: std::sync::Mutex::default(),
+            images: std::sync::Mutex::default(),
         }
     }
 
@@ -676,7 +695,23 @@ impl ToolExecutor {
             cancellation,
         };
 
-        tool.execute(call.arguments.clone(), &ctx).await
+        let (output, images) = tool.execute_with_images(call.arguments.clone(), &ctx).await?;
+        if !images.is_empty() {
+            self.images
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(call.id.0.clone(), images.into_iter().take(MAX_TOOL_IMAGES).collect());
+        }
+        Ok(output)
+    }
+
+    /// The images the call `call_id` returned, if any, removing them.
+    pub fn take_images(&self, call_id: &aivyx_types::ToolCallId) -> Vec<ImageData> {
+        self.images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&call_id.0)
+            .unwrap_or_default()
     }
 }
 
@@ -684,6 +719,90 @@ impl ToolExecutor {
 mod tests {
     use super::*;
     use aivyx_sandbox::PlanMode;
+
+    /// Returns one image with its output, like `generate_image`.
+    struct OneImage;
+
+    #[async_trait]
+    impl Tool for OneImage {
+        fn name(&self) -> &str {
+            "one_image"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "one_image".to_string(),
+                description: "test".to_string(),
+                parameters_schema: serde_json::json!({}),
+            }
+        }
+        fn mutates_outside_session(&self) -> bool {
+            false
+        }
+        fn permission_request(
+            &self,
+            _arguments: &serde_json::Value,
+            _cwd: &Path,
+        ) -> Result<PermissionRequest, ToolError> {
+            Ok(PermissionRequest {
+                tool_name: "one_image".to_string(),
+                action: aivyx_sandbox::ActionKind::Read,
+                target: aivyx_sandbox::PermissionTarget::Other("test".to_string()),
+                arguments_preview: serde_json::json!({}),
+                preview: None,
+                diff: None,
+            })
+        }
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
+            unreachable!("the executor calls execute_with_images")
+        }
+        async fn execute_with_images(
+            &self,
+            _arguments: serde_json::Value,
+            _ctx: &ToolExecutionContext,
+        ) -> Result<(ToolOutput, Vec<ImageData>), ToolError> {
+            let image = ImageData {
+                media_type: "image/png".to_string(),
+                data: "aGk=".to_string(),
+            };
+            Ok((ToolOutput::Ok("made one".to_string()), vec![image; MAX_TOOL_IMAGES + 2]))
+        }
+    }
+
+    struct AllowAll;
+
+    #[async_trait]
+    impl PermissionGate for AllowAll {
+        async fn check(&self, _request: &PermissionRequest) -> aivyx_sandbox::PermissionDecision {
+            aivyx_sandbox::PermissionDecision::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn the_executor_hands_a_calls_images_over_once_and_caps_them() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(OneImage));
+        let executor = ToolExecutor::new(
+            registry,
+            Arc::new(AllowAll),
+            Arc::new(aivyx_sandbox::NoopConfiner),
+        );
+        let call = ToolCall {
+            id: aivyx_types::ToolCallId("c1".to_string()),
+            name: "one_image".to_string(),
+            arguments: serde_json::json!({}),
+            source: aivyx_types::ToolCallSource::Native,
+        };
+        let result = executor
+            .dispatch(call, Path::new("."), CancellationToken::new())
+            .await;
+        assert!(matches!(result.output, ToolOutput::Ok(_)));
+        assert_eq!(executor.take_images(&result.call_id).len(), MAX_TOOL_IMAGES);
+        assert!(executor.take_images(&result.call_id).is_empty());
+    }
 
     #[test]
     fn plan_definitions_offer_only_session_safe_tools() {

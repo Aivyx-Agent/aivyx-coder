@@ -26,6 +26,8 @@ use crate::specialist_sessions::{SpawnSpecialistTool, SpecialistSessionsConfig};
 struct MockBackend {
     responses: Mutex<VecDeque<Vec<StreamEvent>>>,
     received: Mutex<Vec<ChatRequest>>,
+    /// What `sees_images` answers (default `None`: can't tell).
+    sees: Option<bool>,
 }
 
 impl MockBackend {
@@ -33,6 +35,7 @@ impl MockBackend {
         Self {
             responses: Mutex::new(responses.into()),
             received: Mutex::new(Vec::new()),
+            sees: None,
         }
     }
 }
@@ -41,6 +44,10 @@ impl MockBackend {
 impl LlmBackend for MockBackend {
     fn model_id(&self) -> &str {
         "mock"
+    }
+
+    async fn sees_images(&self) -> Option<bool> {
+        self.sees
     }
 
     async fn stream_chat(
@@ -296,6 +303,167 @@ impl Tool for FakeNetworkTool {
     ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput::Ok("fetched (not really)".to_string()))
     }
+}
+
+/// A 1x1 PNG, base64.
+const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+/// Makes "an image" and returns a preview of it, like `generate_image`.
+struct ImageMakingTool;
+
+#[async_trait::async_trait]
+impl Tool for ImageMakingTool {
+    fn name(&self) -> &str {
+        "make_image"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "make_image".to_string(),
+            description: "test".to_string(),
+            parameters_schema: serde_json::json!({}),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        _arguments: &serde_json::Value,
+        _cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        Ok(PermissionRequest {
+            tool_name: "make_image".to_string(),
+            action: ActionKind::Read,
+            target: PermissionTarget::Other("test".to_string()),
+            arguments_preview: serde_json::json!({}),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(self.execute_with_images(arguments, ctx).await?.0)
+    }
+
+    async fn execute_with_images(
+        &self,
+        _arguments: serde_json::Value,
+        _ctx: &ToolExecutionContext,
+    ) -> Result<(ToolOutput, Vec<aivyx_types::ImageData>), ToolError> {
+        Ok((
+            ToolOutput::Ok("saved assets/generated/a.png".to_string()),
+            vec![aivyx_types::ImageData {
+                media_type: "image/jpeg".to_string(),
+                data: TINY_PNG_B64.to_string(),
+            }],
+        ))
+    }
+}
+
+/// One `make_image` call, then a reply, against a backend whose
+/// `sees_images` is `sees`. Returns the history and the second request.
+async fn run_image_turn(sees: Option<bool>) -> (Vec<Message>, ChatRequest) {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ImageMakingTool));
+    let (tx, _rx) = unbounded_channel();
+    let mut mock = MockBackend::new(vec![
+        vec![
+            StreamEvent::ToolCallComplete(tool_call("c1", "make_image")),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![
+            StreamEvent::TextDelta("it is a lantern".to_string()),
+            StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ],
+    ]);
+    mock.sees = sees;
+    let mock = Arc::new(mock);
+    let llm: std::sync::Arc<dyn LlmBackend> = mock.clone();
+    let executor = ToolExecutor::new(registry, Arc::new(AllowAllGate), Arc::new(NoopConfiner));
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+    agent
+        .run_turn("draw a lantern".to_string(), Path::new("."), CancellationToken::new())
+        .await
+        .unwrap();
+    let second = mock.received.lock().unwrap()[1].clone();
+    (agent.history.clone(), second)
+}
+
+fn image_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| matches!(b, ContentBlock::Image(_)))
+        .count()
+}
+
+#[tokio::test]
+async fn a_tools_images_are_shown_after_its_result_to_a_model_that_sees() {
+    let (history, second) = run_image_turn(Some(true)).await;
+    assert_eq!(image_count(&second.messages), 1);
+    let at = second
+        .messages
+        .iter()
+        .position(|m| m.role == Role::Tool)
+        .expect("a tool result");
+    let shown = &second.messages[at + 1];
+    assert_eq!(shown.role, Role::User);
+    assert!(!shown.starts_turn(), "an image message isn't a new turn");
+    let label = shown.text_content();
+    assert!(label.contains("make_image") && label.contains("not instructions"), "{label}");
+    // Still one turn, and the reply is this turn's.
+    assert_eq!(crate::session::count_turns(&history), 1);
+    assert_eq!(image_count(&history), 1);
+}
+
+#[tokio::test]
+async fn a_tools_images_are_noted_not_sent_to_a_model_that_cannot_see() {
+    for sees in [Some(false), None] {
+        let (history, second) = run_image_turn(sees).await;
+        assert_eq!(image_count(&second.messages), 0, "{sees:?}");
+        let result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .unwrap()
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some(r.output.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let ToolOutput::Ok(text) = result else { panic!("{result:?}") };
+        assert!(text.contains("1 image(s) not shown"), "{sees:?}: {text}");
+    }
+}
+
+#[test]
+fn an_image_counts_as_what_it_costs_not_its_base64_length() {
+    let image = Message {
+        role: Role::User,
+        content: vec![ContentBlock::Image(aivyx_types::ImageData {
+            media_type: "image/jpeg".to_string(),
+            data: "A".repeat(150_000),
+        })],
+        tool_call_id: None,
+    };
+    assert_eq!(message_chars("", &[image]), IMAGE_CHARS_EQUIVALENT);
 }
 
 fn tool_call(id: &str, name: &str) -> ToolCall {

@@ -164,14 +164,18 @@ impl RoutedBackend {
 }
 
 /// `ChatRequest` + `RouteHint` → what the shared Router needs to plan a
-/// call. aivyx-coder has no image content blocks, so `vision` is always
-/// `false`.
+/// call. A request carrying an image (a tool's result shown to the model)
+/// needs a model with vision.
 fn query(request: &ChatRequest, hint: &RouteHint) -> RouteQuery {
     RouteQuery {
         task: hint.task.clone(),
         session: hint.session.clone(),
         tools: !request.tools.is_empty(),
-        vision: false,
+        vision: request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, aivyx_types::ContentBlock::Image(_))),
         estimated_prompt_tokens: hint.estimated_prompt_tokens,
         // aivyx-coder has no classifier-driven soft tier of its own yet.
         tier: None,
@@ -180,6 +184,21 @@ fn query(request: &ChatRequest, hint: &RouteHint) -> RouteQuery {
 
 #[async_trait]
 impl LlmBackend for RoutedBackend {
+    /// Whether some route can serve an agent step (tools) with an image.
+    /// A routed request carrying an image needs one, so the default
+    /// backend's own answer doesn't count.
+    async fn sees_images(&self) -> Option<bool> {
+        let query = RouteQuery {
+            task: aivyx_route::TaskKind::CodeEdit,
+            session: None,
+            tools: true,
+            vision: true,
+            estimated_prompt_tokens: 0,
+            tier: None,
+        };
+        Some(self.router.plan(&query, Instant::now()).is_ok())
+    }
+
     /// The configured `[backend]` model — the one untagged calls use.
     fn model_id(&self) -> &str {
         self.default_backend.model_id()
@@ -408,6 +427,40 @@ mod tests {
             description: "read".into(),
             parameters_schema: serde_json::json!({}),
         }
+    }
+
+    /// An agent step needs tools and, with an image, vision, in one model.
+    #[tokio::test]
+    async fn sees_images_needs_a_route_with_tools_and_vision() {
+        let split = fixture(
+            vec![
+                profile("gpu", "caller", Tier::Small, &[Capability::Tools]),
+                profile("gpu", "seer", Tier::Small, &[Capability::Vision]),
+            ],
+            &[],
+        );
+        assert_eq!(split.router.sees_images().await, Some(false));
+        let both = fixture(
+            vec![profile("gpu", "seer", Tier::Small, &[Capability::Tools, Capability::Vision])],
+            &[],
+        );
+        assert_eq!(both.router.sees_images().await, Some(true));
+    }
+
+    #[test]
+    fn a_request_carrying_an_image_needs_vision() {
+        let mut request = routed(TaskKind::CodeEdit, None);
+        let hint = request.route.clone().unwrap();
+        assert!(!query(&request, &hint).vision);
+        request.messages.push(Message {
+            role: Role::User,
+            content: vec![aivyx_types::ContentBlock::Image(aivyx_types::ImageData {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            })],
+            tool_call_id: None,
+        });
+        assert!(query(&request, &hint).vision);
     }
 
     #[tokio::test]
