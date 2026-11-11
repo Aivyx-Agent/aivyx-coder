@@ -1049,10 +1049,10 @@ pub(crate) async fn build_agent(
                     UpscaleImageTool::new(provider.clone(), deny_paths.clone())
                         .with_model_previews(previews),
                 ));
-                registry.register(Arc::new(GenerateThreeDTool::new(
-                    provider,
-                    deny_paths.clone(),
-                )));
+                registry.register(Arc::new(
+                    GenerateThreeDTool::new(provider, deny_paths.clone())
+                        .with_model_previews(previews),
+                ));
             }
             Err(e) => {
                 tracing::warn!(

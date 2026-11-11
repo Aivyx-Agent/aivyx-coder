@@ -337,6 +337,7 @@ struct GenerateThreeDArgs {
 pub struct GenerateThreeDTool {
     provider: Arc<dyn GenerationProvider>,
     deny_paths: Vec<PathBuf>,
+    previews: bool,
 }
 
 impl GenerateThreeDTool {
@@ -344,7 +345,15 @@ impl GenerateThreeDTool {
         Self {
             provider,
             deny_paths,
+            previews: true,
         }
+    }
+
+    /// `[vision] show_model_previews` (default on): give the agent a render
+    /// of the mesh, shown to a model that can take images.
+    pub fn with_model_previews(mut self, on: bool) -> Self {
+        self.previews = on;
+        self
     }
 }
 
@@ -391,6 +400,14 @@ impl Tool for GenerateThreeDTool {
         arguments: serde_json::Value,
         ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        Ok(self.execute_with_images(arguments, ctx).await?.0)
+    }
+
+    async fn execute_with_images(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<(ToolOutput, Vec<ImageData>), ToolError> {
         let args: GenerateThreeDArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
         let reference_image = args
@@ -400,10 +417,13 @@ impl Tool for GenerateThreeDTool {
         if let Some(path) = &reference_image
             && path_is_denied(path, &self.deny_paths)
         {
-            return Ok(ToolOutput::Denied(format!(
-                "reference_image `{}` is under a configured deny_paths entry (hard-blocked)",
-                path.display()
-            )));
+            return Ok((
+                ToolOutput::Denied(format!(
+                    "reference_image `{}` is under a configured deny_paths entry (hard-blocked)",
+                    path.display()
+                )),
+                Vec::new(),
+            ));
         }
         let req = ThreeDRequest {
             prompt: args.prompt,
@@ -412,14 +432,18 @@ impl Tool for GenerateThreeDTool {
             seed: args.seed,
         };
         match self.provider.generate_3d(req).await {
-            Ok(asset) => Ok(ToolOutput::Ok(success_message("3D model", &asset))),
-            Err(e) => Ok(ToolOutput::Error(format!("generate_3d: {e}"))),
+            Ok(asset) => Ok((
+                ToolOutput::Ok(success_message("3D model", &asset)),
+                previews(self.previews, [asset.path.clone()]).await,
+            )),
+            Err(e) => Ok((ToolOutput::Error(format!("generate_3d: {e}")), Vec::new())),
         }
     }
 }
 
-/// A small JPEG of each image (at most 768 px; `aivyx_vision_mold::preview`)
-/// for the model to look at, or none when `on` is false. An image that
+/// A small JPEG of each image or `.glb` mesh (at most 768 px; a mesh is
+/// rendered from two angles; `aivyx_vision_mold::preview`) for the model
+/// to look at, or none when `on` is false. An image that
 /// can't be previewed is left out; the result text still names its file.
 async fn previews(on: bool, paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageData> {
     use base64::Engine;

@@ -436,8 +436,8 @@ enabled = true
 If either program is down, or the GPU lock isn't granted in time, the call
 fails with an error and nothing is retried. Images are saved under `assets/generated/` in the
 project, and the first save of a session asks you for that folder.
-The model is shown a small preview of each image it makes, so it can
-check its work and try again, when it can take images: a `llama-server`
+The model is shown a small preview of each image it makes (and of each
+mesh, rendered from two angles), so it can check its work and try again, when it can take images: a `llama-server`
 started with its vision projector (`--mmproj`, for a model that has one)
 or a `[routing]` model with both `tools` and `vision`. Otherwise the tool
 result says the image wasn't shown. Each preview costs about 600–800
