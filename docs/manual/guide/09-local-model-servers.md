@@ -387,12 +387,17 @@ makes same-session requests keep landing on a fast, already-warmed slot.
 
 ## Image generation (`[vision]`)
 
-The model can make pictures with three tools. `generate_svg` draws a
+The model can make pictures with four tools. `generate_svg` draws a
 vector image with your own model and needs nothing else: it is always
 there, returns the SVG (sanitized), and the model saves it with
 `write_file`. `generate_image` makes a raster image (PNG, JPEG or WebP)
-with a separate local image server, and `generate_3d` is reserved for 3D
-models (every call fails for now). Those two appear only with
+with a separate local image server: from a prompt, from a reference
+image (`strength` sets how far it may move; without a size it keeps the
+reference's), repainting only the white part of a `mask_image`, or up to
+four variations at once (`count`). `upscale_image` enlarges an image 4x
+(up to 1 megapixel in; pull the upscaler with
+`mold pull real-esrgan-x4plus:fp16`). `generate_3d` is reserved for 3D
+models (every call fails for now). The last three appear only with
 `[vision] enabled = true`, because they need two programs aivyx-coder
 doesn't install:
 
@@ -423,6 +428,9 @@ enabled = true
 If either program is down, or the GPU lock isn't granted in time, the call
 fails with an error and nothing is retried. Images are saved under `assets/generated/` in the
 project, and the first save of a session asks you for that folder.
+Saved images don't carry their prompt: mold is asked not to embed it, and
+any it embeds anyway is removed. mold still keeps image-to-image results
+and every prompt on its own machine.
 
 `[vision]` is about generating images. It is not the `vision` capability
 in `[[routing.models]]`, which marks a model that can read images (see

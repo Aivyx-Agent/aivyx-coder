@@ -6,8 +6,8 @@ edit the tool, not this page.
 
 **Asks first?** Reading, searching and fetching from the web don't ask.
 Anything that writes, deletes, moves or runs something, calls an MCP
-server, or saves memory asks you (`y` once, `A` always for that exact file,
-command or topic, `n` no, `a` to show all of a long text) — unless you pre-approved it. In plan mode the
+server, or saves memory asks you (`y` once, `a` always for that exact file,
+command or topic, `n` no) — unless you pre-approved it. In plan mode the
 tools that change things are hidden from the model and refused if it tries.
 Files on your deny list are refused outright. Delegated sub-agents and
 specialists ask for their own actions the same way. See the
@@ -133,10 +133,11 @@ Your `[[mcp.servers]]`' resources and prompts. Their own tools appear as `mcp__<
 
 ## Images
 
-`generate_svg` uses your own model and returns the SVG (save it with `write_file`). `generate_image` needs `[vision] enabled = true`, saves under `assets/generated/`, and asks once for that folder per session.
+`generate_svg` uses your own model and returns the SVG (save it with `write_file`). `generate_image` and `upscale_image` need `[vision] enabled = true`, save under `assets/generated/`, and ask once for that folder per session.
 
 | Tool | Asks first? | What it does |
 |---|---|---|
 | `generate_svg` | no | Generate a sanitized SVG image from a text prompt. Returns the SVG markup as a string -- use write_file separately if you want to save it. |
 | `generate_image` | yes | Generate an image from a text prompt via a local image-generation backend and save it under assets/generated/. Returns the saved file's path. |
+| `upscale_image` | yes | Enlarge an image four times with the local image-generation backend's upscaler and save the result under assets/generated/. Returns the saved file's path. |
 | `generate_3d` | yes | Generate a 3D model from a text prompt and save it under assets/generated/. **Not yet implemented** -- every call currently fails with a clear error; the tool exists now so it's discoverable ahead of a future backend that implements it. |

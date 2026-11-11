@@ -26,6 +26,7 @@ use aivyx_sandbox::{
 use aivyx_tools::{
     CoderTextCompleter, CommandSpec, DeleteFileTool, DetectOutcome, EditFileTool,
     FindReferencesTool, GenerateImageTool, GenerateSvgTool, GenerateThreeDTool, GetMcpPromptTool,
+    UpscaleImageTool,
     GitBranchTool, GitCheckpointer, GitCommitTool, GitPrTool, GitPushTool, GitReadTool, GlobTool,
     GoToDefinitionTool, GrepTool, ListMcpPromptsTool, ListMcpResourcesTool, LoadSkillTool,
     LspClient, McpClient, McpToolAdapter, MemoryForgetTool, MemoryReadTool, MemoryWriteTool,
@@ -1040,6 +1041,10 @@ pub(crate) async fn build_agent(
             Ok(provider) => {
                 let provider: Arc<dyn aivyx_vision_core::GenerationProvider> = Arc::new(provider);
                 registry.register(Arc::new(GenerateImageTool::new(
+                    provider.clone(),
+                    deny_paths.clone(),
+                )));
+                registry.register(Arc::new(UpscaleImageTool::new(
                     provider.clone(),
                     deny_paths.clone(),
                 )));

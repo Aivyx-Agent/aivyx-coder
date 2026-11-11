@@ -64,8 +64,8 @@ pub use tools::{
     ListMcpResourcesTool, LoadSkillTool, McpToolAdapter, MemoryForgetTool, MemoryReadTool,
     MemoryWriteTool, MoveFileTool, PatchFileTool, ReadFileTool, ReadMcpResourceTool,
     RememberPreferenceTool, ReplResizeTarget, ReplSendTool, ReplStartTool, ReplStopTool,
-    RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, WebFetchTool, WebSearchTool,
-    WriteFileTool, new_shared_repl_session,
+    RunCommandTool, RunShellTool, SetTasksTool, SharedReplSession, UpscaleImageTool, WebFetchTool,
+    WebSearchTool, WriteFileTool, new_shared_repl_session,
 };
 
 #[derive(Debug, Error)]

@@ -36,7 +36,7 @@ pub use edit_file::EditFileTool;
 pub use find_references::FindReferencesTool;
 pub use generate_svg::GenerateSvgTool;
 pub use generate_svg_completer::CoderTextCompleter;
-pub use generation_tools::{GenerateImageTool, GenerateThreeDTool};
+pub use generation_tools::{GenerateImageTool, GenerateThreeDTool, UpscaleImageTool};
 pub use git_branch::GitBranchTool;
 pub use git_commit::{GitCommitTool, confined_git};
 pub use git_pr::GitPrTool;

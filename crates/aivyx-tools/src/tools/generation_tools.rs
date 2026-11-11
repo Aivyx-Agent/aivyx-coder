@@ -21,7 +21,10 @@ use std::sync::Arc;
 
 use aivyx_sandbox::{ActionKind, PermissionRequest, PermissionTarget, path_is_denied};
 use aivyx_types::{ToolDefinition, ToolOutput};
-use aivyx_vision_core::{GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest};
+use aivyx_vision_core::{
+    GeneratedAsset, GenerationProvider, ImageRequest, ThreeDRequest, UpscaleRequest,
+    generate_variations,
+};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -43,6 +46,10 @@ struct GenerateImageArgs {
     reference_image: Option<String>,
     /// Image-to-image only: how far the result may move from reference_image, from 0 (keep it) to 1 (ignore it). Default 0.75.
     strength: Option<f32>,
+    /// Inpainting: path to a mask the same size as reference_image (white = repaint, black = keep). Needs reference_image.
+    mask_image: Option<String>,
+    /// How many variations to make (1-4), with consecutive seeds. Default 1.
+    count: Option<usize>,
 }
 
 /// `deny_paths` is required separately from the usual
@@ -101,6 +108,8 @@ impl Tool for GenerateImageTool {
             arguments_preview: json!({
                 "prompt": args.prompt,
                 "reference_image": args.reference_image,
+                "mask_image": args.mask_image,
+                "count": args.count,
             }),
             preview: None,
             diff: None,
@@ -118,34 +127,142 @@ impl Tool for GenerateImageTool {
             .reference_image
             .as_ref()
             .map(|path| resolve(&ctx.cwd, path));
-        // `reference_image` is never the declared `PermissionTarget` above
-        // (that's `assets/generated/`, the output directory) — so
-        // `ConfirmationGate::is_denied` never sees this path at all. Check
-        // it against `deny_paths` here, before it's read and transmitted to
-        // the generation backend, the same way `GrepTool`/`MoveFileTool`
-        // check every path they touch beyond their own declared target.
-        if let Some(path) = &reference_image
-            && path_is_denied(path, &self.deny_paths)
-        {
-            return Ok(ToolOutput::Denied(
-                format!(
-                    "reference_image `{}` is under a configured deny_paths entry (hard-blocked)",
+        let mask_image = args.mask_image.as_ref().map(|path| resolve(&ctx.cwd, path));
+        // `reference_image` and `mask_image` are never the declared
+        // `PermissionTarget` above (that's `assets/generated/`, the output
+        // directory) — so `ConfirmationGate::is_denied` never sees these
+        // paths at all. Check them against `deny_paths` here, before they're
+        // read and transmitted to the generation backend, the same way
+        // `GrepTool`/`MoveFileTool` check every path they touch beyond their
+        // own declared target.
+        for (field, path) in [
+            ("reference_image", &reference_image),
+            ("mask_image", &mask_image),
+        ] {
+            if let Some(path) = path
+                && path_is_denied(path, &self.deny_paths)
+            {
+                return Ok(ToolOutput::Denied(format!(
+                    "{field} `{}` is under a configured deny_paths entry (hard-blocked)",
                     path.display()
-                ),
-            ));
+                )));
+            }
         }
         let req = ImageRequest {
             prompt: args.prompt,
             reference_image,
+            mask_image,
             width: args.width,
             height: args.height,
             seed: args.seed,
             style_hint: args.style_hint,
             strength: args.strength,
         };
+        let count = args.count.unwrap_or(1);
+        if count != 1 {
+            let results = match generate_variations(self.provider.as_ref(), req, count).await {
+                Ok(results) => results,
+                Err(e) => return Ok(ToolOutput::Error(format!("generate_image: {e}"))),
+            };
+            let lines: Vec<String> = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| match r {
+                    Ok(asset) => format!("{}. {}", i + 1, success_message("image", asset)),
+                    Err(e) => format!("{}. failed: {e}", i + 1),
+                })
+                .collect();
+            if results.iter().all(|r| r.is_err()) {
+                return Ok(ToolOutput::Error(format!(
+                    "generate_image: every variation failed\n{}",
+                    lines.join("\n")
+                )));
+            }
+            return Ok(ToolOutput::Ok(format!(
+                "{count} variations:\n{}",
+                lines.join("\n")
+            )));
+        }
         match self.provider.generate_image(req).await {
             Ok(asset) => Ok(ToolOutput::Ok(success_message("image", &asset))),
             Err(e) => Ok(ToolOutput::Error(format!("generate_image: {e}"))),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UpscaleImageArgs {
+    /// Path to a PNG or JPEG of up to 1 megapixel (for example 1024x1024), absolute or relative to the working directory.
+    image: String,
+}
+
+/// Same `deny_paths` reasoning as `GenerateImageTool`: `image` is read and
+/// sent to the backend but is not the declared permission target.
+pub struct UpscaleImageTool {
+    provider: Arc<dyn GenerationProvider>,
+    deny_paths: Vec<PathBuf>,
+}
+
+impl UpscaleImageTool {
+    pub fn new(provider: Arc<dyn GenerationProvider>, deny_paths: Vec<PathBuf>) -> Self {
+        Self {
+            provider,
+            deny_paths,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for UpscaleImageTool {
+    fn name(&self) -> &str {
+        "upscale_image"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name().to_string(),
+            description: "Enlarge an image four times with the local image-generation \
+                backend's upscaler and save the result under assets/generated/. Returns the \
+                saved file's path."
+                .to_string(),
+            parameters_schema: serde_json::Value::from(schemars::schema_for!(UpscaleImageArgs)),
+        }
+    }
+
+    fn permission_request(
+        &self,
+        arguments: &serde_json::Value,
+        cwd: &Path,
+    ) -> Result<PermissionRequest, ToolError> {
+        let args: UpscaleImageArgs = serde_json::from_value(arguments.clone())
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        Ok(PermissionRequest {
+            tool_name: self.name().to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(resolve(cwd, "assets/generated")),
+            arguments_preview: json!({ "image": args.image }),
+            preview: None,
+            diff: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: serde_json::Value,
+        ctx: &ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let args: UpscaleImageArgs = serde_json::from_value(arguments)
+            .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        let image = resolve(&ctx.cwd, &args.image);
+        if path_is_denied(&image, &self.deny_paths) {
+            return Ok(ToolOutput::Denied(format!(
+                "image `{}` is under a configured deny_paths entry (hard-blocked)",
+                image.display()
+            )));
+        }
+        match self.provider.upscale_image(UpscaleRequest { image }).await {
+            Ok(asset) => Ok(ToolOutput::Ok(success_message("image", &asset))),
+            Err(e) => Ok(ToolOutput::Error(format!("upscale_image: {e}"))),
         }
     }
 }
@@ -244,7 +361,7 @@ mod tests {
     use std::sync::Arc;
 
     use aivyx_types::ToolOutput;
-    use aivyx_vision_core::{FakeGenerationProvider, GeneratedAsset, VisionError};
+    use aivyx_vision_core::{FakeGenerationProvider, GeneratedAsset, MAX_VARIATIONS, VisionError};
     use serde_json::json;
 
     use super::*;
@@ -280,6 +397,123 @@ mod tests {
             request.target,
             PermissionTarget::Path(resolve(&ctx().cwd, "assets/generated"))
         );
+    }
+
+    /// Answers every call with the seed it was asked for, failing the
+    /// call numbered `fail`.
+    struct Seeds {
+        calls: std::sync::Mutex<u64>,
+        fail: Option<u64>,
+    }
+
+    #[async_trait]
+    impl GenerationProvider for Seeds {
+        async fn generate_image(&self, req: ImageRequest) -> Result<GeneratedAsset, VisionError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if self.fail == Some(*calls) {
+                return Err(VisionError::GenerationTimeout);
+            }
+            Ok(GeneratedAsset {
+                seed_used: req.seed,
+                ..sample_asset(&format!("assets/generated/{calls}.png"))
+            })
+        }
+        async fn generate_3d(&self, _: ThreeDRequest) -> Result<GeneratedAsset, VisionError> {
+            Err(VisionError::Unsupported("3D"))
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_image_with_count_lists_every_variation_and_each_failure() {
+        let provider = Arc::new(Seeds {
+            calls: std::sync::Mutex::new(0),
+            fail: Some(2),
+        });
+        let tool = GenerateImageTool::new(provider, vec![]);
+        let output = tool
+            .execute(json!({"prompt": "a cat", "seed": 5, "count": 3}), &ctx())
+            .await
+            .unwrap();
+        let ToolOutput::Ok(msg) = output else {
+            panic!("expected Ok output, got {output:?}")
+        };
+        assert!(
+            msg.contains("1. generated image saved to assets/generated/1.png (seed 5)"),
+            "{msg}"
+        );
+        assert!(msg.contains("2. failed: generation timed out"), "{msg}");
+        assert!(msg.contains("(seed 7)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn generate_image_refuses_a_count_over_the_limit() {
+        let provider = Arc::new(Seeds {
+            calls: std::sync::Mutex::new(0),
+            fail: None,
+        });
+        let tool = GenerateImageTool::new(provider, vec![]);
+        let output = tool
+            .execute(
+                json!({"prompt": "a cat", "count": MAX_VARIATIONS + 1}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Error(_)), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn generate_image_denies_a_mask_under_deny_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
+        let tool = GenerateImageTool::new(Arc::new(provider), vec![secret.clone()]);
+        let output = tool
+            .execute(
+                json!({
+                    "prompt": "repaint",
+                    "reference_image": dir.path().join("ok.png"),
+                    "mask_image": secret.join("mask.png"),
+                }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Denied(msg) = output else {
+            panic!("expected Denied, got {output:?}")
+        };
+        assert!(msg.contains("mask_image"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn upscale_image_passes_the_path_and_honours_deny_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeGenerationProvider::with_upscale_result(Ok(
+            sample_asset("assets/generated/big.png"),
+        )));
+        let tool = UpscaleImageTool::new(provider.clone(), vec![dir.path().join("secret")]);
+        assert_eq!(tool.name(), "upscale_image");
+        let request = tool
+            .permission_request(&json!({"image": "a.png"}), &ctx().cwd)
+            .unwrap();
+        assert_eq!(request.action, ActionKind::Write);
+
+        let output = tool
+            .execute(json!({"image": dir.path().join("a.png")}), &ctx())
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Ok(_)), "{output:?}");
+        assert_eq!(
+            provider.captured_upscale_request().unwrap().image,
+            dir.path().join("a.png")
+        );
+
+        let output = tool
+            .execute(json!({"image": dir.path().join("secret/a.png")}), &ctx())
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Denied(_)), "{output:?}");
     }
 
     #[test]

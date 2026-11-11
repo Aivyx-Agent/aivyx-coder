@@ -47,9 +47,9 @@ GROUPS = {
                     f"`mcp__<server>__<tool>`. See [MCP]({GUIDE}/13-mcp.md).",
                     ["list_mcp_resources", "read_mcp_resource", "list_mcp_prompts", "get_mcp_prompt"]),
     "Images": ("`generate_svg` uses your own model and returns the SVG (save it with `write_file`). "
-               "`generate_image` needs `[vision] enabled = true`, saves under `assets/generated/`, and "
-               "asks once for that folder per session.",
-               ["generate_svg", "generate_image", "generate_3d"]),
+               "`generate_image` and `upscale_image` need `[vision] enabled = true`, save under `assets/generated/`, and "
+               "ask once for that folder per session.",
+               ["generate_svg", "generate_image", "upscale_image", "generate_3d"]),
 }
 # Test doubles and fixtures, never registered.
 IGNORED = {"cancel_tool", "counting_tool", "counting_read_tool", "fake_network_tool",
