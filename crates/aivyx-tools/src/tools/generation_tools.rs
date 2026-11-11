@@ -39,8 +39,10 @@ struct GenerateImageArgs {
     seed: Option<u64>,
     /// A free-text style nudge, e.g. "watercolor", "pixel art".
     style_hint: Option<String>,
-    /// Path to a reference image for image-to-image generation, absolute or relative to the working directory.
+    /// Path to a reference image for image-to-image generation, absolute or relative to the working directory. Without width/height the result keeps its size.
     reference_image: Option<String>,
+    /// Image-to-image only: how far the result may move from reference_image, from 0 (keep it) to 1 (ignore it). Default 0.75.
+    strength: Option<f32>,
 }
 
 /// `deny_paths` is required separately from the usual
@@ -139,6 +141,7 @@ impl Tool for GenerateImageTool {
             height: args.height,
             seed: args.seed,
             style_hint: args.style_hint,
+            strength: args.strength,
         };
         match self.provider.generate_image(req).await {
             Ok(asset) => Ok(ToolOutput::Ok(success_message("image", &asset))),
@@ -318,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_image_passes_width_height_seed_style_hint_through() {
+    async fn generate_image_passes_its_optional_fields_through() {
         let provider = FakeGenerationProvider::with_image_result(Ok(sample_asset("/tmp/x.png")));
         let provider = Arc::new(provider);
         let tool = GenerateImageTool::new(provider.clone(), vec![]);
@@ -328,7 +331,8 @@ mod tests {
                 "width": 512,
                 "height": 768,
                 "seed": 7,
-                "style_hint": "watercolor"
+                "style_hint": "watercolor",
+                "strength": 0.5
             }),
             &ctx(),
         )
@@ -342,6 +346,7 @@ mod tests {
         assert_eq!(captured.height, Some(768));
         assert_eq!(captured.seed, Some(7));
         assert_eq!(captured.style_hint.as_deref(), Some("watercolor"));
+        assert_eq!(captured.strength, Some(0.5));
     }
 
     #[tokio::test]
