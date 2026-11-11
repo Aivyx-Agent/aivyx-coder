@@ -1033,6 +1033,8 @@ pub(crate) async fn build_agent(
             // own `permission_request` reasons about — see those tools'
             // doc comments and `path_resolve::resolve`'s own.
             output_dir: resolve(&cwd, "assets/generated"),
+            // The image model downloaded on mold serve (no config key yet).
+            model: None,
         };
         match aivyx_vision_mold::MoldProvider::new(mold_config) {
             Ok(provider) => {

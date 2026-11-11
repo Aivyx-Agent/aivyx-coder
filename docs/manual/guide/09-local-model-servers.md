@@ -398,7 +398,12 @@ doesn't install:
 
 - **`mold serve`**, the image generator ([mold](https://github.com/utensils/mold)),
   at `[vision] mold_url` (default `http://127.0.0.1:7680`). Set
-  `[vision] api_key` if you started it with `MOLD_API_KEY`.
+  `[vision] api_key` if you started it with `MOLD_API_KEY`. aivyx-coder
+  uses the image model downloaded on it (pull one with, for example,
+  `mold pull flux2-klein:q8`), and fills in that model's default size and
+  steps. Tested with mold 0.37. A mold in Docker or on another machine
+  must be started with `--allow-direct-api` (`MOLD_ALLOW_DIRECT_API=1`),
+  or it refuses plain-HTTP calls.
 - **aivyx-broker**, which hands out the GPU: each `generate_image` call
   takes the broker's GPU lock first and gives it back afterwards, so image
   work and model inference don't fight over one card. It is the same
