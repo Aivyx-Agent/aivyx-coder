@@ -1048,7 +1048,10 @@ pub(crate) async fn build_agent(
                     provider.clone(),
                     deny_paths.clone(),
                 )));
-                registry.register(Arc::new(GenerateThreeDTool::new(provider)));
+                registry.register(Arc::new(GenerateThreeDTool::new(
+                    provider,
+                    deny_paths.clone(),
+                )));
             }
             Err(e) => {
                 tracing::warn!(

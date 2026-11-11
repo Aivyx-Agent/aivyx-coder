@@ -140,4 +140,4 @@ Your `[[mcp.servers]]`' resources and prompts. Their own tools appear as `mcp__<
 | `generate_svg` | no | Generate a sanitized SVG image from a text prompt. Returns the SVG markup as a string -- use write_file separately if you want to save it. |
 | `generate_image` | yes | Generate an image from a text prompt via a local image-generation backend and save it under assets/generated/. Returns the saved file's path. |
 | `upscale_image` | yes | Enlarge an image four times with the local image-generation backend's upscaler and save the result under assets/generated/. Returns the saved file's path. |
-| `generate_3d` | yes | Generate a 3D model from a text prompt and save it under assets/generated/. **Not yet implemented** -- every call currently fails with a clear error; the tool exists now so it's discoverable ahead of a future backend that implements it. |
+| `generate_3d` | yes | Generate a 3D model of one object (a .glb mesh, untextured) and save it under assets/generated/; takes about half a minute. Returns the saved file's path. |

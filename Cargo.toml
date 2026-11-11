@@ -48,9 +48,9 @@ aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "2c9b517
 # backend, so no target-gating needed. All three pinned to the same rev
 # (Milestone 2 Pass A's merge commit in that repo) so they never drift
 # out of lockstep with each other.
-aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e8e8ff7959e98f71556731adbadd8214d0439f79" }
-aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e8e8ff7959e98f71556731adbadd8214d0439f79" }
-aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e8e8ff7959e98f71556731adbadd8214d0439f79" }
+aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "16a989e222028d1bf1e2a03f76e743fa06a00d24" }
+aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "16a989e222028d1bf1e2a03f76e743fa06a00d24" }
+aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "16a989e222028d1bf1e2a03f76e743fa06a00d24" }
 
 [profile.release]
 strip = true

@@ -396,8 +396,16 @@ image (`strength` sets how far it may move; without a size it keeps the
 reference's), repainting only the white part of a `mask_image`, or up to
 four variations at once (`count`). `upscale_image` enlarges an image 4x
 (up to 1 megapixel in; pull the upscaler with
-`mold pull real-esrgan-x4plus:fp16`). `generate_3d` is reserved for 3D
-models (every call fails for now). The last three appear only with
+`mold pull real-esrgan-x4plus:fp16`). `generate_3d` makes a `.glb` mesh
+of one object (about 40,000 faces, untextured, about half a minute), from
+a `reference_image` showing one whole object on a plain background, or
+from the prompt alone (an image of the object is generated first and
+kept). It needs a Hunyuan3D model on mold (`mold pull
+hunyuan3d-mini-turbo:fp16`, 3.8 GB). Its licence is Tencent's Hunyuan 3D
+2.0 Community License, which does not apply in the EU, the UK or South
+Korea and needs a separate Tencent licence above 1 million monthly active
+users; mold asks you to accept it before downloading. The last three
+appear only with
 `[vision] enabled = true`, because they need two programs aivyx-coder
 doesn't install:
 

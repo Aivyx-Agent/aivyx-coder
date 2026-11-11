@@ -269,20 +269,30 @@ impl Tool for UpscaleImageTool {
 
 #[derive(Deserialize, JsonSchema)]
 struct GenerateThreeDArgs {
-    /// Description of the 3D model to generate.
+    /// Description of the object to model.
     prompt: String,
+    /// Path to a PNG or JPEG of one whole object on a plain background, absolute or relative to the working directory. Without it, an image of the object is generated first and kept.
+    reference_image: Option<String>,
+    /// A style nudge for the generated image, e.g. "low poly".
+    style_hint: Option<String>,
+    seed: Option<u64>,
 }
 
+/// Same `deny_paths` reasoning as `GenerateImageTool`: `reference_image`
+/// is read and sent to the backend but is not the declared permission
+/// target.
 pub struct GenerateThreeDTool {
     provider: Arc<dyn GenerationProvider>,
+    deny_paths: Vec<PathBuf>,
 }
 
 impl GenerateThreeDTool {
-    pub fn new(provider: Arc<dyn GenerationProvider>) -> Self {
-        Self { provider }
+    pub fn new(provider: Arc<dyn GenerationProvider>, deny_paths: Vec<PathBuf>) -> Self {
+        Self {
+            provider,
+            deny_paths,
+        }
     }
-
-    // TODO: when a real reference_image parameter is added here, add the same deny_paths check GenerateImageTool has.
 }
 
 #[async_trait]
@@ -294,10 +304,10 @@ impl Tool for GenerateThreeDTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Generate a 3D model from a text prompt and save it under \
-                assets/generated/. **Not yet implemented** -- every call currently fails \
-                with a clear error; the tool exists now so it's discoverable ahead of a \
-                future backend that implements it."
+            description: "Generate a 3D model of one object (a .glb mesh, untextured) and \
+                save it under assets/generated/; takes about half a minute. Returns the saved \
+                file's path. Without `reference_image`, an image of the object is generated \
+                first and kept."
                 .to_string(),
             parameters_schema: serde_json::Value::from(schemars::schema_for!(GenerateThreeDArgs)),
         }
@@ -314,7 +324,10 @@ impl Tool for GenerateThreeDTool {
             tool_name: self.name().to_string(),
             action: ActionKind::Write,
             target: PermissionTarget::Path(resolve(cwd, "assets/generated")),
-            arguments_preview: json!({ "prompt": args.prompt }),
+            arguments_preview: json!({
+                "prompt": args.prompt,
+                "reference_image": args.reference_image,
+            }),
             preview: None,
             diff: None,
         })
@@ -323,14 +336,27 @@ impl Tool for GenerateThreeDTool {
     async fn execute(
         &self,
         arguments: serde_json::Value,
-        _ctx: &ToolExecutionContext,
+        ctx: &ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let args: GenerateThreeDArgs = serde_json::from_value(arguments)
             .map_err(|err| ToolError::InvalidArguments(err.to_string()))?;
+        let reference_image = args
+            .reference_image
+            .as_ref()
+            .map(|path| resolve(&ctx.cwd, path));
+        if let Some(path) = &reference_image
+            && path_is_denied(path, &self.deny_paths)
+        {
+            return Ok(ToolOutput::Denied(format!(
+                "reference_image `{}` is under a configured deny_paths entry (hard-blocked)",
+                path.display()
+            )));
+        }
         let req = ThreeDRequest {
             prompt: args.prompt,
-            reference_image: None,
-            style_hint: None,
+            reference_image,
+            style_hint: args.style_hint,
+            seed: args.seed,
         };
         match self.provider.generate_3d(req).await {
             Ok(asset) => Ok(ToolOutput::Ok(success_message("3D model", &asset))),
@@ -516,6 +542,35 @@ mod tests {
         assert!(matches!(output, ToolOutput::Denied(_)), "{output:?}");
     }
 
+    #[tokio::test]
+    async fn generate_3d_passes_its_reference_and_honours_deny_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeGenerationProvider::with_3d_result(Ok(sample_asset(
+            "assets/generated/x.glb",
+        ))));
+        let tool = GenerateThreeDTool::new(provider.clone(), vec![dir.path().join("secret")]);
+        let output = tool
+            .execute(
+                json!({"prompt": "a lantern", "reference_image": dir.path().join("l.png"), "seed": 3}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Ok(_)), "{output:?}");
+        let captured = provider.captured_3d_request().unwrap();
+        assert_eq!(captured.reference_image, Some(dir.path().join("l.png")));
+        assert_eq!(captured.seed, Some(3));
+
+        let output = tool
+            .execute(
+                json!({"prompt": "a lantern", "reference_image": dir.path().join("secret/l.png")}),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output, ToolOutput::Denied(_)), "{output:?}");
+    }
+
     #[test]
     fn generate_image_needs_checkpoint_and_mutates_outside_session_default_true() {
         // Unlike generate_svg's deliberate false override, generate_image
@@ -669,7 +724,7 @@ mod tests {
     #[test]
     fn generate_3d_metadata_is_sound() {
         let provider = FakeGenerationProvider::with_3d_result(Ok(sample_asset("/tmp/x.glb")));
-        let tool = GenerateThreeDTool::new(Arc::new(provider));
+        let tool = GenerateThreeDTool::new(Arc::new(provider), vec![]);
         assert_eq!(tool.name(), "generate_3d");
         let request = tool
             .permission_request(&json!({"prompt": "a small statue"}), &ctx().cwd)
@@ -680,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn generate_3d_returns_the_generated_asset_on_success() {
         let provider = FakeGenerationProvider::with_3d_result(Ok(sample_asset("/tmp/out/x.glb")));
-        let tool = GenerateThreeDTool::new(Arc::new(provider));
+        let tool = GenerateThreeDTool::new(Arc::new(provider), vec![]);
         let output = tool
             .execute(json!({"prompt": "a small statue"}), &ctx())
             .await
@@ -696,7 +751,7 @@ mod tests {
         let provider = FakeGenerationProvider::with_3d_result(Err(VisionError::Unsupported(
             "3D generation via mold (Pass B is not yet implemented)",
         )));
-        let tool = GenerateThreeDTool::new(Arc::new(provider));
+        let tool = GenerateThreeDTool::new(Arc::new(provider), vec![]);
         let output = tool
             .execute(json!({"prompt": "a small statue"}), &ctx())
             .await
