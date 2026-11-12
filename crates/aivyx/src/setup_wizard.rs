@@ -18,6 +18,7 @@ use aivyx_llm::probe::{ServedContext, probe_served_context, verify_model_respond
 pub(crate) enum BackendChoice {
     Ollama,
     Lemonade,
+    DockerModelRunner,
     GenericOpenAiCompatible,
 }
 
@@ -43,6 +44,8 @@ pub(crate) fn default_base_url(choice: BackendChoice) -> &'static str {
         BackendChoice::Ollama => "http://localhost:11434/v1",
         // Lemonade Server's OpenAI-compatible API lives under /api.
         BackendChoice::Lemonade => "http://127.0.0.1:13305/api/v1",
+        // Docker Model Runner's OpenAI-compatible API on the host.
+        BackendChoice::DockerModelRunner => "http://localhost:12434/engines/v1",
         BackendChoice::GenericOpenAiCompatible => "http://localhost:8080/v1",
     }
 }
@@ -197,12 +200,14 @@ pub(crate) async fn run_then(after: AfterSetup) -> anyhow::Result<()> {
 }
 
 /// The backend menu's labels and preselected index, given which of Ollama,
-/// Lemonade and a generic server (in menu order) answered at their default
-/// address. The first one running is preselected; with none, Ollama is.
-pub(crate) fn backend_menu(running: [bool; 3]) -> ([String; 3], usize) {
+/// Lemonade, Docker Model Runner and a generic server (in menu order)
+/// answered at their default address. The first one running is
+/// preselected; with none, Ollama is.
+pub(crate) fn backend_menu(running: [bool; 4]) -> ([String; 4], usize) {
     let base = [
         "Ollama",
         "Lemonade Server",
+        "Docker Model Runner",
         "A running OpenAI-compatible server (llama-server, vLLM, Jan, ...)",
     ];
     let default = running.iter().position(|r| *r);
@@ -215,13 +220,13 @@ pub(crate) fn backend_menu(running: [bool; 3]) -> ([String; 3], usize) {
 }
 
 /// Which backends answer at their default address right now (menu order).
-async fn detect_running_backends() -> [bool; 3] {
+async fn detect_running_backends() -> [bool; 4] {
     let client = match aivyx_llm::model_client_builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
     {
         Ok(client) => client,
-        Err(_) => return [false; 3],
+        Err(_) => return [false; 4],
     };
     let answers = |url: &'static str| {
         let client = client.clone();
@@ -233,12 +238,13 @@ async fn detect_running_backends() -> [bool; 3] {
                 .is_ok_and(|r| r.status().is_success())
         }
     };
-    let (ollama, lemonade, generic) = tokio::join!(
+    let (ollama, lemonade, dmr, generic) = tokio::join!(
         answers("http://localhost:11434/api/tags"),
         answers("http://127.0.0.1:13305/api/v1/health"),
+        answers("http://localhost:12434/engines/v1/models"),
         answers("http://localhost:8080/v1/models"),
     );
-    [ollama, lemonade, generic]
+    [ollama, lemonade, dmr, generic]
 }
 
 async fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
@@ -251,6 +257,7 @@ async fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
     Ok(match selection {
         0 => BackendChoice::Ollama,
         1 => BackendChoice::Lemonade,
+        2 => BackendChoice::DockerModelRunner,
         _ => BackendChoice::GenericOpenAiCompatible,
     })
 }
@@ -267,7 +274,9 @@ fn prompt_base_url(choice: BackendChoice) -> anyhow::Result<String> {
 async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<String> {
     let listed = match choice {
         BackendChoice::Ollama => list_ollama_models(base_url).await,
-        BackendChoice::Lemonade | BackendChoice::GenericOpenAiCompatible => {
+        BackendChoice::Lemonade
+        | BackendChoice::DockerModelRunner
+        | BackendChoice::GenericOpenAiCompatible => {
             list_openai_compatible_models(base_url).await
         }
     };
@@ -296,17 +305,21 @@ mod tests {
     #[test]
     fn the_menu_preselects_the_first_server_found_running() {
         // Nothing running: Ollama, the easiest to install, stays first choice.
-        let (labels, default) = backend_menu([false, false, false]);
+        let (labels, default) = backend_menu([false, false, false, false]);
         assert_eq!(default, 0);
         assert_eq!(labels[0], "Ollama (recommended, zero setup)");
         // Only Lemonade running: it's preselected and marked.
-        let (labels, default) = backend_menu([false, true, false]);
+        let (labels, default) = backend_menu([false, true, false, false]);
         assert_eq!(default, 1);
         assert_eq!(labels[1], "Lemonade Server -- running now");
         assert_eq!(labels[0], "Ollama");
         // Several running: the first one wins.
-        let (_, default) = backend_menu([true, true, false]);
+        let (_, default) = backend_menu([true, true, false, false]);
         assert_eq!(default, 0);
+        // Onboarding audit 3 (M7): Docker Model Runner is found too.
+        let (labels, default) = backend_menu([false, false, true, false]);
+        assert_eq!(default, 2);
+        assert_eq!(labels[2], "Docker Model Runner -- running now");
     }
 
     #[test]
@@ -461,6 +474,14 @@ mod tests {
         assert_eq!(
             default_base_url(BackendChoice::Ollama),
             "http://localhost:11434/v1"
+        );
+    }
+
+    #[test]
+    fn default_base_url_for_docker_model_runner_is_its_host_api() {
+        assert_eq!(
+            default_base_url(BackendChoice::DockerModelRunner),
+            "http://localhost:12434/engines/v1"
         );
     }
 

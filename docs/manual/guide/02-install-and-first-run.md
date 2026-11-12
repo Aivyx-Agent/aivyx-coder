@@ -34,8 +34,8 @@ From the project you want to work on:
 aivyx-coder --setup
 ```
 
-Setup finds the servers already running (Ollama, Lemonade Server, or one on
-port 8080) and offers them first, lists the models, checks that the one you
+Setup finds the servers already running (Ollama, Lemonade Server, Docker
+Model Runner, or one on port 8080) and offers them first, lists the models, checks that the one you
 pick really answers, reads the context window it's served with, and writes
 `~/.config/aivyx-coder/config.toml`. You don't strictly need `--setup` the
 first time: a plain `aivyx-coder` at a terminal runs the same setup when
