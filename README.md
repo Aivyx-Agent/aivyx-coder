@@ -28,11 +28,15 @@ Apple Silicon set `T=darwin-aarch64`):
 ```sh
 V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Aivyx-Agent/aivyx-coder/releases/latest | sed 's#.*/##')
 T=x86_64-linux-musl
-curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" | tar xz
-mkdir -p ~/.local/bin && mv "aivyx-coder-$V-$T/aivyx-coder" ~/.local/bin/
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" \
+  | tar xz -C ~/.local/bin --strip-components=1 "aivyx-coder-$T/aivyx-coder"
 ```
 
-(Make sure `~/.local/bin` is on your `PATH`.)
+Check it with `aivyx-coder --version`. If that says "command not found",
+`~/.local/bin` isn't on your `PATH` yet (common on macOS): add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell's startup file and
+open a new terminal.
 
 **2. Start a local model server** with a tool-capable model loaded:
 Lemonade Server, Ollama, llama.cpp's `llama-server`, vLLM or Jan.

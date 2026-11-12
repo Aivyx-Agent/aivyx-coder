@@ -8,11 +8,15 @@ Silicon set `T=darwin-aarch64`):
 ```sh
 V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Aivyx-Agent/aivyx-coder/releases/latest | sed 's#.*/##')
 T=x86_64-linux-musl
-curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" | tar xz
-mkdir -p ~/.local/bin && mv "aivyx-coder-$V-$T/aivyx-coder" ~/.local/bin/
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" \
+  | tar xz -C ~/.local/bin --strip-components=1 "aivyx-coder-$T/aivyx-coder"
 ```
 
-Make sure `~/.local/bin` is on your `PATH`. To build it yourself instead,
+Check it with `aivyx-coder --version`. If that says "command not found",
+`~/.local/bin` isn't on your `PATH` yet (common on macOS): add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell's startup file and
+open a new terminal. To build it yourself instead,
 see [Building and testing](../developer/03-building-and-testing.md), or run
 it in a container — see [Docker](14-docker.md).
 
