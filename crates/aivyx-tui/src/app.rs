@@ -2330,7 +2330,10 @@ fn render_permission_modal_in(
     // leaving a human with no visible way to know how to respond to a large
     // new-file write. Splitting the two guarantees the legend always shows,
     // regardless of how long the content above it is.
-    let footer_height = 2u16.min(inner.height);
+    // The key line wraps rather than being cut off in a narrow box
+    // (onboarding audit 3, L4): one more row when it can't fit.
+    let footer_height = if usize::from(inner.width) < APPROVAL_KEYS.len() { 3u16 } else { 2u16 }
+        .min(inner.height);
     let content_height = inner.height.saturating_sub(footer_height);
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -2358,7 +2361,14 @@ fn render_permission_modal_in(
     if max_scroll > 0 {
         let below = max_scroll - scroll;
         let marker = if below > 0 {
-            format!("… {below} more line(s) below — Down/PgDn to scroll, End for the last")
+            let full =
+                format!("… {below} more line(s) below — Down/PgDn to scroll, End for the last");
+            // The short form in a narrow box, so the keys aren't cut off.
+            if full.chars().count() > usize::from(rows[0].width) {
+                format!("… {below} more line(s) below — Down/PgDn, End")
+            } else {
+                full
+            }
         } else {
             "— end of the text — Up/PgUp to scroll back".to_string()
         };
@@ -2390,7 +2400,9 @@ fn render_permission_modal_in(
     } else if request.tool_name == "redo" {
         "[y] Redo    [n] Cancel (default)"
     } else if offer_always_allow(request) && always_hidden_by_clip {
-        "[y] allow  [n] deny (default)  [a] show all  (always allow once you have seen it all)"
+        // Onboarding audit 3 (L4): short enough for the box (the longer
+        // wording was cut off mid-sentence).
+        "[y] allow  [n] deny (default)  [a] show all, then [A] always"
     } else if offer_always_allow(request) && max_scroll > 0 {
         APPROVAL_KEYS
     } else if offer_always_allow(request) {
@@ -2405,7 +2417,9 @@ fn render_permission_modal_in(
     if takes_a_note(request) {
         footer_lines.push(Line::from(DENY_WITH_NOTE_KEY));
     }
-    let footer = Paragraph::new(footer_lines).style(Style::default().fg(Color::DarkGray));
+    let footer = Paragraph::new(footer_lines)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, rows[1]);
 }
 
@@ -2936,6 +2950,31 @@ mod tests {
         // Exactly 4 printed lines (top border, 2 content lines, bottom
         // border), each terminated by \n.
         assert_eq!(banner.matches('\n').count(), 4);
+    }
+
+    /// Onboarding audit 3 (L4): on an 80-column terminal the key help
+    /// wraps instead of being cut off, and the deny-with-note line stays.
+    #[test]
+    fn the_key_help_fits_an_80_column_terminal() {
+        let long_preview: String = (0..200).map(|i| format!("+line {i}\n")).collect();
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            action: ActionKind::Write,
+            target: PermissionTarget::Path(PathBuf::from("/tmp/big_file.rs")),
+            arguments_preview: serde_json::json!({}),
+            preview: Some(long_preview),
+            diff: None,
+        };
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_permission_modal(frame, &request))
+            .unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(rendered.contains("[y] allow  [n] deny (default)"), "{rendered}");
+        assert!(rendered.contains("always"), "the always-allow hint is shown:\n{rendered}");
+        assert!(rendered.contains(DENY_WITH_NOTE_KEY), "{rendered}");
+        assert!(rendered.contains("more line(s) below — Down/PgDn, End"), "{rendered}");
     }
 
     #[test]
