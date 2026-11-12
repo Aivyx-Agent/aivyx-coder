@@ -82,7 +82,8 @@ set one, otherwise a command detected from the project:
 | `go.mod` | `go test ./...` |
 | `package.json` | `pnpm test`, `yarn test` or `npm test`, by lockfile |
 | pytest markers (`pytest.ini`, `[tool.pytest]`, `conftest.py`) | `python3 -m pytest` |
-| Python test files or a `tests/` folder | `python3 -m unittest` |
+| Python test files or a `tests/` folder that use `unittest` | `python3 -m unittest` (with `discover` for `*_test.py` or `tests/`) |
+| other Python test files (pytest style: `def test_…` with `assert`) | `python3 -m pytest` |
 | a `Makefile` with a `test:` target | `make test` |
 
 The start-up hint and `/help` show which one it found. `/test` needs no

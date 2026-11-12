@@ -168,8 +168,9 @@ pub fn detect(dir: &Path) -> Option<DetectedTests> {
     if has("conftest.py") {
         return found("python3", &["-m", "pytest"], "detected from conftest.py");
     }
-    if has_python_tests(dir) {
-        return found("python3", &["-m", "unittest"], "detected from Python test files");
+    let python = python_tests(dir);
+    if python.is_some() {
+        return python;
     }
     if read_capped(&dir.join("Makefile")).is_some_and(|t| t.lines().any(|l| l.starts_with("test:"))) {
         return found("make", &["test"], "detected from Makefile");
@@ -177,9 +178,48 @@ pub fn detect(dir: &Path) -> Option<DetectedTests> {
     None
 }
 
-/// `test_*.py` / `*_test.py` directly in `dir`, or a `tests/` folder
-/// holding any `.py` file (not recursive).
-fn has_python_tests(dir: &Path) -> bool {
+/// Plain Python test files with no pytest marker: `unittest` only when
+/// they use it, else pytest, since a pytest-style file (bare `def test_`
+/// functions) runs 0 tests under unittest and that reads as a pass
+/// (onboarding audit 3, M1). unittest's default discovery finds only
+/// top-level `test*.py`, so `*_test.py` files or a `tests/` folder get an
+/// explicit `discover`.
+fn python_tests(dir: &Path) -> Option<DetectedTests> {
+    let files = python_test_files(dir);
+    if files.is_empty() {
+        return None;
+    }
+    let uses_unittest = files
+        .iter()
+        .take(MAX_PYTHON_FILES_READ)
+        .any(|f| read_capped(f).is_some_and(|t| t.contains("unittest")));
+    if !uses_unittest {
+        return found("python3", &["-m", "pytest"], "detected from pytest-style test files");
+    }
+    let top_level_default = files.iter().any(|f| {
+        f.parent() == Some(dir)
+            && f.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("test"))
+    });
+    let reason = "detected from unittest test files";
+    if top_level_default {
+        return found("python3", &["-m", "unittest"], reason);
+    }
+    let start = if files.iter().any(|f| f.parent() == Some(dir)) { "." } else { "tests" };
+    found(
+        "python3",
+        &["-m", "unittest", "discover", "-s", start, "-p", "*test*.py"],
+        reason,
+    )
+}
+
+/// How many test files [`python_tests`] reads looking for `unittest`.
+const MAX_PYTHON_FILES_READ: usize = 20;
+
+/// `test_*.py` / `*_test.py` directly in `dir`, and every `.py` file in a
+/// `tests/` folder (not recursive).
+fn python_test_files(dir: &Path) -> Vec<std::path::PathBuf> {
     let names = |d: &Path| -> Vec<String> {
         std::fs::read_dir(d)
             .map(|entries| {
@@ -191,9 +231,20 @@ fn has_python_tests(dir: &Path) -> bool {
             })
             .unwrap_or_default()
     };
-    names(dir).iter().any(|n| {
-        n.ends_with(".py") && (n.starts_with("test_") || n.ends_with("_test.py"))
-    }) || names(&dir.join("tests")).iter().any(|n| n.ends_with(".py"))
+    let mut files: Vec<std::path::PathBuf> = names(dir)
+        .into_iter()
+        .filter(|n| n.ends_with(".py") && (n.starts_with("test_") || n.ends_with("_test.py")))
+        .map(|n| dir.join(n))
+        .collect();
+    let tests = dir.join("tests");
+    files.extend(
+        names(&tests)
+            .into_iter()
+            .filter(|n| n.ends_with(".py"))
+            .map(|n| tests.join(n)),
+    );
+    files.sort();
+    files
 }
 
 #[cfg(test)]
@@ -211,6 +262,9 @@ mod tests {
         }
         dir
     }
+
+    const PY_UNITTEST: &str = "import unittest\n\nclass T(unittest.TestCase):\n    def test_x(self):\n        self.assertTrue(True)\n";
+    const PY_PYTEST: &str = "from orders import total\n\ndef test_total():\n    assert total([1, 2]) == 3\n";
 
     fn detected_pair(files: &[(&str, &str)]) -> Option<(String, String)> {
         let dir = dir_with(files);
@@ -248,9 +302,12 @@ mod tests {
             (vec![("pyproject.toml", "[tool.pytest.ini_options]\n")], pair("python3 -m pytest", "detected from pyproject.toml")),
             (vec![("pyproject.toml", "[project]\nname = \"x\"\n")], None),
             (vec![("conftest.py", "")], pair("python3 -m pytest", "detected from conftest.py")),
-            (vec![("test_calc.py", "")], pair("python3 -m unittest", "detected from Python test files")),
-            (vec![("calc_test.py", "")], pair("python3 -m unittest", "detected from Python test files")),
-            (vec![("tests/check.py", "")], pair("python3 -m unittest", "detected from Python test files")),
+            (vec![("test_calc.py", PY_UNITTEST)], pair("python3 -m unittest", "detected from unittest test files")),
+            (vec![("calc_test.py", PY_UNITTEST)], pair("python3 -m unittest discover -s . -p *test*.py", "detected from unittest test files")),
+            (vec![("tests/test_check.py", PY_UNITTEST)], pair("python3 -m unittest discover -s tests -p *test*.py", "detected from unittest test files")),
+            (vec![("test_orders.py", PY_PYTEST)], pair("python3 -m pytest", "detected from pytest-style test files")),
+            (vec![("calc_test.py", PY_PYTEST)], pair("python3 -m pytest", "detected from pytest-style test files")),
+            (vec![("tests/check.py", "")], pair("python3 -m pytest", "detected from pytest-style test files")),
             (vec![("tests/readme.md", "")], None),
             (vec![("Makefile", "build:\n\tcc x.c\ntest: build\n\t./run\n")], pair("make test", "detected from Makefile")),
             (vec![("Makefile", "build:\n\tcc x.c\n")], None),
