@@ -930,13 +930,17 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn tmp(tag: &str) -> PathBuf {
+        // A counter as well: two calls in one clock tick could share a
+        // folder (a pa test flaked that way on CI, 2026-11-13).
+        static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "aivyx-coder-packs-{tag}-{}-{}",
+            "aivyx-coder-packs-{tag}-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
