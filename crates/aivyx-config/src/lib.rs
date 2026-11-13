@@ -789,6 +789,10 @@ pub struct SandboxSettings {
     pub share_system_tmp: bool,
 }
 
+// Off Linux every field is its type's default (`require_enforcement` is
+// `cfg!(target_os = "linux")`), so clippy there asks for a derive; on Linux
+// it isn't one.
+#[allow(clippy::derivable_impls)]
 impl Default for SandboxSettings {
     fn default() -> Self {
         Self {
