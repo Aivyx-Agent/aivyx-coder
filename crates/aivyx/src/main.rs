@@ -309,7 +309,7 @@ mod tests {
                 saved == text,
                 "docs/stable/{name} differs from the code: a change to coder's stable surface \
                  (docs/COMPATIBILITY.md). If it is intended, run \
-                 UPDATE_STABLE_SURFACE=1 cargo test -p aivyx stable_surface and commit docs/stable/"
+                 UPDATE_STABLE_SURFACE=1 cargo test -p aivyx-coder stable_surface and commit docs/stable/"
             );
         }
     }

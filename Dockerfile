@@ -15,7 +15,7 @@ WORKDIR /build
 COPY . .
 
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
-RUN cargo build --release --target x86_64-unknown-linux-musl -p aivyx
+RUN cargo build --release --target x86_64-unknown-linux-musl -p aivyx-coder
 
 # ---- Runtime stage: a minimal, real Alpine base with git/bash/coreutils
 # so the agent's own run_command/run_shell/git_* tools have real

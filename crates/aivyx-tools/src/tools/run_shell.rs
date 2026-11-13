@@ -131,7 +131,7 @@ mod tests {
 
     /// Confined commands get a private, writable `TMPDIR`; the shared
     /// `/tmp` is not writable (`[sandbox] share_system_tmp` is off).
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn confined_commands_write_temp_files_under_a_private_tmpdir() {
         let dir = tempfile::tempdir().unwrap();
@@ -169,7 +169,7 @@ mod tests {
     /// A sandboxed command that fails on a denied read gets the full note
     /// telling the model the sandbox may be the cause; one that fails for
     /// another reason gets the short line; one that succeeds gets neither.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn a_sandbox_denial_is_called_out_to_the_model() {
         let dir = tempfile::tempdir().unwrap();

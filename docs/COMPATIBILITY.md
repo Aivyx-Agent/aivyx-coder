@@ -55,7 +55,7 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
 `docs/stable/` is generated from the code; a test fails when it changes.
 The test is `stable_surface_matches_the_snapshot` in
 `crates/aivyx/src/main.rs`. To update the snapshot on purpose, run
-`UPDATE_STABLE_SURFACE=1 cargo test -p aivyx stable_surface`.
+`UPDATE_STABLE_SURFACE=1 cargo test -p aivyx-coder stable_surface`.
 
 The check has limits:
 

@@ -24,8 +24,8 @@ logic in `aivyx-core`.
 ## Build, run, test, lint
 
 ```sh
-cargo run -p aivyx                         # run the TUI agent
-cargo run -p aivyx -- --acp                # run as an ACP server (Zed/VS Code), stdio
+cargo run -p aivyx-coder                         # run the TUI agent
+cargo run -p aivyx-coder -- --acp                # run as an ACP server (Zed/VS Code), stdio
 
 cargo build --workspace
 cargo test --workspace
@@ -44,14 +44,17 @@ python3 scripts/gen-tools-reference.py  > docs/manual/reference/04-tools.md
 Tests fail if a CLI flag or slash command has no section in
 `docs/manual/reference/01-command-line.md` / `02-slash-commands.md`.
 
-- The real sandbox (Linux Landlock + seccomp) is on by default. To build
-  without it (non-Linux, or a kernel without Landlock), use
-  `--no-default-features` on `aivyx-sandbox` — this changes runtime behavior
-  (see `sandbox.require_enforcement` below), not just the build. The macOS
-  release leg (`.github/workflows/release.yml`, `aarch64-apple-darwin`) is
-  a real, shipped instance of this `--no-default-features` build, not just
-  a theoretical one — see "Sandbox internals" below and the "Platform support"
-  section of `docs/manual/guide/02-install-and-first-run.md`.
+- The real sandbox (Linux Landlock + seccomp) is on by default. On every
+  other platform the `sandbox-backend` feature compiles away (since
+  2026-11-13: `aivyx-confine` gates its backend on Linux, and coder's own
+  gates are `all(feature = "sandbox-backend", target_os = "linux")`), so
+  the macOS release builds with the default features and runs
+  `NoopConfiner` — see "Sandbox internals" below and the "Platform support"
+  section of `docs/manual/guide/02-install-and-first-run.md`. Gate new
+  backend-only code the same way. On Linux, `--no-default-features` still
+  builds without the sandbox (a kernel without Landlock) — this changes
+  runtime behavior (see `sandbox.require_enforcement` below). CI's `macos`
+  job keeps the macOS build working.
 - Config lives at `~/.config/aivyx-coder/config.toml` (written `0600` on
   first run — it may hold an `api_key`). Sessions persist under
   `~/.local/state/aivyx-coder/sessions/<project-key>/`, one file per
@@ -77,20 +80,23 @@ Tests fail if a CLI flag or slash command has no section in
 2. Bump the version in `Cargo.toml` and every `crates/*/Cargo.toml` that
    names it, run `cargo check --workspace` so `Cargo.lock` follows, commit
    `Release vX.Y.Z`, tag `vX.Y.Z`, push both.
-3. Watch the Release, Docker Publish and CI workflows to green. Check the
-   darwin-aarch64 and x86_64-linux-musl archives against their `.sha256`
-   files, and run the Linux binary's `--version`.
+3. Watch the Release (cargo-dist: `dist-workspace.toml`, generated
+   `.github/workflows/release.yml` — regenerate with
+   `dist generate --mode=ci` after changing the config), Docker Publish and
+   CI workflows to green. Check the `aivyx-coder-aarch64-apple-darwin` and
+   `aivyx-coder-x86_64-unknown-linux-musl` archives against their `.sha256`
+   files, and run the README's install command in a clean home
+   (`aivyx-coder --version`).
 4. Update `docs/registry-submission/aivyx-coder/agent.json` (version, URLs,
    sha256s), commit `registry: aivyx-coder vX.Y.Z`, and update
    the registry fork's `aivyx-coder/agent.json` on branch `add-aivyx-coder`
-   (PR 620). The `cmd` paths are version-free
-   (`./aivyx-coder-<target>/aivyx-coder`: the release workflow names the
-   folder inside each archive without the version, only the archive file
-   carries it), so they stay as they are: the registry's hourly
-   auto-updater rewrites only `version`, the archive URLs and the sha256s,
-   and a versioned `cmd` would break the Zed install on the first release
-   after the entry is merged. The v0.6.4 and older archives have the old
-   layout; the first release with this workflow is the first that matches.
+   (PR 620). Since v0.8.2 cargo-dist names archives
+   `aivyx-coder-<target triple>.tar.gz` with the binary at
+   `aivyx-coder-<target triple>/aivyx-coder` (no version in either), so
+   the `cmd` paths stay as they are: the registry's hourly auto-updater
+   rewrites only `version`, the archive URLs and the sha256s.
+   `crates/aivyx/tests/install_docs.rs` checks the docs, the dist config
+   and this entry agree.
 5. After the release ships, record its bench results as the new baseline:
    `coder-bench baseline set <label> --as X.Y.Z --profile models/qwen38-27b.toml`,
    then commit the results and `baselines.json` in the bench repo.
@@ -203,11 +209,10 @@ policy summary below is still accurate and worth knowing before touching
 `ExecutionConfiner` or its call sites, but the actual source — and its
 own more detailed doc comments — now lives in that other repo, not here.
 All of it (`aivyx-confine`'s `sandbox-backend` feature) is Linux-only —
-`landlock`/`seccompiler` don't build on other platforms — so a
-`--no-default-features` build has none of this; this is no longer purely
-hypothetical, since the shipped `aarch64-apple-darwin` release binary
-(`.github/workflows/release.yml`) is built exactly that way and runs with
-`NoopConfiner` (no OS-level confinement, gate-only) — see the "Platform support" section of
+`landlock`/`seccompiler` don't build on other platforms, so there the
+feature compiles away: the shipped `aarch64-apple-darwin` release binary
+runs with `NoopConfiner` (no OS-level confinement, gate-only), as does a
+Linux `--no-default-features` build — see the "Platform support" section of
 `docs/manual/guide/02-install-and-first-run.md`.
 
 - **Landlock** (ABI V7): write grants are `cwd` + a private per-confiner

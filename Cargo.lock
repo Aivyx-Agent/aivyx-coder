@@ -98,7 +98,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "aivyx"
+name = "aivyx-acp"
+version = "0.8.1"
+dependencies = [
+ "agent-client-protocol",
+ "aivyx-core",
+ "aivyx-sandbox",
+ "aivyx-types",
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid 1.24.0",
+]
+
+[[package]]
+name = "aivyx-checkpoint"
+version = "0.1.0"
+source = "git+https://github.com/Aivyx-Agent/aivyx-checkpoint?rev=55f4c93ee87c593f58b5e0ca206263cead98f20d#55f4c93ee87c593f58b5e0ca206263cead98f20d"
+dependencies = [
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "aivyx-coder"
 version = "0.8.1"
 dependencies = [
  "agent-client-protocol",
@@ -143,32 +169,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aivyx-acp"
-version = "0.8.1"
-dependencies = [
- "agent-client-protocol",
- "aivyx-core",
- "aivyx-sandbox",
- "aivyx-types",
- "anyhow",
- "async-trait",
- "serde_json",
- "tokio",
- "tokio-util",
- "uuid 1.24.0",
-]
-
-[[package]]
-name = "aivyx-checkpoint"
-version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-checkpoint?rev=55f4c93ee87c593f58b5e0ca206263cead98f20d#55f4c93ee87c593f58b5e0ca206263cead98f20d"
-dependencies = [
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "aivyx-config"
 version = "0.8.1"
 dependencies = [
@@ -186,7 +186,7 @@ dependencies = [
 [[package]]
 name = "aivyx-confine"
 version = "0.1.0"
-source = "git+https://github.com/Aivyx-Agent/aivyx-confine?rev=e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8#e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8"
+source = "git+https://github.com/Aivyx-Agent/aivyx-confine?rev=836936f16a535c3ddd048fe5a13f1a338c1cd9bd#836936f16a535c3ddd048fe5a13f1a338c1cd9bd"
 dependencies = [
  "globset",
  "landlock",

@@ -5623,7 +5623,7 @@ async fn run_scoped_verification_reports_failure_for_a_nonzero_exit() {
 
 /// The scoped run is confined like `run_command`, so its failures get the
 /// same sandbox note.
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 #[tokio::test]
 async fn a_sandboxed_scoped_verification_failure_gets_the_sandbox_note() {
     let (mut agent, _rx, _mock) = build_agent(vec![], ToolRegistry::new(), 10);
@@ -9240,7 +9240,7 @@ async fn test_passes_streams_output_and_notes_it_for_the_model() {
 /// the sandbox may be the cause -- even when the denial scrolled out of
 /// the tail the note keeps. Any other failure gets the short line; a pass
 /// gets nothing.
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 #[tokio::test]
 async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
     let dir = tempfile::tempdir().unwrap();
@@ -9271,7 +9271,7 @@ async fn sandboxed_test_failure_with_a_denial_gets_the_sandbox_note() {
 
 /// A sandboxed `/test` run names the known sandbox failures among its
 /// failures, even when they scrolled out of the tail the note keeps.
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 #[tokio::test]
 async fn sandboxed_test_run_names_known_sandbox_failures() {
     let dir = tempfile::tempdir().unwrap();

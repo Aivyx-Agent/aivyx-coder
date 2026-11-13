@@ -33,7 +33,7 @@ aivyx-tui = { path = "crates/aivyx-tui", default-features = false }
 # exactly one place to bump: aivyx-kvcache and aivyx-recall previously
 # had the identical git/rev pair duplicated across 3 Cargo.tomls each,
 # which a partial bump could silently desync.
-aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "e4b604e2dfa90a87cb1a6ccb0bb627cda00b3fe8", default-features = false }
+aivyx-confine = { git = "https://github.com/Aivyx-Agent/aivyx-confine", rev = "836936f16a535c3ddd048fe5a13f1a338c1cd9bd", default-features = false }
 aivyx-checkpoint = { git = "https://github.com/Aivyx-Agent/aivyx-checkpoint", rev = "55f4c93ee87c593f58b5e0ca206263cead98f20d" }
 aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "0fb15c3ed2728da49c192890bff6af45e78ecbcc" }
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "c16530ecc58201e81c0e907fc1ffce150f63960d" }
@@ -56,3 +56,7 @@ aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev =
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# The profile cargo-dist builds release archives with: the release profile.
+[profile.dist]
+inherits = "release"

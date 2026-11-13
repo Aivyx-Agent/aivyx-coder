@@ -3,8 +3,8 @@
 ## Build and run
 
 ```sh
-cargo run -p aivyx                  # the TUI, from a checkout
-cargo run -p aivyx -- --acp         # as an ACP server
+cargo run -p aivyx-coder                  # the TUI, from a checkout
+cargo run -p aivyx-coder -- --acp         # as an ACP server
 cargo build --workspace
 ```
 

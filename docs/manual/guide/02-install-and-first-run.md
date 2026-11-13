@@ -2,21 +2,19 @@
 
 ## 1. Install
 
-Download the latest release into `~/.local/bin` (Linux x86_64; on Apple
-Silicon set `T=darwin-aarch64`):
+Install the latest release (Linux x86_64 or an Apple Silicon Mac):
 
 ```sh
-V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Aivyx-Agent/aivyx-coder/releases/latest | sed 's#.*/##')
-T=x86_64-linux-musl
-mkdir -p ~/.local/bin
-curl -fsSL "https://github.com/Aivyx-Agent/aivyx-coder/releases/download/$V/aivyx-coder-$V-$T.tar.gz" \
-  | tar xz -C ~/.local/bin --strip-components=1 "aivyx-coder-$T/aivyx-coder"
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-installer.sh | sh
 ```
 
-Check it with `aivyx-coder --version`. If that says "command not found",
-`~/.local/bin` isn't on your `PATH` yet (common on macOS): add
-`export PATH="$HOME/.local/bin:$PATH"` to your shell's startup file and
-open a new terminal. To build it yourself instead,
+The installer checks the download against its published SHA-256, puts
+`aivyx-coder` in `~/.cargo/bin` (beside Aivyx PA's `aivyx-pa`, if you have
+it) and adds that folder to your `PATH`. Check it with
+`aivyx-coder --version`; if your shell says "command not found", open a
+new terminal. Installed an earlier version into `~/.local/bin`? Remove it
+(`rm ~/.local/bin/aivyx-coder`) so the new one is the one you run. To
+build it yourself instead,
 see [Building and testing](../developer/03-building-and-testing.md), or run
 it in a container — see [Docker](14-docker.md).
 
@@ -62,7 +60,7 @@ command waits for your approval (`y` to allow). The next chapter,
 - **macOS (Apple Silicon)** — works the same, but there is **no kernel
   sandbox**: commands rely on the approval prompts, the deny list and
   checkpoints alone. The binary is unsigned and unnotarized; installing
-  with `curl | tar` as above avoids Gatekeeper's quarantine (a browser
+  with the command above avoids Gatekeeper's quarantine (a browser
   download may be refused).
 - **Windows** — no native build. WSL2 runs the Linux binary; if its
   kernel lacks Landlock, commands refuse to run rather than run unconfined

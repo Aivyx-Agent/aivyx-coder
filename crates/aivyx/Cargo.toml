@@ -1,13 +1,24 @@
 [package]
-name = "aivyx"
+# The package is named for the binary so cargo-dist's archives and installer
+# are aivyx-coder-*, not aivyx-* (the unrelated Aivyx PA platform). The
+# folder stays crates/aivyx.
+name = "aivyx-coder"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository = "https://github.com/Aivyx-Agent/aivyx-coder"
+homepage = "https://aivyx-ecosystem.com/coder"
+description = "A terminal coding agent for local LLMs only"
 
 [[bin]]
 name = "aivyx-coder"
 path = "src/main.rs"
+
+# The workspace sets `publish = false` (nothing goes to crates.io), which
+# also hides a package from cargo-dist unless it opts in.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 aivyx-acp = { version = "0.8.1", path = "../aivyx-acp", default-features = false }

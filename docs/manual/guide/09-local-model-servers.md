@@ -463,15 +463,15 @@ during inference; no separate runtime server to install.
 
 ```bash
 # Lean build (default) — no mistralrs dependency, fast compile, small binary:
-$ cargo build -p aivyx
+$ cargo build -p aivyx-coder
 
 # Embedded provider, CPU only — no C compiler, no CUDA toolkit, no Metal SDK required:
-$ cargo build -p aivyx --features provider-mistral-rs
+$ cargo build -p aivyx-coder --features provider-mistral-rs
 
 # Embedded provider with platform GPU acceleration — pick exactly one:
-$ cargo build -p aivyx --features provider-mistral-rs-cuda       # NVIDIA
-$ cargo build -p aivyx --features provider-mistral-rs-metal      # Apple Silicon
-$ cargo build -p aivyx --features provider-mistral-rs-accelerate # Apple CPU
+$ cargo build -p aivyx-coder --features provider-mistral-rs-cuda       # NVIDIA
+$ cargo build -p aivyx-coder --features provider-mistral-rs-metal      # Apple Silicon
+$ cargo build -p aivyx-coder --features provider-mistral-rs-accelerate # Apple CPU
 ```
 
 | Backend | Feature | Build prerequisite | Runtime |

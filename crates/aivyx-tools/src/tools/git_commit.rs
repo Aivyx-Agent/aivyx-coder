@@ -256,7 +256,7 @@ mod tests {
     /// Under the real confiner `setsid` is refused, so git's detached
     /// auto-maintenance after a commit would print `fatal: setsid failed`
     /// into every successful commit's output.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn a_confined_commit_does_not_report_a_failed_setsid() {
         let dir = tempfile::tempdir().unwrap();

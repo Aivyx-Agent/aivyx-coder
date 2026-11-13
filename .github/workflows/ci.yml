@@ -22,6 +22,19 @@ jobs:
       - run: timeout 600 cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The macOS release builds with the default features since aivyx-confine
+  # compiles its Linux-only backend away elsewhere; this keeps that true.
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo build -p aivyx-coder
+      - run: cargo clippy -p aivyx-coder -- -D warnings
+
   deny:
     runs-on: ubuntu-latest
     steps:

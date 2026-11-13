@@ -67,7 +67,7 @@ pub(crate) fn carved_root_cargo_notice(
     cwd: &std::path::Path,
     deny_paths: &[PathBuf],
 ) -> Option<String> {
-    if !cfg!(feature = "sandbox-backend")
+    if !cfg!(all(feature = "sandbox-backend", target_os = "linux"))
         || !cwd.join("Cargo.toml").is_file()
         || cwd.join("target").exists()
     {
@@ -457,7 +457,7 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
         #[cfg(not(feature = "provider-mistral-rs"))]
         BackendKind::MistralRs => Err(anyhow::anyhow!(
             "backend.kind = \"mistral_rs\" but this binary was built without the \
-             `provider-mistral-rs` feature. Rebuild with `cargo build -p aivyx --features \
+             `provider-mistral-rs` feature. Rebuild with `cargo build -p aivyx-coder --features \
              provider-mistral-rs` to enable embedded inference."
         )),
     }
@@ -772,7 +772,7 @@ pub(crate) async fn build_agent(
     // above always returns the `NoopConfiner` fallback — real OS-level
     // filesystem/process confinement never happens here, no matter what
     // `sandbox.require_enforcement` says in the user's config.
-    #[cfg(not(feature = "sandbox-backend"))]
+    #[cfg(not(all(feature = "sandbox-backend", target_os = "linux")))]
     tracing::warn!(
         "compiled without the sandbox-backend feature — no OS-level (Landlock/seccomp) \
          confinement is available on this build; filesystem and process access are not \
@@ -1630,7 +1630,7 @@ pub(crate) async fn build_agent(
     // With Landlock compiled in, confined child processes (the `git commit`
     // `/commit` runs) can only write under `cwd`; `/commit` refuses up
     // front when the git directory lies outside it.
-    if cfg!(feature = "sandbox-backend") {
+    if cfg!(all(feature = "sandbox-backend", target_os = "linux")) {
         agent.set_write_sandbox(Some(cwd.clone()));
     }
     agent.set_generated_ignore(settings.git.ignore.clone());
@@ -1935,7 +1935,7 @@ mod tests {
         assert!(err.contains("final_checks") && err.contains("\"lint\""), "{err}");
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[test]
     fn carved_root_cargo_notice_fires_only_for_a_rust_root_holding_a_denied_entry_without_target() {
         let dir = tempfile::tempdir().unwrap();

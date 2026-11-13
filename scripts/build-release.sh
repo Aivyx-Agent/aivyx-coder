@@ -21,7 +21,7 @@ echo "Building aivyx-coder v${VERSION} for ${TARGET}..."
 BUILD_LOG="$(mktemp)"
 trap 'rm -f "${BUILD_LOG}"' EXIT
 
-if ! cargo build --release --target "${TARGET}" -p aivyx 2>&1 | tee "${BUILD_LOG}"; then
+if ! cargo build --release --target "${TARGET}" -p aivyx-coder 2>&1 | tee "${BUILD_LOG}"; then
   if grep -q "may not be installed" "${BUILD_LOG}"; then
     echo ""
     echo "ERROR: the ${TARGET} Rust target is not installed."

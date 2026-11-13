@@ -183,7 +183,7 @@ mod tests {
 
     /// Whether a command confined by `member`'s scoped confiner can
     /// create an `AF_UNIX` socket. `None` when python3 isn't installed.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     async fn specialist_can_open_a_unix_socket(options: aivyx_sandbox::ConfineOptions) -> Option<bool> {
         if std::process::Command::new("python3").arg("-c").arg("").status().is_err() {
             eprintln!("python3 not found; skipping");
@@ -205,7 +205,7 @@ mod tests {
 
     /// Specialists get the lead's `[sandbox]` policy: no per-member
     /// loosening, and the lead's opt-outs do reach them.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn a_specialist_confiner_inherits_the_leads_confine_options() {
         let strict = aivyx_sandbox::ConfineOptions::new().require_enforcement(true);

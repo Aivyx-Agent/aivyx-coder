@@ -26,7 +26,7 @@ pub use aivyx_confine::{
     ConfineOptions, ExecutionConfiner, NoopConfiner, default_confiner, default_confiner_with_options,
     kill_process_group,
 };
-#[cfg(feature = "sandbox-backend")]
+#[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
 pub use aivyx_confine::LandlockConfiner;
 pub use aivyx_injection_guard::{InjectionFinding, InjectionTaint, scan_for_injection_markers};
 pub use confirmation::ConfirmationGate;
@@ -97,7 +97,7 @@ pub const SANDBOX_ENV: &str = "AIVYX_CODER_SANDBOX";
 /// Whether this build confines commands with the real sandbox: every
 /// command `build_confiner`'s confiner confines is then `is_sandboxed`.
 pub fn has_sandbox() -> bool {
-    cfg!(feature = "sandbox-backend")
+    cfg!(all(feature = "sandbox-backend", target_os = "linux"))
 }
 
 /// Whether `command` was confined by `build_confiner`'s real sandbox
@@ -1096,7 +1096,7 @@ mod build_confiner_tests {
         vars.iter().map(|(k, v)| (*k, OsString::from(v))).collect()
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn without_the_socket_opt_out_session_ipc_variables_stay_scrubbed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1112,7 +1112,7 @@ mod build_confiner_tests {
         assert_eq!(echo_ipc_env(confiner.as_ref(), &cwd, Some("/explicit")).await, "|");
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn the_socket_opt_out_hands_session_ipc_variables_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1140,13 +1140,13 @@ mod build_confiner_tests {
         for options in [ConfineOptions::new(), ConfineOptions::new().allow_unix_sockets(true)] {
             let confiner = build_confiner_with_parent_env(&cwd, &[], &[], options, parent(&[]));
             let command = confiner.confine(tokio::process::Command::new("true"));
-            assert_eq!(is_sandboxed(&command), cfg!(feature = "sandbox-backend"));
+            assert_eq!(is_sandboxed(&command), cfg!(all(feature = "sandbox-backend", target_os = "linux")));
         }
         let plain = NoopConfiner.confine(tokio::process::Command::new("true"));
         assert!(!is_sandboxed(&plain));
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn a_confined_command_can_see_it_is_sandboxed() {
         let dir = tempfile::tempdir().unwrap();

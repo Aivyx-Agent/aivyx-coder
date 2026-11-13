@@ -335,7 +335,7 @@ mod tests {
         client
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     fn have_python3() -> bool {
         let found = std::process::Command::new("python3").arg("-c").arg("").status().is_ok();
         if !found {
@@ -347,7 +347,7 @@ mod tests {
     /// A real stdio MCP server (python3): answers `initialize`, records in
     /// `unix.txt` whether it could create an `AF_UNIX` socket, and starts
     /// a helper that would write `late.txt` a second later.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     fn python_mcp_server(name: &str) -> McpClient {
         let script = r#"
 import json, socket, subprocess, sys
@@ -377,7 +377,7 @@ for line in sys.stdin:
     /// command — no `AF_UNIX` sockets unless `[sandbox] allow_unix_sockets`
     /// is set — since their stdio transport is a pair of pipes and needs
     /// none; dropping the client kills the server's whole process group.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn a_confined_stdio_mcp_server_works_without_unix_sockets() {
         if !have_python3() {
@@ -400,7 +400,7 @@ for line in sys.stdin:
         );
     }
 
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn allow_unix_sockets_reaches_confined_mcp_servers() {
         if !have_python3() {

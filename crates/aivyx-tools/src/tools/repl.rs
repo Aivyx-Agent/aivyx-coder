@@ -829,7 +829,7 @@ mod tests {
     /// `LandlockConfiner` makes every confined command lead its own
     /// process group and blocks `setsid()`, so the REPL's own
     /// `setsid()`+`TIOCSCTTY` pre-exec hook can't be a hard requirement.
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     #[tokio::test]
     async fn repl_starts_and_talks_under_the_real_confiner() {
         let dir = tempfile::tempdir().unwrap();

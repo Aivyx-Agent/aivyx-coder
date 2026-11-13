@@ -455,11 +455,11 @@ impl Drop for ProcessGroup {
 /// every command in one, so this sends the signal itself. Failures (the
 /// group is already gone) are ignored.
 pub fn kill_process_group(pgid: u32) {
-    #[cfg(feature = "sandbox-backend")]
+    #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]
     {
         let _ = aivyx_sandbox::kill_process_group(pgid);
     }
-    #[cfg(not(feature = "sandbox-backend"))]
+    #[cfg(not(all(feature = "sandbox-backend", target_os = "linux")))]
     {
         // Same validation as aivyx-confine's: never 0 (our own group) or
         // a value that isn't a positive pid_t.

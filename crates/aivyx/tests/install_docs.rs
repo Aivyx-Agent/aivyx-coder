@@ -1,8 +1,9 @@
-//! The install command in the README and the manual must match the archives
-//! the release workflow builds. Since v0.6.5 the folder inside each archive
-//! has no version (for the ACP registry's `cmd`), and the documented
-//! `mv "aivyx-coder-$V-$T/aivyx-coder"` failed for every new user until
-//! onboarding audit 3 (2026-11-12) caught it.
+//! The install command in the README and the manual, the release config
+//! that produces what it downloads, and the ACP registry entry's paths
+//! must agree. A five-line hand-written install snippet once drifted from
+//! the release archives and failed for every new user from v0.6.5 until
+//! onboarding audit 3 (2026-11-12); since 2026-11-13 cargo-dist builds the
+//! release and a one-line installer, and these tests keep the three in step.
 
 use std::path::{Path, PathBuf};
 
@@ -14,34 +15,46 @@ fn read(path: &str) -> String {
     std::fs::read_to_string(repo().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
+const INSTALLER: &str = "https://github.com/Aivyx-Agent/aivyx-coder/releases/latest/download/aivyx-coder-installer.sh";
+
+/// The targets the release builds, as cargo-dist names them.
+const TARGETS: [&str; 2] = ["x86_64-unknown-linux-musl", "aarch64-apple-darwin"];
+
 #[test]
-fn the_release_workflow_names_archives_and_folders_as_the_docs_expect() {
-    let workflow = read(".github/workflows/release.yml");
+fn the_release_config_builds_the_installer_and_the_archives() {
+    let dist = read("dist-workspace.toml");
+    assert!(dist.contains(r#"installers = ["shell"]"#), "the shell installer is gone");
+    assert!(dist.contains(r#"unix-archive = ".tar.gz""#), "the registry reads .tar.gz");
+    for target in TARGETS {
+        assert!(dist.contains(&format!("\"{target}\"")), "{target} is no longer built");
+    }
+    let manifest = read("crates/aivyx/Cargo.toml");
     assert!(
-        workflow.contains(r#"ARCHIVE_NAME="aivyx-coder-${GITHUB_REF_NAME}-${{ matrix.stage_suffix }}""#),
-        "the archive file name changed: update the install command in README.md and the manual"
-    );
-    assert!(
-        workflow.contains(r#"STAGE_NAME="aivyx-coder-${{ matrix.stage_suffix }}""#),
-        "the folder inside the archive changed: update the install command in README.md and the manual"
+        manifest.contains("name = \"aivyx-coder\""),
+        "the package name names the installer and archives (aivyx-coder-installer.sh)"
     );
 }
 
 #[test]
-fn the_documented_install_command_extracts_the_binary_the_archive_holds() {
+fn the_docs_install_with_the_installer() {
     for doc in ["README.md", "docs/manual/guide/02-install-and-first-run.md"] {
         let text = read(doc);
+        assert!(text.contains(INSTALLER), "{doc}: install with {INSTALLER}");
+        assert!(!text.contains("--strip-components"), "{doc}: the old snippet is back");
+    }
+}
+
+#[test]
+fn the_registry_entry_points_into_the_archives_cargo_dist_builds() {
+    let entry = read("docs/registry-submission/aivyx-coder/agent.json");
+    for target in TARGETS {
         assert!(
-            text.contains(r#"releases/download/$V/aivyx-coder-$V-$T.tar.gz"#),
-            "{doc}: the archive URL must be aivyx-coder-$V-$T.tar.gz"
+            entry.contains(&format!(r#""cmd": "./aivyx-coder-{target}/aivyx-coder""#)),
+            "agent.json: the binary is at aivyx-coder-{target}/aivyx-coder in the archive"
         );
         assert!(
-            text.contains(r#"--strip-components=1 "aivyx-coder-$T/aivyx-coder""#),
-            "{doc}: extract the binary by its version-free path inside the archive"
-        );
-        assert!(
-            !text.contains(r#"aivyx-coder-$V-$T/"#),
-            "{doc}: no folder inside the archive carries the version"
+            entry.contains(&format!("aivyx-coder-{target}.tar.gz")),
+            "agent.json: the archive is aivyx-coder-{target}.tar.gz"
         );
     }
 }
