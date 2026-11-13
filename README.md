@@ -6,6 +6,8 @@
   <img alt="aivyx-coder" src="docs/logos/aivyx-lockup-horizontal-light.svg" width="280">
 </picture>
 
+**Website:** [aivyx-ecosystem.com/coder](https://aivyx-ecosystem.com/coder/) · [User manual](https://aivyx-ecosystem.com/coder/manual/) · [Get started](https://aivyx-ecosystem.com/start/)
+
 [![CI](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aivyx-Agent/aivyx-coder/actions/workflows/ci.yml)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
