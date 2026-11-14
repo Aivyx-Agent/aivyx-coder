@@ -4728,14 +4728,58 @@ async fn wiki_batch_regenerates_missing_pages_and_stamps_frontmatter() {
 }
 
 #[tokio::test]
+async fn wiki_in_a_folder_with_nothing_to_document_says_so() {
+    // No manifest, entry point or crates: no pages. The notice must say
+    // why, not claim the wiki is up to date, and no model call is made.
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (tx, mut rx) = unbounded_channel();
+    let llm: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(vec![]));
+    let gate: Arc<dyn PermissionGate> = Arc::new(AllowAllGate);
+    let confiner: Arc<dyn ExecutionConfiner> = Arc::new(NoopConfiner);
+    let executor = ToolExecutor::new(ToolRegistry::new(), gate, confiner);
+    let mut agent = Agent::new(
+        llm,
+        executor,
+        "system",
+        AgentConfig::default(),
+        Arc::default(),
+        PlanMode::new(),
+        AutonomousMode::new(),
+        tx,
+    );
+
+    agent
+        .run_wiki_turn(
+            crate::wiki::WikiCommand::Batch,
+            dir.path(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = drain(&mut rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("nothing to document")))
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("up to date"))));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnComplete)));
+}
+
+#[tokio::test]
 async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing() {
-    // No `crates/` directory at all in this tempdir, so
-    // `crate::wiki::page_specs` (Task 3) discovers exactly one page:
+    // A root Cargo.toml and no `crates/` directory, so
+    // `crate::wiki::page_specs` discovers exactly one page:
     // `architecture-overview` (matches
     // `page_specs_handles_a_missing_crates_directory_gracefully`'s
     // behavior) — stamping *that* page at the real current HEAD is what
     // makes `stale_pages` report nothing stale.
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
     init_git_repo(dir.path()).await;
     let wiki_dir = dir.path().join("docs/wiki");
     std::fs::create_dir_all(&wiki_dir).unwrap();
@@ -4749,7 +4793,7 @@ async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing
     // `covers` is deliberately omitted here: `stale_pages` only reads
     // `generated_at_commit` back from a page's own frontmatter — the
     // covered paths it diffs against come from `spec.covers`
-    // (`crate::wiki::ARCHITECTURE_OVERVIEW_COVERS` for this page), not
+    // (`Cargo.toml` for this page, found on disk), not
     // from the file on disk. Since `generated_at_commit` here equals
     // the repo's current HEAD with no commits made since, `git diff
     // --name-only <head> HEAD -- <anything>` is trivially empty
@@ -4800,6 +4844,9 @@ async fn wiki_bare_invocation_with_nothing_stale_emits_notice_and_writes_nothing
 #[tokio::test]
 async fn wiki_forced_invocation_with_unknown_page_name_rejects_with_no_turn() {
     let dir = tempfile::tempdir().unwrap();
+    // A project with one page (architecture-overview), so the unknown name
+    // is what gets rejected.
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
     init_git_repo(dir.path()).await;
 
     let registry = ToolRegistry::new();

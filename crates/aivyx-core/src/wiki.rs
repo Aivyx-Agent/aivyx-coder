@@ -15,17 +15,71 @@ use aivyx_tools::wiki::PageSpec;
 /// Where generated wiki pages live, relative to the process `cwd`.
 pub const WIKI_DIR: &str = "docs/wiki";
 
-/// `architecture-overview.md`'s curated coverage: cross-cutting structural
-/// files, not the whole repo — deliberately fixed here rather than
-/// re-curated by the model on every run (see this plan's Global
-/// Constraints). Update this list by hand if the workspace's structural
-/// shape changes materially.
-const ARCHITECTURE_OVERVIEW_COVERS: &[&str] = &[
+/// Build manifests that describe a project's overall shape, in the order
+/// they're listed on `architecture-overview`.
+const MANIFESTS: &[&str] = &[
     "Cargo.toml",
-    "crates/aivyx/src/main.rs",
-    "crates/aivyx-core/src/agent.rs",
-    "crates/aivyx-tui/src/app.rs",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
 ];
+
+/// Common top-level entry points.
+const ENTRY_POINTS: &[&str] = &[
+    "src/main.rs",
+    "src/lib.rs",
+    "main.go",
+    "src/index.ts",
+    "src/index.js",
+    "src/main.ts",
+    "src/main.py",
+    "main.py",
+];
+
+/// `architecture-overview.md`'s coverage for the project at `cwd`: the
+/// structural files it actually has — its build manifests, its top-level
+/// entry points and each workspace crate's `src/main.rs` — not the whole
+/// repo. Found on disk (this used to be a fixed list of aivyx-coder's own
+/// files, so `/wiki` in any other project asked the model to document
+/// files that weren't there). Empty when nothing is recognised.
+fn architecture_overview_covers(cwd: &Path) -> Vec<String> {
+    let mut covers: Vec<String> = MANIFESTS
+        .iter()
+        .chain(ENTRY_POINTS)
+        .filter(|path| cwd.join(path).is_file())
+        .map(|path| path.to_string())
+        .collect();
+    let mut binaries: Vec<String> = workspace_crates(cwd)
+        .into_iter()
+        .map(|name| format!("crates/{name}/src/main.rs"))
+        .filter(|path| cwd.join(path).is_file())
+        .collect();
+    binaries.sort();
+    covers.extend(binaries);
+    covers
+}
+
+/// Directories under `cwd/crates` that hold a `Cargo.toml`, sorted.
+fn workspace_crates(cwd: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(cwd.join("crates"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join("Cargo.toml").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// What `/wiki` says when `page_specs` finds nothing to document.
+pub const NOTHING_TO_DOCUMENT: &str = "/wiki found nothing to document here: it looks for \
+     a build manifest (Cargo.toml, package.json, pyproject.toml, go.mod, ...), a top-level \
+     entry point (src/main.rs, main.go, src/index.ts, ...) or crates under crates/. Run it \
+     from the project's root.";
 
 /// Recognized `/wiki` forms. Bare `/wiki` regenerates whatever
 /// `aivyx_tools::wiki::stale_pages` reports; `/wiki <page>` forces exactly
@@ -47,32 +101,24 @@ pub fn parse_command(input: &str) -> Option<WikiCommand> {
     }
 }
 
-/// This project's full page skeleton: `architecture-overview` plus one page
-/// per workspace crate, discovered from `cwd/crates/*` (a directory
-/// containing a `Cargo.toml`) rather than hand-maintained, so a new crate
-/// automatically gets a page without this list needing an update. Crate
-/// directory names in this workspace are identical to their package names
-/// (verified: `crates/aivyx-core` contains package `aivyx-core`), so the
-/// directory name is used directly without parsing `Cargo.toml`.
+/// The project's full page skeleton: `architecture-overview` (when
+/// `architecture_overview_covers` finds anything) plus one page per
+/// workspace crate, discovered from `cwd/crates/*` (a directory containing
+/// a `Cargo.toml`), so a new crate automatically gets a page. The
+/// directory name is used as the page name without parsing `Cargo.toml`.
+/// Empty when the project has nothing recognisable: `/wiki` then says so
+/// (`NOTHING_TO_DOCUMENT`) instead of claiming the wiki is up to date.
 pub fn page_specs(cwd: &Path) -> Vec<PageSpec> {
-    let mut specs = vec![PageSpec {
-        name: "architecture-overview".to_string(),
-        covers: ARCHITECTURE_OVERVIEW_COVERS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    }];
+    let mut specs = Vec::new();
+    let overview = architecture_overview_covers(cwd);
+    if !overview.is_empty() {
+        specs.push(PageSpec {
+            name: "architecture-overview".to_string(),
+            covers: overview,
+        });
+    }
 
-    let mut crate_names: Vec<String> = std::fs::read_dir(cwd.join("crates"))
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().join("Cargo.toml").is_file())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect();
-    crate_names.sort();
-
-    for name in crate_names {
+    for name in workspace_crates(cwd) {
         specs.push(PageSpec {
             covers: vec![format!("crates/{name}")],
             name,
@@ -105,6 +151,7 @@ mod tests {
     #[test]
     fn page_specs_includes_architecture_overview_and_discovered_crates_sorted() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         for name in ["zeta-crate", "alpha-crate"] {
             let crate_dir = dir.path().join("crates").join(name);
             std::fs::create_dir_all(&crate_dir).unwrap();
@@ -126,8 +173,58 @@ mod tests {
     #[test]
     fn page_specs_handles_a_missing_crates_directory_gracefully() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
         let specs = page_specs(dir.path());
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "architecture-overview");
+        assert_eq!(specs[0].covers, vec!["Cargo.toml"]);
+    }
+
+    #[test]
+    fn the_overview_covers_only_files_this_project_has() {
+        // A single-crate Rust project like aivyx-deploy: none of
+        // aivyx-coder's own files (the 2026-11-13 failure).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for file in ["Cargo.toml", "src/main.rs", "README.md"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        assert_eq!(
+            architecture_overview_covers(dir.path()),
+            vec!["Cargo.toml", "src/main.rs"]
+        );
+
+        // A workspace: the root manifest plus each binary crate's main.rs,
+        // sorted; a library crate adds no entry point.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        for (name, file) in [("zed", "main.rs"), ("app", "main.rs"), ("core", "lib.rs")] {
+            let src = dir.path().join("crates").join(name).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.parent().unwrap().join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(src.join(file), "").unwrap();
+        }
+        assert_eq!(
+            architecture_overview_covers(dir.path()),
+            vec!["Cargo.toml", "crates/app/src/main.rs", "crates/zed/src/main.rs"]
+        );
+
+        // A Node project.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for file in ["package.json", "src/index.ts"] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        assert_eq!(
+            architecture_overview_covers(dir.path()),
+            vec!["package.json", "src/index.ts"]
+        );
+    }
+
+    #[test]
+    fn a_folder_with_nothing_recognisable_has_no_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+        assert!(page_specs(dir.path()).is_empty());
     }
 }

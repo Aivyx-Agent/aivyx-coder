@@ -112,7 +112,9 @@ get no tools and don't see your files. Needs `[council]` in the config.
 ### `/wiki`
 
 Regenerate the project wiki pages that are out of date, or `/wiki <page>`
-to regenerate one. See [Memory and learning](../guide/07-memory-and-learning.md).
+to regenerate one. In a folder with no build manifest, entry point or
+`crates/` it says there is nothing to document. See [Memory and
+learning](../guide/07-memory-and-learning.md).
 
 ## The app
 

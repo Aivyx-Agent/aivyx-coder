@@ -42,7 +42,10 @@ Each topic keeps at most 1,000 notes. Not available in `--auto`.
 ## The project wiki
 
 **`/wiki`** has the model write and maintain `docs/wiki/` — one page per
-part of the workspace plus an architecture overview — with every page write
+crate under `crates/` plus an architecture overview of the build manifests
+and entry points it finds (`Cargo.toml`, `package.json`, `pyproject.toml`,
+`go.mod`, `src/main.rs`, `main.go`, `src/index.ts`, each crate's
+`src/main.rs`, ...) — with every page write
 approved as usual. Later, bare `/wiki` regenerates only the pages whose
 source changed since they were written; `/wiki <page>` regenerates one. The
 repository map lists the pages so the model can read the right one when it

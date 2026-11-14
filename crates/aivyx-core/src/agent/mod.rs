@@ -2995,6 +2995,11 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let wiki_dir = cwd.join(crate::wiki::WIKI_DIR);
         let specs = crate::wiki::page_specs(cwd);
+        if specs.is_empty() {
+            self.emit(AgentEvent::Error(crate::wiki::NOTHING_TO_DOCUMENT.to_string()));
+            self.emit(AgentEvent::TurnComplete);
+            return Ok(());
+        }
 
         let pages: Vec<StalePage> = match command {
             crate::wiki::WikiCommand::Batch => {
