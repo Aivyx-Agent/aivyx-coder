@@ -1049,6 +1049,21 @@ mcp = "coder/mcp.toml"
     }
 
     #[test]
+    fn a_pack_signed_with_a_built_in_aivyx_key_installs_with_no_trusted_publishers() {
+        // aivyx-pack's own fixtures: the coder-base template signed with
+        // the primary and the backup key in AIVYX_PUBLISHER_KEYS.
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for name in ["primary", "backup"] {
+            let packs = PacksDir::at(tmp(&format!("builtin-{name}")));
+            let installed = install(&packs, &fixtures.join(format!("{name}.aivyxpack")), &[])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(installed.version, "0.1.0", "{name}");
+            assert!(installed.dir.join("coder/AGENTS.md").is_file(), "{name}");
+            assert_eq!(packs.find("fixture").unwrap().version, "0.1.0", "{name}");
+        }
+    }
+
+    #[test]
     fn an_untrusted_pack_is_refused_and_nothing_is_left() {
         let packs = PacksDir::at(tmp("untrusted-root"));
         let (bundle, _key) = signed(&good_pack("untrusted"));

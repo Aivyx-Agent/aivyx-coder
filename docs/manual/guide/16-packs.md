@@ -28,7 +28,10 @@ exact commands they would run) and whether it passes its checks.
 `~/.config/aivyx-coder/packs/`. Installing a newer version replaces the
 older one.
 
-To trust a publisher, add their key (from `aivyx-pack keygen`) to your
+Packs from Aivyx itself install as they are: aivyx-coder has the Aivyx
+publisher keys built in. The Hub lists them on its
+[home page](https://aivyx-hub.com/#trust-heading) so you can compare. To trust
+another publisher, add their key (from `aivyx-pack keygen`) to your
 config:
 
 ```toml
