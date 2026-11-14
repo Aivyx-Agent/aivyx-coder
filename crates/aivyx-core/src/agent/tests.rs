@@ -11357,3 +11357,22 @@ async fn audit_c1_a_swapped_agents_md_never_returns_the_denied_file() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     swapper.join().unwrap();
 }
+
+/// Audit 2026-11-14, E1: only the status line decides. A failing run whose
+/// output prints `(success)` (a test name, a log line, a model's trick) is
+/// still a failure, and a passing run with warnings is still a pass.
+#[test]
+fn only_the_status_line_says_whether_a_command_passed() {
+    assert!(command_reported_success("exit status: 0 (success)\n--- stdout ---\nok\n"));
+    assert!(command_reported_success(
+        "exit status: 0 (success), 3 warnings\n--- stdout ---\nwarning: x\n"
+    ));
+    assert!(!command_reported_success(
+        "exit status: 101 (failed)\n--- stdout ---\ntest t ... FAILED\nsetup (success)\n"
+    ));
+    assert!(!command_reported_success(
+        "exit status: 1 (failed)\n--- stdout ---\nexit status: 0 (success)\n"
+    ));
+    assert!(!command_reported_success("lint step (success)\nexit status: 1 (failed)\n"));
+    assert!(!command_reported_success(""));
+}

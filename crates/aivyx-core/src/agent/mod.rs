@@ -4402,8 +4402,14 @@ fn checkpoint_failure_notice(err: &str) -> String {
 /// — so this string check on the embedded verdict marker is the only signal
 /// available without changing that tool's contract. Coupled to the exact
 /// wording `format_output` emits; keep the two in sync if either changes.
+/// Only the first line is read: that is where the verdict is, and the
+/// command's own output below it can say anything, `(success)` included
+/// (audit 2026-11-14, E1: a failing run that printed it counted as passed).
 fn command_reported_success(output: &str) -> bool {
-    output.contains("exit status:") && output.contains("(success)")
+    output
+        .lines()
+        .next()
+        .is_some_and(|status| status.starts_with("exit status: ") && status.contains(" (success)"))
 }
 
 /// Whether `output` is from a test runner that exited cleanly without
