@@ -64,7 +64,10 @@ command waits for your approval (`y` to allow). The next chapter,
   confined by the kernel (Landlock and seccomp).
 - **macOS (Apple Silicon)** — works the same, but there is **no kernel
   sandbox**: commands rely on the approval prompts, the deny list and
-  checkpoints alone. The binary is unsigned and unnotarized; installing
+  checkpoints alone, and aivyx-coder says so when it starts. In `--auto`
+  nobody approves anything, so pre-approved commands such as `cargo test`
+  run code the model wrote with your full access: run unattended work in a
+  container ([Docker](14-docker.md)) or on Linux. The binary is unsigned and unnotarized; installing
   with the command above avoids Gatekeeper's quarantine (a browser
   download may be refused).
 - **Windows** — no native build. WSL2 runs the Linux binary; if its

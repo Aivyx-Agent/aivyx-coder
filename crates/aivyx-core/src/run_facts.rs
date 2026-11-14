@@ -113,6 +113,9 @@ pub struct RunReport<'a> {
     /// Tool-call checkpoints during the run, and how many failed.
     pub checkpoints: u32,
     pub checkpoint_failures: u32,
+    /// Whether this build confined the commands it ran (Landlock and
+    /// seccomp; `false` on macOS). Audit 2026-11-14, M1.
+    pub sandboxed: bool,
 }
 
 /// The JSON shape: `RunReport` flattened, with the read-only files that
@@ -138,6 +141,7 @@ struct ReportJson<'a> {
     peak_context_tokens: u32,
     checkpoints: u32,
     checkpoint_failures: u32,
+    sandboxed: bool,
     /// Files in `read_only_paths` that changed anyway (a command can change
     /// what the file tools may not).
     read_only_touched: Vec<&'a str>,
@@ -247,6 +251,7 @@ impl RunReport<'_> {
             peak_context_tokens: self.usage.peak_prompt_tokens,
             checkpoints: self.checkpoints,
             checkpoint_failures: self.checkpoint_failures,
+            sandboxed: self.sandboxed,
             read_only_touched: self
                 .changed_files
                 .iter()
@@ -350,6 +355,7 @@ mod tests {
             },
             checkpoints: 30,
             checkpoint_failures: 1,
+            sandboxed: true,
         };
         let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(json["report_version"], 2);
@@ -358,6 +364,7 @@ mod tests {
             serde_json::from_str(&with_userinfo.to_json()).unwrap();
         assert_eq!(json_userinfo["base_url"], "http://llama:8080/v1");
         assert_eq!(json["coder_version"], "0.6.3");
+        assert_eq!(json["sandboxed"], true);
         assert_eq!(json["outcome"], "goal_achieved");
         assert_eq!(json["iterations"], 5);
         assert_eq!(json["final_checks"][0]["warnings"], 3);

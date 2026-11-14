@@ -491,6 +491,7 @@ async fn finish(
             usage: agent.usage_totals(),
             checkpoints,
             checkpoint_failures,
+            sandboxed: aivyx_sandbox::has_sandbox(),
         };
         if let Err(err) = write_report(path, &report.to_json()) {
             agent.notify(format!("couldn't write the --report file {}: {err}", path.display()));

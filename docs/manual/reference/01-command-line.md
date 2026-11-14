@@ -99,6 +99,8 @@ aivyx-coder checked itself to this file as JSON:
   `peak_context_tokens` over the main loop's model requests (as the server
   reported them; sub-agents aren't counted);
 - `checkpoints` and `checkpoint_failures` during the run;
+- `sandboxed`: whether this build confined the commands it ran (`false` on
+  macOS);
 - `report_version` (2) and `coder_version`. The version goes up only when a
   field changes meaning or is removed, not when one is added.
 

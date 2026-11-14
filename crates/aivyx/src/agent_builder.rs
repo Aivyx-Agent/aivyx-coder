@@ -88,6 +88,32 @@ pub(crate) fn carved_root_cargo_notice(
     ))
 }
 
+/// The start-up warning for a build without the OS sandbox (macOS, or a
+/// Linux `--no-default-features` build), or `None` with it. Without it the
+/// approval prompts and `deny_paths` are the only guard, and in `--auto`
+/// pre-approved commands run code the model wrote with the user's access
+/// (audit 2026-11-14, M1: this used to reach only `aivyx.log`).
+pub(crate) fn no_sandbox_notice(has_sandbox: bool, autonomous: bool) -> Option<String> {
+    if has_sandbox {
+        return None;
+    }
+    let base = "This build has no OS sandbox (Landlock and seccomp are Linux-only), so the \
+                commands the model runs are not confined: the approval prompts and \
+                deny_paths are the only guard.";
+    Some(if autonomous {
+        format!(
+            "{base} In --auto nobody approves anything: pre-approved commands such as \
+             `cargo test` run code the model wrote, with your full access. Run unattended \
+             work in a container or on Linux."
+        )
+    } else {
+        format!(
+            "{base} A command you allow, such as `cargo test`, runs the project's code with \
+             your full access."
+        )
+    })
+}
+
 /// The `[sandbox]` section as `aivyx-confine`'s policy: every confiner
 /// this binary builds (the lead's, and each specialist's) uses it.
 /// `require_enforcement` keeps its existing meaning; the three opt-outs
@@ -772,12 +798,11 @@ pub(crate) async fn build_agent(
     // above always returns the `NoopConfiner` fallback — real OS-level
     // filesystem/process confinement never happens here, no matter what
     // `sandbox.require_enforcement` says in the user's config.
-    #[cfg(not(all(feature = "sandbox-backend", target_os = "linux")))]
-    tracing::warn!(
-        "compiled without the sandbox-backend feature — no OS-level (Landlock/seccomp) \
-         confinement is available on this build; filesystem and process access are not \
-         enforced regardless of sandbox.require_enforcement"
-    );
+    // Told to the user below, once the event channel exists.
+    let no_sandbox = no_sandbox_notice(aivyx_sandbox::has_sandbox(), cli.auto.is_some());
+    if let Some(notice) = &no_sandbox {
+        tracing::warn!(%notice, "no OS-level confinement on this build");
+    }
 
     let mut checkpointer: Option<Arc<GitCheckpointer>> = None;
     // Set when cwd is a git repository whose checkpoints aivyx-checkpoint
@@ -833,6 +858,9 @@ pub(crate) async fn build_agent(
         });
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    if let Some(notice) = no_sandbox {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Warning(notice));
+    }
     if let Some(reason) = &checkpoints_refused {
         let _ = events_tx.send(aivyx_core::AgentEvent::Warning(refused_checkpoints_notice(reason)));
     }
@@ -1933,6 +1961,17 @@ mod tests {
         assert!(check_final_checks(&[], &allowed).is_ok());
         let err = check_final_checks(&["lint".to_string()], &allowed).unwrap_err().to_string();
         assert!(err.contains("final_checks") && err.contains("\"lint\""), "{err}");
+    }
+
+    #[test]
+    fn a_build_without_the_sandbox_says_so_at_start_up() {
+        assert_eq!(no_sandbox_notice(true, false), None);
+        assert_eq!(no_sandbox_notice(true, true), None);
+        let interactive = no_sandbox_notice(false, false).expect("no sandbox: a notice");
+        assert!(interactive.contains("no OS sandbox") && interactive.contains("not confined"));
+        assert!(!interactive.contains("--auto"), "{interactive}");
+        let auto = no_sandbox_notice(false, true).expect("no sandbox: a notice");
+        assert!(auto.contains("--auto") && auto.contains("container"), "{auto}");
     }
 
     #[cfg(all(feature = "sandbox-backend", target_os = "linux"))]

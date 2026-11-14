@@ -214,7 +214,8 @@ fact.
 
 This tier is Linux-only — see [Install and first run](../guide/02-install-and-first-run.md#platform-support). On the macOS
 binary, process execution stops after tier 2 (`ConfirmationGate`); no
-OS-level confinement applies.
+OS-level confinement applies. aivyx-coder shows a warning at start-up, and `--report`
+records `"sandboxed": false`.
 
 Confinement isn't limited to `run_command`/`run_shell` — it applies to every
 tool that spawns a child process: `git_commit`/`git_push`/`git_branch`/
