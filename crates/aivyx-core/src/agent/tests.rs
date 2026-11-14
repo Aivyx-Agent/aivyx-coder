@@ -3005,7 +3005,28 @@ async fn progress_check_agent(
     dir: &Path,
     file: &str,
 ) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-    let args = vec!["-c".to_string(), FAKE_SUITE.to_string()];
+    progress_check_agent_with(dir, file, FAKE_SUITE).await
+}
+
+/// A suite in plain `cargo test` format, which names every test it runs:
+/// `a::was_fine` passes unless `broke.txt` exists, and `a::new_test` only
+/// exists once `new_test.txt` does, and fails.
+const LISTED_SUITE: &str = "ok=''; fail=''; \
+    if [ -e broke.txt ]; then fail=a::was_fine; else ok=a::was_fine; fi; \
+    [ -e new_test.txt ] && fail=\"$fail a::new_test\"; \
+    n=$(echo $fail | wc -w); p=$(echo $ok | wc -w); \
+    for t in $ok; do echo \"test $t ... ok\"; done; \
+    for t in $fail; do echo \"test $t ... FAILED\"; done; \
+    echo; echo failures:; for t in $fail; do echo \"    $t\"; done; echo; \
+    echo \"test result: FAILED. $p passed; $n failed; 0 ignored; 0 measured; 0 filtered out\"; \
+    [ $n -eq 0 ] || exit 101";
+
+async fn progress_check_agent_with(
+    dir: &Path,
+    file: &str,
+    suite: &str,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    let args = vec!["-c".to_string(), suite.to_string()];
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(aivyx_tools::WriteFileTool));
     registry.register(Arc::new(RunCommandTool::new(vec![CommandSpec {
@@ -3109,6 +3130,76 @@ async fn autonomous_mode_still_discards_edits_that_broke_a_test() {
     assert!(!dir.path().join("broke.txt").exists(), "the harmful edit was kept");
     let errors = error_events(&mut rx);
     assert!(errors.iter().any(|e| e.contains("discarded this round")), "{errors:?}");
+}
+
+/// Live finding (2026-11-14, xp-debrief follow-up): the model fixed a hang
+/// and added a regression test that didn't pass yet; the test wasn't in the
+/// suite before, so the round read as a breakage and the fix was discarded
+/// with it. A new failing test is not a broken one.
+#[tokio::test]
+async fn autonomous_mode_keeps_a_round_that_only_added_a_failing_test() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, mut rx) =
+        progress_check_agent_with(dir.path(), "new_test.txt", LISTED_SUITE).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(dir.path().join("new_test.txt").exists(), "the round was discarded");
+    let errors = error_events(&mut rx);
+    let notice = errors.iter().find(|e| e.contains("was kept")).expect("a kept notice");
+    assert!(
+        notice.contains("added 1 new test(s) that don't pass yet (a::new_test)"),
+        "{notice}"
+    );
+    assert!(notice.contains("broke no existing test"), "{notice}");
+    assert!(!notice.contains("Still failing"), "{notice}");
+    assert!(agent.pending_notes.is_empty(), "{:?}", agent.pending_notes);
+}
+
+/// A new failing test doesn't excuse breaking an old one.
+#[tokio::test]
+async fn autonomous_mode_still_discards_a_breakage_beside_a_new_test() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, mut rx) =
+        progress_check_agent_with(dir.path(), "broke.txt", LISTED_SUITE).await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(!dir.path().join("broke.txt").exists(), "the harmful edit was kept");
+    let errors = error_events(&mut rx);
+    assert!(errors.iter().any(|e| e.contains("discarded this round")), "{errors:?}");
+}
+
+/// After a discard the model is told, in its next message, what went back
+/// and what the lost diff was — in the xp-debrief follow-up it didn't know
+/// and rewrote a test that only failed because its fix was gone.
+#[tokio::test]
+async fn a_discarded_round_is_told_to_the_model_with_its_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, _rx) = progress_check_agent(dir.path(), "broke.txt").await;
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert!(!dir.path().join("broke.txt").exists());
+    assert_eq!(agent.pending_notes.len(), 1, "{:?}", agent.pending_notes);
+    let note = &agent.pending_notes[0];
+    assert!(note.starts_with("Your last round of edits was discarded"), "{note}");
+    assert!(note.contains("Reverted: broke.txt."), "{note}");
+    assert!(note.contains("+++ b/broke.txt"), "{note}");
+    assert!(note.contains("\n+x"), "{note}");
+    assert!(note.contains("shown as data"), "{note}");
 }
 
 fn known_failures(patterns: &[&str]) -> crate::SandboxFailures {

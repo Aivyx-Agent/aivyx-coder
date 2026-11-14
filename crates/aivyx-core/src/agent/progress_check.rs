@@ -8,8 +8,16 @@
 //! The test command is run twice, streamed and uncapped (`run_command`
 //! keeps only the tail of its output, which can drop part of the failure
 //! list): on the edited tree, then on the pre-experiment checkpoint, after
-//! which the edits are put back. The round is kept only when it fixed at
-//! least one failing test and broke none (`failing_tests::progress`).
+//! which the edits are put back. The round is kept only when it broke no
+//! existing test and either fixed a failing one or added new tests that
+//! don't pass yet (`failing_tests::progress`).
+//!
+//! A round that is still discarded is told to the model
+//! (`discarded_round_note`): which files went back, and the discarded
+//! diff. Live finding (2026-11-14, xp-debrief follow-up): after a discard
+//! the model didn't know its fix was gone, and spent its last two
+//! iterations rewriting a test that only failed because the fix had been
+//! reverted.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -156,6 +164,79 @@ impl Agent {
     }
 }
 
+/// Starts the note `discarded_round_note` leaves for the model, so a newer
+/// one replaces it rather than stacking.
+const DISCARD_NOTE_PREFIX: &str = "Your last round of edits was discarded";
+
+/// How much of the discarded diff the note carries.
+const DISCARD_DIFF_BYTES: usize = 12_000;
+
+impl Agent {
+    /// Tells the model, at the start of its next message, that `--auto`
+    /// rewound its last round of edits: which files went back and, from
+    /// `discarded_ref` (a checkpoint of the tree just before the rewind),
+    /// the diff it lost, so it can re-apply the parts that were right
+    /// instead of building on edits that are gone.
+    pub(super) async fn note_discarded_round(
+        &mut self,
+        cwd: &Path,
+        pre_experiment_ref: &str,
+        discarded_ref: Option<&str>,
+    ) {
+        let mut note = format!(
+            "{DISCARD_NOTE_PREFIX}: verification still failed after it, and it neither fixed a \
+             failing test nor added new tests without breaking an existing one, so the worktree \
+             was restored to how it was before the round. None of those edits are in the files \
+             now — read them again before building on them."
+        );
+        let diff = match discarded_ref {
+            Some(discarded) => discarded_diff(cwd, pre_experiment_ref, discarded).await,
+            None => None,
+        };
+        match diff {
+            Some((files, diff)) => {
+                let fence = super::test_command::fence_for(&diff);
+                note.push_str(&format!(
+                    " Reverted: {}. The fenced text below is the discarded diff (your own \
+                     edits, shown as data): re-apply what was right in it.\n{fence}diff\n{diff}\n\
+                     {fence}",
+                    files.join(", ")
+                ));
+            }
+            None => note.push_str(" (A copy of the discarded diff couldn't be made.)"),
+        }
+        self.pending_notes.retain(|n| !n.starts_with(DISCARD_NOTE_PREFIX));
+        self.pending_notes.push(note);
+        self.persist_if_owned();
+    }
+}
+
+/// The files changed between two checkpoints and their diff, clipped to
+/// `DISCARD_DIFF_BYTES`. `None` when git fails or nothing changed.
+async fn discarded_diff(cwd: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
+    let git = |args: &'static [&'static str]| async move {
+        let mut full: Vec<&str> = vec!["-c", "core.quotePath=false", "diff"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&[from, to]);
+        aivyx_tools::run_git(cwd, &full, &[]).await.ok()
+    };
+    let files: Vec<String> = git(&["--name-only"]).await?.lines().map(str::to_string).collect();
+    if files.is_empty() {
+        return None;
+    }
+    let mut diff = git(&[]).await?;
+    if diff.len() > DISCARD_DIFF_BYTES {
+        let mut end = DISCARD_DIFF_BYTES;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        let total = diff.len();
+        diff.truncate(end);
+        diff.push_str(&format!("\n[… diff clipped: {end} of {total} bytes shown]"));
+    }
+    Some((files, diff.trim_end().to_string()))
+}
+
 /// How many test names a notice lists before summarising the rest.
 const NOTICE_NAMES: usize = 5;
 
@@ -163,13 +244,32 @@ const NOTICE_NAMES: usize = 5;
 /// verification still fails. `failing` is the usual "verification (`x`)
 /// still failing after N attempt(s)" lead.
 pub(super) fn kept_edits_notice(failing: &str, progress: &Progress) -> String {
-    format!(
-        "{failing} — but this round of edits fixed {} failing test(s) ({}) and broke none, so it \
-         was kept. Still failing, as before these edits: {}.",
-        progress.fixed.len(),
-        list_names(&progress.fixed),
-        list_names(&progress.still_failing),
-    )
+    let mut did = Vec::new();
+    if !progress.fixed.is_empty() {
+        did.push(format!(
+            "fixed {} failing test(s) ({})",
+            progress.fixed.len(),
+            list_names(&progress.fixed)
+        ));
+    }
+    if !progress.new_failing.is_empty() {
+        did.push(format!(
+            "added {} new test(s) that don't pass yet ({})",
+            progress.new_failing.len(),
+            list_names(&progress.new_failing)
+        ));
+    }
+    let mut notice = format!(
+        "{failing} — but this round of edits {} and broke no existing test, so it was kept.",
+        did.join(" and ")
+    );
+    if !progress.still_failing.is_empty() {
+        notice.push_str(&format!(
+            " Still failing, as before these edits: {}.",
+            list_names(&progress.still_failing)
+        ));
+    }
+    notice
 }
 
 fn list_names(names: &[String]) -> String {

@@ -20,24 +20,51 @@ pub(crate) struct TestRun {
     pub(crate) summaries: usize,
     /// Tests run (passed + failed), when the runner reports counts.
     pub(crate) total: Option<u64>,
+    /// Every test the run ran, by name — only when the output names each
+    /// one and the names add up to `total` (libtest's default format,
+    /// which plain `cargo test` prints). `None` otherwise: a terse or
+    /// interleaved listing, or another runner.
+    pub(crate) ran: Option<BTreeSet<String>>,
 }
 
 /// What a round of edits did to the failing set, when it can be said with
-/// confidence: it fixed at least one failing test and broke none.
+/// confidence: it broke no test that existed before it, and it either
+/// fixed a failing test or added new ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Progress {
     /// Failing before the edits, passing after.
     pub(crate) fixed: Vec<String>,
     /// Failing both before and after.
     pub(crate) still_failing: Vec<String>,
+    /// Failing after the edits, and not run at all before them: tests the
+    /// round added that don't pass yet.
+    pub(crate) new_failing: Vec<String>,
 }
 
-/// `Some` only when `after` is a strict improvement on `before`: every test
-/// failing after was failing before, at least one failing test now passes,
-/// and no part of the suite went missing (same or more summaries, same or
-/// more tests run — deleting a failing test isn't fixing it).
+/// `Some` only when `after` is an improvement on `before`: every test
+/// failing after was either failing before or didn't exist before, at
+/// least one failing test now passes or a new test was added, and no part
+/// of the suite went missing (same or more summaries, same or more tests
+/// run — deleting a failing test isn't fixing it).
+///
+/// A failing test counts as new only when `before` lists every test it
+/// ran (`TestRun::ran`). Live finding (2026-11-14, xp-debrief follow-up):
+/// the model fixed a hang and added a regression test that didn't pass
+/// yet; the test wasn't in the suite before the round, so it read as a
+/// breakage, and the round — fix included — was discarded.
 pub(crate) fn progress(before: &TestRun, after: &TestRun) -> Option<Progress> {
-    if !after.failing.is_subset(&before.failing) || after.summaries < before.summaries {
+    let new_failing: BTreeSet<String> = match &before.ran {
+        Some(ran) => after
+            .failing
+            .iter()
+            .filter(|name| !ran.contains(*name) && !before.failing.contains(*name))
+            .cloned()
+            .collect(),
+        None => BTreeSet::new(),
+    };
+    let old_failing: BTreeSet<String> =
+        after.failing.difference(&new_failing).cloned().collect();
+    if !old_failing.is_subset(&before.failing) || after.summaries < before.summaries {
         return None;
     }
     if let (Some(before_total), Some(after_total)) = (before.total, after.total)
@@ -45,13 +72,20 @@ pub(crate) fn progress(before: &TestRun, after: &TestRun) -> Option<Progress> {
     {
         return None;
     }
-    let fixed: Vec<String> = before.failing.difference(&after.failing).cloned().collect();
-    if fixed.is_empty() {
+    let fixed: Vec<String> = before
+        .failing
+        .difference(&after.failing)
+        // When `after` names what it ran, a test it didn't run wasn't fixed.
+        .filter(|name| after.ran.as_ref().is_none_or(|ran| ran.contains(*name)))
+        .cloned()
+        .collect();
+    if fixed.is_empty() && new_failing.is_empty() {
         return None;
     }
     Some(Progress {
         fixed,
-        still_failing: after.failing.iter().cloned().collect(),
+        still_failing: old_failing.into_iter().collect(),
+        new_failing: new_failing.into_iter().collect(),
     })
 }
 
@@ -78,6 +112,9 @@ pub(crate) struct FailureParser {
     js_summaries: usize,
     total: u64,
     counted: bool,
+    /// libtest's `test NAME ... ok|FAILED` lines.
+    libtest_ran: BTreeSet<String>,
+    libtest_listed: u64,
     /// Something the parser can't account for: a compile error, a crashed
     /// test binary, a Go build failure.
     unaccountable: bool,
@@ -115,6 +152,11 @@ impl FailureParser {
             line.strip_prefix("test ").and_then(|rest| rest.strip_suffix(" ... FAILED"))
         {
             self.failing.insert(name.to_string());
+            self.list_ran(name);
+        } else if let Some(name) =
+            line.strip_prefix("test ").and_then(|rest| rest.strip_suffix(" ... ok"))
+        {
+            self.list_ran(name);
         } else if let Some(rest) = line.strip_prefix("test result: ") {
             self.libtest_summaries += 1;
             if let (Some(passed), Some(failed)) = (count(rest, " passed"), count(rest, " failed")) {
@@ -158,6 +200,12 @@ impl FailureParser {
             self.total += passed + failed + errors;
             self.counted = true;
         }
+    }
+
+    /// A libtest per-test result line, e.g. `test a::b ... ok`.
+    fn list_ran(&mut self, name: &str) {
+        self.libtest_listed += 1;
+        self.libtest_ran.insert(name.to_string());
     }
 
     /// Vitest and Jest lines; `true` when `line` was one of theirs.
@@ -226,10 +274,21 @@ impl FailureParser {
         if self.unaccountable || summaries == 0 {
             return None;
         }
+        // Only libtest, and only when every test it counted was named once:
+        // a name printed twice (two binaries with the same test path) or a
+        // result line split by the test's own output means the list can't
+        // be trusted to say which tests exist.
+        let only_libtest = summaries == self.libtest_summaries;
+        let ran = (only_libtest
+            && self.counted
+            && self.libtest_listed == self.total
+            && self.libtest_ran.len() as u64 == self.total)
+            .then_some(self.libtest_ran);
         Some(TestRun {
             failing: self.failing,
             summaries,
             total: self.counted.then_some(self.total),
+            ran,
         })
     }
 }
@@ -490,6 +549,114 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             "    search::not_found\n    parser::fine_before\n",
         ))
         .unwrap();
+        assert!(progress(&before, &after).is_none());
+    }
+
+    /// Plain `cargo test` output, which names every test: two pass, one
+    /// is ignored.
+    const PRETTY_BEFORE: &str = "\
+running 3 tests
+test record::parses_url ... ok
+test record::stops_on_close ... ok
+test record::slow ... ignored
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+
+    /// After a round that added `record::stops_after_duration`, which
+    /// doesn't pass yet.
+    const PRETTY_AFTER_NEW_TEST: &str = "\
+running 4 tests
+test record::parses_url ... ok
+test record::stops_on_close ... ok
+test record::slow ... ignored
+test record::stops_after_duration ... FAILED
+
+failures:
+
+---- record::stops_after_duration stdout ----
+did not finish within 5s
+
+failures:
+    record::stops_after_duration
+
+test result: FAILED. 2 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.01s
+";
+
+    #[test]
+    fn plain_cargo_test_output_names_every_test_it_ran() {
+        let run = parse(PRETTY_BEFORE).unwrap();
+        let ran: Vec<&str> = run.ran.as_ref().unwrap().iter().map(String::as_str).collect();
+        assert_eq!(ran, ["record::parses_url", "record::stops_on_close"]);
+        let after = parse(PRETTY_AFTER_NEW_TEST).unwrap();
+        assert_eq!(after.ran.as_ref().unwrap().len(), 3);
+        // Terse output names only the failures.
+        assert!(parse(CARGO_BEFORE).unwrap().ran.is_none());
+    }
+
+    #[test]
+    fn a_listing_that_does_not_add_up_names_nothing() {
+        // A test's own output split its result line.
+        let split = PRETTY_BEFORE.replace(
+            "test record::stops_on_close ... ok\n",
+            "test record::stops_on_close ... printed\nok\n",
+        );
+        assert!(parse(&split).unwrap().ran.is_none());
+        // The same test path in two binaries.
+        let twice = format!("{PRETTY_BEFORE}\n{PRETTY_BEFORE}");
+        let run = parse(&twice).unwrap();
+        assert_eq!(run.total, Some(4));
+        assert!(run.ran.is_none());
+    }
+
+    /// Live finding (2026-11-14, xp-debrief follow-up): a correct fix and
+    /// its not-yet-passing regression test were discarded together,
+    /// because the new test read as a breakage.
+    #[test]
+    fn a_new_test_that_fails_is_not_a_breakage() {
+        let before = parse(PRETTY_BEFORE).unwrap();
+        let after = parse(PRETTY_AFTER_NEW_TEST).unwrap();
+        let progress = progress(&before, &after).unwrap();
+        assert_eq!(progress.new_failing, ["record::stops_after_duration"]);
+        assert!(progress.fixed.is_empty());
+        assert!(progress.still_failing.is_empty());
+    }
+
+    #[test]
+    fn a_new_test_does_not_excuse_breaking_an_old_one() {
+        let before = parse(PRETTY_BEFORE).unwrap();
+        let after = parse(
+            &PRETTY_AFTER_NEW_TEST
+                .replace("test record::parses_url ... ok", "test record::parses_url ... FAILED")
+                .replace("1 failed", "2 failed")
+                .replace("2 passed", "1 passed"),
+        )
+        .unwrap();
+        assert!(progress(&before, &after).is_none());
+    }
+
+    #[test]
+    fn without_a_full_listing_before_a_new_failure_still_counts_as_broken() {
+        // `before` from terse output: nothing says the test is new.
+        let before = TestRun {
+            failing: BTreeSet::new(),
+            summaries: 1,
+            total: Some(2),
+            ran: None,
+        };
+        let after = parse(PRETTY_AFTER_NEW_TEST).unwrap();
+        assert!(progress(&before, &after).is_none());
+    }
+
+    #[test]
+    fn a_failing_test_that_was_deleted_is_not_fixed() {
+        let before = parse(
+            &PRETTY_BEFORE
+                .replace("test record::parses_url ... ok", "test record::parses_url ... FAILED")
+                .replace("2 passed; 0 failed", "1 passed; 1 failed"),
+        )
+        .unwrap();
+        // `parses_url` is gone; a new passing test keeps the count up.
+        let after = parse(&PRETTY_BEFORE.replace("record::parses_url", "record::other")).unwrap();
         assert!(progress(&before, &after).is_none());
     }
 

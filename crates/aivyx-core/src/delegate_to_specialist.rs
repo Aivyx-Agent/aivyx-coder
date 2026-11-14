@@ -214,6 +214,8 @@ fn build_specialist_agent(
     // guard never seeing it.
     specialist.set_injection_taint(config.injection_taint.clone());
     specialist.set_broker_mode(config.broker_mode);
+    // Every round trip ends at the cap of 1 (above): no pause notice each time.
+    specialist.set_announce_cap_pause(false);
     // See `DelegateToSpecialistConfig::generated_ignore`'s doc comment --
     // without this, the specialist would keep `Agent::new`'s built-in
     // default instead of the user's own configured `[git] ignore` list.

@@ -215,6 +215,8 @@ fn build_sub_agent(
     // `aivyx_slot_hint` entirely, which the broker interprets as "clear
     // this slot's tracked prefix."
     sub_agent.set_broker_mode(config.broker_mode);
+    // Every round trip ends at the cap of 1 (above): no pause notice each time.
+    sub_agent.set_announce_cap_pause(false);
     // See `DelegateTaskConfig::generated_ignore`'s doc comment — without
     // this, the sub-agent would keep `Agent::new`'s built-in default
     // instead of the user's own configured `[git] ignore` list.
@@ -607,7 +609,7 @@ mod tests {
             })
             .collect();
         let mock: Arc<dyn LlmBackend> = Arc::new(MockBackend::new(responses));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let tool = DelegateTaskTool::new(base_config(mock, tx, ToolRegistry::new(), 3));
 
         let output = tool
@@ -622,6 +624,16 @@ mod tests {
             ),
             other => panic!("expected Ok with a cutoff notice, got: {other:?}"),
         }
+        // Live finding (2026-11-14): each of those round trips forwarded the
+        // sub-agent's "send another message to continue" pause notice to
+        // the parent — noise, since this loop continues it on its own.
+        let pauses = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| {
+                matches!(event, AgentEvent::SubAgentActivity(inner)
+                    if matches!(**inner, AgentEvent::TurnPaused(_)))
+            })
+            .count();
+        assert_eq!(pauses, 0, "a sub-agent's cap pauses reached the parent");
     }
 
     #[tokio::test]

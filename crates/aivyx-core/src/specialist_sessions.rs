@@ -710,6 +710,8 @@ fn build_specialist_agent(
     agent.set_sandbox_failures(config.sandbox_failures.clone());
     agent.set_injection_taint(config.injection_taint.clone());
     agent.set_broker_mode(config.broker_mode);
+    // Every round trip ends at the cap of 1 (above): no pause notice each time.
+    agent.set_announce_cap_pause(false);
     // See `SpecialistSessionsConfig::generated_ignore`'s doc comment --
     // without this, this session's own `Agent` would keep `Agent::new`'s
     // built-in default instead of the user's own configured `[git]

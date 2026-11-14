@@ -171,7 +171,7 @@ fn finish_capped_line(mut buf: Vec<u8>) -> String {
 }
 
 /// More backticks than any run in `text`, at least three.
-fn fence_for(text: &str) -> String {
+pub(super) fn fence_for(text: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in text.chars() {

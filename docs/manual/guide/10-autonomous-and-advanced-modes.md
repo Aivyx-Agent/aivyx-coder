@@ -39,6 +39,18 @@ nothing about the edits. This needs output it can read (`cargo test`,
 pytest, `go test`, Vitest or Jest); with anything else, or when part of the suite didn't
 report or fewer tests ran, it rewinds as before.
 
+A new test that doesn't pass yet isn't a broken one. When the output
+names every test it ran (plain `cargo test` does; `cargo test -q` doesn't),
+a failing test that didn't exist before the batch counts as new, and a
+batch that broke no existing test and added new ones is kept too, so a fix
+written together with its regression test survives while the test is
+still red. With output that doesn't name every test, a new failing test
+counts as broken, as before.
+
+When a batch is rewound, the model's next message says so: which files
+went back, and the discarded diff (up to 12 KB), so it can re-apply what
+was right instead of building on edits that are gone.
+
 Tests you know fail only inside the sandbox can be listed in
 `[verification] sandbox_failures` ([details](15-troubleshooting.md)): the
 model is told they aren't its task, and a verification run whose only

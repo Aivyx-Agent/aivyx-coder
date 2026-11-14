@@ -347,6 +347,15 @@ pub struct Agent {
     /// and MCP-server sessions) would pay a request for text nobody reads.
     /// The TUI and ACP turn it on (`set_summarize_on_pause`).
     summarize_on_pause: bool,
+    /// Whether hitting `max_tool_iterations` emits `AgentEvent::TurnPaused`
+    /// ("send another message to continue"). On by default; off for agents
+    /// an outer loop drives one round trip at a time (delegated sub-agents
+    /// and specialists, `max_tool_iterations: 1`), where every round trip
+    /// ends at the cap and the notice is noise in the parent's transcript —
+    /// live finding (2026-11-14): fifteen of them in one delegated task.
+    /// `last_turn_paused` is set either way, and the injection pause is
+    /// always emitted.
+    announce_cap_pause: bool,
     /// The autonomous run's goal (`set_autonomous_goal`), restated in the
     /// system prompt once compaction has dropped the turn that carried it —
     /// an unattended run has no user to ask to restate it.
@@ -624,6 +633,7 @@ impl Agent {
             injection_taint: InjectionTaint::new(),
             last_turn_paused: false,
             summarize_on_pause: false,
+            announce_cap_pause: true,
             autonomous_goal: None,
             budget_too_small_reported: false,
             dropped_requests: Vec::new(),
@@ -1185,6 +1195,11 @@ impl Agent {
     /// See the `summarize_on_pause` field.
     pub fn set_summarize_on_pause(&mut self, enabled: bool) {
         self.summarize_on_pause = enabled;
+    }
+
+    /// See the `announce_cap_pause` field.
+    pub fn set_announce_cap_pause(&mut self, enabled: bool) {
+        self.announce_cap_pause = enabled;
     }
 
     /// Tags this agent's main-loop calls as `task` (e.g. a specialist's
@@ -3673,11 +3688,12 @@ impl Agent {
                         && let Some(pre_experiment_ref) = self.pre_experiment_ref.take()
                     {
                         // Discard only edits that didn't help: a round that
-                        // fixed failing tests and broke none is kept even
-                        // though something that failed before it still does
-                        // (live finding, 2026-10-21: correct fixes to three
-                        // bugs were thrown away over a test that fails only
-                        // inside the sandbox).
+                        // broke no existing test and fixed one, or added
+                        // new tests, is kept even though verification still
+                        // fails (live findings: 2026-10-21, correct fixes to
+                        // three bugs thrown away over a test that fails only
+                        // inside the sandbox; 2026-11-14, a correct fix
+                        // thrown away with its not-yet-passing new test).
                         if let Some(progress) = self
                             .edits_made_progress(&pre_experiment_ref, cwd, &cancellation)
                             .await
@@ -3686,6 +3702,12 @@ impl Agent {
                             self.verification_touched_paths.clear();
                             self.emit(AgentEvent::Error(kept_edits_notice(&failing, &progress)));
                         } else {
+                            // Taken before the rewind, so the model can be
+                            // shown what it lost (`note_discarded_round`).
+                            let discarded_ref = self
+                                .executor
+                                .checkpoint_now("discarded-round", &cancellation)
+                                .await;
                             match self
                                 .executor
                                 .restore_to_checkpoint(&pre_experiment_ref, &cancellation)
@@ -3694,6 +3716,12 @@ impl Agent {
                                 Ok(()) => {
                                     self.unverified_edits = false;
                                     self.verification_touched_paths.clear();
+                                    self.note_discarded_round(
+                                        cwd,
+                                        &pre_experiment_ref,
+                                        discarded_ref.as_deref(),
+                                    )
+                                    .await;
                                     self.emit(AgentEvent::Error(format!(
                                         "{failing} — discarded this round of edits and restored \
                                          the worktree to the pre-experiment checkpoint."
@@ -3988,11 +4016,13 @@ impl Agent {
                 // Phase 12 Part A.
                 self.last_turn_paused = true;
                 self.summarize_at_cap(&cancellation).await;
-                self.emit(AgentEvent::TurnPaused(format!(
-                    "reached the {}-round-trip cap for this turn while still working — \
-                     send another message to continue; nothing has been lost.",
-                    self.max_tool_iterations
-                )));
+                if self.announce_cap_pause {
+                    self.emit(AgentEvent::TurnPaused(format!(
+                        "reached the {}-round-trip cap for this turn while still working — \
+                         send another message to continue; nothing has been lost.",
+                        self.max_tool_iterations
+                    )));
+                }
                 return Ok(());
             }
         }
