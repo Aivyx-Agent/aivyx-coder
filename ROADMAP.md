@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Current release: v0.6.5 (2026-11-01)._
+_Current release: v0.8.2 (2026-11-13)._
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
@@ -17,7 +17,7 @@ implementation plan is tracked in `docs/superpowers/specs/` and
 All planned phases and the capability-gap, Nonagon team, ACP, MCP-server,
 packs and routing work are shipped and live-verified; see the archived log
 for each item. The
-audits of 2026-10-28 and 2026-10-31 fixed every High and Medium finding;
+audits of 2026-10-28, 2026-10-31 and 2026-11-14 fixed every High and Medium finding;
 what they left open is in the last two backlog sections below.
 
 ## Backlog — capability opportunities, not yet scheduled

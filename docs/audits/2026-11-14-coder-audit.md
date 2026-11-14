@@ -160,3 +160,20 @@ says macOS is "gate-only" (`02-install-and-first-run.md`, Platform support;
   - clippy `-D warnings`: clean;
   - `cargo deny check advisories`: ok (the accepted zip/mistralrs entries
     have reasons).
+
+## Status (2026-11-14)
+
+Every finding is fixed:
+
+- **E1:** 5d28397. Only the first line decides; regression test
+  `only_the_status_line_says_whether_a_command_passed`.
+- **M1:** b099dd1. A start-up warning in every frontend, with its own
+  wording in `--auto`; `--report` gains `sandboxed`; the install guide and
+  security model are updated.
+- **L1–L5:** the commit after b099dd1.
+  - `quinn-udp` is now 0.5.16. `cargo audit` still lists the four zip
+    advisories that `deny.toml` accepts with reasons.
+  - ROADMAP release line updated.
+  - The notice now reads "(The model replied only in its thinking.)".
+  - Docker Model Runner tool-calling note updated.
+  - The setup menu says "on any port".

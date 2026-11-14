@@ -1013,7 +1013,7 @@ async fn reasoning_only_response_is_pushed_to_history_as_the_answer() {
     assert_eq!(agent.history.last().unwrap().text_content(), "Fixed it.");
     assert!(
         infos(&mut rx)
-            .contains(&"(The model answered only in its thinking, shown above.)".to_string()),
+            .contains(&"(The model replied only in its thinking.)".to_string()),
         "expected the reasoning-only Info to have been emitted"
     );
 }
@@ -5217,7 +5217,7 @@ async fn a_passing_verification_completes_the_turn_without_an_extra_round_trip()
 #[tokio::test]
 async fn empty_response_notice_only_fires_once_the_turn_actually_ends() {
     // A reasoning-only response whose own enforced-verification attempt
-    // then *fails* must not emit its own "answered only in its thinking"
+    // then *fails* must not emit its own "replied only in its thinking"
     // notice -- the turn doesn't end there, it `continue`s for another
     // round trip (see agent/mod.rs's `empty_response_notice`, deferred
     // past that check). Only the later reasoning-only response whose
@@ -5271,7 +5271,7 @@ async fn empty_response_notice_only_fires_once_the_turn_actually_ends() {
 
     let notice_count = infos(&mut rx)
         .into_iter()
-        .filter(|t| t == "(The model answered only in its thinking, shown above.)")
+        .filter(|t| t == "(The model replied only in its thinking.)")
         .count();
     assert_eq!(
         notice_count, 1,

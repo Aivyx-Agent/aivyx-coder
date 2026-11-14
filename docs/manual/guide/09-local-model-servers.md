@@ -190,8 +190,11 @@ a Lemonade-managed `qwen3.5:9b`.
 
 Base URL, model-naming convention, and basic chat completions
 confirmed live 2026-09-21 against a real running instance (see
-`docs/HISTORY.md`). ⚠️ **The context-window default and end-to-end
-tool-calling below are still unverified.**
+`docs/HISTORY.md`). Tool calling depends on the model: the small
+`smollm2` models often used in examples can't call tools (checked 2026-11-14 with
+`smollm2:135M`), so pull a tool-capable model such as `ai/qwen2.5-coder`.
+`aivyx-coder --setup` asks the model you pick to call a tool and warns if
+it doesn't. ⚠️ **The context-window default below is still unverified.**
 
 Docker Model Runner (DMR) serves local models through an
 OpenAI-compatible API, integrated into the normal Docker workflow —

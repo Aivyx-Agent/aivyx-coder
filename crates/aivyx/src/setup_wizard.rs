@@ -254,7 +254,7 @@ pub(crate) fn backend_menu(running: [bool; 4]) -> ([String; 4], usize) {
         "Ollama",
         "Lemonade Server",
         "Docker Model Runner",
-        "A running OpenAI-compatible server (llama-server, vLLM, Jan, ...)",
+        "A running OpenAI-compatible server on any port (llama-server, vLLM, Jan, ...)",
     ];
     let default = running.iter().position(|r| *r);
     let labels = std::array::from_fn(|i| match (default, running[i]) {

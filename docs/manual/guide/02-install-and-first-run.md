@@ -39,8 +39,8 @@ with, and writes `~/.config/aivyx-coder/config.toml`. A model that only
 answers in text (very small ones, such as Docker Model Runner's
 `smollm2:135M`, can't drive tools) gets a warning and you can pick another;
 so does a context window under 16,384 tokens, since aivyx-coder's own prompt
-takes about 8,000. A server on another port is the "running OpenAI-compatible
-server" choice with its URL typed in. You don't strictly need `--setup` the
+takes about 8,000. A server on another port is the "OpenAI-compatible server
+on any port" choice, with its URL typed in. You don't strictly need `--setup` the
 first time: a plain `aivyx-coder` at a terminal runs the same setup when
 there's no config yet.
 

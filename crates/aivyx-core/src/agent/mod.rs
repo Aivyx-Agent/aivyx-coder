@@ -3573,7 +3573,7 @@ impl Agent {
                 } else {
                     assistant_content.push(ContentBlock::Text(reasoning_trimmed.to_string()));
                     empty_response_notice =
-                        Some("(The model answered only in its thinking, shown above.)");
+                        Some("(The model replied only in its thinking.)");
                 }
             }
             if !assistant_content.is_empty() {
