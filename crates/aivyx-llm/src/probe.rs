@@ -137,6 +137,129 @@ pub async fn verify_model_responds(base_url: &str, model: &str) -> Result<(), St
     Err(format!("the server answered {status}: {}", body.trim()))
 }
 
+/// What `probe_tool_calling` learned about the model's tool calling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolProbe {
+    /// The model called the offered tool.
+    Called,
+    /// The model answered without calling it, or the server refused the
+    /// request's tools. The string says which, for the wizard to print.
+    NoCall(String),
+    /// The probe itself failed (timeout, unreachable, unreadable reply):
+    /// nothing is known about the model.
+    Unknown(String),
+}
+
+/// The one tool `probe_tool_calling` offers.
+const PROBE_TOOL: &str = "read_file";
+
+/// Asks `model` to call one offered tool, the way every aivyx-coder turn
+/// does. A model too small to drive tools (Docker Model Runner's default
+/// `smollm2:135M`, say) answers "ok" to `verify_model_responds` and then
+/// fails every task, so the setup wizard runs this as well. Thinking is
+/// turned off for the probe (`chat_template_kwargs`; servers that don't
+/// know the field ignore it) so a thinking model isn't cut off mid-thought.
+pub async fn probe_tool_calling(base_url: &str, model: &str) -> ToolProbe {
+    let base = base_url.trim_end_matches('/');
+    let client = match crate::model_client_builder().timeout(VERIFY_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(e) => return ToolProbe::Unknown(e.to_string()),
+    };
+    let response = client
+        .post(format!("{base}/chat/completions"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": "Use the read_file tool to read the file README.md. \
+                            Call the tool; do not answer in text."
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": PROBE_TOOL,
+                    "description": "Read a text file and return its contents.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "The file's path." }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            }],
+            "max_tokens": 256,
+            "stream": false,
+            "chat_template_kwargs": { "enable_thinking": false },
+        }))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) if e.is_timeout() => {
+            return ToolProbe::Unknown(format!(
+                "no reply from {base} within {}s",
+                VERIFY_TIMEOUT.as_secs()
+            ));
+        }
+        Err(_) => return ToolProbe::Unknown(format!("couldn't reach {base}")),
+    };
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let body: String = body.chars().take(200).collect();
+        // A 4xx answer to a request with tools: this server or model
+        // doesn't take tools. A 5xx says nothing about the model.
+        return if status.is_client_error() {
+            ToolProbe::NoCall(format!("the server refused tools ({status}: {})", body.trim()))
+        } else {
+            ToolProbe::Unknown(format!("the server answered {status}: {}", body.trim()))
+        };
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(json) => parse_tool_probe_reply(&json),
+        Err(_) => ToolProbe::Unknown("the server's reply wasn't JSON".to_string()),
+    }
+}
+
+/// Reads a non-streamed chat completion: did the model call `read_file`?
+fn parse_tool_probe_reply(json: &serde_json::Value) -> ToolProbe {
+    let Some(message) = json.pointer("/choices/0/message") else {
+        return ToolProbe::Unknown("the server's reply had no message".to_string());
+    };
+    let called = message
+        .get("tool_calls")
+        .and_then(|calls| calls.as_array())
+        .is_some_and(|calls| {
+            calls.iter().any(|call| {
+                call.pointer("/function/name").and_then(|n| n.as_str()) == Some(PROBE_TOOL)
+            })
+        });
+    if called {
+        ToolProbe::Called
+    } else {
+        ToolProbe::NoCall("it answered in text instead of calling the tool".to_string())
+    }
+}
+
+/// aivyx-coder's fixed prompt (instructions, tool definitions, repo map)
+/// takes about 8k tokens, so a smaller window leaves almost no room for the
+/// conversation itself.
+pub const SMALL_CONTEXT_TOKENS: u32 = 16_384;
+
+/// The setup wizard's advisory for a served window too small to work in.
+/// `None` when the window is big enough or unknown.
+pub fn small_context_warning(served: &ServedContext) -> Option<String> {
+    match served {
+        ServedContext::Known(n) if *n < SMALL_CONTEXT_TOKENS => Some(format!(
+            "the server serves only a {n}-token context window. aivyx-coder's own prompt \
+             takes about 8,000 tokens, so there is little room left for your files and the \
+             conversation. Serve the model with 32768 tokens or more (llama-server: -c 32768)."
+        )),
+        _ => None,
+    }
+}
+
 /// The context size Lemonade Server launched `model` with, from its
 /// `/health` body: `recipe_options.ctx_size`, else the `--ctx-size` in its
 /// launch command. `None` when `model` isn't loaded.
@@ -256,6 +379,106 @@ mod tests {
         ] {
             assert_eq!(effective_context_tokens(8192, &served), (8192, None));
         }
+    }
+
+    /// Serves one HTTP request with `status` and `body`, returning the base
+    /// URL to call.
+    async fn answer_once(status: &'static str, body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read the whole request (headers, then the Content-Length body)
+            // so the client never sees the connection close mid-send.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn a_model_that_calls_the_tool_passes_the_probe() {
+        let body = serde_json::json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }
+                }]
+            }}]
+        });
+        let url = answer_once("200 OK", body.to_string()).await;
+        assert_eq!(probe_tool_calling(&url, "m").await, ToolProbe::Called);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_answers_in_text_fails_the_probe() {
+        // What smollm2:135M on Docker Model Runner does (2026-11-13).
+        let body = serde_json::json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": "Here's the updated code:\nuse crates::aivyx::*;"
+            }}]
+        });
+        let url = answer_once("200 OK", body.to_string()).await;
+        let ToolProbe::NoCall(why) = probe_tool_calling(&url, "m").await else {
+            panic!("a text answer is a failed probe");
+        };
+        assert!(why.contains("text"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_refuses_tools_fails_the_probe_but_a_5xx_says_nothing() {
+        let url = answer_once("400 Bad Request", r#"{"error":"tools not supported"}"#.into()).await;
+        let ToolProbe::NoCall(why) = probe_tool_calling(&url, "m").await else {
+            panic!("a 400 to a tools request means no tools");
+        };
+        assert!(why.contains("tools not supported"), "{why}");
+
+        let url = answer_once("503 Service Unavailable", "{}".into()).await;
+        assert!(matches!(probe_tool_calling(&url, "m").await, ToolProbe::Unknown(_)));
+        assert!(matches!(
+            probe_tool_calling("http://127.0.0.1:9/v1", "m").await,
+            ToolProbe::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_small_served_window_is_warned_about() {
+        let warning = small_context_warning(&ServedContext::Known(8192)).expect("8192 is small");
+        assert!(warning.contains("8192") && warning.contains("32768"), "{warning}");
+        assert!(small_context_warning(&ServedContext::Known(SMALL_CONTEXT_TOKENS)).is_none());
+        assert!(small_context_warning(&ServedContext::Known(32768)).is_none());
+        assert!(small_context_warning(&ServedContext::Unknown).is_none());
     }
 
     #[tokio::test]

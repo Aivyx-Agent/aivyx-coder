@@ -5,7 +5,7 @@
 - **Check the log**: `~/.config/aivyx-coder/aivyx.log` records start-up
   problems and every permission decision.
 - **Re-run setup**: `aivyx-coder --setup` re-detects your server, checks the
-  model really answers, and reads its context window.
+  model really answers and can call a tool, and reads its context window.
 - **Capture the raw traffic**: start with `AIVYX_DEBUG_LOG=/tmp/wire.log
   aivyx-coder` to see exactly what goes to and from the model. The file holds
   everything in plain text — delete it when you're done.

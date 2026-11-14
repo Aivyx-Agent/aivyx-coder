@@ -12,7 +12,10 @@
 use aivyx_config::{BackendKind, BackendSettings, Settings};
 use aivyx_llm::context_warning;
 use aivyx_llm::list_models::{list_ollama_models, list_openai_compatible_models};
-use aivyx_llm::probe::{ServedContext, probe_served_context, verify_model_responds};
+use aivyx_llm::probe::{
+    ServedContext, ToolProbe, probe_served_context, probe_tool_calling, small_context_warning,
+    verify_model_responds,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendChoice {
@@ -106,6 +109,25 @@ pub(crate) fn verification_lines(
     lines
 }
 
+/// What the wizard prints after asking the model to call a tool. Pure, so
+/// the wording is tested.
+pub(crate) fn tool_probe_lines(probe: &ToolProbe) -> Vec<String> {
+    match probe {
+        ToolProbe::Called => vec!["  ok: the model called a tool".to_string()],
+        ToolProbe::NoCall(why) => vec![
+            format!("  warning: the model didn't call a tool when asked ({why})."),
+            "  aivyx-coder works only through tool calls (reading, editing, running \
+             commands), so with this model it can chat but can't do any work. Very small \
+             models (under about 3B parameters) usually can't; Qwen3.5-9B or larger can."
+                .to_string(),
+        ],
+        ToolProbe::Unknown(why) => vec![format!(
+            "  couldn't check tool calling ({why}); if aivyx-coder answers but never edits \
+             anything, try a larger model"
+        )],
+    }
+}
+
 /// Whether a plain launch should run the wizard before starting: no config
 /// yet and someone at a terminal to answer it. `--mcp-server` and `--auto`
 /// have nobody to ask, so they keep writing the defaults.
@@ -155,23 +177,47 @@ pub(crate) async fn run_then(after: AfterSetup) -> anyhow::Result<()> {
         println!("Moved the old config to {}.", backup.display());
     }
 
-    let backend_choice = prompt_backend_choice().await?;
-    let base_url = prompt_base_url(backend_choice)?;
-    let model = prompt_model(backend_choice, &base_url).await?;
+    let (answers, served) = loop {
+        let backend_choice = prompt_backend_choice().await?;
+        let base_url = prompt_base_url(backend_choice)?;
+        let model = prompt_model(backend_choice, &base_url).await?;
 
-    println!("Verifying {model} at {base_url} (the first reply can take a while if it has to load) ...");
-    // Verify first: on servers that load a model on first use (Lemonade),
-    // that load is what lets the probe below see its context window.
-    let verified = verify_model_responds(&base_url, &model).await;
-    let served = probe_served_context(&base_url, &model).await;
-    let default_context = BackendSettings::default().context_tokens;
-    for line in verification_lines(&verified, &served, default_context) {
-        println!("{line}");
-    }
-    let answers = WizardAnswers {
-        backend_choice,
-        base_url,
-        model,
+        println!("Verifying {model} at {base_url} (the first reply can take a while if it has to load) ...");
+        // Verify first: on servers that load a model on first use (Lemonade),
+        // that load is what lets the probe below see its context window.
+        let verified = verify_model_responds(&base_url, &model).await;
+        let served = probe_served_context(&base_url, &model).await;
+        let default_context = BackendSettings::default().context_tokens;
+        for line in verification_lines(&verified, &served, default_context) {
+            println!("{line}");
+        }
+        if let Some(warning) = small_context_warning(&served) {
+            println!("  warning: {warning}");
+        }
+        // Only a model that answered can be asked to call a tool.
+        if verified.is_ok() {
+            let probe = probe_tool_calling(&base_url, &model).await;
+            for line in tool_probe_lines(&probe) {
+                println!("{line}");
+            }
+            if matches!(probe, ToolProbe::NoCall(_))
+                && !dialoguer::Confirm::new()
+                    .with_prompt("Use this model anyway?")
+                    .default(false)
+                    .interact()?
+            {
+                println!("Pick another model or server.");
+                continue;
+            }
+        }
+        break (
+            WizardAnswers {
+                backend_choice,
+                base_url,
+                model,
+            },
+            served,
+        );
     };
     let backend = backend_settings_from_answers(&answers, &served);
     // Compare against what backend_settings_from_answers is actually about
@@ -301,6 +347,19 @@ async fn prompt_model(choice: BackendChoice, base_url: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_that_cannot_call_tools_is_called_out_plainly() {
+        assert_eq!(
+            tool_probe_lines(&ToolProbe::Called),
+            vec!["  ok: the model called a tool"]
+        );
+        let lines = tool_probe_lines(&ToolProbe::NoCall("it answered in text".into()));
+        assert!(lines[0].starts_with("  warning:") && lines[0].contains("answered in text"));
+        assert!(lines[1].contains("can't do any work"), "{lines:?}");
+        let lines = tool_probe_lines(&ToolProbe::Unknown("no reply".into()));
+        assert!(lines[0].contains("couldn't check") && lines[0].contains("no reply"));
+    }
 
     #[test]
     fn the_menu_preselects_the_first_server_found_running() {

@@ -34,8 +34,13 @@ aivyx-coder --setup
 
 Setup finds the servers already running (Ollama, Lemonade Server, Docker
 Model Runner, or one on port 8080) and offers them first, lists the models, checks that the one you
-pick really answers, reads the context window it's served with, and writes
-`~/.config/aivyx-coder/config.toml`. You don't strictly need `--setup` the
+pick really answers and can call a tool, reads the context window it's served
+with, and writes `~/.config/aivyx-coder/config.toml`. A model that only
+answers in text (very small ones, such as Docker Model Runner's
+`smollm2:135M`, can't drive tools) gets a warning and you can pick another;
+so does a context window under 16,384 tokens, since aivyx-coder's own prompt
+takes about 8,000. A server on another port is the "running OpenAI-compatible
+server" choice with its URL typed in. You don't strictly need `--setup` the
 first time: a plain `aivyx-coder` at a terminal runs the same setup when
 there's no config yet.
 
