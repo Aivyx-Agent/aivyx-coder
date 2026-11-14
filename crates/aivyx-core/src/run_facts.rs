@@ -60,6 +60,13 @@ pub struct RunFacts {
     /// The `[verification] command` and whether its last run passed
     /// (`None` when it never ran).
     pub verification: Option<(String, Option<bool>)>,
+    /// Files were edited after the last verification run, so its result
+    /// doesn't cover them (`Agent::edited_since_verification`) — a run
+    /// cut off mid-turn by its budget or a signal. Live finding
+    /// (2026-11-14, xp-debrief follow-up): two edits a second before the
+    /// budget ran out left a test file that didn't compile, under a
+    /// notice that said verification passed.
+    pub edited_after_verification: bool,
     pub final_checks: Vec<FinalCheck>,
     /// `None` when there was no snapshot to compare (not a git repository).
     pub changed: Option<Vec<ChangedFile>>,
@@ -103,6 +110,8 @@ pub struct RunReport<'a> {
     pub iterations: u32,
     pub duration_secs: u64,
     pub last_verification_passed: Option<bool>,
+    /// See `RunFacts::edited_after_verification`.
+    pub edited_after_verification: bool,
     pub final_checks: &'a [FinalCheck],
     pub changed_files: &'a [ChangedFile],
     /// `[backend]` model and address, and `reasoning_effort` if set.
@@ -130,6 +139,7 @@ struct ReportJson<'a> {
     iterations: u32,
     duration_secs: u64,
     last_verification_passed: Option<bool>,
+    edited_after_verification: bool,
     final_checks: &'a [FinalCheck],
     changed_files: &'a [ChangedFile],
     model: &'a str,
@@ -187,6 +197,13 @@ impl RunFacts {
         let mut lines = Vec::new();
         if let Some((name, passed)) = &self.verification {
             let verdict = match passed {
+                Some(true) if self.edited_after_verification => {
+                    "passed, but files were edited after its last run and those edits were never \
+                     verified"
+                }
+                Some(false) if self.edited_after_verification => {
+                    "failed, and files were edited after its last run without being verified"
+                }
                 Some(true) => "passed",
                 Some(false) => "failed",
                 None => "was not run by automatic verification (it runs after edits; a run the model made itself is not counted)",
@@ -240,6 +257,7 @@ impl RunReport<'_> {
             iterations: self.iterations,
             duration_secs: self.duration_secs,
             last_verification_passed: self.last_verification_passed,
+            edited_after_verification: self.edited_after_verification,
             final_checks: self.final_checks,
             changed_files: self.changed_files,
             model: self.model,
@@ -292,6 +310,7 @@ mod tests {
                 file("data/airports.csv", "modified", 1, 1, true),
                 file("src/db.rs", "added", 300, 0, false),
             ]),
+            edited_after_verification: false,
         };
         assert_eq!(
             facts.notice_lines(),
@@ -305,6 +324,32 @@ mod tests {
         );
     }
 
+    /// Live finding (2026-11-14, xp-debrief follow-up): edits made after
+    /// the last verification run, right as the budget ran out, sat under a
+    /// notice that said verification passed.
+    #[test]
+    fn the_notice_says_when_edits_came_after_the_last_verification() {
+        let passed = RunFacts {
+            verification: Some(("test".into(), Some(true))),
+            edited_after_verification: true,
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            passed.notice_lines(),
+            ["verification: `test` passed, but files were edited after its last run and those \
+              edits were never verified"]
+        );
+        let failed = RunFacts { verification: Some(("test".into(), Some(false))), ..passed };
+        assert_eq!(
+            failed.notice_lines(),
+            ["verification: `test` failed, and files were edited after its last run without \
+              being verified"]
+        );
+        // Never run: the existing wording already says nothing was verified.
+        let never = RunFacts { verification: Some(("test".into(), None)), ..failed };
+        assert!(never.notice_lines()[0].contains("was not run by automatic verification"));
+    }
+
     #[test]
     fn the_notice_caps_the_file_list_and_says_what_it_does_not_know() {
         let many: Vec<ChangedFile> =
@@ -313,6 +358,7 @@ mod tests {
             verification: Some(("test".into(), None)),
             final_checks: vec![],
             changed: Some(many),
+            edited_after_verification: false,
         };
         assert_eq!(
             facts.notice_lines(),
@@ -342,6 +388,7 @@ mod tests {
             iterations: 5,
             duration_secs: 1200,
             last_verification_passed: Some(true),
+            edited_after_verification: true,
             final_checks: &checks,
             changed_files: &files,
             model: "Qwen3.8-27B",
@@ -371,6 +418,7 @@ mod tests {
         assert_eq!(json["changed_files"][0]["status"], "modified");
         assert_eq!(json["changed_files"][0]["read_only"], false);
         assert_eq!(json["last_verification_passed"], true);
+        assert_eq!(json["edited_after_verification"], true);
         assert_eq!(json["model"], "Qwen3.8-27B");
         assert_eq!(json["base_url"], "http://llama:8080/v1");
         assert_eq!(json["reasoning_effort"], "medium");

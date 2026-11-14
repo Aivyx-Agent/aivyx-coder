@@ -3202,6 +3202,38 @@ async fn a_discarded_round_is_told_to_the_model_with_its_diff() {
     assert!(note.contains("shown as data"), "{note}");
 }
 
+/// Live finding (2026-11-14, xp-debrief follow-up): a turn cut off right
+/// after an edit — there by the run's budget — never reached its
+/// end-of-turn verification, and the stop notice still reported the
+/// earlier run as passed. The agent says the tree isn't covered.
+#[tokio::test]
+async fn an_edit_after_the_last_verification_is_reported_until_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    init_git_repo(dir.path()).await;
+    let (mut agent, _rx) =
+        progress_check_agent_with(dir.path(), "notes.txt", LISTED_SUITE).await;
+    // The turn pauses at the cap right after the write: cut off before its
+    // end-of-turn verification.
+    agent.max_tool_iterations = 1;
+    assert!(!agent.edited_since_verification());
+
+    agent
+        .run_turn("go".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(agent.last_turn_paused());
+    assert!(dir.path().join("notes.txt").exists());
+    assert!(agent.edited_since_verification());
+
+    // The next turn ends normally; its verification covers the edit.
+    agent
+        .run_turn("continue".to_string(), dir.path(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(agent.last_verification_passed(), Some(true));
+    assert!(!agent.edited_since_verification());
+}
+
 fn known_failures(patterns: &[&str]) -> crate::SandboxFailures {
     let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
     crate::SandboxFailures::new(&patterns).0

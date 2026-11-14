@@ -445,6 +445,7 @@ async fn finish(
         verification: agent
             .verification_command()
             .map(|name| (name.to_string(), agent.last_verification_passed())),
+        edited_after_verification: agent.edited_since_verification(),
         ..Default::default()
     };
     if outcome == Outcome::GoalAchieved
@@ -483,6 +484,7 @@ async fn finish(
             iterations,
             duration_secs: started.elapsed().as_secs(),
             last_verification_passed: agent.last_verification_passed(),
+            edited_after_verification: facts.edited_after_verification,
             final_checks: &facts.final_checks,
             changed_files: facts.changed.as_deref().unwrap_or_default(),
             model: &run.model.model,

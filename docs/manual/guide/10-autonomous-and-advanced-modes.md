@@ -100,6 +100,11 @@ autonomous run stopped: goal achieved after 5 iteration(s)
   read-only files changed: data/airports.csv
 ```
 
+- **Verification** is the last run of the verification command. When the
+  run stopped mid-turn (its budget ran out, or a signal) after the model
+  edited files, that run doesn't cover the edits, and the line says so:
+  ``verification: `test` passed, but files were edited after its last run
+  and those edits were never verified``.
 - **Final checks:** `[verification] final_checks` names allowed commands
   (a linter, a type check, a build) that aivyx-coder runs itself when the
   goal is reached. If one fails, the run isn't over: its output goes back

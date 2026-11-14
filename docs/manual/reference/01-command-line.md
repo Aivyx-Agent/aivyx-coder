@@ -90,7 +90,9 @@ With `--auto` only. When the run stops, for any reason, write what
 aivyx-coder checked itself to this file as JSON:
 - the outcome and the stop notice;
 - iterations and duration;
-- the last verification result;
+- the last verification result, and `edited_after_verification`: whether
+  files were edited after that run (a run cut off mid-turn), so the result
+  doesn't cover them;
 - the `[verification] final_checks` results with their warning counts;
 - every file the run changed, marking any in `read_only_paths`, and
   `read_only_touched`, the read-only files that changed anyway;

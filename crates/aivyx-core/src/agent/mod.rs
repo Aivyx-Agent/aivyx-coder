@@ -1013,6 +1013,14 @@ impl Agent {
         self.last_verification_passed
     }
 
+    /// Whether a file edit succeeded after the last verification run, so
+    /// `last_verification_passed` doesn't cover the tree as it stands
+    /// (`unverified_edits`). Only a turn cut off before its end-of-turn
+    /// verification — a run's budget or a signal — leaves this set.
+    pub fn edited_since_verification(&self) -> bool {
+        self.unverified_edits
+    }
+
     /// Enables enforced verification (Phase 12 Part B): `command_name` must
     /// name an entry the `run_command` tool was built with (the caller's
     /// responsibility to keep in sync with `[[permissions.allowed_commands]]`
