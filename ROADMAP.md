@@ -1,6 +1,6 @@
 # aivyx-coder Roadmap
 
-_Current release: v0.8.3 (2026-11-15)._
+_Current release: v1.0.0 (2026-11-15)._
 
 A terminal (TUI) coding agent for local LLMs only (Ollama, vLLM, or
 llama.cpp) — see `README.md` for what it does and how to run it. This
