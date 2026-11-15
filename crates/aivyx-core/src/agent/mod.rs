@@ -2382,12 +2382,13 @@ impl Agent {
     /// since every dispatched `ToolCall` requires a matching `Role::Tool`
     /// result or the next request's unanswered `tool_calls` entry gets
     /// rejected by most OpenAI-compatible backends. Also where injection
-    /// scanning happens: a flagged `ToolOutput::Ok` result taints
-    /// `self.injection_taint`, consulted by `ConfirmationGate` and the
-    /// autonomous driver. See docs/superpowers/specs/
-    /// 2026-07-22-autonomous-mode-injection-guard-design.md. Only
-    /// `ToolOutput::Ok` content is scanned — `Error`/`Denied` results are
-    /// tool-framing text, not ingested external content.
+    /// scanning happens: a flagged `ToolOutput::Ok` or `ToolOutput::Error`
+    /// result taints `self.injection_taint`, consulted by
+    /// `ConfirmationGate` and the autonomous driver. See
+    /// docs/superpowers/specs/
+    /// 2026-07-22-autonomous-mode-injection-guard-design.md. `Error`
+    /// results are scanned because a timed-out command's error carries the
+    /// tail of its output; `Denied` results are the gate's own text.
     /// Tells the user that a verification run's only failures were known
     /// sandbox failures, so it counted as passed.
     fn excused_known_failures(&mut self, known: &crate::sandbox_failures::Assessment) {
@@ -2444,7 +2445,10 @@ impl Agent {
     }
 
     fn record_tool_result(&mut self, result: ToolResult, source: &str) {
-        if let ToolOutput::Ok(text) = &result.output
+        // Errors too: a timed-out command's error carries the tail of its
+        // output (`aivyx_tools::process::run`), which is as untrusted as
+        // any other output.
+        if let ToolOutput::Ok(text) | ToolOutput::Error(text) = &result.output
             && let Some(finding) = aivyx_sandbox::scan_for_injection_markers(text, source)
         {
             self.injection_taint.flag(finding);

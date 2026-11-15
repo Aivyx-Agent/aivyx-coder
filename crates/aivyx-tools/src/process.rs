@@ -30,13 +30,48 @@ pub struct CommandSpec {
 }
 
 enum RunOutcome {
-    Exited {
-        status: ExitStatus,
-        stdout: (Vec<u8>, usize),
-        stderr: (Vec<u8>, usize),
-    },
+    /// The output is in the drains (`take_drained`).
+    Exited { status: ExitStatus },
     TimedOut,
     Cancelled,
+}
+
+/// One output stream being read by its own task (see `run`).
+type Drain = futures::future::MaybeDone<tokio::task::JoinHandle<(Vec<u8>, usize)>>;
+
+/// How long a timed-out command's output may take to arrive once its
+/// group is killed.
+const TIMED_OUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// What a drain read, or nothing if it hasn't finished — in which case
+/// its task is stopped, so it can't outlive the call.
+fn take_drained(drain: &mut Drain) -> (Vec<u8>, usize) {
+    if let futures::future::MaybeDone::Future(handle) = drain {
+        handle.abort();
+        return Default::default();
+    }
+    std::pin::Pin::new(drain).take_output().and_then(Result::ok).unwrap_or_default()
+}
+
+/// The error a timed-out command gives the model: the timeout, then the
+/// tail of what it printed until it was killed, in `format_output`'s
+/// layout. A hang usually names itself there (cargo's `test … has been
+/// running for over 60 seconds`, a last progress line).
+fn timed_out_message(
+    timeout: Duration,
+    stdout: (Vec<u8>, usize),
+    stderr: (Vec<u8>, usize),
+) -> String {
+    let lead = format!("command timed out after {:.0}s and was killed", timeout.as_secs_f64());
+    if stdout.1 == 0 && stderr.1 == 0 {
+        return format!("{lead}; it printed nothing before then.");
+    }
+    format!(
+        "{lead}. Its output until then, which may show what it was stuck on:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        format_stream(stdout.0, stdout.1),
+        format_stream(stderr.0, stderr.1)
+    )
 }
 
 /// Held by the caller of [`die_with_parent`] for as long as the command's
@@ -188,13 +223,24 @@ pub async fn run(
     // drives both reads to completion on its own statement, before control
     // ever reaches `select!`, which would defeat the race against the
     // timeout/cancellation branches below entirely.
-    let drain = futures::future::join(
-        drain_capped_tail(stdout, MAX_OUTPUT_BYTES),
-        drain_capped_tail(stderr, MAX_OUTPUT_BYTES),
-    );
+    //
+    // Spawned rather than polled inside `select!`, so what they read
+    // survives a timeout: the output up to then is what says *why* a
+    // command hung. Live finding (2026-11-15, recipe bench run): the
+    // model's own code looped forever, every `cargo test` was killed at
+    // the timeout, and the model was told only "timed out" four times —
+    // while cargo had printed `test … has been running for over 60
+    // seconds`, naming the culprits.
+    // `MaybeDone` keeps a finished drain's result until it is taken, so a
+    // drain that finished before a timeout is neither polled again nor
+    // lost.
+    let mut stdout_drain =
+        futures::future::maybe_done(tokio::spawn(drain_capped_tail(stdout, MAX_OUTPUT_BYTES)));
+    let mut stderr_drain =
+        futures::future::maybe_done(tokio::spawn(drain_capped_tail(stderr, MAX_OUTPUT_BYTES)));
     // Once the direct child exits, kill the rest of its group: whatever
     // it left behind holds no claim on the call, and killing it closes
-    // any pipe ends it inherited, so the drain above can finish.
+    // any pipe ends it inherited, so the drains above can finish.
     let reap = async {
         let status = child.wait().await;
         group.kill();
@@ -202,10 +248,13 @@ pub async fn run(
     };
 
     let outcome = tokio::select! {
-        ((stdout, stderr), status) = futures::future::join(drain, reap) => {
+        (_, status) = futures::future::join(
+            futures::future::join(&mut stdout_drain, &mut stderr_drain),
+            reap,
+        ) => {
             let status = status
                 .map_err(|err| ToolError::ExecutionFailed(format!("failed to reap command: {err}")))?;
-            RunOutcome::Exited { status, stdout, stderr }
+            RunOutcome::Exited { status }
         }
         _ = tokio::time::sleep(timeout) => RunOutcome::TimedOut,
         _ = cancellation.cancelled() => RunOutcome::Cancelled,
@@ -216,18 +265,31 @@ pub async fn run(
     }
 
     match outcome {
-        RunOutcome::Exited {
+        RunOutcome::Exited { status } => Ok(ToolOutput::Ok(format_output(
             status,
-            stdout,
-            stderr,
-        } => Ok(ToolOutput::Ok(format_output(status, stdout, stderr))),
-        RunOutcome::TimedOut => Err(ToolError::ExecutionFailed(format!(
-            "command timed out after {:.0}s and was killed",
-            timeout.as_secs_f64()
+            take_drained(&mut stdout_drain),
+            take_drained(&mut stderr_drain),
         ))),
-        RunOutcome::Cancelled => Err(ToolError::ExecutionFailed(
-            "command was cancelled".to_string(),
-        )),
+        RunOutcome::TimedOut => {
+            // The group is dead, so its pipe ends are closed and the drains
+            // finish; a process that escaped the group could still hold
+            // one, hence the grace period rather than an unbounded wait.
+            let _ = tokio::time::timeout(
+                TIMED_OUT_DRAIN_GRACE,
+                futures::future::join(&mut stdout_drain, &mut stderr_drain),
+            )
+            .await;
+            Err(ToolError::ExecutionFailed(timed_out_message(
+                timeout,
+                take_drained(&mut stdout_drain),
+                take_drained(&mut stderr_drain),
+            )))
+        }
+        RunOutcome::Cancelled => {
+            take_drained(&mut stdout_drain);
+            take_drained(&mut stderr_drain);
+            Err(ToolError::ExecutionFailed("command was cancelled".to_string()))
+        }
     }
 }
 
@@ -712,6 +774,66 @@ warning: `vaops` (test \"api\") generated 1 warning\n";
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         command
+    }
+
+    /// Live finding (2026-11-15, recipe bench run): the model's code looped
+    /// forever, and each `cargo test` that hit the timeout told it only
+    /// "timed out" — not cargo's `has been running for over 60 seconds`
+    /// line naming the stuck tests.
+    #[tokio::test]
+    async fn a_timed_out_command_returns_what_it_printed_before_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            sh(
+                "echo 'test tests::parses_args has been running for over 60 seconds'; \
+                 echo 'warning: still busy' >&2; sleep 30",
+                dir.path(),
+            ),
+            Duration::from_millis(500),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let ToolError::ExecutionFailed(msg) = err else { panic!("expected ExecutionFailed") };
+        assert!(msg.starts_with("command timed out after 0s and was killed. Its output"), "{msg}");
+        assert!(
+            msg.contains(
+                "--- stdout ---\ntest tests::parses_args has been running for over 60 seconds"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("--- stderr ---\nwarning: still busy"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_timed_out_command_says_it_printed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            sh("sleep 30", dir.path()),
+            Duration::from_millis(300),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let ToolError::ExecutionFailed(msg) = err else { panic!("expected ExecutionFailed") };
+        assert!(msg.ends_with("; it printed nothing before then."), "{msg}");
+    }
+
+    /// The output of a timed-out command is still capped: a hang that
+    /// floods its output can't flood the model's context.
+    #[tokio::test]
+    async fn a_timed_out_commands_output_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            sh("yes flood | head -c 200000; sleep 30", dir.path()),
+            Duration::from_millis(1500),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let ToolError::ExecutionFailed(msg) = err else { panic!("expected ExecutionFailed") };
+        assert!(msg.len() < MAX_OUTPUT_BYTES * 2 + 1024, "{} bytes", msg.len());
+        assert!(msg.contains("flood"), "{msg}");
     }
 
     /// A background job that would write `late.txt` a second after the
