@@ -237,16 +237,27 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
 /// `CoderPartSummary::warnings` (what `pack install` runs). When there are
 /// hard problems, `Err` lists them followed by the warnings.
 pub fn check_coder_part_lenient(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
+    check_coder_part_split(dir).map_err(|(mut problems, warnings)| {
+        problems.extend(warnings);
+        problems
+    })
+}
+
+/// As `check_coder_part_lenient`, but a failure keeps the hard problems and
+/// the warnings apart: `Err((problems, warnings))`.
+pub fn check_coder_part_split(
+    dir: &Path,
+) -> Result<CoderPartSummary, (Vec<String>, Vec<String>)> {
     let text = std::fs::read_to_string(dir.join("manifest.toml"))
-        .map_err(|e| vec![format!("can't read manifest.toml: {e}")])?;
-    let manifest = match Manifest::parse(&text).map_err(|e| vec![e.to_string()])? {
+        .map_err(|e| (vec![format!("can't read manifest.toml: {e}")], Vec::new()))?;
+    let manifest = match Manifest::parse(&text).map_err(|e| (vec![e.to_string()], Vec::new()))? {
         Manifest::Config(m) => m,
         Manifest::Binary(_) => {
-            return Err(vec!["this is a tool pack for aivyx-pa, not a config pack".into()]);
+            return Err((vec!["this is a tool pack for aivyx-pa, not a config pack".into()], Vec::new()));
         }
     };
     let Some(coder) = manifest.coder.clone() else {
-        return Err(vec!["this pack has no aivyx-coder part — it's for aivyx-pa".into()]);
+        return Err((vec!["this pack has no aivyx-coder part — it's for aivyx-pa".into()], Vec::new()));
     };
 
     let mut problems = Vec::new();
@@ -377,8 +388,7 @@ pub fn check_coder_part_lenient(dir: &Path) -> Result<CoderPartSummary, Vec<Stri
     if problems.is_empty() {
         Ok(CoderPartSummary { manifest, skills, roster_members, mcp_servers, settings, warnings })
     } else {
-        problems.extend(warnings);
-        Err(problems)
+        Err((problems, warnings))
     }
 }
 
@@ -481,12 +491,15 @@ pub fn render_inspect(payload: &[u8]) -> Result<String, String> {
     {
         let dir = scratch(&std::env::temp_dir());
         let result = aivyx_pack::unpack_payload(payload, &dir)
-            .map_err(|e| vec![e.to_string()])
-            .and_then(|()| check_coder_part(&dir));
+            .map_err(|e| (vec![e.to_string()], Vec::new()))
+            .and_then(|()| check_coder_part_split(&dir));
         let _ = std::fs::remove_dir_all(&dir);
         match result {
             Ok(s) => {
                 out.push_str(&format!("  {}\n  checks: OK\n", summary_counts(&s)));
+                for w in &s.warnings {
+                    out.push_str(&format!("    warning: {w}\n"));
+                }
                 for server in &s.mcp_servers {
                     out.push_str(&format!("    MCP {}\n", consent_text(server)));
                 }
@@ -496,7 +509,7 @@ pub fn render_inspect(payload: &[u8]) -> Result<String, String> {
                     }
                 }
             }
-            Err(problems) => {
+            Err((problems, warnings)) => {
                 out.push_str(&format!(
                     "  checks: {} problem{} — this pack won't install\n",
                     problems.len(),
@@ -504,6 +517,9 @@ pub fn render_inspect(payload: &[u8]) -> Result<String, String> {
                 ));
                 for p in problems {
                     out.push_str(&format!("    - {p}\n"));
+                }
+                for w in warnings {
+                    out.push_str(&format!("    warning: {w}\n"));
                 }
             }
         }
@@ -1856,6 +1872,22 @@ Then `read_fil` it, and `read_fil` again.
         assert!(text.contains("aivyx-coder part"), "{text}");
         assert!(text.contains("MCP files: mcp-files --root ."), "{text}");
         assert!(text.contains("checks: OK"), "{text}");
+    }
+
+    #[test]
+    fn inspect_shows_a_near_miss_as_a_warning_not_a_blocker() {
+        let d = good_pack("inspect-near-miss");
+        rewrite(&d, "coder/AGENTS.md", |t| format!("{t}Then call `read_fil`.\n"));
+        let text = render_inspect(&aivyx_pack::build_payload(&d).unwrap()).unwrap();
+        assert!(text.contains("checks: OK"), "{text}");
+        assert!(text.contains("warning: ") && text.contains("`read_fil`"), "{text}");
+        assert!(!text.contains("won't install"), "{text}");
+        // A real problem keeps the old wording, with the warning beside it.
+        rewrite(&d, "coder/AGENTS.md", |_| "Call `read_fil`.\n".into());
+        let text = render_inspect(&aivyx_pack::build_payload(&d).unwrap()).unwrap();
+        assert!(text.contains("won't install"), "{text}");
+        assert!(text.contains("doesn't name the pack's skill"), "{text}");
+        assert!(text.contains("warning: ") && text.contains("`read_fil`"), "{text}");
     }
 }
 
