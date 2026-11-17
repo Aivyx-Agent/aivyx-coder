@@ -32,6 +32,7 @@ From 1.0, aivyx-coder follows semantic versioning for its stable surface.
   `backend.mistralrs_*` keys work only in a build with the
   `provider-mistral-rs` feature, which no release binary has. They can
   change or be removed in any release.
+- **The pack checks.** What `pack check` and `pack install` verify may get stricter in a minor release, so a pack that installs today can be refused later. The pack format itself doesn't change.
 
 ## Rules
 

@@ -982,6 +982,9 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
     match action {
         PackAction::Install { file } => {
             let installed = packs::install(&packs, &file, &trusted()?).map_err(anyhow::Error::msg)?;
+            for w in &installed.warnings {
+                println!("warning: {w}");
+            }
             println!(
                 "Installed {} v{}. Use it in a project with `aivyx-coder pack use {}` \
                  (add --global for every project).",

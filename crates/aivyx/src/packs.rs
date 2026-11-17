@@ -28,6 +28,9 @@ pub struct Installed {
     /// `packs/<name>/<version>`.
     pub dir: PathBuf,
     pub manifest: ConfigPackManifest,
+    /// Findings that didn't stop the install (near-miss tool names); empty
+    /// for a pack read back from disk.
+    pub warnings: Vec<String>,
 }
 
 impl PacksDir {
@@ -82,6 +85,7 @@ impl PacksDir {
                     version: manifest.version.clone(),
                     dir: e.path(),
                     manifest,
+                    warnings: Vec::new(),
                 })
             })
     }
@@ -97,6 +101,9 @@ pub struct CoderPartSummary {
     pub mcp_servers: Vec<McpServerConfig>,
     /// The verification commands in `coder.settings`, if it names any.
     pub settings: Option<PackVerification>,
+    /// Near-miss tool names: an error in `pack check`, only a warning at
+    /// install.
+    pub warnings: Vec<String>,
 }
 
 /// `coder.mcp`'s shape: `[[servers]]` blocks, as in `config.toml`'s `[mcp]`.
@@ -217,8 +224,19 @@ fn misspelt_tools(text: &str) -> Vec<(String, &'static str)> {
     out
 }
 
-/// Check the aivyx-coder part of a pack folder. `Err` lists every problem.
+/// Check the aivyx-coder part of a pack folder, strictly (what `pack check`
+/// runs): near-miss tool names count as problems. `Err` lists every problem.
 pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
+    match check_coder_part_lenient(dir) {
+        Ok(s) if !s.warnings.is_empty() => Err(s.warnings),
+        other => other,
+    }
+}
+
+/// As `check_coder_part`, but near-miss tool names come back as
+/// `CoderPartSummary::warnings` (what `pack install` runs). When there are
+/// hard problems, `Err` lists them followed by the warnings.
+pub fn check_coder_part_lenient(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
     let text = std::fs::read_to_string(dir.join("manifest.toml"))
         .map_err(|e| vec![format!("can't read manifest.toml: {e}")])?;
     let manifest = match Manifest::parse(&text).map_err(|e| vec![e.to_string()])? {
@@ -232,6 +250,7 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
     };
 
     let mut problems = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     let agents_text = match std::fs::read_to_string(dir.join(&coder.agents_file)) {
         Ok(text) if !text.trim().is_empty() => text,
@@ -293,7 +312,7 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
             );
             if !reported.contains(&problem) {
                 reported.push(problem.clone());
-                problems.push(problem);
+                warnings.push(problem);
             }
         }
     }
@@ -356,8 +375,9 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
     });
 
     if problems.is_empty() {
-        Ok(CoderPartSummary { manifest, skills, roster_members, mcp_servers, settings })
+        Ok(CoderPartSummary { manifest, skills, roster_members, mcp_servers, settings, warnings })
     } else {
+        problems.extend(warnings);
         Err(problems)
     }
 }
@@ -410,19 +430,21 @@ pub fn install(packs: &PacksDir, file: &Path, trusted: &[String]) -> Result<Inst
 
     let home = packs.0.join(&manifest.name);
     let tmp = scratch(&home);
-    let staged = (|| -> Result<(), String> {
+    let staged = (|| -> Result<CoderPartSummary, String> {
         std::fs::create_dir_all(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
         aivyx_pack::unpack_payload(&bundle.payload, &tmp).map_err(|e| e.to_string())?;
-        check_coder_part(&tmp).map_err(|problems| {
+        check_coder_part_lenient(&tmp).map_err(|problems| {
             format!("the pack doesn't pass its checks:\n  - {}", problems.join("\n  - "))
-        })?;
-        Ok(())
+        })
     })();
-    if let Err(e) = staged {
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir(&home);
-        return Err(e);
-    }
+    let warnings = match staged {
+        Ok(summary) => summary.warnings,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir(&home);
+            return Err(e);
+        }
+    };
     // One version per pack: drop the others, then move the new one in.
     for entry in std::fs::read_dir(&home).map_err(|e| e.to_string())?.flatten() {
         if entry.path() != tmp {
@@ -431,7 +453,7 @@ pub fn install(packs: &PacksDir, file: &Path, trusted: &[String]) -> Result<Inst
     }
     let dir = home.join(&manifest.version);
     std::fs::rename(&tmp, &dir).map_err(|e| format!("move into {}: {e}", dir.display()))?;
-    Ok(Installed { name: manifest.name.clone(), version: manifest.version.clone(), dir, manifest })
+    Ok(Installed { name: manifest.name.clone(), version: manifest.version.clone(), dir, manifest, warnings })
 }
 
 /// Delete an installed pack (every version) and switch it off everywhere.
@@ -1161,6 +1183,30 @@ Then `read_fil` it, and `read_fil` again.
         let problems = check_coder_part(&d).unwrap_err();
         let n = problems.iter().filter(|p| p.contains("skill `example` names `git_pushh`")).count();
         assert_eq!(n, 1, "{problems:?}");
+    }
+
+    #[test]
+    fn a_near_miss_fails_pack_check_but_only_warns_at_install() {
+        let d = good_pack("near-miss");
+        rewrite(&d, "coder/AGENTS.md", |t| format!("{t}Then call `read_fil`.\n"));
+        let problems = check_coder_part(&d).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("`read_fil`") && p.contains("`read_file`")), "{problems:?}");
+
+        let packs = PacksDir::at(tmp("near-miss-root"));
+        let (bundle, key) = signed(&d);
+        let installed = install(&packs, &bundle, &[key]).unwrap();
+        assert_eq!(installed.warnings.len(), 1, "{:?}", installed.warnings);
+        assert!(installed.warnings[0].contains("`read_fil`"));
+        assert!(packs.find("business-manager").is_some());
+    }
+
+    #[test]
+    fn a_missing_skill_name_still_blocks_install() {
+        let d = good_pack("near-miss-skill");
+        rewrite(&d, "coder/AGENTS.md", |_| "Explain changes.\n".into());
+        let packs = PacksDir::at(tmp("near-miss-skill-root"));
+        let (bundle, key) = signed(&d);
+        assert!(install(&packs, &bundle, &[key]).unwrap_err().contains("doesn't name the pack's skill"));
     }
 
     #[test]
