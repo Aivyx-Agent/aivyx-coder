@@ -150,19 +150,71 @@ pub const CODER_TOOLS: &[&str] = &[
     "upscale_image",
 ];
 
-/// Backticked snake_case words (`read_file`, not `x` or `Foo`): what a skill
-/// or AGENTS.md uses to name a tool.
-fn backticked_tool_names(text: &str) -> Vec<&str> {
-    text.split('`')
+/// Backticked snake_case words (`read_file`, not `x` or `Foo`) outside fenced
+/// code blocks: what a skill or AGENTS.md uses to name a tool.
+fn backticked_words(text: &str) -> Vec<String> {
+    let mut prose = String::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+    prose
+        .split('`')
         .skip(1)
         .step_by(2)
         .filter(|w| {
             w.contains('_')
-                && !w.starts_with('_')
+                && w.starts_with(|c: char| c.is_ascii_lowercase())
                 && !w.ends_with('_')
-                && w.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         })
+        .map(str::to_string)
         .collect()
+}
+
+/// Levenshtein distance between two ASCII words.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Backticked words in `text` that look like a misspelt aivyx-coder tool
+/// (not a tool, but one or two edits from one), each with its closest tool,
+/// once each in first-seen order. Other snake_case words (config keys, file
+/// names) are left alone.
+fn misspelt_tools(text: &str) -> Vec<(String, &'static str)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for word in backticked_words(text) {
+        if seen.contains(&word) || CODER_TOOLS.contains(&word.as_str()) {
+            continue;
+        }
+        seen.push(word.clone());
+        let closest = CODER_TOOLS
+            .iter()
+            .map(|t| (edit_distance(&word, t), *t))
+            .min_by_key(|(d, _)| *d);
+        if let Some((d, tool)) = closest
+            && (1..=2).contains(&d)
+        {
+            out.push((word, tool));
+        }
+    }
+    out
 }
 
 /// Check the aivyx-coder part of a pack folder. `Err` lists every problem.
@@ -233,14 +285,19 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
             }
         }
     }
+    let mut reported: Vec<String> = Vec::new();
     for (label, text) in &texts {
-        for tool in backticked_tool_names(text) {
-            if !CODER_TOOLS.contains(&tool) {
-                problems.push(format!("{label} names `{tool}`, which isn't an aivyx-coder tool"));
+        for (word, closest) in misspelt_tools(text) {
+            let problem = format!(
+                "{label} names `{word}`, which isn't an aivyx-coder tool (did you mean `{closest}`?)"
+            );
+            if !reported.contains(&problem) {
+                reported.push(problem.clone());
+                problems.push(problem);
             }
         }
     }
-    for name in &skills {
+    for name in skills.iter().filter(|_| !agents_text.is_empty()) {
         if !agents_text.contains(&format!("`{name}`")) {
             problems.push(format!(
                 "{} doesn't name the pack's skill `{name}` (write it as `{name}`)",
@@ -1075,11 +1132,35 @@ mcp = "coder/mcp.toml"
     }
 
     #[test]
-    fn backticked_tool_names_finds_snake_case_only() {
-        assert_eq!(
-            backticked_tool_names("use `read_file`, `x`, `Foo_bar`, `head -n 20`"),
-            vec!["read_file"]
-        );
+    fn only_near_misses_of_a_tool_name_are_flagged() {
+        let text = "`min_version` `my_script` `allowed_commands` `read_file` `x` `Foo_bar` `head -n 20`";
+        assert!(misspelt_tools(text).is_empty());
+        assert_eq!(misspelt_tools("`read_fil`"), vec![("read_fil".to_string(), "read_file")]);
+        assert_eq!(misspelt_tools("`git_pushh`"), vec![("git_pushh".to_string(), "git_push")]);
+        assert_eq!(misspelt_tools("`generate_3dd`"), vec![("generate_3dd".to_string(), "generate_3d")]);
+    }
+
+    #[test]
+    fn a_fence_with_an_odd_backtick_does_not_flip_pairing() {
+        let text = "```sh
+echo `oops
+```
+Then `read_fil` it, and `read_fil` again.
+";
+        assert_eq!(misspelt_tools(text), vec![("read_fil".to_string(), "read_file")]);
+    }
+
+    #[test]
+    fn a_misspelt_tool_is_reported_once() {
+        let d = good_pack("lint-once");
+        rewrite(&d, "coder/skills/example/SKILL.md", |t| format!("{t}
+`git_pushh` then `git_pushh`.
+"));
+        rewrite(&d, "coder/AGENTS.md", |t| format!("{t}`git_pushh`
+"));
+        let problems = check_coder_part(&d).unwrap_err();
+        let n = problems.iter().filter(|p| p.contains("skill `example` names `git_pushh`")).count();
+        assert_eq!(n, 1, "{problems:?}");
     }
 
     #[test]
@@ -1087,7 +1168,7 @@ mcp = "coder/mcp.toml"
         let d = good_pack("lint-tool");
         rewrite(&d, "coder/skills/example/SKILL.md", |t| format!("{t}\nThen call `git_pushh`.\n"));
         let problems = check_coder_part(&d).unwrap_err();
-        assert!(problems.iter().any(|p| p.contains("isn't an aivyx-coder tool")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("isn't an aivyx-coder tool (did you mean `git_push`?)")), "{problems:?}");
     }
 
     #[test]
