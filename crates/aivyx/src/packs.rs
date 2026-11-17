@@ -137,6 +137,34 @@ pub fn command_count(v: &PackVerification) -> usize {
     usize::from(v.command.is_some()) + usize::from(v.scoped_command.is_some()) + v.final_checks.len()
 }
 
+/// Every tool aivyx-coder can give the model. A test keeps this equal to
+/// the generated `docs/manual/reference/04-tools.md`.
+pub const CODER_TOOLS: &[&str] = &[
+    "read_file", "write_file", "edit_file", "patch_file", "move_file", "delete_file", "grep", "glob",
+    "run_command", "run_shell", "repl_start", "repl_send", "repl_stop", "git_read", "git_commit",
+    "git_branch", "git_push", "git_pr", "set_tasks", "web_fetch", "web_search", "memory_read",
+    "memory_write", "memory_forget", "remember_preference", "load_skill", "delegate_task",
+    "delegate_to_specialist", "spawn_specialist", "query_specialist", "close_specialist",
+    "decompose_task", "verify_output", "synthesize_results", "list_mcp_resources",
+    "read_mcp_resource", "list_mcp_prompts", "get_mcp_prompt", "generate_svg", "generate_3d", "generate_image",
+    "upscale_image",
+];
+
+/// Backticked snake_case words (`read_file`, not `x` or `Foo`): what a skill
+/// or AGENTS.md uses to name a tool.
+fn backticked_tool_names(text: &str) -> Vec<&str> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|w| {
+            w.contains('_')
+                && !w.starts_with('_')
+                && !w.ends_with('_')
+                && w.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        })
+        .collect()
+}
+
 /// Check the aivyx-coder part of a pack folder. `Err` lists every problem.
 pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
     let text = std::fs::read_to_string(dir.join("manifest.toml"))
@@ -153,11 +181,17 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
 
     let mut problems = Vec::new();
 
-    match std::fs::read_to_string(dir.join(&coder.agents_file)) {
-        Ok(text) if !text.trim().is_empty() => {}
-        Ok(_) => problems.push(format!("{} is empty", coder.agents_file)),
-        Err(e) => problems.push(format!("can't read {}: {e}", coder.agents_file)),
-    }
+    let agents_text = match std::fs::read_to_string(dir.join(&coder.agents_file)) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => {
+            problems.push(format!("{} is empty", coder.agents_file));
+            String::new()
+        }
+        Err(e) => {
+            problems.push(format!("can't read {}: {e}", coder.agents_file));
+            String::new()
+        }
+    };
 
     let mut skills = Vec::new();
     if let Some(rel) = &coder.skills {
@@ -187,6 +221,31 @@ pub fn check_coder_part(dir: &Path) -> Result<CoderPartSummary, Vec<String>> {
                      frontmatter, and `name` must match its folder)"
                 ));
             }
+        }
+    }
+
+    // Every tool a skill or AGENTS.md names exists, and AGENTS.md names each skill.
+    let mut texts: Vec<(String, String)> = vec![(coder.agents_file.clone(), agents_text.clone())];
+    if let Some(rel) = &coder.skills {
+        for name in &skills {
+            if let Ok(t) = std::fs::read_to_string(dir.join(rel).join(name).join("SKILL.md")) {
+                texts.push((format!("skill `{name}`"), t));
+            }
+        }
+    }
+    for (label, text) in &texts {
+        for tool in backticked_tool_names(text) {
+            if !CODER_TOOLS.contains(&tool) {
+                problems.push(format!("{label} names `{tool}`, which isn't an aivyx-coder tool"));
+            }
+        }
+    }
+    for name in &skills {
+        if !agents_text.contains(&format!("`{name}`")) {
+            problems.push(format!(
+                "{} doesn't name the pack's skill `{name}` (write it as `{name}`)",
+                coder.agents_file
+            ));
         }
     }
 
@@ -963,7 +1022,7 @@ mcp = "coder/mcp.toml"
         let dir = tmp(tag);
         for (rel, body) in [
             ("manifest.toml", MANIFEST),
-            ("coder/AGENTS.md", "Explain changes in plain language.\n"),
+            ("coder/AGENTS.md", "Explain changes in plain language. Use the `example` skill.\n"),
             (
                 "coder/skills/example/SKILL.md",
                 "---\nname: example\ndescription: An example skill.\n---\n\nDo the example thing.\n",
@@ -995,6 +1054,48 @@ mcp = "coder/mcp.toml"
         let bundle = out.join("pack.aivyxpack");
         aivyx_pack::write_bundle(&aivyx_pack::build_payload(dir).unwrap(), &signing, &bundle).unwrap();
         (bundle, pubkey)
+    }
+
+    #[test]
+    fn coder_tools_match_the_generated_reference() {
+        let reference = include_str!("../../../docs/manual/reference/04-tools.md");
+        let mut documented: Vec<&str> = reference
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| {
+                l.split_once("` | ")
+                    .filter(|(_, rest)| rest.starts_with("yes |") || rest.starts_with("no |"))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        documented.sort_unstable();
+        let mut ours = CODER_TOOLS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(ours, documented);
+    }
+
+    #[test]
+    fn backticked_tool_names_finds_snake_case_only() {
+        assert_eq!(
+            backticked_tool_names("use `read_file`, `x`, `Foo_bar`, `head -n 20`"),
+            vec!["read_file"]
+        );
+    }
+
+    #[test]
+    fn a_skill_naming_a_made_up_tool_is_a_problem() {
+        let d = good_pack("lint-tool");
+        rewrite(&d, "coder/skills/example/SKILL.md", |t| format!("{t}\nThen call `git_pushh`.\n"));
+        let problems = check_coder_part(&d).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("isn't an aivyx-coder tool")), "{problems:?}");
+    }
+
+    #[test]
+    fn agents_md_must_name_each_skill() {
+        let d = good_pack("lint-skill");
+        rewrite(&d, "coder/AGENTS.md", |_| "Explain changes.\n".into());
+        let problems = check_coder_part(&d).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("doesn't name the pack's skill")), "{problems:?}");
     }
 
     #[test]
@@ -1053,13 +1154,18 @@ mcp = "coder/mcp.toml"
         // aivyx-pack's own fixtures: the coder-base template signed with
         // the primary and the backup key in AIVYX_PUBLISHER_KEYS.
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // The fixtures are signed with the offline keys and predate the
+        // AGENTS.md-names-its-skills lint, so they verify with no trusted
+        // publishers but `install` now stops at that lint (and only at it).
+        // Re-sign them to restore the full install assertion.
         for name in ["primary", "backup"] {
+            let file = fixtures.join(format!("{name}.aivyxpack"));
+            let bundle = aivyx_pack::read_bundle(&file).unwrap();
+            aivyx_pack::verify_bundle(&bundle, &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
             let packs = PacksDir::at(tmp(&format!("builtin-{name}")));
-            let installed = install(&packs, &fixtures.join(format!("{name}.aivyxpack")), &[])
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(installed.version, "0.1.0", "{name}");
-            assert!(installed.dir.join("coder/AGENTS.md").is_file(), "{name}");
-            assert_eq!(packs.find("fixture").unwrap().version, "0.1.0", "{name}");
+            let err = install(&packs, &file, &[]).unwrap_err();
+            assert!(err.contains("doesn't name the pack's skill `example`"), "{name}: {err}");
+            assert!(!err.contains("signature"), "{name}: {err}");
         }
     }
 

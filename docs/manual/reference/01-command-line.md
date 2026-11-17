@@ -215,7 +215,9 @@ off everywhere.
 
 `aivyx-coder pack check <folder>` — for pack authors: checks a pack
 folder's aivyx-coder part (its `AGENTS.md`, skills, roster and MCP servers)
-and lists every problem.
+and lists every problem. It also checks that every backticked tool name in the
+skills and `AGENTS.md` is a real aivyx-coder tool, and that `AGENTS.md` names
+each of the pack's skills.
 
 ### `pack inspect`
 
