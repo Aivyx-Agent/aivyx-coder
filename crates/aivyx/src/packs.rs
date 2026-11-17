@@ -1235,18 +1235,13 @@ Then `read_fil` it, and `read_fil` again.
         // aivyx-pack's own fixtures: the coder-base template signed with
         // the primary and the backup key in AIVYX_PUBLISHER_KEYS.
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        // The fixtures are signed with the offline keys and predate the
-        // AGENTS.md-names-its-skills lint, so they verify with no trusted
-        // publishers but `install` now stops at that lint (and only at it).
-        // Re-sign them to restore the full install assertion.
         for name in ["primary", "backup"] {
-            let file = fixtures.join(format!("{name}.aivyxpack"));
-            let bundle = aivyx_pack::read_bundle(&file).unwrap();
-            aivyx_pack::verify_bundle(&bundle, &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
             let packs = PacksDir::at(tmp(&format!("builtin-{name}")));
-            let err = install(&packs, &file, &[]).unwrap_err();
-            assert!(err.contains("doesn't name the pack's skill `example`"), "{name}: {err}");
-            assert!(!err.contains("signature"), "{name}: {err}");
+            let installed = install(&packs, &fixtures.join(format!("{name}.aivyxpack")), &[])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(installed.version, "0.1.0", "{name}");
+            assert!(installed.dir.join("coder/AGENTS.md").is_file(), "{name}");
+            assert_eq!(packs.find("fixture").unwrap().version, "0.1.0", "{name}");
         }
     }
 
