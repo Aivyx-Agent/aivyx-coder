@@ -67,6 +67,18 @@ version = 2
 yanked = "deny"
 unmaintained = "all"
 ignore = [
+    # chrono — RUSTSEC-2026-0543 / chrono-tz — RUSTSEC-2026-0555 (accepted
+    # 2026-11-18): unmaintained, not vulnerable, no safe upgrade exists.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; no safe upgrade exists; revisit when a successor is adopted" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained, not vulnerable; no safe upgrade exists; revisit with chrono" },
+    # zip 7.x — RUSTSEC-2026-0545..0548 (accepted 2026-11-18), fixed in zip
+    # 9.x. Reachable only through the opt-in in-process mistralrs provider
+    # (mistralrs 0.8.1 -> candle 0.10 -> zip 7), which no shipped build
+    # enables. Remove when mistralrs moves to candle with zip 9.
+    { id = "RUSTSEC-2026-0545", reason = "zip 7 AES MAC; only via the opt-in mistralrs provider; not in shipped builds; revisit on the next mistralrs release" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 7 extract symlink escape; only via the opt-in mistralrs provider; not in shipped builds" },
+    { id = "RUSTSEC-2026-0547", reason = "zip 7 legacy decoder preallocation; only via the opt-in mistralrs provider; not in shipped builds" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 7 ZipStreamReader name mismatch; only via the opt-in mistralrs provider; not in shipped builds" },
     # fxhash — RUSTSEC-2025-0057 (unmaintained). Pulled via
     #   fxhash → bm25 → mistralrs-core → mistralrs → aivyx-llm
     # (the in-process mistralrs local-LLM provider). Same path as aivyx-pa.
