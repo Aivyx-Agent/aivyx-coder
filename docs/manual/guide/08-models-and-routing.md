@@ -136,9 +136,10 @@ summarize = { tier = "small" }
 
 aivyx-coder is local-only. Models run on your machine or your own network
 (llama-server, Ollama, Jan, vLLM, Lemonade). Every model URL must be local:
-loopback, a private LAN address, Tailscale (`100.64.0.0/10`), or a
-`.local`/`.lan`/`.home.arpa` name. A host name counts only if every address
-it resolves to is local. For a DNS-named LAN box, also set
+loopback, a private LAN address (RFC 1918), link-local, IPv6 ULA
+(`fc00::/7`), Tailscale/CGNAT (`100.64.0.0/10`), a
+`.local`/`.lan`/`.internal`/`.home.arpa` name, or a single-label name. A DNS
+name counts only if every address it resolves to is local. For a DNS-named LAN box, also set
 `locality = "local"` on its `[routing.endpoints.*]` table.
 
 - **A cloud URL stops startup.** Config load fails with
