@@ -16,33 +16,30 @@ use aivyx_route::{
 /// The `[backend]` section, as a routing endpoint name.
 pub(crate) const DEFAULT_ENDPOINT: &str = "backend";
 
-/// The address the embedded `mistral_rs` backend is given as the default
-/// endpoint's: never contacted.
-const EMBEDDED_PLACEHOLDER_URL: &str = "http://127.0.0.1";
-
 /// `[backend]` as aivyx-route's default endpoint, with the address chat
 /// actually connects to, so its locality follows the same rule as any
 /// routing endpoint's (`DefaultEndpoint::effective_locality`). Not yet
 /// verified: a `locality = "local"` override on a DNS name counts only
-/// after [`verify_routing_with`].
+/// after [`verify_routing_with`]. The embedded `mistral_rs` backend is
+/// in-process (`DefaultEndpoint::in_process`): local, with no address to
+/// check or contact.
 pub(crate) fn default_endpoint(settings: &Settings) -> DefaultEndpoint {
     let backend = &settings.backend;
-    let (base_url, implied) = match backend.kind {
-        BackendKind::Generic | BackendKind::LlamaServer => (Some(backend.base_url.clone()), None),
-        BackendKind::LlamaServerBroker => (settings.broker.base_url.clone(), None),
-        // In-process: nothing leaves the machine, whatever base_url says.
-        // aivyx-route 0.2 honours `locality = "local"` only for a verified
-        // address, so it gets a loopback placeholder, local by its
-        // spelling; nothing ever connects to it.
-        BackendKind::MistralRs => {
-            (Some(EMBEDDED_PLACEHOLDER_URL.to_string()), Some(Locality::Local))
+    let mut default = match backend.kind {
+        BackendKind::Generic | BackendKind::LlamaServer => {
+            DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat)
+                .with_base_url(backend.base_url.clone())
         }
+        BackendKind::LlamaServerBroker => {
+            let default = DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat);
+            match &settings.broker.base_url {
+                Some(url) => default.with_base_url(url.clone()),
+                None => default,
+            }
+        }
+        BackendKind::MistralRs => DefaultEndpoint::in_process(DEFAULT_ENDPOINT),
     };
-    let mut default = DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat);
-    if let Some(url) = base_url {
-        default = default.with_base_url(url);
-    }
-    if let Some(locality) = backend.locality.or(implied) {
+    if let Some(locality) = backend.locality {
         default = default.with_locality(locality);
     }
     default
@@ -68,7 +65,7 @@ pub(crate) fn verify_routing_with(
         }
         anyhow::bail!("[routing.endpoints.{endpoint}]: {reason}");
     }
-    Ok(routing_config_warnings(issues, default))
+    Ok(routing_config_warnings(issues))
 }
 
 /// Why routing counts `[backend]` as cloud, and the fix, or `None` when it
@@ -164,17 +161,10 @@ pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()>
 /// `validate`), with the ones about the default endpoint pointed at
 /// `[backend]` (there is no `[routing.endpoints.backend]` to set
 /// `locality` on).
-fn routing_config_warnings(issues: Vec<ConfigIssue>, default: &DefaultEndpoint) -> Vec<String> {
-    let default_is_local = default.effective_locality() == Locality::Local;
+/// The in-process embedded backend raises none: aivyx-route skips it.
+fn routing_config_warnings(issues: Vec<ConfigIssue>) -> Vec<String> {
     issues
         .into_iter()
-        .filter(|issue| {
-            // Local with no address is the embedded backend (or a marked-
-            // local broker, which fails at backend construction anyway):
-            // nothing for routing to check.
-            !(default_is_local
-                && matches!(issue, ConfigIssue::MissingBaseUrl { endpoint } if endpoint == DEFAULT_ENDPOINT))
-        })
         .map(|issue| match &issue {
             ConfigIssue::NonLocalAddress { endpoint, host } if endpoint == DEFAULT_ENDPOINT => {
                 format!(
@@ -924,6 +914,38 @@ mod tests {
         let (_, _, warnings) = verified(&broker, &PUBLIC).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[broker] base_url"), "{warnings:?}");
+    }
+
+    /// Panics on any lookup: proves a path makes none.
+    struct NoLookups;
+
+    impl Resolve for NoLookups {
+        fn resolve(&self, host: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            panic!("unexpected lookup of {host}");
+        }
+    }
+
+    /// The embedded mistral_rs backend is in-process: local, with no
+    /// address, and never looked up, whatever `[backend] base_url` says.
+    #[test]
+    fn the_embedded_default_is_local_in_process_and_never_looked_up() {
+        let mut embedded = backend(BackendKind::MistralRs, "http://gpu.example.com/v1", None);
+        embedded.routing.enabled = true;
+        let (_, default, warnings) = verified(&embedded, &NoLookups).unwrap();
+        assert!(default.is_in_process());
+        assert_eq!(default.base_url(), None);
+        assert_eq!(default.effective_locality(), Locality::Local);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cloud_backend_notice(&embedded, &default), None);
+        assert_eq!(default_residency(&embedded, &default), DefaultResidency::Resident);
+        assert_eq!(embedded.require_local_models_with(&NoLookups), Ok(()));
+
+        // `[backend] locality = "cloud"` still applies, with its own remedy.
+        embedded.backend.locality = Some(Locality::Cloud);
+        let (_, default, _) = verified(&embedded, &NoLookups).unwrap();
+        assert_eq!(default.effective_locality(), Locality::Cloud);
+        let notice = cloud_backend_notice(&embedded, &default).unwrap();
+        assert!(notice.contains("marked `locality = \"cloud\"`"), "{notice}");
     }
 
     /// aivyx-route never probes an endpoint it calls cloud; neither does

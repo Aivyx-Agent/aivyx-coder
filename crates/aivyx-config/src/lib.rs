@@ -1394,12 +1394,17 @@ impl Settings {
     }
 
     /// Every model server address this config makes aivyx-coder contact,
-    /// each with the key that sets it: `[backend] base_url`, `[broker]
-    /// base_url`, `[architect]` and `[council]` seats, every
-    /// `[routing.endpoints.*]` entry (routing on or not), and `[vision]
-    /// mold_url` when the image tools are on.
+    /// each with the key that sets it: `[backend] base_url` (for the kinds
+    /// that connect to it: not `llama_server_broker`, which uses `[broker]
+    /// base_url`, nor the in-process `mistral_rs`), `[broker] base_url`,
+    /// `[architect]` and `[council]` seats, every `[routing.endpoints.*]`
+    /// entry (routing on or not), and `[vision] mold_url` when the image
+    /// tools are on.
     pub fn model_urls(&self) -> Vec<(String, String)> {
-        let mut urls = vec![("[backend] base_url".to_string(), self.backend.base_url.clone())];
+        let mut urls = Vec::new();
+        if matches!(self.backend.kind, BackendKind::Generic | BackendKind::LlamaServer) {
+            urls.push(("[backend] base_url".to_string(), self.backend.base_url.clone()));
+        }
         if let Some(url) = &self.broker.base_url {
             urls.push(("[broker] base_url".to_string(), url.clone()));
         }
@@ -1761,6 +1766,20 @@ mod tests {
             assert!(err.contains("resolves to a public address 93.184.216.34"), "{err}");
             // The same names on the operator's own network are fine.
             assert_eq!(s.require_local_models_with(&lan()), Ok(()), "{key}");
+        }
+    }
+
+    /// `[backend] base_url` is only checked for the kinds that connect to
+    /// it: the broker kind uses `[broker] base_url`, and the embedded
+    /// backend has no address at all.
+    #[test]
+    fn backend_base_url_is_checked_only_for_kinds_that_use_it() {
+        let mut s: Settings =
+            toml::from_str("[backend]\nbase_url = \"https://api.openai.com/v1\"\n").unwrap();
+        assert!(s.require_local_models_with(&lan()).is_err());
+        for kind in [BackendKind::LlamaServerBroker, BackendKind::MistralRs] {
+            s.backend.kind = kind;
+            assert_eq!(s.require_local_models_with(&Fixed(Vec::new())), Ok(()), "{kind:?}");
         }
     }
 
