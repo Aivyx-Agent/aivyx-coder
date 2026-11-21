@@ -1567,15 +1567,28 @@ pub(crate) async fn build_agent(
                                 // aivyx-config, also reused by Settings::effective_deny_paths
                                 // below so the two can never silently diverge.
                                 let store_path = settings.kvcache.resolved_store_path();
-                                match aivyx_kvcache::LlamaServerSlotStore::open(
-                                    &store_path,
-                                    origin, // NOT settings.backend.base_url -- /slots is a native
-                                    // llama-server endpoint at the origin, not under /v1
-                                    // (confirmed live: a /v1-prefixed base_url 404s on
-                                    // /v1/slots/{id}?action=save, since the real path is
-                                    // just /slots/{id}?action=save)
-                                    settings.kvcache.max_bytes,
-                                ) {
+                                // The slot client is a model client: no proxy, no
+                                // redirects, local-only DNS. 60 s matches
+                                // aivyx-kvcache's SLOT_HTTP_TIMEOUT (slot files are
+                                // large, so a status-check bound would be too short).
+                                let slot_client = aivyx_llm::model_client_builder()
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()
+                                    .map_err(|e| {
+                                        aivyx_kvcache::KvCacheError::Backend(e.to_string())
+                                    });
+                                match slot_client.and_then(|http| {
+                                    aivyx_kvcache::LlamaServerSlotStore::open_with_client(
+                                        &store_path,
+                                        origin, // NOT settings.backend.base_url -- /slots is a native
+                                        // llama-server endpoint at the origin, not under /v1
+                                        // (confirmed live: a /v1-prefixed base_url 404s on
+                                        // /v1/slots/{id}?action=save, since the real path is
+                                        // just /slots/{id}?action=save)
+                                        settings.kvcache.max_bytes,
+                                        http,
+                                    )
+                                }) {
                                     Ok(store) => {
                                         // Scoped by origin (not just store_path, which
                                         // defaults to one global directory regardless of
