@@ -77,8 +77,8 @@ summarize = { tier = "small" }
 - Every model discovery finds becomes a candidate, even without a
   `[[routing.models]]` entry. Such a model is `medium` tier with no
   strengths.
-- Only local endpoints are accepted; `aivyx-coder` never talks to a cloud
-  API. Every endpoint's `base_url` must pass the local-only check at
+- Only local endpoints are accepted; `aivyx-coder` is local-only: models run on
+  your machine or your own network. Every endpoint's `base_url` must pass the local-only check at
   startup, or `aivyx-coder` doesn't start: its host must be a loopback,
   private (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`), link-local or
   CGNAT/Tailscale (`100.64.0.0/10`) address, a name that is `localhost`,
