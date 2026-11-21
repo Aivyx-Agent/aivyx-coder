@@ -38,8 +38,8 @@ use aivyx_tools::{
 use tokio::sync::mpsc;
 
 use crate::{
-    COUNCIL_IDLE_TIMEOUT, Cli, DEFAULT_COMMAND_TIMEOUT_SECS, base_url_looks_local,
-    build_plan_system_prompt, build_system_prompt,
+    COUNCIL_IDLE_TIMEOUT, Cli, DEFAULT_COMMAND_TIMEOUT_SECS, build_plan_system_prompt,
+    build_system_prompt,
 };
 
 /// The `allowed_commands` entry name synthesized for `--auto` when no
@@ -424,20 +424,41 @@ fn render_skills_listing(
     listing
 }
 
+/// Builds an `OpenAiCompatBackend` on the blocking pool: its constructor
+/// checks the address is local, which may resolve a DNS name.
+async fn local_backend<F>(build: F) -> anyhow::Result<OpenAiCompatBackend>
+where
+    F: FnOnce() -> Result<OpenAiCompatBackend, aivyx_llm::local::NotLocal> + Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(build).await??)
+}
+
+/// The load-time local-only check of every model address in `settings`
+/// (`Settings::require_local_models`), off the async worker threads. A
+/// failure stops start-up with the `NotLocal` text.
+pub(crate) async fn require_local_models(settings: &Settings) -> anyhow::Result<()> {
+    let settings = settings.clone();
+    tokio::task::spawn_blocking(move || settings.require_local_models())
+        .await?
+        .map_err(anyhow::Error::msg)
+}
+
 /// Constructs the configured `LlmBackend`. Extracted from `build_agent`
 /// so the dispatch itself -- including its error path when a required
 /// mistral.rs config field is missing -- is directly testable without
 /// building a full `BuiltAgent`.
 async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBackend>> {
     match settings.backend.kind {
-        BackendKind::Generic | BackendKind::LlamaServer => Ok(Arc::new(
-            OpenAiCompatBackend::new(
-                settings.backend.base_url.clone(),
-                settings.backend.model.clone(),
-                settings.backend.api_key.clone(),
-            )
-            .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
-        )),
+        BackendKind::Generic | BackendKind::LlamaServer => {
+            let backend = settings.backend.clone();
+            Ok(Arc::new(
+                local_backend(move || {
+                    OpenAiCompatBackend::new(backend.base_url, backend.model, backend.api_key)
+                })
+                .await?
+                .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
+            ))
+        }
         BackendKind::LlamaServerBroker => {
             let broker_url = settings.broker.base_url.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -448,12 +469,16 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             })?;
             // aivyx-broker serves `/v1/chat/completions`; the documented
             // `broker.base_url` has no `/v1`, and one that does keeps it.
+            let backend = settings.backend.clone();
             Ok(Arc::new(
-                OpenAiCompatBackend::new(
-                    crate::routing::chat_base_url(&broker_url),
-                    settings.backend.model.clone(),
-                    settings.backend.api_key.clone(),
-                )
+                local_backend(move || {
+                    OpenAiCompatBackend::new(
+                        crate::routing::chat_base_url(&broker_url),
+                        backend.model,
+                        backend.api_key,
+                    )
+                })
+                .await?
                 .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
             ))
         }
@@ -596,16 +621,11 @@ pub(crate) async fn build_agent(
         "starting aivyx"
     );
 
-    if settings.backend.api_key.is_some() && !base_url_looks_local(&settings.backend.base_url) {
-        tracing::warn!(
-            base_url = %settings.backend.base_url,
-            "backend.api_key is set but base_url doesn't look like a local endpoint — \
-             credentials are being sent to a non-local host, which contradicts this \
-             project's local-only premise"
-        );
-    }
+    // aivyx-coder is local-only: every model address must be on this
+    // machine or the operator's own network, or it doesn't start.
+    require_local_models(settings).await?;
 
-    let (llm, router) =
+    let crate::routing::Wrapped { llm, router, cloud_backend_notice } =
         crate::routing::wrap_with_routing(settings, build_llm_backend(settings).await?).await?;
 
     let deny_paths = settings.effective_deny_paths();
@@ -889,6 +909,10 @@ pub(crate) async fn build_agent(
         {
             tracing::warn!(%warning, "context window mismatch");
             let _ = events_tx.send(aivyx_core::AgentEvent::Error(warning));
+        }
+        if let aivyx_llm::ServedContext::NotLocal(why) = &served {
+            tracing::warn!(%why, "model server not local at startup");
+            let _ = events_tx.send(aivyx_core::AgentEvent::Error(why.clone()));
         }
         if served == aivyx_llm::ServedContext::Unreachable {
             let notice = aivyx_llm::unreachable_notice(&settings.backend.base_url);
@@ -1483,16 +1507,13 @@ pub(crate) async fn build_agent(
     // A `[backend]` routing counts as cloud leaves routed calls (the main
     // loop's included) with nothing to pick unless another local model is
     // a candidate; aivyx.log alone is not where a user looks for that.
-    if let Some(notice) = crate::routing::cloud_backend_notice(settings) {
+    if let Some(notice) = cloud_backend_notice {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
     for notice in pack.iter().flat_map(|p| p.notices.iter()) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice.clone()));
     }
     if let Some(notice) = carved_root_cargo_notice(&cwd, &deny_paths) {
-        let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
-    }
-    if let Some(notice) = remote_mold_notice(settings) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice));
     }
 
@@ -1526,7 +1547,13 @@ pub(crate) async fn build_agent(
         if let Err(err) = &built_client {
             tracing::warn!(error = %err, "kvcache: failed to build HTTP client; disabled for this run");
         }
-        match built_client.ok() {
+        // Checked again here, as before every model request: a name's
+        // addresses can change after the load-time check.
+        let local = aivyx_llm::local::require_local(&props_url).await;
+        if let Err(err) = &local {
+            tracing::warn!(error = %err, "kvcache: disabled for this run");
+        }
+        match built_client.ok().filter(|_| local.is_ok()) {
             None => None,
             Some(props_client) => match props_client.get(&props_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -1717,23 +1744,35 @@ pub(crate) async fn build_agent(
     // `/council` needs ≥2 members and a chairman; anything less and the
     // command explains itself instead (the agent handles the None case).
     if settings.council.configured() {
-        let seat = |member: &aivyx_config::CouncilMember| CouncilSeat {
-            model: member.model.clone(),
-            backend: Arc::new(OpenAiCompatBackend::with_idle_timeout(
-                member.base_url.clone(),
-                member.model.clone(),
-                member.api_key.clone(),
-                COUNCIL_IDLE_TIMEOUT,
-            )),
-        };
+        async fn seat(member: &aivyx_config::CouncilMember) -> anyhow::Result<CouncilSeat> {
+            let member = member.clone();
+            Ok(CouncilSeat {
+                model: member.model.clone(),
+                backend: Arc::new(
+                    local_backend(move || {
+                        OpenAiCompatBackend::with_idle_timeout(
+                            member.base_url,
+                            member.model,
+                            member.api_key,
+                            COUNCIL_IDLE_TIMEOUT,
+                        )
+                    })
+                    .await?,
+                ),
+            })
+        }
         let chairman = settings
             .council
             .chairman
             .as_ref()
             .expect("configured() guarantees a chairman");
+        let mut members = Vec::new();
+        for member in &settings.council.members {
+            members.push(seat(member).await?);
+        }
         agent.set_council(Council {
-            members: settings.council.members.iter().map(seat).collect(),
-            chairman: seat(chairman),
+            members,
+            chairman: seat(chairman).await?,
             tail_budget_tokens: settings.council.tail_budget_tokens,
         });
     }
@@ -1744,12 +1783,18 @@ pub(crate) async fn build_agent(
         agent.set_architect(Architect {
             seat: ArchitectSeat {
                 model: settings.architect.model.clone(),
-                backend: Arc::new(OpenAiCompatBackend::with_idle_timeout(
-                    settings.architect.base_url.clone(),
-                    settings.architect.model.clone(),
-                    settings.architect.api_key.clone(),
-                    COUNCIL_IDLE_TIMEOUT,
-                )),
+                backend: Arc::new({
+                    let architect = settings.architect.clone();
+                    local_backend(move || {
+                        OpenAiCompatBackend::with_idle_timeout(
+                            architect.base_url,
+                            architect.model,
+                            architect.api_key,
+                            COUNCIL_IDLE_TIMEOUT,
+                        )
+                    })
+                    .await?
+                }),
             },
             tail_budget_tokens: settings.architect.tail_budget_tokens,
         });
@@ -1898,24 +1943,6 @@ pub(crate) async fn build_agent(
 /// handle. Matching `aivyx_llm::probe::probe_served_context`'s own
 /// handling of the identical failure (probe.rs:33-36): treat it as
 /// "kvcache unavailable this run", not a startup panic.
-/// A startup notice when image generation is on and `[vision] mold_url` is
-/// not a local address: `generate_image` sends it the prompt and, for
-/// image-to-image, the reference image's bytes. The same address rule as
-/// `[backend]` (aivyx-route's `url_locality`); aivyx-vision audit
-/// 2026-11-11 M2.
-fn remote_mold_notice(settings: &Settings) -> Option<String> {
-    if !settings.vision.enabled
-        || aivyx_route::url_locality(&settings.vision.mold_url) == aivyx_route::Locality::Local
-    {
-        return None;
-    }
-    Some(format!(
-        "[vision] mold_url `{}` is not a local address: generate_image sends it your prompts \
-         and any reference image. Point it at a mold serve on this machine or your own network.",
-        settings.vision.mold_url
-    ))
-}
-
 fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
     aivyx_llm::model_client_builder()
         .timeout(aivyx_llm::probe::PROBE_TIMEOUT) // matches aivyx_llm::probe's own /props fetch
@@ -2192,25 +2219,6 @@ mod tests {
                 assert_eq!(sent.and_then(|v| v.as_str()), effort, "{kind:?}");
                 assert_eq!(body.get("reasoning_effort").and_then(|v| v.as_str()), effort);
             }
-        }
-    }
-
-    /// aivyx-vision audit 2026-11-11 M2.
-    #[test]
-    fn a_remote_mold_url_gets_a_startup_notice_only_when_vision_is_on() {
-        let mut settings = Settings::default();
-        settings.vision.mold_url = "http://mold.example.com:7680".to_string();
-        assert_eq!(remote_mold_notice(&settings), None, "vision is off by default");
-        settings.vision.enabled = true;
-        let notice = remote_mold_notice(&settings).expect("a remote mold_url is named");
-        assert!(notice.contains("mold.example.com"), "{notice}");
-        for local in [
-            "http://127.0.0.1:7680",
-            "http://localhost:7680",
-            "http://192.168.1.20:7680",
-        ] {
-            settings.vision.mold_url = local.to_string();
-            assert_eq!(remote_mold_notice(&settings), None, "{local} is local");
         }
     }
 

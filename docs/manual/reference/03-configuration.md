@@ -78,9 +78,9 @@ Per-call model routing across several local models. Off by default. See [Models 
 
 | Key | Type | Example | Meaning |
 |---|---|---|---|
-| `kind` | `ollama` \| `llama_router` \| `openai_compat` \| `lemonade` \| `anthropic` \| `openai` |  | What kind of server this is. |
+| `kind` | `ollama` \| `llama_router` \| `openai_compat` \| `lemonade` |  | What kind of server this is. |
 | `base_url` | string |  | The server's URL. Unset uses the kind's usual local address. |
-| `locality` | `local` \| `cloud` |  | Operator override of the locality the address implies: `local` marks a non-cloud kind local even when its host looks public (a LAN box with a public DNS name); `cloud` marks it cloud. Never makes a cloud kind local. |
+| `locality` | `local` \| `cloud` |  | Operator override of the locality the address implies: `cloud` marks the endpoint cloud. |
 
 #### `[[routing.models]]`
 

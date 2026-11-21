@@ -26,8 +26,10 @@ pub trait ProfileRefresher: Send + Sync {
 }
 
 /// Builds the backend serving one model. The error is a human sentence.
-pub type BackendFactory =
-    Box<dyn Fn(&ModelKey) -> Result<Arc<dyn LlmBackend>, String> + Send + Sync>;
+pub type BackendFactory = Box<BuildBackend>;
+
+/// The function behind a [`BackendFactory`].
+pub type BuildBackend = dyn Fn(&ModelKey) -> Result<Arc<dyn LlmBackend>, String> + Send + Sync;
 
 /// Delegates every routing decision (profiles, stickiness, pins,
 /// cooldowns, residency, last-decision bookkeeping) to a shared
@@ -36,7 +38,7 @@ pub type BackendFactory =
 pub struct RoutedBackend {
     default_key: ModelKey,
     default_backend: Arc<dyn LlmBackend>,
-    factory: BackendFactory,
+    factory: Arc<BuildBackend>,
     refresher: Option<Arc<dyn ProfileRefresher>>,
     router: Router,
     pool: Mutex<HashMap<ModelKey, Arc<dyn LlmBackend>>>,
@@ -58,7 +60,7 @@ impl RoutedBackend {
         RoutedBackend {
             default_key,
             default_backend,
-            factory,
+            factory: Arc::from(factory),
             refresher: None,
             router: Router::new(profiles, tasks),
             pool: Mutex::new(HashMap::new()),
@@ -148,18 +150,24 @@ impl RoutedBackend {
     }
 
     /// The default model is served by the configured backend; every
-    /// other model's backend is built once, on first use.
-    fn backend_for(&self, key: &ModelKey) -> Result<Arc<dyn LlmBackend>, String> {
+    /// other model's backend is built once, on first use. Built on the
+    /// blocking pool: a backend checks its address is local, which may
+    /// resolve a DNS name.
+    async fn backend_for(&self, key: &ModelKey) -> Result<Arc<dyn LlmBackend>, String> {
         if *key == self.default_key {
             return Ok(Arc::clone(&self.default_backend));
         }
-        let mut pool = self.pool.lock().unwrap();
-        if let Some(backend) = pool.get(key) {
+        if let Some(backend) = self.pool.lock().unwrap().get(key) {
             return Ok(Arc::clone(backend));
         }
-        let backend = (self.factory)(key)?;
-        pool.insert(key.clone(), Arc::clone(&backend));
-        Ok(backend)
+        let factory = Arc::clone(&self.factory);
+        let owned = key.clone();
+        let backend = tokio::task::spawn_blocking(move || factory(&owned))
+            .await
+            .map_err(|e| format!("building its backend failed: {e}"))??;
+        // Two calls may race to build it; the first one stored wins.
+        let mut pool = self.pool.lock().unwrap();
+        Ok(Arc::clone(pool.entry(key.clone()).or_insert(backend)))
     }
 }
 
@@ -221,7 +229,7 @@ impl LlmBackend for RoutedBackend {
         }
         let mut failures: Vec<String> = Vec::new();
         for key in &plan.chain {
-            let backend = match self.backend_for(key) {
+            let backend = match self.backend_for(key).await {
                 Ok(backend) => backend,
                 Err(why) => {
                     self.router.failed(key, Instant::now());
@@ -260,7 +268,8 @@ impl LlmBackend for RoutedBackend {
 /// same way on every model.
 fn is_retryable(err: &LlmError) -> bool {
     match err {
-        LlmError::Request(_) | LlmError::Timeout => true,
+        // One endpoint's address: another candidate may be fine.
+        LlmError::Request(_) | LlmError::Timeout | LlmError::NotLocal(_) => true,
         LlmError::BackendError { status, .. } => matches!(status, 404 | 408 | 500..=599),
         _ => false,
     }

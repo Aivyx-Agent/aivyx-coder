@@ -9,38 +9,75 @@ use aivyx_llm::{BackendFactory, LlmBackend, OpenAiCompatBackend, ProfileRefreshe
 use aivyx_route::discovery::residency::{BrokerSource, collect, endpoints_of};
 use aivyx_route::{
     Capability, ConfigIssue, DefaultEndpoint, EndpointConfig, EndpointKind, EndpointRef, Locality,
-    ModelKey, ModelProfile, ResidencySnapshot, RosterEntry, RoutingConfig, find, merge,
+    ModelKey, ModelProfile, ResidencySnapshot, Resolve, RosterEntry, RoutingConfig, SystemResolver,
+    find, merge,
 };
 
 /// The `[backend]` section, as a routing endpoint name.
 pub(crate) const DEFAULT_ENDPOINT: &str = "backend";
 
+/// The address the embedded `mistral_rs` backend is given as the default
+/// endpoint's: never contacted.
+const EMBEDDED_PLACEHOLDER_URL: &str = "http://127.0.0.1";
+
 /// `[backend]` as aivyx-route's default endpoint, with the address chat
 /// actually connects to, so its locality follows the same rule as any
-/// routing endpoint's (`DefaultEndpoint::effective_locality`).
+/// routing endpoint's (`DefaultEndpoint::effective_locality`). Not yet
+/// verified: a `locality = "local"` override on a DNS name counts only
+/// after [`verify_routing_with`].
 pub(crate) fn default_endpoint(settings: &Settings) -> DefaultEndpoint {
     let backend = &settings.backend;
     let (base_url, implied) = match backend.kind {
         BackendKind::Generic | BackendKind::LlamaServer => (Some(backend.base_url.clone()), None),
         BackendKind::LlamaServerBroker => (settings.broker.base_url.clone(), None),
         // In-process: nothing leaves the machine, whatever base_url says.
-        BackendKind::MistralRs => (None, Some(Locality::Local)),
+        // aivyx-route 0.2 honours `locality = "local"` only for a verified
+        // address, so it gets a loopback placeholder, local by its
+        // spelling; nothing ever connects to it.
+        BackendKind::MistralRs => {
+            (Some(EMBEDDED_PLACEHOLDER_URL.to_string()), Some(Locality::Local))
+        }
     };
-    DefaultEndpoint {
-        base_url,
-        locality: backend.locality.or(implied),
-        ..DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat)
+    let mut default = DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat);
+    if let Some(url) = base_url {
+        default = default.with_base_url(url);
     }
+    if let Some(locality) = backend.locality.or(implied) {
+        default = default.with_locality(locality);
+    }
+    default
+}
+
+/// The load-time routing pass (blocking DNS: call it from
+/// `spawn_blocking`): `RoutingConfig::verify_local_with`, so a verified
+/// `locality = "local"` override counts, then aivyx-route's
+/// `validate_with`. A `NotLocal` issue from either is fatal; the other
+/// issues come back as warnings ([`routing_config_warnings`]).
+pub(crate) fn verify_routing_with(
+    config: &mut RoutingConfig,
+    default: &mut DefaultEndpoint,
+    r: &dyn Resolve,
+) -> anyhow::Result<Vec<String>> {
+    let mut issues = config.verify_local_with(default, r);
+    issues.extend(config.validate_with(default, r));
+    if let Some(ConfigIssue::NotLocal { endpoint, reason }) =
+        issues.iter().find(|i| matches!(i, ConfigIssue::NotLocal { .. }))
+    {
+        if endpoint == DEFAULT_ENDPOINT {
+            anyhow::bail!("[backend]: {reason}");
+        }
+        anyhow::bail!("[routing.endpoints.{endpoint}]: {reason}");
+    }
+    Ok(routing_config_warnings(issues, default))
 }
 
 /// Why routing counts `[backend]` as cloud, and the fix, or `None` when it
 /// is local.
-fn cloud_backend_remedy(settings: &Settings) -> Option<String> {
-    let default = default_endpoint(settings);
+fn cloud_backend_remedy(default: &DefaultEndpoint) -> Option<String> {
     if default.effective_locality() == Locality::Local {
         return None;
     }
-    Some(match (default.locality, default.base_url.as_deref()) {
+    Some(match (default.locality, default.base_url()) {
         (Some(Locality::Cloud), _) => "[backend] is marked `locality = \"cloud\"`, so routing \
              never picks its model — remove that, or add a capable local model to \
              [[routing.models]] (see /models)"
@@ -61,12 +98,15 @@ fn cloud_backend_remedy(settings: &Settings) -> Option<String> {
 
 /// A startup notice for the transcript when routing is on and counts
 /// `[backend]` as cloud: routed calls, the main loop's included, then
-/// never use it.
-pub(crate) fn cloud_backend_notice(settings: &Settings) -> Option<String> {
+/// never use it. `default` is the verified [`default_endpoint`].
+pub(crate) fn cloud_backend_notice(
+    settings: &Settings,
+    default: &DefaultEndpoint,
+) -> Option<String> {
     if !settings.routing.enabled {
         return None;
     }
-    cloud_backend_remedy(settings).map(|remedy| {
+    cloud_backend_remedy(default).map(|remedy| {
         format!(
             "Model routing will not use your [backend] model: routed calls, the main loop \
              included, fail unless another local model is a candidate. {remedy}."
@@ -89,9 +129,11 @@ fn host_of(url: &str) -> String {
         .unwrap_or_else(|| "an unparseable base_url".to_string())
 }
 
-/// aivyx-coder never routes to a cloud endpoint — by kind, by address, or
-/// marked `locality = "cloud"` (`EndpointConfig::effective_locality`) —
-/// and `backend` names `[backend]`.
+/// aivyx-coder never routes to a cloud endpoint — by address, or marked
+/// `locality = "cloud"` (`EndpointConfig::effective_locality`; the hosted-
+/// API kinds are gone, and a config naming one fails to load) — and
+/// `backend` names `[backend]`. Run after [`verify_routing_with`], so a
+/// verified `locality = "local"` override counts.
 pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()> {
     for (name, endpoint) in &config.endpoints {
         if name == DEFAULT_ENDPOINT {
@@ -101,15 +143,6 @@ pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()>
             );
         }
         if endpoint.effective_locality() == Locality::Cloud {
-            if matches!(
-                endpoint.kind,
-                EndpointKind::Anthropic | EndpointKind::Openai
-            ) {
-                anyhow::bail!(
-                    "[routing.endpoints.{name}] is a cloud endpoint, but aivyx-coder only talks \
-                     to local models — remove it"
-                );
-            }
             if endpoint.locality == Some(Locality::Cloud) {
                 anyhow::bail!(
                     "[routing.endpoints.{name}] is marked `locality = \"cloud\"`, but aivyx-coder \
@@ -127,17 +160,13 @@ pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()>
     Ok(())
 }
 
-/// aivyx-route's config warnings, with the ones about the default endpoint
-/// pointed at `[backend]` (there is no `[routing.endpoints.backend]` to
-/// set `locality` on).
-pub(crate) fn routing_config_warnings(
-    config: &RoutingConfig,
-    settings: &Settings,
-) -> Vec<String> {
-    let default = default_endpoint(settings);
+/// aivyx-route's config warnings (`issues`, from `verify_local` and
+/// `validate`), with the ones about the default endpoint pointed at
+/// `[backend]` (there is no `[routing.endpoints.backend]` to set
+/// `locality` on).
+fn routing_config_warnings(issues: Vec<ConfigIssue>, default: &DefaultEndpoint) -> Vec<String> {
     let default_is_local = default.effective_locality() == Locality::Local;
-    config
-        .validate(&default)
+    issues
         .into_iter()
         .filter(|issue| {
             // Local with no address is the embedded backend (or a marked-
@@ -247,10 +276,11 @@ pub(crate) fn backend_factory(settings: &Settings, config: &RoutingConfig) -> Ba
         let api_key = (key.endpoint.as_str() == DEFAULT_ENDPOINT)
             .then(|| backend.api_key.clone())
             .flatten();
-        Ok(
-            Arc::new(OpenAiCompatBackend::new(base, key.id.clone(), api_key))
-                as Arc<dyn LlmBackend>,
-        )
+        // Checks the address is local (`RoutedBackend` calls this on the
+        // blocking pool).
+        let backend =
+            OpenAiCompatBackend::new(base, key.id.clone(), api_key).map_err(|e| e.to_string())?;
+        Ok(Arc::new(backend) as Arc<dyn LlmBackend>)
     })
 }
 
@@ -323,9 +353,12 @@ pub(crate) enum DefaultResidency {
 /// [`DefaultResidency`] for `[backend]`, per the exact `BackendKind`
 /// mapping (see the Model Routing Part 4b spec). A `[backend]` that
 /// routing counts as cloud is never polled, as aivyx-route never polls a cloud
-/// endpoint.
-pub(crate) fn default_residency(settings: &Settings) -> DefaultResidency {
-    if default_endpoint(settings).effective_locality() == Locality::Cloud {
+/// endpoint. `default` is the verified [`default_endpoint`].
+pub(crate) fn default_residency(
+    settings: &Settings,
+    default: &DefaultEndpoint,
+) -> DefaultResidency {
+    if default.effective_locality() == Locality::Cloud {
         return DefaultResidency::None;
     }
     let backend = &settings.backend;
@@ -352,18 +385,17 @@ pub(crate) struct ResidencySources {
 
 impl ResidencySources {
     /// Precondition: `default` names only a non-cloud `[backend]`, as [`default_residency`] guarantees.
-    pub(crate) fn new(config: &RoutingConfig, default: DefaultResidency) -> Self {
+    /// May resolve a DNS name (blocking): see [`verified_local_endpoint`].
+    pub(crate) fn new(config: &RoutingConfig, default: DefaultResidency, r: &dyn Resolve) -> Self {
         let mut endpoints = endpoints_of(config);
         if let DefaultResidency::LlamaServer(url) = &default {
+            // `default_residency` only names a local `[backend]`, possibly
+            // local by `[backend] locality` alone.
+            let endpoint = EndpointConfig::new(EndpointKind::LlamaRouter, Some(url.clone()))
+                .with_locality(Locality::Local);
             endpoints.push((
                 EndpointRef::new(DEFAULT_ENDPOINT),
-                EndpointConfig {
-                    kind: EndpointKind::LlamaRouter,
-                    base_url: Some(url.clone()),
-                    // `default_residency` only names a local `[backend]`,
-                    // possibly local by `[backend] locality` alone.
-                    locality: Some(Locality::Local),
-                },
+                verified_local_endpoint(endpoint, r),
             ));
         }
         ResidencySources {
@@ -407,6 +439,20 @@ impl ResidencySources {
     }
 }
 
+/// `endpoint` (with `locality = "local"`) as `RoutingConfig::verify_local_with`
+/// leaves it, so the override counts for a DNS name that resolves only to
+/// local addresses. Blocking DNS for such a name; one that fails stays
+/// unverified, so it counts as cloud and is never polled.
+fn verified_local_endpoint(endpoint: EndpointConfig, r: &dyn Resolve) -> EndpointConfig {
+    const NAME: &str = "residency";
+    let mut config = RoutingConfig::default();
+    config.endpoints.insert(NAME.to_string(), endpoint);
+    // A default with no address of its own: nothing to verify there.
+    let mut default = DefaultEndpoint::new(DEFAULT_ENDPOINT, EndpointKind::OpenaiCompat);
+    let _ = config.verify_local_with(&mut default, r);
+    config.endpoints.remove(NAME).expect("inserted above")
+}
+
 /// Polls `sources` every [`RESIDENCY_REFRESH`] (first poll immediately)
 /// and hands each snapshot to `routed`'s router; exits once `routed` is
 /// gone.
@@ -434,23 +480,57 @@ pub(crate) fn spawn_residency_refresh(routed: Weak<RoutedBackend>, sources: Resi
     });
 }
 
-/// Routing off ⇒ `(llm, None)` with `llm` untouched. Routing on ⇒ a
-/// `RoutedBackend` whose default is `llm`.
+/// What [`wrap_with_routing`] hands back.
+pub(crate) struct Wrapped {
+    pub(crate) llm: Arc<dyn LlmBackend>,
+    pub(crate) router: Option<Arc<RoutedBackend>>,
+    /// [`cloud_backend_notice`], for the transcript.
+    pub(crate) cloud_backend_notice: Option<String>,
+}
+
+/// Routing off ⇒ `llm` untouched and no router. Routing on ⇒ a
+/// `RoutedBackend` whose default is `llm`, after the load-time routing
+/// pass ([`verify_routing_with`]; a `NotLocal` endpoint is fatal).
 pub(crate) async fn wrap_with_routing(
     settings: &Settings,
     llm: Arc<dyn LlmBackend>,
-) -> anyhow::Result<(Arc<dyn LlmBackend>, Option<Arc<RoutedBackend>>)> {
+) -> anyhow::Result<Wrapped> {
+    wrap_with_routing_with(settings, llm, Arc::new(SystemResolver)).await
+}
+
+/// [`wrap_with_routing`], resolving names through `resolver` at load (a
+/// seam for tests).
+async fn wrap_with_routing_with(
+    settings: &Settings,
+    llm: Arc<dyn LlmBackend>,
+    resolver: Arc<dyn Resolve>,
+) -> anyhow::Result<Wrapped> {
     if !settings.routing.enabled {
-        return Ok((llm, None));
+        return Ok(Wrapped { llm, router: None, cloud_backend_notice: None });
     }
-    check_routing_config(&settings.routing)?;
     let config = effective_routing_config(settings);
-    for issue in routing_config_warnings(&config, settings) {
+    let default = default_endpoint(settings);
+    let backend_residency = settings.clone();
+    // verify_local, validate and the residency endpoint may all resolve
+    // DNS names: off the async worker threads.
+    let (config, default, warnings, residency) = tokio::task::spawn_blocking(move || {
+        let (mut config, mut default) = (config, default);
+        let warnings = verify_routing_with(&mut config, &mut default, &*resolver)?;
+        let residency = ResidencySources::new(
+            &config,
+            default_residency(&backend_residency, &default),
+            &*resolver,
+        );
+        anyhow::Ok((config, default, warnings, residency))
+    })
+    .await??;
+    check_routing_config(&config)?;
+    for issue in warnings {
         tracing::warn!(%issue, "routing config");
     }
     let refresher = Arc::new(DiscoveryRefresher {
         config: config.clone(),
-        default: default_endpoint(settings),
+        default: default.clone(),
         // aivyx-route's client: no redirects, and no proxy (discovery only
         // asks local servers).
         client: aivyx_route::discovery::client()?,
@@ -471,7 +551,7 @@ pub(crate) async fn wrap_with_routing(
         backend_factory(settings, &config),
     )
     .with_refresher(refresher);
-    if let Some(remedy) = cloud_backend_remedy(settings) {
+    if let Some(remedy) = cloud_backend_remedy(&default) {
         router = router.with_no_route_hint(remedy);
     }
     let router = Arc::new(router);
@@ -479,11 +559,14 @@ pub(crate) async fn wrap_with_routing(
         candidates = router.profiles().len(),
         "model routing enabled"
     );
-    let residency = ResidencySources::new(&config, default_residency(settings));
     if residency.is_active() {
         spawn_residency_refresh(Arc::downgrade(&router), residency);
     }
-    Ok((Arc::clone(&router) as Arc<dyn LlmBackend>, Some(router)))
+    Ok(Wrapped {
+        llm: Arc::clone(&router) as Arc<dyn LlmBackend>,
+        router: Some(router),
+        cloud_backend_notice: cloud_backend_notice(settings, &default),
+    })
 }
 
 #[cfg(test)]
@@ -491,6 +574,30 @@ mod tests {
     use super::*;
     use aivyx_config::{BackendKind, BackendSettings, Settings};
     use aivyx_route::{EndpointConfig, Locality};
+
+    /// Answers every lookup with one address; no network.
+    struct Resolves(&'static str);
+
+    impl Resolve for Resolves {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec![self.0.parse().unwrap()])
+        }
+    }
+
+    const LAN: Resolves = Resolves("192.168.1.9");
+    const PUBLIC: Resolves = Resolves("93.184.216.34");
+
+    /// The routing config and `[backend]` endpoint as start-up verifies
+    /// them, with the warnings.
+    fn verified(
+        s: &Settings,
+        r: &dyn Resolve,
+    ) -> anyhow::Result<(RoutingConfig, DefaultEndpoint, Vec<String>)> {
+        let mut config = effective_routing_config(s);
+        let mut default = default_endpoint(s);
+        let warnings = verify_routing_with(&mut config, &mut default, r)?;
+        Ok((config, default, warnings))
+    }
 
     fn settings_with(routing_toml: &str) -> Settings {
         let mut s: Settings = toml::from_str(routing_toml).unwrap();
@@ -513,12 +620,21 @@ mod tests {
         assert_eq!(chat_base_url("http://h:1337/v1/"), "http://h:1337/v1");
     }
 
+    /// The hosted-API kinds are gone: a config naming one doesn't load,
+    /// and says which kinds to use.
     #[test]
-    fn cloud_endpoints_and_the_reserved_name_are_rejected() {
-        let s = settings_with("[routing.endpoints.claude]\nkind = \"anthropic\"\n");
-        let err = check_routing_config(&s.routing).unwrap_err().to_string();
-        assert!(err.contains("claude") && err.contains("local"), "{err}");
+    fn a_removed_cloud_kind_fails_to_load_with_the_fix() {
+        let raw = "[routing.endpoints.claude]\nkind = \"anthropic\"\n";
+        let err = Settings::parse_with_warnings(raw).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "[routing.endpoints.claude]: provider \"anthropic\" was removed in 2.0 — aivyx is \
+             local-only; use ollama, llama_router, openai_compat or lemonade with a local base_url"
+        );
+    }
 
+    #[test]
+    fn the_reserved_name_is_rejected() {
         let s = settings_with("[routing.endpoints.backend]\nkind = \"ollama\"\n");
         let err = check_routing_config(&s.routing).unwrap_err().to_string();
         assert!(err.contains("reserved"), "{err}");
@@ -602,8 +718,45 @@ mod tests {
             let s = settings_with(&format!(
                 "[routing.endpoints.gpu]\nkind = \"ollama\"\n{extra}"
             ));
-            assert!(check_routing_config(&s.routing).is_ok(), "{extra}");
+            let (config, _, _) = verified(&s, &LAN).unwrap();
+            assert!(check_routing_config(&config).is_ok(), "{extra}");
         }
+    }
+
+    /// `locality = "local"` on a DNS name counts only once start-up has
+    /// checked it resolves only to local addresses.
+    #[test]
+    fn an_unverified_local_override_counts_as_cloud() {
+        let s = settings_with(
+            "[routing.endpoints.gpu]\nkind = \"ollama\"\n\
+             base_url = \"http://gpu.example.com:11434\"\nlocality = \"local\"\n",
+        );
+        assert!(check_routing_config(&s.routing).is_err());
+    }
+
+    /// An endpoint that fails the local-only guard stops start-up, with
+    /// the guard's text.
+    #[test]
+    fn a_routing_endpoint_that_is_not_local_is_fatal() {
+        let s = settings_with(
+            "[routing.endpoints.gpu]\nkind = \"ollama\"\n\
+             base_url = \"http://gpu.example.com:11434\"\nlocality = \"local\"\n",
+        );
+        let err = verified(&s, &PUBLIC).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "[routing.endpoints.gpu]: http://gpu.example.com:11434/ is not local (resolves to a \
+             public address 93.184.216.34) — aivyx is local-only; point it at a model server on \
+             this machine or your own network"
+        );
+
+        let mut s = settings_with("");
+        s.backend.base_url = "https://api.groq.com/openai/v1".into();
+        let err = verified(&s, &LAN).unwrap_err().to_string();
+        assert!(
+            err.starts_with("[backend]: https://api.groq.com/openai/v1 is not local (cloud host)"),
+            "{err}"
+        );
     }
 
     fn backend(kind: BackendKind, base_url: &str, broker: Option<&str>) -> Settings {
@@ -696,26 +849,28 @@ mod tests {
             Local
         );
         // `[backend] locality` overrides the address, either way.
+        // ... once verified: unverified, a DNS name stays cloud.
         let mut lan = backend(BackendKind::Generic, "http://gpu.example.com:8080/v1", None);
         lan.backend.locality = Some(Local);
-        assert_eq!(loc(&lan), Local);
+        assert_eq!(loc(&lan), Cloud);
+        assert_eq!(verified(&lan, &LAN).unwrap().1.effective_locality(), Local);
         let mut forced = backend(BackendKind::Generic, "http://localhost:11434/v1", None);
         forced.backend.locality = Some(Cloud);
         assert_eq!(loc(&forced), Cloud);
     }
 
-    /// A remote `[backend]` makes its model cloud, so local-only routing
+    /// A `[backend]` on a DNS name, even one that resolves to the LAN,
+    /// makes its model cloud until marked local, so local-only routing
     /// never picks it; the startup warning says how to mark it local.
     #[test]
-    fn a_remote_backend_model_is_cloud_and_the_warning_names_backend_locality() {
+    fn a_dns_named_backend_model_is_cloud_and_the_warning_names_backend_locality() {
         let mut s = settings_with("[routing]\nenabled = true\n");
-        s.backend.base_url = "https://api.groq.com/openai/v1".into();
-        let config = effective_routing_config(&s);
-        let profiles = merge(&config, &default_endpoint(&s), &[]);
+        s.backend.base_url = "http://gpu.example.com:8080/v1".into();
+        let (config, default, warnings) = verified(&s, &LAN).unwrap();
+        let profiles = merge(&config, &default, &[]);
         let backend_model = find(&profiles, &key(DEFAULT_ENDPOINT, "qwen3.5:9b")).unwrap();
         assert_eq!(backend_model.locality, Locality::Cloud);
 
-        let warnings = routing_config_warnings(&config, &s);
         assert!(
             warnings
                 .iter()
@@ -724,10 +879,11 @@ mod tests {
         );
 
         s.backend.locality = Some(Locality::Local);
-        let profiles = merge(&config, &default_endpoint(&s), &[]);
+        let (config, default, warnings) = verified(&s, &LAN).unwrap();
+        let profiles = merge(&config, &default, &[]);
         let backend_model = find(&profiles, &key(DEFAULT_ENDPOINT, "qwen3.5:9b")).unwrap();
         assert_eq!(backend_model.locality, Locality::Local);
-        assert!(routing_config_warnings(&config, &s).is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// `locality = "local"` on a roster entry for a model on a cloud
@@ -739,8 +895,7 @@ mod tests {
              endpoint = \"backend\"\nlocality = \"local\"\n",
         );
         s.backend.base_url = "http://gpu.example.com/v1".into();
-        let config = effective_routing_config(&s);
-        let warnings = routing_config_warnings(&config, &s);
+        let (_, _, warnings) = verified(&s, &LAN).unwrap();
         let ignored: Vec<&String> = warnings
             .iter()
             .filter(|w| w.contains("qwen3.5:9b"))
@@ -756,16 +911,17 @@ mod tests {
     /// no `[broker] base_url` has nothing to check, so it is cloud.
     #[test]
     fn a_default_without_an_address_is_warned_about_only_when_it_counts_as_cloud() {
-        let config = RoutingConfig::default();
         let embedded = backend(BackendKind::MistralRs, "http://localhost:11434/v1", None);
-        assert!(routing_config_warnings(&config, &embedded).is_empty());
+        let (_, _, warnings) = verified(&embedded, &PUBLIC).unwrap();
+        // The implicit roster entry for its model is no warning either.
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         let broker = backend(
             BackendKind::LlamaServerBroker,
             "http://localhost:8080/v1",
             None,
         );
-        let warnings = routing_config_warnings(&config, &broker);
+        let (_, _, warnings) = verified(&broker, &PUBLIC).unwrap();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("[broker] base_url"), "{warnings:?}");
     }
@@ -774,8 +930,9 @@ mod tests {
     /// aivyx-coder's own poll of the `[backend]` server.
     #[test]
     fn a_cloud_default_is_never_polled_for_residency() {
+        let residency = |s: &Settings| default_residency(s, &default_endpoint(s));
         assert_eq!(
-            default_residency(&backend(
+            residency(&backend(
                 BackendKind::LlamaServer,
                 "http://llama.example.com:8080/v1",
                 None
@@ -783,7 +940,7 @@ mod tests {
             DefaultResidency::None
         );
         assert_eq!(
-            default_residency(&backend(
+            residency(&backend(
                 BackendKind::LlamaServerBroker,
                 "http://127.0.0.1:8080/v1",
                 Some("http://broker.example.com:8899")
@@ -797,10 +954,13 @@ mod tests {
             None,
         );
         lan.backend.locality = Some(Locality::Local);
-        assert_eq!(
-            default_residency(&lan),
-            DefaultResidency::LlamaServer("http://llama.example.com:8080".into())
-        );
+        let (config, default, _) = verified(&lan, &LAN).unwrap();
+        let polled = default_residency(&lan, &default);
+        assert_eq!(polled, DefaultResidency::LlamaServer("http://llama.example.com:8080".into()));
+        // ... and its residency endpoint is verified too, so it is polled.
+        let sources = ResidencySources::new(&config, polled, &LAN);
+        let (_, endpoint) = sources.endpoints.last().unwrap();
+        assert_eq!(endpoint.effective_locality(), Locality::Local);
     }
 
     #[test]
@@ -837,11 +997,10 @@ mod tests {
         let mut s = settings_with("");
         s.routing.endpoints.insert(
             "gpu".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Ollama,
-                base_url: Some("http://gpu:11434".into()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Ollama,
+                Some("http://gpu:11434".into()),
+            ),
         );
         let factory = backend_factory(&s, &s.routing);
         assert_eq!(
@@ -939,11 +1098,10 @@ mod tests {
         s.backend.api_key = Some("backend-secret".into());
         s.routing.endpoints.insert(
             "gpu".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Ollama,
-                base_url: Some(gpu_server.uri()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Ollama,
+                Some(gpu_server.uri()),
+            ),
         );
         let factory = backend_factory(&s, &s.routing);
         let request = || {
@@ -1025,11 +1183,10 @@ mod tests {
         let mut s = settings_with("");
         s.routing.endpoints.insert(
             "lemon".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Lemonade,
-                base_url: Some(format!("{}/api", lemonade.uri())),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Lemonade,
+                Some(format!("{}/api", lemonade.uri())),
+            ),
         );
         let factory = backend_factory(&s, &s.routing);
         let request = aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
@@ -1057,8 +1214,9 @@ mod tests {
             s.backend.base_url.clone(),
             s.backend.model.clone(),
             None,
-        ));
-        let (wrapped, router) = wrap_with_routing(&s, Arc::clone(&llm)).await.unwrap();
+        ).unwrap());
+        let Wrapped { llm: wrapped, router, .. } =
+            wrap_with_routing(&s, Arc::clone(&llm)).await.unwrap();
         assert!(Arc::ptr_eq(&wrapped, &llm));
         assert!(router.is_none());
     }
@@ -1072,8 +1230,9 @@ mod tests {
             s.backend.base_url.clone(),
             s.backend.model.clone(),
             None,
-        ));
-        let (wrapped, router) = wrap_with_routing(&s, Arc::clone(&llm)).await.unwrap();
+        ).unwrap());
+        let Wrapped { llm: wrapped, router, .. } =
+            wrap_with_routing(&s, Arc::clone(&llm)).await.unwrap();
         let router = router.expect("routing is on");
         assert!(!Arc::ptr_eq(&wrapped, &llm));
         assert_eq!(router.default_key(), &key("backend", "qwen3.5:9b"));
@@ -1087,16 +1246,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cloud_endpoint_fails_startup() {
+    async fn a_non_local_endpoint_fails_startup() {
         let s = settings_with(
-            "[routing]\nenabled = true\n[routing.endpoints.claude]\nkind = \"anthropic\"\n",
+            "[routing]\nenabled = true\n[routing.endpoints.gpu]\nkind = \"ollama\"\n\
+             base_url = \"http://gpu.example.com:11434\"\nlocality = \"local\"\n",
         );
-        let llm: Arc<dyn LlmBackend> = Arc::new(aivyx_llm::OpenAiCompatBackend::new(
-            "http://x/v1",
-            "m",
-            None,
-        ));
-        assert!(wrap_with_routing(&s, llm).await.is_err());
+        let llm: Arc<dyn LlmBackend> =
+            Arc::new(aivyx_llm::OpenAiCompatBackend::new("http://x/v1", "m", None).unwrap());
+        let err = match wrap_with_routing_with(&s, llm, Arc::new(PUBLIC)).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a public endpoint must stop start-up"),
+        };
+        assert!(err.contains("aivyx is local-only"), "{err}");
     }
 
     /// A `[backend]` routing counts as cloud, with no other local
@@ -1107,12 +1268,17 @@ mod tests {
     async fn a_cloud_backend_with_no_other_candidate_names_backend_locality_in_the_error() {
         let mut s = settings_with("[routing]\nenabled = true\ndiscover = false\n");
         s.backend.base_url = "http://gpu.example.com/v1".into();
-        let llm: Arc<dyn LlmBackend> = Arc::new(aivyx_llm::OpenAiCompatBackend::new(
-            s.backend.base_url.clone(),
-            s.backend.model.clone(),
-            None,
-        ));
-        let (wrapped, _) = wrap_with_routing(&s, llm).await.unwrap();
+        let llm: Arc<dyn LlmBackend> = Arc::new(
+            aivyx_llm::OpenAiCompatBackend::with_resolver(
+                s.backend.base_url.clone(),
+                s.backend.model.clone(),
+                None,
+                Duration::from_secs(60),
+                Arc::new(LAN),
+            )
+            .unwrap(),
+        );
+        let wrapped = wrap_with_routing_with(&s, llm, Arc::new(LAN)).await.unwrap().llm;
         let mut request = aivyx_llm::ChatRequest::new(vec![aivyx_types::Message::text(
             aivyx_types::Role::User,
             "hi",
@@ -1136,11 +1302,12 @@ mod tests {
     /// `[backend]`, and names both the consequence and the fix.
     #[test]
     fn the_startup_notice_names_backend_locality_for_a_cloud_backend() {
+        let notice_of = |s: &Settings| cloud_backend_notice(s, &verified(s, &LAN).unwrap().1);
         let mut s = settings_with("[routing]\nenabled = true\n");
-        assert_eq!(cloud_backend_notice(&s), None, "local backend");
+        assert_eq!(notice_of(&s), None, "local backend");
 
         s.backend.base_url = "http://box.tail1234.ts.net:11434/v1".into();
-        let notice = cloud_backend_notice(&s).expect("cloud backend");
+        let notice = notice_of(&s).expect("cloud backend");
         assert!(notice.contains("main loop"), "{notice}");
         assert!(notice.contains("box.tail1234.ts.net"), "{notice}");
         assert!(
@@ -1149,11 +1316,11 @@ mod tests {
         );
 
         s.backend.locality = Some(Locality::Local);
-        assert_eq!(cloud_backend_notice(&s), None, "marked local");
+        assert_eq!(notice_of(&s), None, "marked local");
 
         s.backend.locality = None;
         s.routing.enabled = false;
-        assert_eq!(cloud_backend_notice(&s), None, "routing off");
+        assert_eq!(notice_of(&s), None, "routing off");
     }
 
     #[test]
@@ -1184,8 +1351,9 @@ mod tests {
                 ..Settings::default()
             }
         };
+        let residency = |s: &Settings| default_residency(s, &default_endpoint(s));
         assert_eq!(
-            default_residency(&backend(
+            residency(&backend(
                 BackendKind::LlamaServer,
                 "http://127.0.0.1:8080/v1",
                 None
@@ -1193,7 +1361,7 @@ mod tests {
             D::LlamaServer("http://127.0.0.1:8080".into())
         );
         assert_eq!(
-            default_residency(&backend(
+            residency(&backend(
                 BackendKind::LlamaServerBroker,
                 "http://x/v1",
                 Some("http://127.0.0.1:8899")
@@ -1201,7 +1369,7 @@ mod tests {
             D::Broker("http://127.0.0.1:8899".into())
         );
         assert_eq!(
-            default_residency(&backend(
+            residency(&backend(
                 BackendKind::LlamaServerBroker,
                 "http://x/v1",
                 None
@@ -1209,11 +1377,11 @@ mod tests {
             D::None
         );
         assert_eq!(
-            default_residency(&backend(BackendKind::MistralRs, "http://x/v1", None)),
+            residency(&backend(BackendKind::MistralRs, "http://x/v1", None)),
             D::Resident
         );
         assert_eq!(
-            default_residency(&backend(BackendKind::Generic, "http://x/v1", None)),
+            residency(&backend(BackendKind::Generic, "http://x/v1", None)),
             D::None
         );
     }
@@ -1223,15 +1391,15 @@ mod tests {
         let mut config = RoutingConfig::default();
         config.endpoints.insert(
             "gpu".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Ollama,
-                base_url: Some("http://gpu:11434".into()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Ollama,
+                Some("http://gpu:11434".into()),
+            ),
         );
         let s = ResidencySources::new(
             &config,
             DefaultResidency::LlamaServer("http://x:8080".into()),
+            &PUBLIC,
         );
         let names: Vec<(String, EndpointKind)> = s
             .endpoints
@@ -1248,27 +1416,27 @@ mod tests {
         assert!(s.is_active());
 
         // Nothing to read ⇒ inactive: no task is spawned.
-        let idle = ResidencySources::new(&RoutingConfig::default(), DefaultResidency::None);
+        let idle =
+            ResidencySources::new(&RoutingConfig::default(), DefaultResidency::None, &PUBLIC);
         assert!(!idle.is_active());
 
         // An OpenAI-compatible routing endpoint is not a residency source.
         let mut compat = RoutingConfig::default();
         compat.endpoints.insert(
             "c".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::OpenaiCompat,
-                base_url: Some("http://c".into()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::OpenaiCompat,
+                Some("http://c".into()),
+            ),
         );
-        assert!(!ResidencySources::new(&compat, DefaultResidency::None).is_active());
+        assert!(!ResidencySources::new(&compat, DefaultResidency::None, &PUBLIC).is_active());
 
         // vram_bytes alone is a source.
         let vram = RoutingConfig {
             vram_bytes: Some(24 << 30),
             ..RoutingConfig::default()
         };
-        assert!(ResidencySources::new(&vram, DefaultResidency::None).is_active());
+        assert!(ResidencySources::new(&vram, DefaultResidency::None, &PUBLIC).is_active());
     }
 
     /// Lemonade holds one LLM at a time and reports its own residency
@@ -1278,18 +1446,18 @@ mod tests {
         let mut config = RoutingConfig::default();
         config.endpoints.insert(
             "lemon".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Lemonade,
-                base_url: Some("http://127.0.0.1:13305/api".into()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Lemonade,
+                Some("http://127.0.0.1:13305/api".into()),
+            ),
         );
-        assert!(ResidencySources::new(&config, DefaultResidency::None).is_active());
+        assert!(ResidencySources::new(&config, DefaultResidency::None, &PUBLIC).is_active());
     }
 
     #[tokio::test]
     async fn a_single_model_default_is_marked_resident_without_any_network() {
-        let s = ResidencySources::new(&RoutingConfig::default(), DefaultResidency::Resident);
+        let s =
+            ResidencySources::new(&RoutingConfig::default(), DefaultResidency::Resident, &PUBLIC);
         let snap = s.poll(&reqwest::Client::new()).await;
         assert!(
             snap.resident_endpoints
@@ -1324,18 +1492,17 @@ mod tests {
         let mut s = settings_with("[routing]\nenabled = true\ndiscover = false\n");
         s.routing.endpoints.insert(
             "ollama".into(),
-            EndpointConfig {
-                kind: aivyx_route::EndpointKind::Ollama,
-                base_url: Some(ollama.uri()),
-                locality: None,
-            },
+            EndpointConfig::new(
+                aivyx_route::EndpointKind::Ollama,
+                Some(ollama.uri()),
+            ),
         );
         let llm: Arc<dyn LlmBackend> = Arc::new(aivyx_llm::OpenAiCompatBackend::new(
             s.backend.base_url.clone(),
             s.backend.model.clone(),
             None,
-        ));
-        let (_, router) = wrap_with_routing(&s, llm).await.unwrap();
+        ).unwrap());
+        let router = wrap_with_routing(&s, llm).await.unwrap().router;
         let router = router.expect("routing is on");
 
         let target = key("ollama", "qwen3:8b");

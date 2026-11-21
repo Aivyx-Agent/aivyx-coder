@@ -14,6 +14,9 @@ pub enum ListModelsError {
     Transport(String),
     #[error("server did not return a recognizable model list")]
     Unsupported,
+    /// Not asked: the address isn't local.
+    #[error("{0}")]
+    NotLocal(#[from] crate::local::NotLocal),
 }
 
 /// Lists models an Ollama server has already pulled, via its native
@@ -21,6 +24,7 @@ pub enum ListModelsError {
 /// Ollama also exposes but with less reliable coverage of locally-pulled
 /// models across versions).
 pub async fn list_ollama_models(base_url: &str) -> Result<Vec<String>, ListModelsError> {
+    crate::local::require_local(base_url).await?;
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
     let client = crate::model_client_builder()
         .timeout(LIST_MODELS_TIMEOUT)
@@ -64,6 +68,7 @@ fn parse_ollama_tags(json: &serde_json::Value) -> Vec<String> {
 /// `Unsupported`, not a hard error, so the wizard can fall back to
 /// manual entry.
 pub async fn list_openai_compatible_models(base_url: &str) -> Result<Vec<String>, ListModelsError> {
+    crate::local::require_local(base_url).await?;
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
     let client = crate::model_client_builder()
         .timeout(LIST_MODELS_TIMEOUT)

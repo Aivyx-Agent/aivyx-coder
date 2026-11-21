@@ -138,6 +138,10 @@ pub enum LlmError {
     ResponseTooLarge,
     #[error("model routing: {0}")]
     Routing(String),
+    /// The server's address isn't local (`aivyx_route::require_local`);
+    /// nothing was sent.
+    #[error("{0}")]
+    NotLocal(#[from] aivyx_route::NotLocal),
 }
 
 /// A request failure in plain words: a refused connection is the common

@@ -77,19 +77,20 @@ summarize = { tier = "small" }
 - Every model discovery finds becomes a candidate, even without a
   `[[routing.models]]` entry. Such a model is `medium` tier with no
   strengths.
-- Only local endpoints are accepted; `aivyx-coder` never routes to a cloud
-  API. An endpoint is local or cloud by `aivyx-route`'s rule: `kind =
-  "anthropic"` or `"openai"` is always cloud, and any other kind is local
-  only when its `base_url` host is a loopback, private (`10/8`,
-  `172.16/12`, `192.168/16`, `fc00::/7`), link-local or CGNAT/Tailscale
-  (`100.64.0.0/10`) address, or a name that is `localhost`, has no dots,
-  or ends in `.local`, `.lan`, `.internal` or `.home.arpa`. So
-  `kind = "openai_compat"` at `https://api.groq.com/openai/v1` is cloud,
-  and so is an `openai_compat` endpoint with no `base_url`. A cloud
-  endpoint stops startup with an error. If a server on your own network
-  has a public-looking name (`gpu.example.com`, a `*.ts.net` MagicDNS
-  name), set `locality = "local"` on its `[routing.endpoints.*]` table;
-  `locality = "cloud"` forces cloud.
+- Only local endpoints are accepted; `aivyx-coder` never talks to a cloud
+  API. Every endpoint's `base_url` must pass the local-only check at
+  startup, or `aivyx-coder` doesn't start: its host must be a loopback,
+  private (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`), link-local or
+  CGNAT/Tailscale (`100.64.0.0/10`) address, a name that is `localhost`,
+  has no dots, or ends in `.local`, `.lan`, `.internal` or `.home.arpa`,
+  or a name that resolves only to such addresses. The hosted-API kinds
+  `anthropic` and `openai` were removed in 2.0; a config naming one fails
+  to load. For routing, a name like `gpu.example.com` or a `*.ts.net`
+  MagicDNS name that resolves to your own network still counts as cloud
+  until you set `locality = "local"` on its `[routing.endpoints.*]` table
+  (checked at startup); an `openai_compat` endpoint with no `base_url` is
+  cloud, and `locality = "cloud"` forces cloud. A cloud endpoint stops
+  startup with an error.
 - The `[backend]` model is judged by the same rule, from the address chat
   connects to (`[broker] base_url` for `kind = "llama_server_broker"`, else
   `base_url`; the embedded `mistral_rs` backend is always local). With

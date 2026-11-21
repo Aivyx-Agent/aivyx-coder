@@ -542,8 +542,9 @@ mod tests {
         advertise: bool,
         plan_mode: aivyx_sandbox::PlanMode,
     ) -> aivyx_core::Agent {
-        let llm: Arc<dyn aivyx_llm::LlmBackend> =
-            Arc::new(aivyx_llm::OpenAiCompatBackend::new("http://127.0.0.1:9/v1", "unused", None));
+        let llm: Arc<dyn aivyx_llm::LlmBackend> = Arc::new(
+            aivyx_llm::OpenAiCompatBackend::new("http://127.0.0.1:9/v1", "unused", None).unwrap(),
+        );
         let autonomous_mode = aivyx_sandbox::AutonomousMode::new();
         autonomous_mode.set_active(autonomous);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1459,22 +1460,6 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
         built.repl_resize,
     )
     .await
-}
-
-/// Best-effort check, used only to decide whether to warn about sending
-/// `backend.api_key` somewhere non-local — not a security boundary (a
-/// misparsed or unusual URL just means the warning might not fire, not that
-/// anything is actually blocked).
-fn base_url_looks_local(base_url: &str) -> bool {
-    let Ok(url) = url::Url::parse(base_url) else {
-        return false;
-    };
-    match url.host() {
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
 }
 
 fn init_tracing() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {

@@ -8,7 +8,7 @@ use thiserror::Error;
 
 mod deprecated;
 mod unknown_keys;
-pub use deprecated::{DEPRECATED_KEYS, Deprecation};
+pub use deprecated::{DEPRECATED_KEYS, Deprecation, LOCAL_ENDPOINT_KINDS};
 pub use unknown_keys::{UnknownKey, parse_reporting};
 
 /// The config a build only uses with a non-default Cargo feature
@@ -1373,6 +1373,12 @@ impl Settings {
     pub fn parse_with_warnings(
         raw: &str,
     ) -> Result<(Self, Vec<UnknownKey>, Vec<Deprecation>), toml::de::Error> {
+        // A removed hosted-API endpoint kind fails with its fix, before
+        // serde's generic "unknown variant" can.
+        let early = raw.parse::<toml::Table>().ok();
+        if let Some(message) = early.as_ref().and_then(deprecated::removed_endpoint_kind) {
+            return Err(<toml::de::Error as serde::de::Error>::custom(message));
+        }
         let (mut settings, unknown) = parse_reporting::<Self>(raw)?;
         let table = raw.parse::<toml::Table>()?;
         let deprecated = deprecated::resolve(&mut settings, &table);
@@ -1385,6 +1391,56 @@ impl Settings {
         unknown_keys::report(&unknown);
         deprecated::report(&deprecated);
         Ok(settings)
+    }
+
+    /// Every model server address this config makes aivyx-coder contact,
+    /// each with the key that sets it: `[backend] base_url`, `[broker]
+    /// base_url`, `[architect]` and `[council]` seats, every
+    /// `[routing.endpoints.*]` entry (routing on or not), and `[vision]
+    /// mold_url` when the image tools are on.
+    pub fn model_urls(&self) -> Vec<(String, String)> {
+        let mut urls = vec![("[backend] base_url".to_string(), self.backend.base_url.clone())];
+        if let Some(url) = &self.broker.base_url {
+            urls.push(("[broker] base_url".to_string(), url.clone()));
+        }
+        if !self.architect.base_url.is_empty() {
+            urls.push(("[architect] base_url".to_string(), self.architect.base_url.clone()));
+        }
+        for (i, member) in self.council.members.iter().enumerate() {
+            if !member.base_url.is_empty() {
+                urls.push((format!("[council] members[{i}] base_url"), member.base_url.clone()));
+            }
+        }
+        if let Some(chairman) = self.council.chairman.as_ref().filter(|c| !c.base_url.is_empty()) {
+            urls.push(("[council] chairman base_url".to_string(), chairman.base_url.clone()));
+        }
+        for (name, endpoint) in &self.routing.endpoints {
+            if let Some(url) = endpoint.base_url() {
+                urls.push((format!("[routing.endpoints.{name}] base_url"), url.to_string()));
+            }
+        }
+        if self.vision.enabled {
+            // Their broker is `[broker] base_url`, above, or the local default.
+            urls.push(("[vision] mold_url".to_string(), self.vision.mold_url.clone()));
+        }
+        urls
+    }
+
+    /// The load-time local-only check: the first [`model_urls`](Self::model_urls)
+    /// entry that fails `aivyx_route::require_local`, as "`<key>`: `<NotLocal
+    /// text>`". aivyx-coder refuses to start on it. May resolve DNS names,
+    /// which blocks: from async code, call it inside `spawn_blocking`.
+    pub fn require_local_models_with(&self, r: &dyn aivyx_route::Resolve) -> Result<(), String> {
+        for (key, url) in self.model_urls() {
+            aivyx_route::require_local_with(&url, r).map_err(|e| format!("{key}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// [`require_local_models_with`](Self::require_local_models_with) with
+    /// the system resolver.
+    pub fn require_local_models(&self) -> Result<(), String> {
+        self.require_local_models_with(&aivyx_route::SystemResolver)
     }
 
     /// Like `load()`, but never creates a config file — returns `None` if
@@ -1649,6 +1705,72 @@ mod tests {
         let parsed: Settings = toml::from_str(&toml_string).unwrap();
         assert_eq!(parsed.backend.base_url, settings.backend.base_url);
         assert_eq!(parsed.backend.model, settings.backend.model);
+    }
+
+    /// Answers every lookup with the same addresses; no network.
+    struct Fixed(Vec<std::net::IpAddr>);
+
+    impl aivyx_route::Resolve for Fixed {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn lan() -> Fixed {
+        Fixed(vec!["192.168.1.7".parse().unwrap()])
+    }
+
+    #[test]
+    fn a_cloud_base_url_is_refused_with_the_local_only_text() {
+        let s: Settings =
+            toml::from_str("[backend]\nbase_url = \"https://user:key@api.openai.com/v1\"\n")
+                .unwrap();
+        assert_eq!(
+            s.require_local_models_with(&lan()).unwrap_err(),
+            "[backend] base_url: https://api.openai.com/v1 is not local (cloud host) — aivyx is \
+             local-only; point it at a model server on this machine or your own network"
+        );
+    }
+
+    #[test]
+    fn every_model_url_is_checked() {
+        let public = Fixed(vec!["93.184.216.34".parse().unwrap()]);
+        for (toml_text, key) in [
+            ("[broker]\nbase_url = \"http://b.example.com:8899\"\n", "[broker] base_url"),
+            (
+                "[architect]\nbase_url = \"http://a.example.com/v1\"\nmodel = \"m\"\n",
+                "[architect] base_url",
+            ),
+            (
+                "[council]\nmembers = [{ base_url = \"http://localhost:1/v1\", model = \"a\" }, \
+                 { base_url = \"http://c.example.com/v1\", model = \"b\" }]\n",
+                "[council] members[1] base_url",
+            ),
+            (
+                "[routing.endpoints.gpu]\nkind = \"ollama\"\nbase_url = \"http://g.example.com\"\n",
+                "[routing.endpoints.gpu] base_url",
+            ),
+            (
+                "[vision]\nenabled = true\nmold_url = \"http://m.example.com:7680\"\n",
+                "[vision] mold_url",
+            ),
+        ] {
+            let s: Settings = toml::from_str(toml_text).unwrap();
+            let err = s.require_local_models_with(&public).unwrap_err();
+            assert!(err.starts_with(&format!("{key}: ")), "{key}: {err}");
+            assert!(err.contains("resolves to a public address 93.184.216.34"), "{err}");
+            // The same names on the operator's own network are fine.
+            assert_eq!(s.require_local_models_with(&lan()), Ok(()), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_lan_ip_and_the_defaults_are_local() {
+        assert_eq!(Settings::default().require_local_models_with(&Fixed(Vec::new())), Ok(()));
+        let s: Settings =
+            toml::from_str("[backend]\nbase_url = \"http://192.168.1.40:8080/v1\"\n").unwrap();
+        // A literal LAN address needs no lookup at all.
+        assert_eq!(s.require_local_models_with(&Fixed(Vec::new())), Ok(()));
     }
 
     #[test]

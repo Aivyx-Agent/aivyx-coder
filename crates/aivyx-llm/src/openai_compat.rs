@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{
     ChatRequest, FinishReason, LlmBackend, LlmError, SlotHint, StreamEvent, ToolChoice,
 };
+use crate::local::{NotLocal, Resolve, SystemResolver};
 
 /// How long to wait for a TCP+TLS handshake before giving up — this is
 /// deliberately NOT a whole-request timeout, since a legitimately long
@@ -35,6 +36,11 @@ const MAX_ACCUMULATED_BYTES: usize = 10 * 1024 * 1024;
 /// Talks to any server exposing an OpenAI-compatible `/chat/completions`
 /// endpoint with SSE streaming — this covers Ollama (`/v1`), vLLM, and
 /// llama.cpp's `--server` mode without backend-specific code.
+///
+/// Local-only: the constructors refuse a `base_url` that fails
+/// `aivyx_route::require_local`, and every request checks it again (a
+/// name's addresses can change), so nothing is ever sent to a server off
+/// this machine or the operator's own network.
 pub struct OpenAiCompatBackend {
     base_url: String,
     model: String,
@@ -43,14 +49,17 @@ pub struct OpenAiCompatBackend {
     idle_timeout: Duration,
     debug_log: Option<Arc<Mutex<std::fs::File>>>,
     reasoning_effort: Option<String>,
+    resolver: Arc<dyn Resolve>,
 }
 
 impl OpenAiCompatBackend {
+    /// Fails when `base_url` isn't local. May resolve a DNS name, which
+    /// blocks: from async code, build it inside `spawn_blocking`.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: Option<String>,
-    ) -> Self {
+    ) -> Result<Self, NotLocal> {
         Self::with_idle_timeout(base_url, model, api_key, IDLE_TIMEOUT)
     }
 
@@ -63,7 +72,21 @@ impl OpenAiCompatBackend {
         model: impl Into<String>,
         api_key: Option<String>,
         idle_timeout: Duration,
-    ) -> Self {
+    ) -> Result<Self, NotLocal> {
+        Self::with_resolver(base_url, model, api_key, idle_timeout, Arc::new(SystemResolver))
+    }
+
+    /// Like `with_idle_timeout`, resolving `base_url`'s host through
+    /// `resolver`, here and before every request (a seam for tests).
+    pub fn with_resolver(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+        resolver: Arc<dyn Resolve>,
+    ) -> Result<Self, NotLocal> {
+        let base_url = base_url.into();
+        aivyx_route::require_local_with(&base_url, &*resolver)?;
         let http = crate::model_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // Bounds the gap `connect_timeout` and the SSE idle-timeout
@@ -75,15 +98,21 @@ impl OpenAiCompatBackend {
             .build()
             .expect("failed to build the HTTP client");
 
-        Self {
-            base_url: base_url.into(),
+        Ok(Self {
+            base_url,
             model: model.into(),
             api_key,
             http,
             idle_timeout,
             debug_log: debug_log_from_env(),
             reasoning_effort: None,
-        }
+            resolver,
+        })
+    }
+
+    /// The local-only check, again, before a request.
+    async fn require_local(&self) -> Result<(), NotLocal> {
+        crate::local::require_local_with(&self.base_url, Arc::clone(&self.resolver)).await
     }
 
     /// Sends `effort` with every request (`[backend] reasoning_effort`).
@@ -159,6 +188,7 @@ impl LlmBackend for OpenAiCompatBackend {
     /// beside `/v1`): `modalities.vision` is true when it was started with
     /// `--mmproj`. Other servers don't have that endpoint, so can't tell.
     async fn sees_images(&self) -> Option<bool> {
+        self.require_local().await.ok()?;
         let root = self.base_url.trim_end_matches('/');
         let root = root.strip_suffix("/v1").unwrap_or(root);
         let mut request = self.http.get(format!("{root}/props")).timeout(Duration::from_secs(5));
@@ -181,6 +211,7 @@ impl LlmBackend for OpenAiCompatBackend {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, LlmError>>, LlmError> {
+        self.require_local().await?;
         let wire_request = WireRequest::from_chat_request(&self.model, &request)
             .with_reasoning_effort(self.reasoning_effort.as_deref());
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -906,5 +937,54 @@ mod tests {
             mode, 0o600,
             "a freshly created debug log must be mode 0600, got {mode:o}"
         );
+    }
+
+    /// Resolves to a LAN address on the first lookup and a public one on
+    /// every later one: a name whose DNS answer changes after start-up.
+    struct Rebinding(std::sync::atomic::AtomicUsize);
+
+    impl Resolve for Rebinding {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![if n == 0 { "192.168.1.5" } else { "93.184.216.34" }.parse().unwrap()])
+        }
+    }
+
+    #[tokio::test]
+    async fn each_request_checks_the_address_again() {
+        let backend = OpenAiCompatBackend::with_resolver(
+            "http://gpu.example.com:8080/v1",
+            "m",
+            None,
+            IDLE_TIMEOUT,
+            Arc::new(Rebinding(Default::default())),
+        )
+        .expect("local at construction");
+        let err = match backend.stream_chat(ChatRequest::new(Vec::new())).await {
+            Err(err) => err,
+            Ok(_) => panic!("the request must be refused"),
+        };
+        assert!(matches!(err, LlmError::NotLocal(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "http://gpu.example.com:8080/v1 is not local (resolves to a public address \
+             93.184.216.34) — aivyx is local-only; point it at a model server on this machine \
+             or your own network"
+        );
+        assert_eq!(backend.sees_images().await, None);
+    }
+
+    #[test]
+    fn a_cloud_base_url_is_refused_at_construction() {
+        let err = match OpenAiCompatBackend::new("https://api.openai.com/v1", "gpt", None) {
+            Err(err) => err,
+            Ok(_) => panic!("a cloud host must be refused"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "https://api.openai.com/v1 is not local (cloud host) — aivyx is local-only; point \
+             it at a model server on this machine or your own network"
+        );
+        assert!(OpenAiCompatBackend::new("http://192.168.1.40:8080/v1", "m", None).is_ok());
     }
 }

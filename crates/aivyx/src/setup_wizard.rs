@@ -42,6 +42,18 @@ pub(crate) struct WizardAnswers {
     pub(crate) model: String,
 }
 
+/// The wizard's check of a typed base URL: `Err` with the `NotLocal` text
+/// when it isn't local, so it is asked again. Blocking DNS for a name that
+/// isn't local by its spelling (the prompt is blocking anyway).
+pub(crate) fn check_base_url_answer(
+    base_url: &str,
+    r: &dyn aivyx_route::Resolve,
+) -> Result<(), String> {
+    aivyx_route::require_local_with(base_url, r).map_err(|e| e.to_string())
+}
+
+/// The base URL the wizard suggests for `choice`: always a server on this
+/// machine.
 pub(crate) fn default_base_url(choice: BackendChoice) -> &'static str {
     match choice {
         BackendChoice::Ollama => "http://localhost:11434/v1",
@@ -105,6 +117,7 @@ pub(crate) fn verification_lines(
         // context_warning() always has something to say for this variant --
         // printed after the settings are built, so nothing extra here.
         ServedContext::OllamaDefaultUnknown => {}
+        ServedContext::NotLocal(why) => lines.push(format!("  error: {why}")),
     }
     lines
 }
@@ -313,6 +326,8 @@ fn prompt_base_url(choice: BackendChoice) -> anyhow::Result<String> {
     let base_url: String = dialoguer::Input::new()
         .with_prompt("Base URL")
         .default(default.to_string())
+        // Local-only: a server on this machine or your own network.
+        .validate_with(|url: &String| check_base_url_answer(url, &aivyx_route::SystemResolver))
         .interact_text()?;
     Ok(base_url)
 }
@@ -526,6 +541,56 @@ mod tests {
             &ServedContext::OllamaDefaultUnknown,
         );
         assert!(warning.is_some_and(|w| w.contains("num_ctx")));
+    }
+
+    /// Fails every lookup; a test never touches the network.
+    struct NoDns;
+
+    impl aivyx_route::Resolve for NoDns {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Err(std::io::Error::other("no DNS in tests"))
+        }
+    }
+
+    #[test]
+    fn every_suggested_base_url_is_local_by_its_spelling() {
+        for choice in [
+            BackendChoice::Ollama,
+            BackendChoice::Lemonade,
+            BackendChoice::DockerModelRunner,
+            BackendChoice::GenericOpenAiCompatible,
+        ] {
+            let url = default_base_url(choice);
+            assert_eq!(
+                aivyx_route::url_locality(url),
+                aivyx_route::Locality::Local,
+                "{choice:?}: {url}"
+            );
+            assert_eq!(check_base_url_answer(url, &NoDns), Ok(()), "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn a_typed_cloud_base_url_is_refused_with_the_local_only_text() {
+        assert_eq!(
+            check_base_url_answer("https://api.anthropic.com/v1", &NoDns).unwrap_err(),
+            "https://api.anthropic.com/v1 is not local (cloud host) — aivyx is local-only; point \
+             it at a model server on this machine or your own network"
+        );
+        assert!(check_base_url_answer("http://gpu.example.com/v1", &NoDns)
+            .unwrap_err()
+            .contains("(doesn't resolve)"));
+        assert_eq!(check_base_url_answer("http://192.168.1.40:8080/v1", &NoDns), Ok(()));
+    }
+
+    #[test]
+    fn a_non_local_probe_says_why() {
+        let lines = verification_lines(
+            &Err("x is not local (cloud host)".into()),
+            &ServedContext::NotLocal("x is not local (cloud host)".into()),
+            8192,
+        );
+        assert_eq!(lines[1], "  error: x is not local (cloud host)");
     }
 
     #[test]

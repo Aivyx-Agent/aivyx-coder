@@ -28,6 +28,8 @@ pub enum ServedContext {
     /// No request got any HTTP response: the server isn't running, or the
     /// address is wrong.
     Unreachable,
+    /// Not probed: the address isn't local (the `NotLocal` text).
+    NotLocal(String),
 }
 
 /// Said at startup when the model server didn't answer the probe, so the
@@ -42,6 +44,9 @@ pub fn unreachable_notice(base_url: &str) -> String {
 /// Queries the server behind `base_url` (the same `.../v1` URL the backend
 /// uses) for its served context window.
 pub async fn probe_served_context(base_url: &str, model: &str) -> ServedContext {
+    if let Err(e) = crate::local::require_local(base_url).await {
+        return ServedContext::NotLocal(e.to_string());
+    }
     let origin = base_url.trim_end_matches('/').trim_end_matches("/v1");
     let client = match crate::model_client_builder().timeout(PROBE_TIMEOUT).build() {
         Ok(client) => client,
@@ -106,6 +111,7 @@ pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(180);
 /// URL). Also loads the model on servers that load on first use, so a
 /// following `probe_served_context` can see it.
 pub async fn verify_model_responds(base_url: &str, model: &str) -> Result<(), String> {
+    crate::local::require_local(base_url).await.map_err(|e| e.to_string())?;
     let base = base_url.trim_end_matches('/');
     let client = crate::model_client_builder()
         .timeout(VERIFY_TIMEOUT)
@@ -160,6 +166,9 @@ const PROBE_TOOL: &str = "read_file";
 /// turned off for the probe (`chat_template_kwargs`; servers that don't
 /// know the field ignore it) so a thinking model isn't cut off mid-thought.
 pub async fn probe_tool_calling(base_url: &str, model: &str) -> ToolProbe {
+    if let Err(e) = crate::local::require_local(base_url).await {
+        return ToolProbe::Unknown(e.to_string());
+    }
     let base = base_url.trim_end_matches('/');
     let client = match crate::model_client_builder().timeout(VERIFY_TIMEOUT).build() {
         Ok(client) => client,
@@ -335,7 +344,7 @@ pub fn context_warning(configured: u32, served: &ServedContext) -> Option<String
              cannot change it. If responses truncate mid-thought, create a derived model: \
              printf 'FROM <model>\\nPARAMETER num_ctx {configured}\\n' | ollama create <model>-ctx -f -"
         )),
-        ServedContext::Unknown | ServedContext::Unreachable => None,
+        ServedContext::Unknown | ServedContext::Unreachable | ServedContext::NotLocal(_) => None,
     }
 }
 

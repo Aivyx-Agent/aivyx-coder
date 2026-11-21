@@ -99,6 +99,28 @@ pub(crate) fn resolve(settings: &mut Settings, table: &toml::Table) -> Vec<Depre
     out
 }
 
+/// The `[routing.endpoints.*] kind`s aivyx-coder takes, for messages.
+pub const LOCAL_ENDPOINT_KINDS: &str = "ollama, llama_router, openai_compat or lemonade";
+
+/// The hosted-API endpoint kinds aivyx-route 0.2 removed.
+const REMOVED_ENDPOINT_KINDS: &[&str] = &["anthropic", "openai"];
+
+/// The error for a `[routing.endpoints.*]` table naming a removed hosted-API
+/// kind, checked before deserializing so the user gets the fix instead of
+/// serde's "unknown variant". `None` when no endpoint does.
+pub(crate) fn removed_endpoint_kind(table: &toml::Table) -> Option<String> {
+    let endpoints = table.get("routing")?.as_table()?.get("endpoints")?.as_table()?;
+    endpoints.iter().find_map(|(name, endpoint)| {
+        let kind = endpoint.as_table()?.get("kind")?.as_str()?;
+        REMOVED_ENDPOINT_KINDS.contains(&kind).then(|| {
+            format!(
+                "[routing.endpoints.{name}]: provider \"{kind}\" was removed in 2.0 — aivyx is \
+                 local-only; use {LOCAL_ENDPOINT_KINDS} with a local base_url"
+            )
+        })
+    })
+}
+
 /// Tells the user, once per key, the same way as an unknown key: a log
 /// line, and stderr.
 pub(crate) fn report(found: &[Deprecation]) {
@@ -181,6 +203,25 @@ mod tests {
         assert_eq!(s.broker.base_url.as_deref(), Some("http://chat:1"));
         assert_eq!(d[1].old, "vision.broker_url");
         assert_eq!(d[1].overridden_by, Some("backend.broker_base_url"));
+    }
+
+    #[test]
+    fn a_removed_endpoint_kind_names_the_local_kinds() {
+        for kind in ["anthropic", "openai"] {
+            let raw = format!("[routing.endpoints.hosted]\nkind = \"{kind}\"\n");
+            let err = Settings::parse_with_warnings(&raw).unwrap_err();
+            assert_eq!(
+                err.message(),
+                format!(
+                    "[routing.endpoints.hosted]: provider \"{kind}\" was removed in 2.0 — \
+                     aivyx is local-only; use ollama, llama_router, openai_compat or lemonade \
+                     with a local base_url"
+                )
+            );
+        }
+        // A local kind still loads.
+        let (s, _, _) = parse("[routing.endpoints.gpu]\nkind = \"ollama\"\n");
+        assert!(s.routing.endpoints.contains_key("gpu"));
     }
 
     #[test]

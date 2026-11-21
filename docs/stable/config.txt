@@ -68,7 +68,7 @@ routing.discover = true
 routing.enabled = false
 routing.endpoints = {}
 routing.endpoints.*.base_url: string?
-routing.endpoints.*.kind: enum (one of: ollama | llama_router | openai_compat | lemonade | anthropic | openai)
+routing.endpoints.*.kind: enum (one of: ollama | llama_router | openai_compat | lemonade)
 routing.endpoints.*.locality: enum? (one of: local | cloud)
 routing.models = []
 routing.models[].capabilities: [enum] (one of: completion | tools | vision | thinking | audio | embedding)
