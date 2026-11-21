@@ -12,7 +12,8 @@
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
 A terminal (TUI) coding agent for **local** LLMs only — Ollama, Lemonade
-Server, Docker Model Runner, llama.cpp, vLLM or Jan over their OpenAI-compatible `/chat/completions` endpoints. It never
+Server, Docker Model Runner, llama.cpp, vLLM or Jan over their OpenAI-compatible `/chat/completions` endpoints. Every model URL must be
+local (your machine or your own network); a non-local URL stops startup. It never
 talks to a cloud API. An LLM drives tool calls (read/write/edit files, search,
 run commands) against your real filesystem, gated by a layered permission and
 sandboxing model designed so that a mistaken — or actively manipulated — model

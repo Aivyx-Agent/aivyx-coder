@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `aivyx-coder` (binary name `aivyx-coder`, crate `crates/aivyx`) is a terminal (TUI)
 coding agent that talks **only** to local LLMs — Ollama, vLLM, or llama.cpp's
 `llama-server`, all via their OpenAI-compatible `/v1/chat/completions`
-endpoint. It never calls a cloud API. The model drives tool calls
+endpoint. It never calls a cloud API: every model URL must be local, checked at
+load, before each request and at connect time, and redirects are refused. The model drives tool calls
 (read/write/edit files, grep/glob, run commands, git) against the real
 filesystem, and every call passes through a layered permission + sandboxing
 model built on the premise that the model may be wrong or actively

@@ -9,9 +9,9 @@ publish.workspace = true
 aivyx-checkpoint = { workspace = true }
 aivyx-recall = { workspace = true }
 aivyx-skills = { workspace = true }
-aivyx-llm = { version = "1.1.0", path = "../aivyx-llm" }
-aivyx-sandbox = { version = "1.1.0", path = "../aivyx-sandbox", default-features = false }
-aivyx-types = { version = "1.1.0", path = "../aivyx-types" }
+aivyx-llm = { version = "2.0.0", path = "../aivyx-llm" }
+aivyx-sandbox = { version = "2.0.0", path = "../aivyx-sandbox", default-features = false }
+aivyx-types = { version = "2.0.0", path = "../aivyx-types" }
 aivyx-vision-svg = { workspace = true }
 aivyx-vision-core = { workspace = true }
 aivyx-vision-mold = { workspace = true }

@@ -132,6 +132,34 @@ summarize = { tier = "small" }
 - Tiers and strengths only ever come from the roster; no server reports
   model quality.
 
+## Local-only: what is checked, and how to migrate
+
+aivyx-coder is local-only. Models run on your machine or your own network
+(llama-server, Ollama, Jan, vLLM, Lemonade). Every model URL must be local:
+loopback, a private LAN address, Tailscale (`100.64.0.0/10`), or a
+`.local`/`.lan`/`.home.arpa` name. A host name counts only if every address
+it resolves to is local. For a DNS-named LAN box, also set
+`locality = "local"` on its `[routing.endpoints.*]` table.
+
+- **A cloud URL stops startup.** Config load fails with
+  `<url> is not local (<reason>) — aivyx is local-only; point it at a model server on this machine or your own network`.
+  Credentials in the URL are removed from the message. The same applies to
+  `--base-url`.
+- **The check is repeated.** It runs at load, before each model request, and
+  at connect time (the resolver only returns local addresses), so a name that
+  later resolves to a public address is refused too.
+- **Redirects are never followed.** If a model server answers with a
+  redirect, the request fails with the HTTP status; the client does not go
+  to the new address.
+- **Migrating from `kind = "anthropic"` or `"openai"`.** Those routing kinds
+  were removed in 2.0, and a config that names one fails to load. Point the
+  endpoint at a local server instead: change `kind` to `ollama`,
+  `llama_router`, `openai_compat` or `lemonade`, set a local `base_url`, and
+  make sure the models you list in `[[routing.models]]` are ones that server
+  serves. Remove the hosted model names. API keys already stored are left
+  untouched; a local server that wants a key (vLLM `--api-key`) can still use
+  `api_key`.
+
 ## Unknown capabilities
 
 Some sources can't say what a model supports (`/v1/models` lists ids only;

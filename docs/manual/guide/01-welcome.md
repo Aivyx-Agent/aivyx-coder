@@ -4,7 +4,7 @@ aivyx-coder is a coding agent that lives in your terminal and works with
 **local** models only — Ollama, Lemonade Server, Docker Model Runner,
 llama.cpp, vLLM or Jan. You
 describe a change; the model reads your project, edits files, runs your
-tests and uses git, and you approve each step. Nothing goes to a cloud API.
+tests and uses git, and you approve each step. Nothing goes to a cloud API, and a non-local model URL is refused.
 
 ## What makes it different
 
