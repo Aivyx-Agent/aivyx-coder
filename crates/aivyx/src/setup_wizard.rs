@@ -279,6 +279,8 @@ pub(crate) fn backend_menu(running: [bool; 4]) -> ([String; 4], usize) {
 }
 
 /// Which backends answer at their default address right now (menu order).
+/// The URLs are fixed loopback constants (the same servers as
+/// `default_base_url`), never user input, so they need no local-only check.
 async fn detect_running_backends() -> [bool; 4] {
     let client = match aivyx_llm::model_client_builder()
         .timeout(std::time::Duration::from_secs(1))

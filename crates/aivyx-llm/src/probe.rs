@@ -373,6 +373,25 @@ pub fn effective_context_tokens(configured: u32, served: &ServedContext) -> (u32
 mod tests {
     use super::*;
 
+    /// A public literal IP: refused before any request, with no lookup.
+    const PUBLIC: &str = "http://8.8.8.8/v1";
+    const NOT_LOCAL: &str = "http://8.8.8.8/v1 is not local (resolves to a public address \
+                             8.8.8.8) — aivyx is local-only; point it at a model server on \
+                             this machine or your own network";
+
+    #[tokio::test]
+    async fn the_probes_refuse_a_non_local_address() {
+        assert_eq!(
+            probe_served_context(PUBLIC, "m").await,
+            ServedContext::NotLocal(NOT_LOCAL.to_string())
+        );
+        assert_eq!(verify_model_responds(PUBLIC, "m").await, Err(NOT_LOCAL.to_string()));
+        assert_eq!(
+            probe_tool_calling(PUBLIC, "m").await,
+            ToolProbe::Unknown(NOT_LOCAL.to_string())
+        );
+    }
+
     #[test]
     fn effective_context_uses_a_larger_served_window() {
         let (tokens, notice) = effective_context_tokens(8192, &ServedContext::Known(32768));

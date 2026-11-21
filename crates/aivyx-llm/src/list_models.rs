@@ -110,6 +110,22 @@ fn parse_openai_models(json: &serde_json::Value) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn listing_refuses_a_non_local_address() {
+        // A public literal IP: refused before any request, with no lookup.
+        let expected = "http://8.8.8.8/v1 is not local (resolves to a public address 8.8.8.8) \
+                        — aivyx is local-only; point it at a model server on this machine or \
+                        your own network";
+        for result in [
+            list_ollama_models("http://8.8.8.8/v1").await,
+            list_openai_compatible_models("http://8.8.8.8/v1").await,
+        ] {
+            let err = result.unwrap_err();
+            assert!(matches!(err, ListModelsError::NotLocal(_)), "{err:?}");
+            assert_eq!(err.to_string(), expected);
+        }
+    }
+
     #[test]
     fn parses_ollama_tags_response() {
         let json = serde_json::json!({

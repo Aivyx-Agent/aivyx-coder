@@ -27,6 +27,13 @@ pub use slot_pool_lock::{SlotPoolLock, fnv1a};
 /// `HTTP_PROXY`/`ALL_PROXY` when one is set (aivyx-vision audit 2026-11-11,
 /// X1). Internet tools (`web_fetch`, `web_search`) build their own clients
 /// and keep honouring a configured proxy.
+///
+/// It never follows a redirect either: a 307/308 from a local server would
+/// otherwise re-send the prompt and code to whatever host it names, past
+/// the local-only check (the same policy as aivyx-route's discovery client
+/// and aivyx-vision-mold). A 3xx comes back as the response.
 pub fn model_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_proxy()
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
 }
