@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0] - 2026-11-21
+## [2.0.0] - 2026-11-23
 
 aivyx-coder is local-only: models run on your machine or your own network (llama-server, Ollama, Jan, vLLM, Lemonade).
 
@@ -15,6 +15,10 @@ aivyx-coder is local-only: models run on your machine or your own network (llama
 ### Migration
 
 If a `[routing.endpoints.*]` table uses `kind = "anthropic"` or `"openai"`, change it to a local kind (`ollama`, `llama_router`, `openai_compat` or `lemonade`) with a local `base_url`, and list models that server serves. If your model server has a DNS name on your own network (for example `gpu.example.com`), set `locality = "local"` on its routing endpoint. Stored API keys are not deleted. See the models and routing chapter of the manual.
+
+### Security
+
+- `url` 2.5.9 ([RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592): a stack overflow in `Url::origin()` on nested `blob:` URLs).
 
 ## [1.1.0] — 2026-11-18
 
