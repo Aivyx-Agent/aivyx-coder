@@ -6,11 +6,12 @@
 
 - The routing tier for a model server on your network that you trust less than this machine is now called "shared" (aivyx-route 0.3): write `locality = "shared"`. aivyx-coder still refuses a shared endpoint at startup, as it did a "cloud" one. `locality = "cloud"` is read as `"shared"` until 3.0, with a startup note: ``locality = "cloud" is now "shared"; the old name works until 3.0``.
 - Downgrading: a 2.0 binary can't read a config with `locality = "shared"` (the stable config surface, `docs/stable/config.txt`, now shows `local | shared`, and 2.1 serializes the tier as `"shared"`). To go back to 2.0, change it to `"cloud"` first.
+- Building backends, council seats and the architect now goes through the new `connect*` constructors instead of an ad-hoc `spawn_blocking` wrapper. Tests now prove that every async local-only check (construction, before each request, routed models) runs off the runtime thread.
 - aivyx-llm: new async constructors `OpenAiCompatBackend::connect`, `connect_with_idle_timeout` and `connect_with_resolver`, which run the local-only check off the async runtime. The sync constructors are unchanged and documented as blocking.
 
 ### Fixed
 
-- Local-only checks no longer block the async runtime: a model URL whose host is a DNS name (not local by its spelling) is looked up on tokio's blocking pool when the backend, council seats and architect are built, before each request, and for routed models; the `--setup` wizard's base-URL prompt and its check run there too.
+- The `--setup` wizard's base-URL prompt and its local-only check no longer block the async runtime.
 
 ## [2.0.0] - 2026-11-23
 

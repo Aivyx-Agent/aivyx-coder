@@ -119,6 +119,22 @@ mod tests {
         );
     }
 
+    struct Panics;
+
+    impl Resolve for Panics {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            panic!("resolver panicked");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_resolver_fails_closed() {
+        let err = require_local_with("http://gpu.example.com/v1", Arc::new(Panics))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, NotLocalReason::DoesNotResolve);
+    }
+
     #[tokio::test]
     async fn a_local_spelling_needs_no_lookup() {
         let never = Arc::new(NeverResolves);

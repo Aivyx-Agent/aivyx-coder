@@ -89,11 +89,13 @@ mod tests {
                     Some(ContainerFormat::Enum(vs)) => {
                         // serde-reflection names a variant by the last of its
                         // aliases; `Locality::Shared` reads `"cloud"` as one
-                        // (until 3.0), so show the real name.
+                        // (until 3.0), so show the real name. Only for
+                        // `Locality`: any other `cloud` variant is real.
+                        let is_locality = t == "Locality";
                         Some(
                             vs.values()
                                 .map(|v| match v.name.as_str() {
-                                    "cloud" => "shared".to_string(),
+                                    "cloud" if is_locality => "shared".to_string(),
                                     name => name.to_string(),
                                 })
                                 .collect(),

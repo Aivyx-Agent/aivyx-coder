@@ -1803,6 +1803,11 @@ mod tests {
         // Unset, it isn't written out.
         let toml_string = toml::to_string_pretty(&Settings::default()).unwrap();
         assert!(!toml_string.contains("locality"), "{toml_string}");
+        // Set, the tier is written under its new name, never `"cloud"`.
+        let mut set = Settings::default();
+        set.backend.locality = Some(aivyx_route::Locality::Shared);
+        let toml_string = toml::to_string_pretty(&set).unwrap();
+        assert!(toml_string.contains("locality = \"shared\""), "{toml_string}");
     }
 
     #[test]

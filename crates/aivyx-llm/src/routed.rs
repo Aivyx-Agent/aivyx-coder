@@ -1028,6 +1028,4 @@ mod tests {
         let (built, ticks) = ticks_during(router.backend_for(&key("gpu", "other"))).await;
         assert!(built.is_ok());
         assert!(ticks >= 5, "the ticker advanced {ticks} times during the check");
-    }
-
-}
+    }}
