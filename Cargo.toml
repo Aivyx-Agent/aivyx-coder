@@ -39,7 +39,7 @@ aivyx-kvcache = { git = "https://github.com/Aivyx-Agent/aivyx-kvcache", rev = "4
 aivyx-recall = { git = "https://github.com/Aivyx-Agent/aivyx-recall", rev = "c16530ecc58201e81c0e907fc1ffce150f63960d" }
 aivyx-injection-guard = { git = "https://github.com/Aivyx-Agent/aivyx-injection-guard", rev = "a3eb989ea86b4784a3bd118d21530c5731ae21f6" }
 aivyx-skills = { git = "https://github.com/Aivyx-Agent/aivyx-skills", rev = "ffaff98acf1bd32955e6abdb659444215218416e" }
-aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "decf3b8fe803757b75170376c17281c3f5cb60f3" }
+aivyx-route = { git = "https://github.com/Aivyx-Agent/aivyx-route", rev = "8f806d8d7618235a17236da35e3b5aaf7b9ff52e" }
 # The signed pack format shared with aivyx-pa (config packs). Not on
 # crates.io -- pinned by commit SHA like the others; MUST stay public.
 aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "5865f02211c96293c2c713f13b84ab5dccfb71a9" }
@@ -48,9 +48,9 @@ aivyx-pack = { git = "https://github.com/Aivyx-Agent/aivyx-pack", rev = "5865f02
 # backend, so no target-gating needed. All three pinned to the same rev
 # (Milestone 2 Pass A's merge commit in that repo) so they never drift
 # out of lockstep with each other.
-aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e827314ab040f0be1b9c46f1372951e1ee4b034d" }
-aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e827314ab040f0be1b9c46f1372951e1ee4b034d" }
-aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "e827314ab040f0be1b9c46f1372951e1ee4b034d" }
+aivyx-vision-svg = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "426b7d9532efa989fa2ad2d3c88fab14912d9915" }
+aivyx-vision-core = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "426b7d9532efa989fa2ad2d3c88fab14912d9915" }
+aivyx-vision-mold = { git = "https://github.com/Aivyx-Agent/aivyx-vision", rev = "426b7d9532efa989fa2ad2d3c88fab14912d9915" }
 
 [profile.release]
 strip = true
