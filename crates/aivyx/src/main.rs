@@ -984,12 +984,21 @@ fn ask_settings_consent(v: &aivyx_pack::PackVerification, allowed: &[aivyx_confi
     matches!(line.trim(), "y" | "Y" | "yes")
 }
 
+/// Config notes for a path that builds no agent (so nothing shows them in
+/// a transcript): to stderr, as the loader used to.
+fn print_config_notes(settings: &Settings) {
+    for note in &settings.load_notes {
+        eprintln!("warning: {note}");
+    }
+}
+
 /// `aivyx-coder pack …`. Reads `config.toml` only for trusted keys and
 /// never creates it.
 fn run_pack(action: PackAction) -> anyhow::Result<()> {
     let packs = packs::PacksDir::user()?;
     let trusted = || -> anyhow::Result<Vec<String>> {
         let settings = Settings::load_existing()?.unwrap_or_default();
+        print_config_notes(&settings);
         packs::trusted_publishers(&settings).map_err(anyhow::Error::msg)
     };
     match action {
@@ -1023,11 +1032,11 @@ fn run_pack(action: PackAction) -> anyhow::Result<()> {
                 .is_some_and(|p| matches!(packs::pack_settings(&p.dir, &p.manifest), Ok(Some(_))));
             let allowed = if has_commands {
                 let path = Settings::config_path()?;
-                Settings::load_existing()
+                let settings = Settings::load_existing()
                     .map_err(|e| anyhow::anyhow!("can't read {}: {e:#}", path.display()))?
-                    .unwrap_or_default()
-                    .permissions
-                    .allowed_commands
+                    .unwrap_or_default();
+                print_config_notes(&settings);
+                settings.permissions.allowed_commands
             } else {
                 Vec::new()
             };

@@ -1498,6 +1498,7 @@ pub(crate) async fn build_agent(
     if let Some(notice) = shared_backend_notice {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
+    send_config_notes(settings, &events_tx);
     for notice in pack.iter().flat_map(|p| p.notices.iter()) {
         let _ = events_tx.send(aivyx_core::AgentEvent::Info(notice.clone()));
     }
@@ -1949,6 +1950,17 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
 /// The session-start notice for a git repository whose checkpoints
 /// aivyx-checkpoint refuses. `reason` names the setting or path, never a
 /// config value; it is cut short so a long list stays one readable notice.
+/// What loading the config had to say (old spellings, unknown keys), as
+/// transcript notices: stderr sits behind the TUI.
+fn send_config_notes(
+    settings: &aivyx_config::Settings,
+    events_tx: &mpsc::UnboundedSender<aivyx_core::AgentEvent>,
+) {
+    for note in &settings.load_notes {
+        let _ = events_tx.send(aivyx_core::AgentEvent::Info(format!("config: {note}")));
+    }
+}
+
 fn refused_checkpoints_notice(reason: &str) -> String {
     const MAX_CHARS: usize = 300;
     let mut detail: String = reason.trim().chars().take(MAX_CHARS).collect();
@@ -1964,6 +1976,33 @@ fn refused_checkpoints_notice(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_notes_reach_the_transcript_as_one_info_each() {
+        let settings = aivyx_config::Settings::parse_with_notes(
+            "bogus_key = 1\n[backend]\nlocality = \"cloud\"\n",
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_config_notes(&settings, &tx);
+        drop(tx);
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                aivyx_core::AgentEvent::Info(text) => infos.push(text),
+                other => panic!("only Info expected, got {other:?}"),
+            }
+        }
+        let with = |needle: &str| infos.iter().filter(|t| t.contains(needle)).count();
+        assert_eq!(infos.len(), 2, "{infos:?}");
+        assert_eq!(
+            with("locality = \"cloud\" is now \"shared\"; the old name works until 3.0"),
+            1,
+            "{infos:?}"
+        );
+        assert_eq!(with("bogus_key"), 1, "{infos:?}");
+        assert!(infos.iter().all(|t| t.starts_with("config: ")), "{infos:?}");
+    }
 
     #[test]
     fn the_refused_checkpoints_notice_names_the_reason_and_what_is_off() {

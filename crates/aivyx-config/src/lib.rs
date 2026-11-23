@@ -53,6 +53,12 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// What loading this config had to say (unknown keys, then old
+    /// spellings), one line each. Never read from or written to the file:
+    /// the agent build sends them as transcript notices, and `pack`
+    /// prints them itself.
+    #[serde(skip)]
+    pub load_notes: Vec<String>,
     pub backend: BackendSettings,
     /// `[broker]`: the aivyx-broker this process talks to. Same spelling
     /// as Aivyx PA's.
@@ -1385,12 +1391,23 @@ impl Settings {
         Ok((settings, unknown, deprecated))
     }
 
-    /// `parse_with_warnings`, telling the user about each warning once.
-    fn parse_and_report(raw: &str) -> Result<Self, toml::de::Error> {
-        let (settings, unknown, deprecated) = Self::parse_with_warnings(raw)?;
+    /// `parse_with_warnings`, logging each warning once and keeping its
+    /// text in `load_notes` (unknown keys first, then deprecations) for
+    /// the caller to show where the user will see it.
+    pub fn parse_with_notes(raw: &str) -> Result<Self, toml::de::Error> {
+        let (mut settings, unknown, deprecated) = Self::parse_with_warnings(raw)?;
         unknown_keys::report(&unknown);
         deprecated::report(&deprecated);
+        settings.load_notes = unknown
+            .iter()
+            .map(ToString::to_string)
+            .chain(deprecated.iter().map(ToString::to_string))
+            .collect();
         Ok(settings)
+    }
+
+    fn parse_and_report(raw: &str) -> Result<Self, toml::de::Error> {
+        Self::parse_with_notes(raw)
     }
 
     /// Every model server address this config makes aivyx-coder contact,

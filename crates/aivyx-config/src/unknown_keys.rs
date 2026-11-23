@@ -169,12 +169,11 @@ pub fn parse_reporting<T: serde::de::DeserializeOwned>(
     Ok((value, keys))
 }
 
-/// Tells the user, once per key: a log line, and stderr (the log is a file,
-/// and this runs before any full-screen UI starts).
+/// Logs each, once per key. The text reaches the user through
+/// `Settings::load_notes` (stderr would sit behind the TUI).
 pub(crate) fn report(keys: &[UnknownKey]) {
     for k in keys {
         tracing::warn!(key = %k.path, "{k}");
-        eprintln!("warning: {k}");
     }
 }
 

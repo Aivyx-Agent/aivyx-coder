@@ -157,12 +157,11 @@ pub(crate) fn removed_endpoint_kind(table: &toml::Table) -> Option<String> {
     })
 }
 
-/// Tells the user, once per key, the same way as an unknown key: a log
-/// line, and stderr.
+/// Logs each, once per key. The text reaches the user through
+/// `Settings::load_notes`.
 pub(crate) fn report(found: &[Deprecation]) {
     for d in found {
         tracing::warn!(key = d.old, "{d}");
-        eprintln!("warning: {d}");
     }
 }
 

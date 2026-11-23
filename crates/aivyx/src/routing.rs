@@ -640,7 +640,7 @@ mod tests {
     }
 
     /// The kind is not the whole story: a hosted OpenAI-compatible API
-    /// (or a remote Ollama) is cloud by its address.
+    /// (or a remote Ollama) is shared by its address.
     #[test]
     fn an_endpoint_whose_address_is_not_local_is_rejected() {
         for (kind, url) in [
@@ -716,7 +716,7 @@ mod tests {
     /// `locality = "local"` on a DNS name counts only once start-up has
     /// checked it resolves only to local addresses.
     #[test]
-    fn an_unverified_local_override_counts_as_cloud() {
+    fn an_unverified_local_override_counts_as_shared() {
         let s = settings_with(
             "[routing.endpoints.gpu]\nkind = \"ollama\"\n\
              base_url = \"http://gpu.example.com:11434\"\nlocality = \"local\"\n",
@@ -839,7 +839,7 @@ mod tests {
             Local
         );
         // `[backend] locality` overrides the address, either way.
-        // ... once verified: unverified, a DNS name stays cloud.
+        // ... once verified: unverified, a DNS name stays shared.
         let mut lan = backend(BackendKind::Generic, "http://gpu.example.com:8080/v1", None);
         lan.backend.locality = Some(Local);
         assert_eq!(loc(&lan), Shared);
@@ -850,10 +850,10 @@ mod tests {
     }
 
     /// A `[backend]` on a DNS name, even one that resolves to the LAN,
-    /// makes its model cloud until marked local, so local-only routing
+    /// makes its model shared until marked local, so local-only routing
     /// never picks it; the startup warning says how to mark it local.
     #[test]
-    fn a_dns_named_backend_model_is_cloud_and_the_warning_names_backend_locality() {
+    fn a_dns_named_backend_model_is_shared_and_the_warning_names_backend_locality() {
         let mut s = settings_with("[routing]\nenabled = true\n");
         s.backend.base_url = "http://gpu.example.com:8080/v1".into();
         let (config, default, warnings) = verified(&s, &LAN).unwrap();
@@ -876,10 +876,10 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// `locality = "local"` on a roster entry for a model on a cloud
+    /// `locality = "local"` on a roster entry for a model on a shared
     /// `[backend]` is ignored upstream; the fix is `[backend] locality`.
     #[test]
-    fn a_local_roster_override_on_a_cloud_backend_names_backend_locality() {
+    fn a_local_roster_override_on_a_shared_backend_names_backend_locality() {
         let mut s = settings_with(
             "[routing]\nenabled = true\n[[routing.models]]\nid = \"qwen3.5:9b\"\n\
              endpoint = \"backend\"\nlocality = \"local\"\n",
@@ -898,9 +898,9 @@ mod tests {
     }
 
     /// The embedded backend has no address and needs none; a broker with
-    /// no `[broker] base_url` has nothing to check, so it is cloud.
+    /// no `[broker] base_url` has nothing to check, so it is shared.
     #[test]
-    fn a_default_without_an_address_is_warned_about_only_when_it_counts_as_cloud() {
+    fn a_default_without_an_address_is_warned_about_only_when_it_counts_as_shared() {
         let embedded = backend(BackendKind::MistralRs, "http://localhost:11434/v1", None);
         let (_, _, warnings) = verified(&embedded, &PUBLIC).unwrap();
         // The implicit roster entry for its model is no warning either.
@@ -948,10 +948,10 @@ mod tests {
         assert!(notice.contains("marked `locality = \"shared\"`"), "{notice}");
     }
 
-    /// aivyx-route never probes an endpoint it calls cloud; neither does
+    /// aivyx-route never probes an endpoint it calls shared; neither does
     /// aivyx-coder's own poll of the `[backend]` server.
     #[test]
-    fn a_cloud_default_is_never_polled_for_residency() {
+    fn a_shared_default_is_never_polled_for_residency() {
         let residency = |s: &Settings| default_residency(s, &default_endpoint(s));
         assert_eq!(
             residency(&backend(
@@ -1287,7 +1287,7 @@ mod tests {
     /// nothing to pick; the error must name the real fix, not just
     /// `[[routing.models]]`.
     #[tokio::test]
-    async fn a_cloud_backend_with_no_other_candidate_names_backend_locality_in_the_error() {
+    async fn a_shared_backend_with_no_other_candidate_names_backend_locality_in_the_error() {
         let mut s = settings_with("[routing]\nenabled = true\ndiscover = false\n");
         s.backend.base_url = "http://gpu.example.com/v1".into();
         let llm: Arc<dyn LlmBackend> = Arc::new(
@@ -1320,16 +1320,16 @@ mod tests {
         );
     }
 
-    /// The transcript notice fires only with routing on and a cloud
+    /// The transcript notice fires only with routing on and a shared
     /// `[backend]`, and names both the consequence and the fix.
     #[test]
-    fn the_startup_notice_names_backend_locality_for_a_cloud_backend() {
+    fn the_startup_notice_names_backend_locality_for_a_shared_backend() {
         let notice_of = |s: &Settings| shared_backend_notice(s, &verified(s, &LAN).unwrap().1);
         let mut s = settings_with("[routing]\nenabled = true\n");
         assert_eq!(notice_of(&s), None, "local backend");
 
         s.backend.base_url = "http://box.tail1234.ts.net:11434/v1".into();
-        let notice = notice_of(&s).expect("cloud backend");
+        let notice = notice_of(&s).expect("shared backend");
         assert!(notice.contains("main loop"), "{notice}");
         assert!(notice.contains("box.tail1234.ts.net"), "{notice}");
         assert!(
