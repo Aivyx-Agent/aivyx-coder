@@ -43,8 +43,8 @@ pub(crate) struct WizardAnswers {
 }
 
 /// The wizard's check of a typed base URL: `Err` with the `NotLocal` text
-/// when it isn't local, so it is asked again. Blocking DNS for a name that
-/// isn't local by its spelling (the prompt is blocking anyway).
+/// when it isn't local, so it is asked again. Blocking DNS: never call
+/// from async code (`run_then` runs the whole prompt on the blocking pool).
 pub(crate) fn check_base_url_answer(
     base_url: &str,
     r: &dyn aivyx_route::Resolve,
@@ -192,7 +192,9 @@ pub(crate) async fn run_then(after: AfterSetup) -> anyhow::Result<()> {
 
     let (answers, served) = loop {
         let backend_choice = prompt_backend_choice().await?;
-        let base_url = prompt_base_url(backend_choice)?;
+        // The prompt and its local-only check both block: off the runtime.
+        let base_url =
+            tokio::task::spawn_blocking(move || prompt_base_url(backend_choice)).await??;
         let model = prompt_model(backend_choice, &base_url).await?;
 
         println!("Verifying {model} at {base_url} (the first reply can take a while if it has to load) ...");
@@ -323,6 +325,7 @@ async fn prompt_backend_choice() -> anyhow::Result<BackendChoice> {
     })
 }
 
+/// Blocking (a terminal prompt, and DNS): never call from async code.
 fn prompt_base_url(choice: BackendChoice) -> anyhow::Result<String> {
     let default = default_base_url(choice);
     let base_url: String = dialoguer::Input::new()

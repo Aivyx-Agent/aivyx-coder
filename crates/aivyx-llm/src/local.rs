@@ -39,6 +39,56 @@ impl Resolve for NeverResolves {
     }
 }
 
+/// The blocking detector: proves an async path runs its local-only check
+/// off the runtime thread. On a `current_thread` runtime a ticker task
+/// can't advance while that thread is blocked, so a path that ticks it
+/// during a [`SlowLan`] lookup did the lookup on the blocking pool.
+#[cfg(test)]
+pub(crate) mod detector {
+    use std::future::Future;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use super::Resolve;
+
+    /// A name for [`SlowLan`]: not local by its spelling, so it is looked up.
+    pub(crate) const URL: &str = "http://gpu.example.com:8090/v1";
+
+    /// Answers `192.168.1.5` after a 300 ms (blocking) sleep.
+    pub(crate) struct SlowLan;
+
+    impl Resolve for SlowLan {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(vec!["192.168.1.5".parse().unwrap()])
+        }
+    }
+
+    /// Awaits `call` beside a ticker that counts every 20 ms; returns the
+    /// call's output and how often the ticker advanced meanwhile.
+    pub(crate) async fn ticks_during<F: Future>(call: F) -> (F::Output, u32) {
+        let ticks = Arc::new(AtomicU32::new(0));
+        let ticker = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        // Let the ticker start before the call.
+        tokio::task::yield_now().await;
+        let start = ticks.load(Ordering::SeqCst);
+        let output = call.await;
+        let advanced = ticks.load(Ordering::SeqCst) - start;
+        ticker.abort();
+        (output, advanced)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +125,14 @@ mod tests {
         for url in ["http://127.0.0.1:8090/v1", "http://localhost:11434", "http://10.0.0.5:8080"] {
             assert!(require_local_with(url, never.clone()).await.is_ok(), "{url}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_lookup_runs_off_the_runtime_thread() {
+        use super::detector::{SlowLan, URL, ticks_during};
+        let (result, ticks) = ticks_during(require_local_with(URL, Arc::new(SlowLan))).await;
+        assert!(result.is_ok());
+        assert!(ticks >= 5, "the ticker advanced {ticks} times during the lookup");
     }
 
     #[tokio::test]

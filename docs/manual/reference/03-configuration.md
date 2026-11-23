@@ -41,7 +41,7 @@ The local model server and model aivyx-coder talks to. `aivyx-coder --setup` wri
 | `context_tokens` | integer | `8192` | The model's context window, in tokens — used to show a live budget indicator and to trigger context compaction before the window overflows. Conservative default; **set this to your model's actual window** (qwen3.5/qwen3.6 support far more than the default). |
 | `edit_format` | `native` \| `prompted` |  | How edit content travels: "native" sends edits as edit_file / write_file tool-call arguments; "prompted" teaches the model to write SEARCH/REPLACE blocks as plain text instead (parsed by aivyx and applied through the same permission gate). |
 | `kind` | `generic` \| `llama_server` \| `llama_server_broker` \| `mistral_rs` | `"llama_server"` | Which server this is, for server-specific features: `generic` (default), `llama_server` (KV-cache persistence), `llama_server_broker` (GPU sharing through aivyx-broker; needs `[broker] base_url`), `mistral_rs` (the embedded engine: a build-time feature, in no release binary, not stable). |
-| `locality` | `local` \| `cloud` | `"local"` | Whether this backend is on your own network, for model routing only (`[routing] enabled = true`). |
+| `locality` | `local` \| `shared` | `"local"` | Whether this backend is on your own network, for model routing only (`[routing] enabled = true`). |
 | `mistralrs_model_path` | string |  | Build-time feature, not stable. With `kind = "mistral_rs"`: a GGUF file, or a directory of them. Required for that kind. |
 | `mistralrs_model_file` | string |  | Build-time feature, not stable. Selects a specific `.gguf` file inside `mistralrs_model_path` when it's a directory containing more than one candidate. |
 | `mistralrs_chat_template_path` | string |  | Build-time feature, not stable. Overrides the chat template mistral.rs would otherwise infer from the model's own metadata. |
@@ -80,7 +80,7 @@ Per-call model routing across several local models. Off by default. See [Models 
 |---|---|---|---|
 | `kind` | `ollama` \| `llama_router` \| `openai_compat` \| `lemonade` |  | What kind of server this is. |
 | `base_url` | string |  | The server's URL. Unset uses the kind's usual local address. |
-| `locality` | `local` \| `cloud` |  | Operator override of the locality the address implies: `local` counts only when the URL's host name resolves to local addresses at load; `cloud` marks the endpoint cloud. |
+| `locality` | `local` \| `shared` |  | Operator override of the locality the address implies: `local` counts only when the URL's host name resolves to local addresses at load; `shared` marks the endpoint shared (`cloud` is read as an alias until 3.0). |
 
 #### `[[routing.models]]`
 
@@ -88,7 +88,7 @@ Per-call model routing across several local models. Off by default. See [Models 
 |---|---|---|---|
 | `id` | string |  | The model id, as its endpoint names it. |
 | `endpoint` | string |  | Which `[routing.endpoints.<name>]` serves it. Unset means `[backend]`. |
-| `locality` | `local` \| `cloud` |  | `cloud` marks this model cloud even on a local endpoint. `local` never makes a model on a cloud endpoint local (it is ignored, and `RoutingConfig::validate` reports it). |
+| `locality` | `local` \| `shared` |  | `shared` marks this model shared even on a local endpoint. `local` never makes a model on a shared endpoint local (it is ignored, and `RoutingConfig::validate` reports it). |
 | `tier` | `small` \| `medium` \| `large` |  | Its size class, for matching tasks to models. |
 | `strengths` | list of `code` \| `reasoning` \| `chat` \| `summarize` |  | What it is good at. |
 | `priority` | integer |  | Operator tie-break; higher wins. Unset = 0 (or an earlier entry's). |

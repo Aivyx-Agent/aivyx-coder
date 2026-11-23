@@ -1433,8 +1433,9 @@ impl Settings {
 
     /// The load-time local-only check: the first [`model_urls`](Self::model_urls)
     /// entry that fails `aivyx_route::require_local`, as "`<key>`: `<NotLocal
-    /// text>`". aivyx-coder refuses to start on it. May resolve DNS names,
-    /// which blocks: from async code, call it inside `spawn_blocking`.
+    /// text>`". aivyx-coder refuses to start on it.
+    /// Blocking DNS: never call from async code; call it inside
+    /// `spawn_blocking` there (as `agent_builder::require_local_models` does).
     pub fn require_local_models_with(&self, r: &dyn aivyx_route::Resolve) -> Result<(), String> {
         for (key, url) in self.model_urls() {
             aivyx_route::require_local_with(&url, r).map_err(|e| format!("{key}: {e}"))?;
@@ -1443,7 +1444,7 @@ impl Settings {
     }
 
     /// [`require_local_models_with`](Self::require_local_models_with) with
-    /// the system resolver.
+    /// the system resolver. Blocking DNS: never call from async code.
     pub fn require_local_models(&self) -> Result<(), String> {
         self.require_local_models_with(&aivyx_route::SystemResolver)
     }

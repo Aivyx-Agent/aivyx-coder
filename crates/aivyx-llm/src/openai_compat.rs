@@ -53,8 +53,8 @@ pub struct OpenAiCompatBackend {
 }
 
 impl OpenAiCompatBackend {
-    /// Fails when `base_url` isn't local. May resolve a DNS name, which
-    /// blocks: from async code, build it inside `spawn_blocking`.
+    /// Fails when `base_url` isn't local. Blocking DNS: never call from
+    /// async code; use [`connect`](Self::connect) there.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -66,7 +66,9 @@ impl OpenAiCompatBackend {
     /// Like `new`, but with a caller-chosen silence tolerance. Council
     /// seats use this: a swapped-in Ollama model that has to cold-load
     /// tens of GB (possibly partially into CPU RAM) can legitimately take
-    /// past the interactive default before its first token.
+    /// past the interactive default before its first token. Blocking DNS:
+    /// never call from async code; use
+    /// [`connect_with_idle_timeout`](Self::connect_with_idle_timeout) there.
     pub fn with_idle_timeout(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -78,6 +80,8 @@ impl OpenAiCompatBackend {
 
     /// Like `with_idle_timeout`, resolving `base_url`'s host through
     /// `resolver`, here and before every request (a seam for tests).
+    /// Blocking DNS: never call from async code; use
+    /// [`connect_with_resolver`](Self::connect_with_resolver) there.
     pub fn with_resolver(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -87,6 +91,51 @@ impl OpenAiCompatBackend {
     ) -> Result<Self, NotLocal> {
         let base_url = base_url.into();
         aivyx_route::require_local_with(&base_url, &*resolver)?;
+        Ok(Self::checked(base_url, model.into(), api_key, idle_timeout, resolver))
+    }
+
+    /// [`new`](Self::new) for async code: the local-only check runs on the
+    /// blocking pool (`crate::local::require_local`).
+    pub async fn connect(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Result<Self, NotLocal> {
+        Self::connect_with_idle_timeout(base_url, model, api_key, IDLE_TIMEOUT).await
+    }
+
+    /// [`with_idle_timeout`](Self::with_idle_timeout) for async code.
+    pub async fn connect_with_idle_timeout(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+    ) -> Result<Self, NotLocal> {
+        let resolver = Arc::new(SystemResolver);
+        Self::connect_with_resolver(base_url, model, api_key, idle_timeout, resolver).await
+    }
+
+    /// [`with_resolver`](Self::with_resolver) for async code.
+    pub async fn connect_with_resolver(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+        resolver: Arc<dyn Resolve>,
+    ) -> Result<Self, NotLocal> {
+        let base_url = base_url.into();
+        crate::local::require_local_with(&base_url, Arc::clone(&resolver)).await?;
+        Ok(Self::checked(base_url, model.into(), api_key, idle_timeout, resolver))
+    }
+
+    /// The backend for a `base_url` that passed the local-only check.
+    fn checked(
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        idle_timeout: Duration,
+        resolver: Arc<dyn Resolve>,
+    ) -> Self {
         let http = crate::model_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // Bounds the gap `connect_timeout` and the SSE idle-timeout
@@ -98,16 +147,16 @@ impl OpenAiCompatBackend {
             .build()
             .expect("failed to build the HTTP client");
 
-        Ok(Self {
+        Self {
             base_url,
-            model: model.into(),
+            model,
             api_key,
             http,
             idle_timeout,
             debug_log: debug_log_from_env(),
             reasoning_effort: None,
             resolver,
-        })
+        }
     }
 
     /// The local-only check, again, before a request.
@@ -972,6 +1021,40 @@ mod tests {
              or your own network"
         );
         assert_eq!(backend.sees_images().await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_async_constructor_checks_off_the_runtime_thread() {
+        use crate::local::detector::{SlowLan, URL, ticks_during};
+        let (backend, ticks) = ticks_during(OpenAiCompatBackend::connect_with_resolver(
+            URL,
+            "m",
+            None,
+            IDLE_TIMEOUT,
+            Arc::new(SlowLan),
+        ))
+        .await;
+        assert!(backend.is_ok());
+        assert!(ticks >= 5, "the ticker advanced {ticks} times during the check");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_per_request_check_runs_off_the_runtime_thread() {
+        use crate::local::detector::{SlowLan, URL, ticks_during};
+        // Built with a resolver that answers at once, then checked through
+        // the slow one, as a request checks it.
+        let mut backend = OpenAiCompatBackend::with_resolver(
+            URL,
+            "m",
+            None,
+            IDLE_TIMEOUT,
+            Arc::new(Rebinding(Default::default())),
+        )
+        .expect("local at construction");
+        backend.resolver = Arc::new(SlowLan);
+        let (result, ticks) = ticks_during(backend.require_local()).await;
+        assert!(result.is_ok());
+        assert!(ticks >= 5, "the ticker advanced {ticks} times during the check");
     }
 
     #[test]

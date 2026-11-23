@@ -424,15 +424,6 @@ fn render_skills_listing(
     listing
 }
 
-/// Builds an `OpenAiCompatBackend` on the blocking pool: its constructor
-/// checks the address is local, which may resolve a DNS name.
-async fn local_backend<F>(build: F) -> anyhow::Result<OpenAiCompatBackend>
-where
-    F: FnOnce() -> Result<OpenAiCompatBackend, aivyx_llm::local::NotLocal> + Send + 'static,
-{
-    Ok(tokio::task::spawn_blocking(build).await??)
-}
-
 /// The load-time local-only check of every model address in `settings`
 /// (`Settings::require_local_models`), off the async worker threads. A
 /// failure stops start-up with the `NotLocal` text.
@@ -450,13 +441,12 @@ pub(crate) async fn require_local_models(settings: &Settings) -> anyhow::Result<
 async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBackend>> {
     match settings.backend.kind {
         BackendKind::Generic | BackendKind::LlamaServer => {
+            // `connect`: the local-only check runs off the async workers.
             let backend = settings.backend.clone();
             Ok(Arc::new(
-                local_backend(move || {
-                    OpenAiCompatBackend::new(backend.base_url, backend.model, backend.api_key)
-                })
-                .await?
-                .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
+                OpenAiCompatBackend::connect(backend.base_url, backend.model, backend.api_key)
+                    .await?
+                    .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
             ))
         }
         BackendKind::LlamaServerBroker => {
@@ -471,13 +461,11 @@ async fn build_llm_backend(settings: &Settings) -> anyhow::Result<Arc<dyn LlmBac
             // `broker.base_url` has no `/v1`, and one that does keeps it.
             let backend = settings.backend.clone();
             Ok(Arc::new(
-                local_backend(move || {
-                    OpenAiCompatBackend::new(
-                        crate::routing::chat_base_url(&broker_url),
-                        backend.model,
-                        backend.api_key,
-                    )
-                })
+                OpenAiCompatBackend::connect(
+                    crate::routing::chat_base_url(&broker_url),
+                    backend.model,
+                    backend.api_key,
+                )
                 .await?
                 .with_reasoning_effort(settings.backend.reasoning_effort.clone()),
             ))
@@ -1762,14 +1750,12 @@ pub(crate) async fn build_agent(
             Ok(CouncilSeat {
                 model: member.model.clone(),
                 backend: Arc::new(
-                    local_backend(move || {
-                        OpenAiCompatBackend::with_idle_timeout(
-                            member.base_url,
-                            member.model,
-                            member.api_key,
-                            COUNCIL_IDLE_TIMEOUT,
-                        )
-                    })
+                    OpenAiCompatBackend::connect_with_idle_timeout(
+                        member.base_url,
+                        member.model,
+                        member.api_key,
+                        COUNCIL_IDLE_TIMEOUT,
+                    )
                     .await?,
                 ),
             })
@@ -1798,14 +1784,12 @@ pub(crate) async fn build_agent(
                 model: settings.architect.model.clone(),
                 backend: Arc::new({
                     let architect = settings.architect.clone();
-                    local_backend(move || {
-                        OpenAiCompatBackend::with_idle_timeout(
-                            architect.base_url,
-                            architect.model,
-                            architect.api_key,
-                            COUNCIL_IDLE_TIMEOUT,
-                        )
-                    })
+                    OpenAiCompatBackend::connect_with_idle_timeout(
+                        architect.base_url,
+                        architect.model,
+                        architect.api_key,
+                        COUNCIL_IDLE_TIMEOUT,
+                    )
                     .await?
                 }),
             },

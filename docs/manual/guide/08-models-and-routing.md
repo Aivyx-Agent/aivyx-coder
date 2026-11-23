@@ -86,15 +86,17 @@ summarize = { tier = "small" }
   or a name that resolves only to such addresses. The hosted-API kinds
   `anthropic` and `openai` were removed in 2.0; a config naming one fails
   to load. For routing, a name like `gpu.example.com` or a `*.ts.net`
-  MagicDNS name that resolves to your own network still counts as cloud
+  MagicDNS name that resolves to your own network still counts as shared
   until you set `locality = "local"` on its `[routing.endpoints.*]` table
   (checked at startup); an `openai_compat` endpoint with no `base_url` is
-  cloud, and `locality = "cloud"` forces cloud. A cloud endpoint stops
-  startup with an error.
+  shared, and `locality = "shared"` forces shared. A shared endpoint stops
+  startup with an error: aivyx-coder only uses your own models. (Before
+  2.1 this tier was called `"cloud"`; `locality = "cloud"` still reads as
+  `"shared"` until 3.0, with a startup note.)
 - The `[backend]` model is judged by the same rule, from the address chat
   connects to (`[broker] base_url` for `kind = "llama_server_broker"`, else
   `base_url`; the embedded `mistral_rs` backend is always local). With
-  routing on, a `[backend]` that counts as cloud is not used for routed
+  routing on, a `[backend]` that counts as shared is not used for routed
   calls — the main loop, `/architect` without an `[architect]` model and
   `/commit` drafts are all routed — so unless another local model is a
   candidate, every turn fails with a routing error. Only calls that carry
@@ -142,7 +144,7 @@ loopback, a private LAN address (RFC 1918), link-local, IPv6 ULA
 name counts only if every address it resolves to is local. For a DNS-named LAN box, also set
 `locality = "local"` on its `[routing.endpoints.*]` table.
 
-- **A cloud URL stops startup.** Config load fails with
+- **A non-local URL stops startup.** Config load fails with
   `<url> is not local (<reason>) — aivyx is local-only; point it at a model server on this machine or your own network`.
   Credentials in the URL are removed from the message. The same applies to
   `--base-url`.
@@ -207,7 +209,7 @@ configured — Ollama (`/api/ps` + `/api/tags`), llama-server router mode
 is `kind = "llama_server"` (resident and router-mode-probed),
 `kind = "llama_server_broker"` (`aivyx-broker`'s residency report, which
 also supplies VRAM), or the embedded `kind = "mistral_rs"` backend (always
-resident, nothing to poll); a `[backend]` that counts as cloud (see "Configuration" above) is never polled — and feeds the result to the router, which
+resident, nothing to poll); a `[backend]` that counts as shared (see "Configuration" above) is never polled — and feeds the result to the router, which
 prefers already-loaded models over ones that would need a load. There is no
 `[backend] kind = "lemonade"`: point `[backend] kind = "generic"` at
 `base_url = "http://127.0.0.1:13305/api/v1"` to use Lemonade as the default

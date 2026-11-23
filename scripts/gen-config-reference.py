@@ -122,7 +122,7 @@ MEANINGS = {
     "routing.discover": "Ask each endpoint what models it serves at startup. Off means use only `[[routing.models]]`.",
     "routing.endpoints.kind": "What kind of server this is.",
     "routing.endpoints.base_url": "The server's URL. Unset uses the kind's usual local address.",
-    "routing.endpoints.locality": "Operator override of the locality the address implies: `local` counts only when the URL's host name resolves to local addresses at load; `cloud` marks the endpoint cloud.",
+    "routing.endpoints.locality": "Operator override of the locality the address implies: `local` counts only when the URL's host name resolves to local addresses at load; `shared` marks the endpoint shared (`cloud` is read as an alias until 3.0).",
     "routing.models.id": "The model id, as its endpoint names it.",
     "routing.models.tier": "Its size class, for matching tasks to models.",
     "routing.models.strengths": "What it is good at.",

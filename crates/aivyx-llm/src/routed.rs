@@ -998,4 +998,36 @@ mod tests {
             .unwrap();
         assert_eq!(big.calls(), 3);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn building_a_pool_backend_checks_off_the_runtime_thread() {
+        use crate::OpenAiCompatBackend;
+        use crate::local::detector::{SlowLan, URL, ticks_during};
+        let default = Scripted::new("default", None);
+        let factory: BackendFactory = Box::new(|k: &ModelKey| {
+            OpenAiCompatBackend::with_resolver(
+                URL,
+                k.id.clone(),
+                None,
+                std::time::Duration::from_secs(60),
+                Arc::new(SlowLan),
+            )
+            .map(|b| Arc::new(b) as Arc<dyn LlmBackend>)
+            .map_err(|e| e.to_string())
+        });
+        let router = RoutedBackend::new(
+            key("backend", "default"),
+            Arc::clone(&default) as Arc<dyn LlmBackend>,
+            vec![
+                profile("backend", "default", Tier::Medium, &[]),
+                profile("gpu", "other", Tier::Medium, &[]),
+            ],
+            TaskOverrides::default(),
+            factory,
+        );
+        let (built, ticks) = ticks_during(router.backend_for(&key("gpu", "other"))).await;
+        assert!(built.is_ok());
+        assert!(ticks >= 5, "the ticker advanced {ticks} times during the check");
+    }
+
 }
