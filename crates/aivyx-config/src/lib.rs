@@ -962,9 +962,9 @@ pub struct BackendSettings {
     /// backend is always local): loopback, private, link-local and
     /// CGNAT/Tailscale addresses and dotless, `.local`, `.lan`,
     /// `.internal` and `.home.arpa` names are local, anything else is
-    /// cloud, and routing never picks a cloud model. `"local"` marks a
-    /// box on your network with a public-looking name local; `"cloud"`
-    /// marks it cloud.
+    /// shared, and routing never picks a shared model. `"local"` marks a
+    /// box on your network with a public-looking name local; `"shared"`
+    /// marks it shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<aivyx_route::Locality>,
     /// Build-time feature, not stable. Absolute path to a local GGUF file
@@ -1793,12 +1793,12 @@ mod tests {
     }
 
     #[test]
-    fn backend_locality_is_optional_and_parses_local_or_cloud() {
+    fn backend_locality_is_optional_and_parses_local_or_shared() {
         assert_eq!(BackendSettings::default().locality, None);
         let parsed: Settings = toml::from_str("[backend]\nlocality = \"local\"\n").unwrap();
         assert_eq!(parsed.backend.locality, Some(aivyx_route::Locality::Local));
-        let parsed: Settings = toml::from_str("[backend]\nlocality = \"cloud\"\n").unwrap();
-        assert_eq!(parsed.backend.locality, Some(aivyx_route::Locality::Cloud));
+        let parsed: Settings = toml::from_str("[backend]\nlocality = \"shared\"\n").unwrap();
+        assert_eq!(parsed.backend.locality, Some(aivyx_route::Locality::Shared));
         // Unset, it isn't written out.
         let toml_string = toml::to_string_pretty(&Settings::default()).unwrap();
         assert!(!toml_string.contains("locality"), "{toml_string}");

@@ -87,7 +87,17 @@ mod tests {
                 Format::Option(inner) | Format::Seq(inner) => variants(registry, inner),
                 Format::TypeName(t) => match registry.get(t) {
                     Some(ContainerFormat::Enum(vs)) => {
-                        Some(vs.values().map(|v| v.name.clone()).collect())
+                        // serde-reflection names a variant by the last of its
+                        // aliases; `Locality::Shared` reads `"cloud"` as one
+                        // (until 3.0), so show the real name.
+                        Some(
+                            vs.values()
+                                .map(|v| match v.name.as_str() {
+                                    "cloud" => "shared".to_string(),
+                                    name => name.to_string(),
+                                })
+                                .collect(),
+                        )
                     }
                     _ => None,
                 },

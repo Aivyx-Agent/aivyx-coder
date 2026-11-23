@@ -68,24 +68,24 @@ pub(crate) fn verify_routing_with(
     Ok(routing_config_warnings(issues))
 }
 
-/// Why routing counts `[backend]` as cloud, and the fix, or `None` when it
+/// Why routing counts `[backend]` as shared, and the fix, or `None` when it
 /// is local.
-fn cloud_backend_remedy(default: &DefaultEndpoint) -> Option<String> {
+fn shared_backend_remedy(default: &DefaultEndpoint) -> Option<String> {
     if default.effective_locality() == Locality::Local {
         return None;
     }
     Some(match (default.locality, default.base_url()) {
-        (Some(Locality::Cloud), _) => "[backend] is marked `locality = \"cloud\"`, so routing \
+        (Some(Locality::Shared), _) => "[backend] is marked `locality = \"shared\"`, so routing \
              never picks its model — remove that, or add a capable local model to \
              [[routing.models]] (see /models)"
             .to_string(),
         (_, None) => "[backend] has no address routing can check (llama_server_broker needs \
-             [broker] base_url), so routing counts its model as cloud and never picks it — set \
+             [broker] base_url), so routing counts its model as shared and never picks it — set \
              [broker] base_url, or add a capable local model to [[routing.models]] (see /models)"
             .to_string(),
         (_, Some(url)) => format!(
             "the [backend] server `{}` is not a local address, so routing counts its model as \
-             cloud and never picks it — if it is on your own network, set `locality = \
+             shared and never picks it — if it is on your own network, set `locality = \
              \"local\"` in [backend]; otherwise add a capable local model to \
              [[routing.models]] (see /models)",
             host_of(url)
@@ -94,16 +94,16 @@ fn cloud_backend_remedy(default: &DefaultEndpoint) -> Option<String> {
 }
 
 /// A startup notice for the transcript when routing is on and counts
-/// `[backend]` as cloud: routed calls, the main loop's included, then
+/// `[backend]` as shared: routed calls, the main loop's included, then
 /// never use it. `default` is the verified [`default_endpoint`].
-pub(crate) fn cloud_backend_notice(
+pub(crate) fn shared_backend_notice(
     settings: &Settings,
     default: &DefaultEndpoint,
 ) -> Option<String> {
     if !settings.routing.enabled {
         return None;
     }
-    cloud_backend_remedy(default).map(|remedy| {
+    shared_backend_remedy(default).map(|remedy| {
         format!(
             "Model routing will not use your [backend] model: routed calls, the main loop \
              included, fail unless another local model is a candidate. {remedy}."
@@ -126,8 +126,8 @@ fn host_of(url: &str) -> String {
         .unwrap_or_else(|| "an unparseable base_url".to_string())
 }
 
-/// aivyx-coder never routes to a cloud endpoint — by address, or marked
-/// `locality = "cloud"` (`EndpointConfig::effective_locality`; the hosted-
+/// aivyx-coder never routes to a shared endpoint — by address, or marked
+/// `locality = "shared"` (`EndpointConfig::effective_locality`; the hosted-
 /// API kinds are gone, and a config naming one fails to load) — and
 /// `backend` names `[backend]`. Run after [`verify_routing_with`], so a
 /// verified `locality = "local"` override counts.
@@ -139,17 +139,17 @@ pub(crate) fn check_routing_config(config: &RoutingConfig) -> anyhow::Result<()>
                  section; give this endpoint another name"
             );
         }
-        if endpoint.effective_locality() == Locality::Cloud {
-            if endpoint.locality == Some(Locality::Cloud) {
+        if endpoint.effective_locality() == Locality::Shared {
+            if endpoint.locality == Some(Locality::Shared) {
                 anyhow::bail!(
-                    "[routing.endpoints.{name}] is marked `locality = \"cloud\"`, but aivyx-coder \
-                     only talks to local models — remove it"
+                    "[routing.endpoints.{name}] is marked `locality = \"shared\"`, but aivyx-coder \
+                     only uses your own models — remove it"
                 );
             }
             let address = endpoint.base_url().map_or("no base_url".to_string(), host_of);
             anyhow::bail!(
                 "[routing.endpoints.{name}] ({address}) is not a local address, so it counts as \
-                 cloud, and aivyx-coder only talks to local models — if it is on your own \
+                 shared, and aivyx-coder only uses your own models — if it is on your own \
                  network, set `locality = \"local\"` on it; otherwise remove it"
             );
         }
@@ -169,20 +169,20 @@ fn routing_config_warnings(issues: Vec<ConfigIssue>) -> Vec<String> {
             ConfigIssue::NonLocalAddress { endpoint, host } if endpoint == DEFAULT_ENDPOINT => {
                 format!(
                     "the [backend] server `{host}` is not a local address, so routing counts its \
-                     model as cloud and never picks it — if it is on your own network, set \
+                     model as shared and never picks it — if it is on your own network, set \
                      `locality = \"local\"` in [backend]"
                 )
             }
             ConfigIssue::MissingBaseUrl { endpoint } if endpoint == DEFAULT_ENDPOINT => {
                 "[backend] has no address routing can check (llama_server_broker needs \
-                 [broker] base_url), so routing counts its model as cloud and never picks it"
+                 [broker] base_url), so routing counts its model as shared and never picks it"
                     .to_string()
             }
             ConfigIssue::LocalOverrideIgnored {
                 endpoint,
                 model: Some(model),
             } if endpoint == DEFAULT_ENDPOINT => format!(
-                "model `{model}` is on [backend], which routing counts as cloud, so its \
+                "model `{model}` is on [backend], which routing counts as shared, so its \
                  [[routing.models]] `locality = \"local\"` is ignored — if the [backend] server \
                  is on your own network, set `locality = \"local\"` in [backend] instead"
             ),
@@ -342,13 +342,13 @@ pub(crate) enum DefaultResidency {
 
 /// [`DefaultResidency`] for `[backend]`, per the exact `BackendKind`
 /// mapping (see the Model Routing Part 4b spec). A `[backend]` that
-/// routing counts as cloud is never polled, as aivyx-route never polls a cloud
+/// routing counts as shared is never polled, as aivyx-route never polls a shared
 /// endpoint. `default` is the verified [`default_endpoint`].
 pub(crate) fn default_residency(
     settings: &Settings,
     default: &DefaultEndpoint,
 ) -> DefaultResidency {
-    if default.effective_locality() == Locality::Cloud {
+    if default.effective_locality() == Locality::Shared {
         return DefaultResidency::None;
     }
     let backend = &settings.backend;
@@ -432,7 +432,7 @@ impl ResidencySources {
 /// `endpoint` (with `locality = "local"`) as `RoutingConfig::verify_local_with`
 /// leaves it, so the override counts for a DNS name that resolves only to
 /// local addresses. Blocking DNS for such a name; one that fails stays
-/// unverified, so it counts as cloud and is never polled.
+/// unverified, so it counts as shared and is never polled.
 fn verified_local_endpoint(endpoint: EndpointConfig, r: &dyn Resolve) -> EndpointConfig {
     const NAME: &str = "residency";
     let mut config = RoutingConfig::default();
@@ -474,8 +474,8 @@ pub(crate) fn spawn_residency_refresh(routed: Weak<RoutedBackend>, sources: Resi
 pub(crate) struct Wrapped {
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) router: Option<Arc<RoutedBackend>>,
-    /// [`cloud_backend_notice`], for the transcript.
-    pub(crate) cloud_backend_notice: Option<String>,
+    /// [`shared_backend_notice`], for the transcript.
+    pub(crate) shared_backend_notice: Option<String>,
 }
 
 /// Routing off ⇒ `llm` untouched and no router. Routing on ⇒ a
@@ -496,7 +496,7 @@ async fn wrap_with_routing_with(
     resolver: Arc<dyn Resolve>,
 ) -> anyhow::Result<Wrapped> {
     if !settings.routing.enabled {
-        return Ok(Wrapped { llm, router: None, cloud_backend_notice: None });
+        return Ok(Wrapped { llm, router: None, shared_backend_notice: None });
     }
     let config = effective_routing_config(settings);
     let default = default_endpoint(settings);
@@ -541,7 +541,7 @@ async fn wrap_with_routing_with(
         backend_factory(settings, &config),
     )
     .with_refresher(refresher);
-    if let Some(remedy) = cloud_backend_remedy(&default) {
+    if let Some(remedy) = shared_backend_remedy(&default) {
         router = router.with_no_route_hint(remedy);
     }
     let router = Arc::new(router);
@@ -555,7 +555,7 @@ async fn wrap_with_routing_with(
     Ok(Wrapped {
         llm: Arc::clone(&router) as Arc<dyn LlmBackend>,
         router: Some(router),
-        cloud_backend_notice: cloud_backend_notice(settings, &default),
+        shared_backend_notice: shared_backend_notice(settings, &default),
     })
 }
 
@@ -657,16 +657,16 @@ mod tests {
                 "{kind} {url}: {err}"
             );
         }
-        // No address at all is cloud too (nothing says where it is).
+        // No address at all is shared too (nothing says where it is).
         let s = settings_with("[routing.endpoints.c]\nkind = \"openai_compat\"\n");
         assert!(check_routing_config(&s.routing).is_err());
-        // locality = "cloud" forces cloud.
+        // locality = "shared" forces shared.
         let s = settings_with(
             "[routing.endpoints.c]\nkind = \"ollama\"\nbase_url = \"http://localhost:11434\"\n\
-             locality = \"cloud\"\n",
+             locality = \"shared\"\n",
         );
         let err = check_routing_config(&s.routing).unwrap_err().to_string();
-        assert!(err.contains("marked `locality = \"cloud\"`"), "{err}");
+        assert!(err.contains("marked `locality = \"shared\"`"), "{err}");
     }
 
     /// The rejection names the host only: a base_url's userinfo may hold
@@ -789,12 +789,12 @@ mod tests {
             d.base_url.as_deref(),
             Some("http://broker.example.com:8899")
         );
-        assert_eq!(d.effective_locality(), Locality::Cloud);
+        assert_eq!(d.effective_locality(), Locality::Shared);
     }
 
     #[test]
     fn the_default_endpoints_locality_follows_its_address() {
-        use Locality::{Cloud, Local};
+        use Locality::{Local, Shared};
         let loc = |b: &Settings| default_endpoint(b).effective_locality();
         assert_eq!(
             loc(&backend(
@@ -818,7 +818,7 @@ mod tests {
                 "https://api.groq.com/openai/v1",
                 None
             )),
-            Cloud
+            Shared
         );
         // A broker kind with no broker address: nothing says where it is.
         assert_eq!(
@@ -827,7 +827,7 @@ mod tests {
                 "http://localhost:8080/v1",
                 None
             )),
-            Cloud
+            Shared
         );
         // The embedded backend runs in-process, whatever base_url says.
         assert_eq!(
@@ -842,11 +842,11 @@ mod tests {
         // ... once verified: unverified, a DNS name stays cloud.
         let mut lan = backend(BackendKind::Generic, "http://gpu.example.com:8080/v1", None);
         lan.backend.locality = Some(Local);
-        assert_eq!(loc(&lan), Cloud);
+        assert_eq!(loc(&lan), Shared);
         assert_eq!(verified(&lan, &LAN).unwrap().1.effective_locality(), Local);
         let mut forced = backend(BackendKind::Generic, "http://localhost:11434/v1", None);
-        forced.backend.locality = Some(Cloud);
-        assert_eq!(loc(&forced), Cloud);
+        forced.backend.locality = Some(Shared);
+        assert_eq!(loc(&forced), Shared);
     }
 
     /// A `[backend]` on a DNS name, even one that resolves to the LAN,
@@ -859,7 +859,7 @@ mod tests {
         let (config, default, warnings) = verified(&s, &LAN).unwrap();
         let profiles = merge(&config, &default, &[]);
         let backend_model = find(&profiles, &key(DEFAULT_ENDPOINT, "qwen3.5:9b")).unwrap();
-        assert_eq!(backend_model.locality, Locality::Cloud);
+        assert_eq!(backend_model.locality, Locality::Shared);
 
         assert!(
             warnings
@@ -936,16 +936,16 @@ mod tests {
         assert_eq!(default.base_url(), None);
         assert_eq!(default.effective_locality(), Locality::Local);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(cloud_backend_notice(&embedded, &default), None);
+        assert_eq!(shared_backend_notice(&embedded, &default), None);
         assert_eq!(default_residency(&embedded, &default), DefaultResidency::Resident);
         assert_eq!(embedded.require_local_models_with(&NoLookups), Ok(()));
 
-        // `[backend] locality = "cloud"` still applies, with its own remedy.
-        embedded.backend.locality = Some(Locality::Cloud);
+        // `[backend] locality = "shared"` still applies, with its own remedy.
+        embedded.backend.locality = Some(Locality::Shared);
         let (_, default, _) = verified(&embedded, &NoLookups).unwrap();
-        assert_eq!(default.effective_locality(), Locality::Cloud);
-        let notice = cloud_backend_notice(&embedded, &default).unwrap();
-        assert!(notice.contains("marked `locality = \"cloud\"`"), "{notice}");
+        assert_eq!(default.effective_locality(), Locality::Shared);
+        let notice = shared_backend_notice(&embedded, &default).unwrap();
+        assert!(notice.contains("marked `locality = \"shared\"`"), "{notice}");
     }
 
     /// aivyx-route never probes an endpoint it calls cloud; neither does
@@ -1282,7 +1282,7 @@ mod tests {
         assert!(err.contains("aivyx is local-only"), "{err}");
     }
 
-    /// A `[backend]` routing counts as cloud, with no other local
+    /// A `[backend]` routing counts as shared, with no other local
     /// candidate, leaves every routed call (the main loop's included) with
     /// nothing to pick; the error must name the real fix, not just
     /// `[[routing.models]]`.
@@ -1324,7 +1324,7 @@ mod tests {
     /// `[backend]`, and names both the consequence and the fix.
     #[test]
     fn the_startup_notice_names_backend_locality_for_a_cloud_backend() {
-        let notice_of = |s: &Settings| cloud_backend_notice(s, &verified(s, &LAN).unwrap().1);
+        let notice_of = |s: &Settings| shared_backend_notice(s, &verified(s, &LAN).unwrap().1);
         let mut s = settings_with("[routing]\nenabled = true\n");
         assert_eq!(notice_of(&s), None, "local backend");
 

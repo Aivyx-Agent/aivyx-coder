@@ -16,7 +16,7 @@ pub async fn require_local(url: &str) -> Result<(), NotLocal> {
 pub async fn require_local_with(url: &str, resolver: Arc<dyn Resolve>) -> Result<(), NotLocal> {
     // Local by its spelling (a loopback or private address, `localhost`, a
     // `.local` name, ...): no lookup, so no thread hop.
-    if aivyx_route::url_locality(url) == aivyx_route::Locality::Local {
+    if aivyx_route::url_is_local(url) {
         return Ok(());
     }
     let owned = url.to_owned();

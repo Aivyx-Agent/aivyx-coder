@@ -44,7 +44,7 @@ pub fn model_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(aivyx_route::discovery::LocalOnlyDns))
+        .dns_resolver(std::sync::Arc::new(aivyx_route::discovery::LocalOnlyDns::new()))
 }
 
 #[cfg(test)]

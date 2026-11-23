@@ -563,11 +563,7 @@ mod tests {
             BackendChoice::GenericOpenAiCompatible,
         ] {
             let url = default_base_url(choice);
-            assert_eq!(
-                aivyx_route::url_locality(url),
-                aivyx_route::Locality::Local,
-                "{choice:?}: {url}"
-            );
+            assert!(aivyx_route::url_is_local(url), "{choice:?}: {url}");
             assert_eq!(check_base_url_answer(url, &NoDns), Ok(()), "{choice:?}");
         }
     }

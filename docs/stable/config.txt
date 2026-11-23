@@ -15,7 +15,7 @@ backend.kind = "generic" (one of: generic | llama_server | llama_server_broker)
 backend.kind = "mistral_rs" (build-time feature)
 backend.kvcache_max_bytes (deprecated: use kvcache.max_bytes)
 backend.kvcache_store_path (deprecated: use kvcache.store_path)
-backend.locality = null (one of: local | cloud)
+backend.locality = null (one of: local | shared)
 backend.mistralrs_chat_template_path = null (build-time feature)
 backend.mistralrs_model_file = null (build-time feature)
 backend.mistralrs_model_path = null (build-time feature)
@@ -69,14 +69,14 @@ routing.enabled = false
 routing.endpoints = {}
 routing.endpoints.*.base_url: string?
 routing.endpoints.*.kind: enum (one of: ollama | llama_router | openai_compat | lemonade)
-routing.endpoints.*.locality: enum? (one of: local | cloud)
+routing.endpoints.*.locality: enum? (one of: local | shared)
 routing.models = []
 routing.models[].capabilities: [enum] (one of: completion | tools | vision | thinking | audio | embedding)
 routing.models[].capabilities_deny: [enum] (one of: completion | tools | vision | thinking | audio | embedding)
 routing.models[].context_window: integer?
 routing.models[].endpoint: string?
 routing.models[].id: string
-routing.models[].locality: enum? (one of: local | cloud)
+routing.models[].locality: enum? (one of: local | shared)
 routing.models[].priority: integer?
 routing.models[].strengths: [enum]? (one of: code | reasoning | chat | summarize)
 routing.models[].tier: enum? (one of: small | medium | large)

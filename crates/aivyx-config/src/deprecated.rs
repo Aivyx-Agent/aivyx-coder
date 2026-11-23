@@ -26,10 +26,36 @@ pub struct Deprecation {
     /// or another deprecated spelling of it read first. `None` when this
     /// one's value was used.
     pub overridden_by: Option<&'static str>,
+    /// A fixed text shown instead of the generic "`old` is deprecated"
+    /// line, for a deprecated *value* rather than a key.
+    pub message: Option<&'static str>,
+}
+
+/// The note for the `"cloud"` spelling of `locality`, now `"shared"`.
+pub const CLOUD_LOCALITY_NOTE: &str =
+    "locality = \"cloud\" is now \"shared\"; the old name works until 3.0";
+
+/// Whether the file spells a `locality` as `"cloud"` at `backend.locality`,
+/// `routing.endpoints.*.locality` or `routing.models[].locality`.
+fn sets_cloud_locality(table: &toml::Table) -> bool {
+    let is_cloud = |t: &toml::Value| {
+        t.as_table().and_then(|t| t.get("locality")).and_then(|v| v.as_str()) == Some("cloud")
+    };
+    if table.get("backend").is_some_and(is_cloud) {
+        return true;
+    }
+    let Some(routing) = table.get("routing").and_then(|r| r.as_table()) else {
+        return false;
+    };
+    routing.get("endpoints").and_then(|e| e.as_table()).is_some_and(|e| e.values().any(is_cloud))
+        || routing.get("models").and_then(|m| m.as_array()).is_some_and(|m| m.iter().any(is_cloud))
 }
 
 impl fmt::Display for Deprecation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(message) = self.message {
+            return f.write_str(message);
+        }
         write!(f, "`{}` is deprecated; use `{}`", self.old, self.new)?;
         if let Some(winner) = self.overridden_by {
             write!(f, " (`{winner}` is set too and wins; this value is ignored)")?;
@@ -72,7 +98,7 @@ pub(crate) fn resolve(settings: &mut Settings, table: &toml::Table) -> Vec<Depre
             settings.broker.base_url = Some(value);
             broker_source = Some(old);
         }
-        out.push(Deprecation { old, new: "broker.base_url", overridden_by });
+        out.push(Deprecation { old, new: "broker.base_url", overridden_by, message: None });
     }
     if let Some(value) = settings.backend.legacy_kvcache_store_path.take() {
         let overridden_by = present(table, "kvcache.store_path").then_some("kvcache.store_path");
@@ -83,6 +109,7 @@ pub(crate) fn resolve(settings: &mut Settings, table: &toml::Table) -> Vec<Depre
             old: "backend.kvcache_store_path",
             new: "kvcache.store_path",
             overridden_by,
+            message: None,
         });
     }
     if let Some(value) = settings.backend.legacy_kvcache_max_bytes.take() {
@@ -94,6 +121,15 @@ pub(crate) fn resolve(settings: &mut Settings, table: &toml::Table) -> Vec<Depre
             old: "backend.kvcache_max_bytes",
             new: "kvcache.max_bytes",
             overridden_by,
+            message: None,
+        });
+    }
+    if sets_cloud_locality(table) {
+        out.push(Deprecation {
+            old: "locality = \"cloud\"",
+            new: "locality = \"shared\"",
+            overridden_by: None,
+            message: Some(CLOUD_LOCALITY_NOTE),
         });
     }
     out
@@ -137,6 +173,29 @@ mod tests {
     fn parse(raw: &str) -> (Settings, Vec<Deprecation>, Vec<crate::UnknownKey>) {
         let (settings, unknown, deprecated) = Settings::parse_with_warnings(raw).unwrap();
         (settings, deprecated, unknown)
+    }
+
+    #[test]
+    fn locality_cloud_loads_as_shared_and_warns_once() {
+        let (s, d, unknown) = parse(
+            "[backend]\nlocality = \"cloud\"\n\
+             [routing.endpoints.a]\nkind = \"ollama\"\nlocality = \"cloud\"\n\
+             [[routing.models]]\nid = \"m\"\nendpoint = \"a\"\nlocality = \"cloud\"\n",
+        );
+        assert_eq!(s.backend.locality, Some(aivyx_route::Locality::Shared));
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].to_string(),
+            "locality = \"cloud\" is now \"shared\"; the old name works until 3.0"
+        );
+    }
+
+    #[test]
+    fn locality_shared_does_not_warn() {
+        let (s, d, _) = parse("[backend]\nlocality = \"shared\"\n");
+        assert_eq!(s.backend.locality, Some(aivyx_route::Locality::Shared));
+        assert!(d.is_empty(), "{d:?}");
     }
 
     #[test]

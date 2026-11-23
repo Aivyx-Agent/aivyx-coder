@@ -625,7 +625,7 @@ pub(crate) async fn build_agent(
     // machine or the operator's own network, or it doesn't start.
     require_local_models(settings).await?;
 
-    let crate::routing::Wrapped { llm, router, cloud_backend_notice } =
+    let crate::routing::Wrapped { llm, router, shared_backend_notice } =
         crate::routing::wrap_with_routing(settings, build_llm_backend(settings).await?).await?;
 
     let deny_paths = settings.effective_deny_paths();
@@ -1504,10 +1504,10 @@ pub(crate) async fn build_agent(
     // (`set_advertise_tools` below), so it always matches the tools sent.
     let system_prompt = build_system_prompt(edit_format, cli.auto.is_some());
 
-    // A `[backend]` routing counts as cloud leaves routed calls (the main
+    // A `[backend]` routing counts as shared leaves routed calls (the main
     // loop's included) with nothing to pick unless another local model is
     // a candidate; aivyx.log alone is not where a user looks for that.
-    if let Some(notice) = cloud_backend_notice {
+    if let Some(notice) = shared_backend_notice {
         let _ = events_tx.send(aivyx_core::AgentEvent::Error(notice));
     }
     for notice in pack.iter().flat_map(|p| p.notices.iter()) {
@@ -1568,11 +1568,11 @@ pub(crate) async fn build_agent(
                                 // below so the two can never silently diverge.
                                 let store_path = settings.kvcache.resolved_store_path();
                                 // The slot client is a model client: no proxy, no
-                                // redirects, local-only DNS. 60 s matches
+                                // redirects, local-only DNS. The timeout is
                                 // aivyx-kvcache's SLOT_HTTP_TIMEOUT (slot files are
                                 // large, so a status-check bound would be too short).
                                 let slot_client = aivyx_llm::model_client_builder()
-                                    .timeout(std::time::Duration::from_secs(60))
+                                    .timeout(aivyx_kvcache::SLOT_HTTP_TIMEOUT)
                                     .build()
                                     .map_err(|e| {
                                         aivyx_kvcache::KvCacheError::Backend(e.to_string())
