@@ -532,8 +532,13 @@ fn startup_warning_text(warning: &str) -> String {
 fn startup_warnings(events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
     let mut warnings = Vec::new();
     while let Ok(event) = events_rx.try_recv() {
-        if let AgentEvent::Error(text) = event {
-            warnings.push(text);
+        match event {
+            AgentEvent::Error(text) => warnings.push(text),
+            // Config notes (old spellings, unknown keys) are sent as
+            // `Info("config: …")` by the agent builder; keep them, drop the
+            // other information.
+            AgentEvent::Info(text) if text.starts_with("config: ") => warnings.push(text),
+            _ => {}
         }
     }
     warnings
@@ -926,7 +931,15 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(AgentEvent::Info("using the server's 32768-token context window".into())).unwrap();
         tx.send(AgentEvent::Error("couldn't reach the model server".into())).unwrap();
-        assert_eq!(startup_warnings(&mut rx), vec!["couldn't reach the model server".to_string()]);
+        tx.send(AgentEvent::Info("config: [backend] locality = \"cloud\" is now \"shared\"".into()))
+            .unwrap();
+        assert_eq!(
+            startup_warnings(&mut rx),
+            vec![
+                "couldn't reach the model server".to_string(),
+                "config: [backend] locality = \"cloud\" is now \"shared\"".to_string(),
+            ]
+        );
         assert!(rx.try_recv().is_err(), "nothing left for the first prompt to pick up");
     }
 

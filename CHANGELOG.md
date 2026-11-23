@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Config notes (old spellings such as `locality = "cloud"`, and unknown keys) now show in the TUI transcript at start, instead of on stderr behind the TUI. Headless and `--acp` show them too; `aivyx-coder pack` still prints them to stderr.
+- Config notes (old spellings such as `locality = "cloud"`, and unknown keys) now show in the TUI transcript at start, instead of on stderr behind the TUI. Headless and `--acp` show them too (ACP as start-up warnings); `--mcp-server`, `aivyx-coder pack` and a failed agent build print them to stderr.
 
 ## [2.1.0] - 2026-11-23
 

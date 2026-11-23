@@ -1947,9 +1947,6 @@ fn kv_cache_props_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// The session-start notice for a git repository whose checkpoints
-/// aivyx-checkpoint refuses. `reason` names the setting or path, never a
-/// config value; it is cut short so a long list stays one readable notice.
 /// What loading the config had to say (old spellings, unknown keys), as
 /// transcript notices: stderr sits behind the TUI.
 fn send_config_notes(
@@ -1961,6 +1958,9 @@ fn send_config_notes(
     }
 }
 
+/// The session-start notice for a git repository whose checkpoints
+/// aivyx-checkpoint refuses. `reason` names the setting or path, never a
+/// config value; it is cut short so a long list stays one readable notice.
 fn refused_checkpoints_notice(reason: &str) -> String {
     const MAX_CHARS: usize = 300;
     let mut detail: String = reason.trim().chars().take(MAX_CHARS).collect();

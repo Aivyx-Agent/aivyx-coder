@@ -40,6 +40,21 @@ fn validate_mcp_server_session_limits(ttl_secs: u64, max_concurrent: u32) -> any
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_notes_are_written_one_warning_per_line() {
+        let settings = Settings { load_notes: vec!["a".into(), "b".into()], ..Settings::default() };
+        let mut out = Vec::new();
+        write_config_notes(&settings, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "warning: a\nwarning: b\n");
+    }
+
+    #[test]
+    fn a_build_result_passes_through_the_notes_helper_unchanged() {
+        let settings = Settings::default();
+        assert_eq!(notes_on_build_error::<_, String>(Ok(1), &settings), Ok(1));
+        assert_eq!(notes_on_build_error::<i32, _>(Err("boom".to_string()), &settings), Err("boom".to_string()));
+    }
+
     /// Every config key, as `docs/stable/config.txt` lists it, one per line:
     ///
     /// - `path = default`: a key and its default (`null`: unset), from
@@ -987,9 +1002,22 @@ fn ask_settings_consent(v: &aivyx_pack::PackVerification, allowed: &[aivyx_confi
 /// Config notes for a path that builds no agent (so nothing shows them in
 /// a transcript): to stderr, as the loader used to.
 fn print_config_notes(settings: &Settings) {
+    let mut err = std::io::stderr();
+    let _ = write_config_notes(settings, &mut err);
+}
+
+fn write_config_notes(settings: &Settings, out: &mut impl std::io::Write) -> std::io::Result<()> {
     for note in &settings.load_notes {
-        eprintln!("warning: {note}");
+        writeln!(out, "warning: {note}")?;
     }
+    Ok(())
+}
+
+/// A failed agent build never sends the notes (they go out once it
+/// succeeds), so print them with the error; a successful build is left
+/// alone, its notes reach the transcript exactly once.
+fn notes_on_build_error<T, E>(built: Result<T, E>, settings: &Settings) -> Result<T, E> {
+    built.inspect_err(|_| print_config_notes(settings))
 }
 
 /// `aivyx-coder pack …`. Reads `config.toml` only for trusted keys and
@@ -1298,14 +1326,14 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
                 let mut settings = settings;
                 let pack = apply_pack_layer(&mut settings);
                 let (deferred, prompter_installer) = aivyx_acp::deferred_prompter();
-                let mut built = crate::agent_builder::build_agent(
+                let built = crate::agent_builder::build_agent(
                     &cli,
                     &settings,
                     Arc::new(deferred),
                     pack.as_ref(),
                 )
-                .await
-                .map_err(|e| e.to_string())?;
+                .await;
+                let mut built = notes_on_build_error(built, &settings).map_err(|e| e.to_string())?;
                 built.agent.set_summarize_on_pause(true);
                 Ok(aivyx_acp::AcpBuilt {
                     agent: built.agent,
@@ -1369,10 +1397,15 @@ async fn run_main(cli: Cli, headless: bool) -> anyhow::Result<()> {
     } else {
         Arc::new(tui_prompter)
     };
-    let mut built =
-        crate::agent_builder::build_agent(&cli, &settings, prompter, pack.as_ref()).await?;
+    let mut built = notes_on_build_error(
+        crate::agent_builder::build_agent(&cli, &settings, prompter, pack.as_ref()).await,
+        &settings,
+    )?;
 
     if cli.mcp_server {
+        // Nothing reads the build's events here, and stdout carries the
+        // protocol: the notes go to stderr.
+        print_config_notes(&settings);
         let Some(max_access_level_str) = settings.mcp_server.max_access_level.as_deref() else {
             anyhow::bail!(
                 "--mcp-server requires [mcp_server].max_access_level to be set in config.toml \

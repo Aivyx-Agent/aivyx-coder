@@ -374,7 +374,7 @@ pub(crate) struct ResidencySources {
 }
 
 impl ResidencySources {
-    /// Precondition: `default` names only a non-cloud `[backend]`, as [`default_residency`] guarantees.
+    /// Precondition: `default` names only a non-shared `[backend]`, as [`default_residency`] guarantees.
     /// May resolve a DNS name (blocking): see [`verified_local_endpoint`].
     pub(crate) fn new(config: &RoutingConfig, default: DefaultResidency, r: &dyn Resolve) -> Self {
         let mut endpoints = endpoints_of(config);
