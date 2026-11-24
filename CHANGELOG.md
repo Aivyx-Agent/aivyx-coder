@@ -1,10 +1,14 @@
 # Changelog
 
-## [2.1.1] - Unreleased
+## [2.1.1] - 2026-11-24
 
 ### Fixed
 
 - Config notes (old spellings such as `locality = "cloud"`, and unknown keys) now show in the TUI transcript at start, instead of on stderr behind the TUI. Headless and `--acp` show them too (ACP as start-up warnings); `--mcp-server`, `aivyx-coder pack` and a failed agent build print them to stderr.
+
+### Changed
+
+- aivyx-route 0.3.1 (a mapped multicast address gets the right refusal reason) and aivyx-vision 426b7d9.
 
 ## [2.1.0] - 2026-11-23
 
